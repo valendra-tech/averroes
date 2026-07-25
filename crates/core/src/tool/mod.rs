@@ -63,3 +63,43 @@ pub enum ToolError {
 }
 
 pub type Result<T> = std::result::Result<T, ToolError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_tool_result_ok() {
+        let result = ToolResult::ok("success");
+        assert!(result.success);
+        assert_eq!(result.content, "success");
+        assert!(result.error.is_none());
+        assert!(result.metadata.is_none());
+    }
+
+    #[test]
+    fn test_tool_result_error() {
+        let result = ToolResult::error("something went wrong");
+        assert!(!result.success);
+        assert_eq!(result.content, "");
+        assert_eq!(result.error, Some("something went wrong".into()));
+        assert!(result.metadata.is_none());
+    }
+
+    #[test]
+    fn test_tool_result_with_metadata() {
+        let result = ToolResult::ok("done").with_metadata(json!({"tokens": 42}));
+        assert!(result.success);
+        assert_eq!(result.content, "done");
+        assert_eq!(result.metadata, Some(json!({"tokens": 42})));
+    }
+
+    #[test]
+    fn test_tool_result_error_with_metadata() {
+        let result = ToolResult::error("fail").with_metadata(json!({"code": 500}));
+        assert!(!result.success);
+        assert_eq!(result.error, Some("fail".into()));
+        assert_eq!(result.metadata, Some(json!({"code": 500})));
+    }
+}

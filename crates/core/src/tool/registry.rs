@@ -12,6 +12,8 @@ impl ToolRegistry {
         Self { tools: DashMap::new() }
     }
 
+    /// Register a tool with the registry. If a tool with the same name already
+    /// exists, it is overwritten.
     pub fn register(&self, tool: impl Tool + 'static) {
         let name = tool.name().to_string();
         self.tools.insert(name, Arc::new(tool));
@@ -35,10 +37,7 @@ impl ToolRegistry {
 
     pub async fn execute(&self, name: &str, ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
         let tool = self.get(name).ok_or_else(|| ToolError::NotFound { tool: name.to_string() })?;
-        tool.execute(ctx, params).await.map_err(|e| ToolError::Execution {
-            tool: name.to_string(),
-            message: e.to_string(),
-        })
+        tool.execute(ctx, params).await
     }
 }
 
@@ -113,6 +112,68 @@ mod tests {
     async fn test_not_found() {
         let registry = ToolRegistry::new();
         let result = registry.execute("nonexistent", &test_ctx(), &json!({})).await;
-        assert!(result.is_err());
+        assert!(matches!(result, Err(ToolError::NotFound { .. })));
+    }
+
+    #[test]
+    fn test_list() {
+        let registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        struct NoopTool;
+        #[async_trait]
+        impl Tool for NoopTool {
+            fn name(&self) -> &str { "noop" }
+            fn description(&self) -> &str { "Does nothing" }
+            fn parameters(&self) -> serde_json::Value { json!({"type": "object", "properties": {}}) }
+            async fn execute(&self, _ctx: &ToolContext, _params: &serde_json::Value) -> Result<ToolResult> {
+                Ok(ToolResult::ok("ok"))
+            }
+        }
+        registry.register(NoopTool);
+        let tools = registry.list();
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().any(|t| t.name() == "echo"));
+        assert!(tools.iter().any(|t| t.name() == "noop"));
+    }
+
+    #[test]
+    fn test_names() {
+        let registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let mut names = registry.names();
+        names.sort();
+        assert_eq!(names, vec!["echo"]);
+    }
+
+    #[test]
+    fn test_remove() {
+        let registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        assert!(registry.get("echo").is_some());
+        let removed = registry.remove("echo");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().name(), "echo");
+        assert!(registry.get("echo").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_execute_propagates_original_error() {
+        struct FailingTool;
+        #[async_trait]
+        impl Tool for FailingTool {
+            fn name(&self) -> &str { "failing" }
+            fn description(&self) -> &str { "Always fails" }
+            fn parameters(&self) -> serde_json::Value { json!({"type": "object", "properties": {}}) }
+            async fn execute(&self, _ctx: &ToolContext, _params: &serde_json::Value) -> Result<ToolResult> {
+                Err(ToolError::InvalidParams {
+                    tool: "failing".into(),
+                    message: "bad input".into(),
+                })
+            }
+        }
+        let registry = ToolRegistry::new();
+        registry.register(FailingTool);
+        let result = registry.execute("failing", &test_ctx(), &json!({})).await;
+        assert!(matches!(result, Err(ToolError::InvalidParams { .. })));
     }
 }
