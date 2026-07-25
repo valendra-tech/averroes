@@ -86,7 +86,7 @@ impl ResourceGovernor {
         }
     }
 
-    pub fn try_spend_tokens(&self, count: u64) -> bool {
+    pub fn try_reserve_tokens(&self, count: u64) -> bool {
         let mut current = self.tokens_used_this_minute.load(Ordering::SeqCst);
         loop {
             let Some(next) = current.checked_add(count) else {
@@ -106,6 +106,26 @@ impl ResourceGovernor {
                 Err(actual) => current = actual,
             }
         }
+    }
+
+    pub fn release_tokens(&self, count: u64) {
+        let mut current = self.tokens_used_this_minute.load(Ordering::SeqCst);
+        loop {
+            let next = current.saturating_sub(count);
+            match self.tokens_used_this_minute.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub fn try_spend_tokens(&self, count: u64) -> bool {
+        self.try_reserve_tokens(count)
     }
 
     pub fn tokens_available(&self) -> u64 {
@@ -194,6 +214,18 @@ mod tests {
         }
         assert_eq!(governor.tokens_available(), 0);
         assert!(!governor.try_spend_tokens(1));
+    }
+
+    #[test]
+    fn test_token_reservation_and_release() {
+        let governor = ResourceGovernor::new(1, 10);
+
+        assert!(governor.try_reserve_tokens(7));
+        assert_eq!(governor.tokens_available(), 3);
+        governor.release_tokens(4);
+        assert_eq!(governor.tokens_available(), 7);
+        assert!(governor.try_reserve_tokens(7));
+        assert!(!governor.try_reserve_tokens(1));
     }
 
     #[tokio::test(flavor = "multi_thread")]

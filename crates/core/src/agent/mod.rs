@@ -4,7 +4,7 @@ pub mod registry;
 use crate::compaction::{CompactionConfig, CompactionStrategy, CompactionStrategyType};
 use crate::compaction::strategies::{TrimStrategy, SummaryStrategy, HybridStrategy};
 use crate::provider::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolDefinition};
-use crate::provider::types::{MessageContent, Role};
+use crate::provider::types::{ContentPart, MessageContent, Role};
 use crate::runtime::ResourceGovernor;
 use crate::tool::{ToolContext, ToolRegistry, ToolResult};
 use std::path::PathBuf;
@@ -61,6 +61,25 @@ pub struct Agent {
     agent_id: String,
     session_id: String,
     working_dir: PathBuf,
+}
+
+fn estimate_request_tokens(request: &ChatRequest) -> u64 {
+    let message_chars = request.messages.iter().fold(0u64, |total, message| {
+        let chars = match &message.content {
+            MessageContent::Text(text) => text.chars().count() as u64,
+            MessageContent::Parts(parts) => parts.iter().fold(0u64, |total, part| {
+                let chars = match part {
+                    ContentPart::Text { text } => text.chars().count() as u64,
+                    ContentPart::ToolResult { content, .. } => content.chars().count() as u64,
+                    _ => 0,
+                };
+                total.saturating_add(chars)
+            }),
+        };
+        total.saturating_add(chars)
+    });
+
+    (message_chars / 4).saturating_add(request.max_tokens.unwrap_or(4096) as u64)
 }
 
 impl Agent {
@@ -141,19 +160,38 @@ impl Agent {
 
             self.set_state(AgentState::Thinking).await;
 
-            let response = self
-                .provider
-                .chat(request)
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let reserved_tokens = estimate_request_tokens(&request);
+            if !self.governor.try_reserve_tokens(reserved_tokens) {
+                self.set_state(AgentState::Errored).await;
+                return Err(anyhow::anyhow!(
+                    "Token budget exhausted before provider request"
+                ));
+            }
+
+            let response = match self.provider.chat(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    self.governor.release_tokens(reserved_tokens);
+                    return Err(anyhow::anyhow!(error.to_string()));
+                }
+            };
 
             if let Some(usage) = response.usage.as_ref() {
-                let tokens = usage
+                let actual_tokens = usage
                     .input_tokens
                     .saturating_add(usage.output_tokens);
-                if !self.governor.try_spend_tokens(tokens) {
-                    self.set_state(AgentState::Errored).await;
-                    return Err(anyhow::anyhow!("Token budget exhausted"));
+                if actual_tokens < reserved_tokens {
+                    self.governor
+                        .release_tokens(reserved_tokens - actual_tokens);
+                } else if actual_tokens > reserved_tokens {
+                    let extra_tokens = actual_tokens - reserved_tokens;
+                    if !self.governor.try_reserve_tokens(extra_tokens) {
+                        self.governor.release_tokens(reserved_tokens);
+                        self.set_state(AgentState::Errored).await;
+                        return Err(anyhow::anyhow!(
+                            "Token budget exhausted after provider response"
+                        ));
+                    }
                 }
             }
 
@@ -476,6 +514,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_agent_rejects_request_before_provider_when_reservation_exceeds_budget() {
+        let provider = Arc::new(TestProvider::new(vec![]));
+        let agent = Agent::new(
+            AgentConfig {
+                system_prompt: None,
+                tools: Vec::new(),
+                max_tokens: Some(1),
+                ..Default::default()
+            },
+            provider.clone(),
+            test_tool_registry(),
+            Arc::new(ResourceGovernor::new(1, 1)),
+            "reservation-session".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        let error = agent.run("request").await.unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Token budget exhausted before provider request"));
+        assert_eq!(*provider.call_count.lock().unwrap(), 0);
+        assert_eq!(agent.state().await, AgentState::Errored);
+    }
+
+    #[tokio::test]
     async fn test_agent_rejects_response_when_token_budget_is_exhausted() {
         let response = ChatResponse {
             message: ChatMessage {
@@ -495,7 +559,12 @@ mod tests {
         let provider = Arc::new(TestProvider::new(vec![response.clone(), response]));
         let governor = Arc::new(ResourceGovernor::new(1, 5));
         let agent = Agent::new(
-            test_agent_config(),
+            AgentConfig {
+                system_prompt: None,
+                tools: Vec::new(),
+                max_tokens: Some(4),
+                ..Default::default()
+            },
             provider,
             test_tool_registry(),
             governor.clone(),
