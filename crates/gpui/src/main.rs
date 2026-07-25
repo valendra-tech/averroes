@@ -1,0 +1,14 @@
+mod app;
+mod shortcuts;
+mod theme;
+mod views;
+
+use anyhow::Result;
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+    tracing::info!("Averroes GPUI starting...");
+    Ok(())
+}
