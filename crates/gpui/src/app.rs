@@ -2,6 +2,8 @@ use gpui::*;
 
 use crate::theme::Theme;
 use crate::views::{chat::ChatView, settings::SettingsView, sidebar::Sidebar};
+use averroes_core::agent::Agent;
+use std::sync::Arc;
 
 pub struct AverroesApp {
     sidebar: Entity<Sidebar>,
@@ -18,11 +20,11 @@ enum ActiveView {
 }
 
 impl AverroesApp {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>, agent: Option<Arc<Agent>>) -> Self {
         let theme = Theme::default();
 
         let sidebar = cx.new(|cx| Sidebar::new(cx));
-        let chat = cx.new(|cx| ChatView::new(cx));
+        let chat = cx.new(|cx| ChatView::new(cx, agent));
         let settings = cx.new(|cx| SettingsView::new(cx));
 
         Self {

@@ -4,35 +4,71 @@ use gpui::*;
 
 use crate::theme::Theme;
 use message::MessageBubble;
+use averroes_core::agent::Agent;
+use std::sync::Arc;
 
 pub struct ChatView {
     messages: Vec<MessageBubble>,
-    input: Entity<Input>,
+    input_text: String,
     theme: Theme,
+    thinking: bool,
+    agent: Option<Arc<Agent>>,
 }
 
 impl ChatView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(_cx: &mut Context<Self>, agent: Option<Arc<Agent>>) -> Self {
+        let mut messages = Vec::new();
+        if agent.is_some() {
+            messages.push(MessageBubble::assistant("Averroes AI ready."));
+        } else {
+            messages.push(MessageBubble::assistant("No AI provider configured."));
+        }
+
         Self {
-            messages: vec![MessageBubble::assistant("Averroes AI ready.")],
-            input: cx.new(|_cx| Input::new()),
+            messages,
+            input_text: String::new(),
             theme: Theme::default(),
+            thinking: false,
+            agent,
         }
     }
 
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
     }
-}
 
-struct Input {
-    text: String,
-}
+    fn send_message(&mut self, cx: &mut Context<Self>) {
+        let text = std::mem::take(&mut self.input_text);
+        if text.is_empty() {
+            return;
+        }
 
-impl Input {
-    fn new() -> Self {
-        Self {
-            text: String::new(),
+        if let Some(ref agent) = self.agent {
+            self.messages.push(MessageBubble::user(text.clone()));
+            cx.notify();
+
+            let agent = Arc::clone(agent);
+            self.thinking = true;
+
+            cx.spawn(async move |this, cx| {
+                let result = agent.run(&text).await;
+                match result {
+                    Ok(response) => {
+                        _ = this.update(cx, |chat, cx| {
+                            chat.messages.push(MessageBubble::assistant(response));
+                            chat.thinking = false;
+                            cx.notify();
+                        });
+                    }
+                    Err(e) => {
+                        _ = this.update(cx, |chat, cx| {
+                            chat.messages.push(MessageBubble::assistant(format!("Error: {}", e)));
+                            chat.thinking = false;
+                            cx.notify();
+                        });
+                    }
+                }
+            }).detach();
         }
     }
 }
@@ -93,7 +129,15 @@ impl Render for ChatView {
                                             .child(msg.content.clone()),
                                     ),
                             )
-                    })),
+                    }))
+                    .child(if self.thinking {
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted)
+                            .child("thinking...")
+                    } else {
+                        div()
+                    }),
             )
             .child(
                 div()
@@ -112,7 +156,11 @@ impl Render for ChatView {
                             .py_2()
                             .text_sm()
                             .text_color(theme.fg)
-                            .child("Type a message..."),
+                            .child(if self.input_text.is_empty() {
+                                String::from("Type a message...")
+                            } else {
+                                self.input_text.clone()
+                            }),
                     )
                     .child(
                         div()
