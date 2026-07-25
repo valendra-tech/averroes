@@ -7,6 +7,9 @@ use averroes_core::runtime::ResourceGovernor;
 use averroes_core::tool::{builtin, ToolRegistry};
 use std::sync::Arc;
 
+const DEFAULT_COMPACTION_THRESHOLD: f64 = 0.8;
+const MAX_CONCURRENT_CALLS: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
 pub struct AgentFactory {
     pub config: AppConfig,
     pub provider: Arc<dyn Provider>,
@@ -103,7 +106,11 @@ impl AgentFactory {
 
 fn runtime_limits(config: &AppConfig) -> (usize, u64) {
     (
-        config.runtime.max_concurrent_calls.unwrap_or(10).max(1),
+        config
+            .runtime
+            .max_concurrent_calls
+            .unwrap_or(10)
+            .clamp(1, MAX_CONCURRENT_CALLS),
         config
             .runtime
             .token_budget_per_minute
@@ -113,13 +120,22 @@ fn runtime_limits(config: &AppConfig) -> (usize, u64) {
 }
 
 fn compaction_config(config: &AppConfig) -> CompactionConfig {
+    let threshold = config
+        .compaction
+        .threshold
+        .unwrap_or(DEFAULT_COMPACTION_THRESHOLD);
+
     CompactionConfig {
         strategy: match config.compaction.strategy.as_deref() {
             Some("trim") => CompactionStrategyType::Trim,
             Some("summary") => CompactionStrategyType::Summary,
             _ => CompactionStrategyType::Hybrid,
         },
-        threshold: config.compaction.threshold.unwrap_or(0.8).clamp(0.0, 1.0),
+        threshold: if threshold.is_finite() {
+            threshold.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_COMPACTION_THRESHOLD
+        },
         ..Default::default()
     }
 }
@@ -193,6 +209,17 @@ mod tests {
     }
 
     #[test]
+    fn runtime_limits_cap_concurrent_calls_at_tokio_maximum() {
+        let mut config = AppConfig::default();
+        config.runtime.max_concurrent_calls = Some(usize::MAX);
+
+        assert_eq!(
+            runtime_limits(&config).0,
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+    }
+
+    #[test]
     fn compaction_threshold_is_clamped() {
         let mut config = AppConfig::default();
         config.compaction.threshold = Some(2.0);
@@ -200,5 +227,18 @@ mod tests {
 
         config.compaction.threshold = Some(-1.0);
         assert_eq!(compaction_config(&config).threshold, 0.0);
+    }
+
+    #[test]
+    fn compaction_threshold_uses_default_for_non_finite_values() {
+        let mut config = AppConfig::default();
+        config.compaction.threshold = Some(f64::NAN);
+        assert_eq!(compaction_config(&config).threshold, 0.8);
+
+        config.compaction.threshold = Some(f64::INFINITY);
+        assert_eq!(compaction_config(&config).threshold, 0.8);
+
+        config.compaction.threshold = Some(f64::NEG_INFINITY);
+        assert_eq!(compaction_config(&config).threshold, 0.8);
     }
 }
