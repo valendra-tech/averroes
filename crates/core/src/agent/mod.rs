@@ -57,7 +57,7 @@ pub struct Agent {
     tool_registry: Arc<ToolRegistry>,
     governor: Arc<ResourceGovernor>,
     state: Arc<Mutex<AgentState>>,
-    messages: Vec<ChatMessage>,
+    messages: Arc<tokio::sync::Mutex<Vec<ChatMessage>>>,
     agent_id: String,
     session_id: String,
     working_dir: PathBuf,
@@ -73,16 +73,18 @@ impl Agent {
         working_dir: PathBuf,
     ) -> Self {
         let agent_id = uuid::Uuid::new_v4().to_string();
-        let mut messages = Vec::new();
-
-        if let Some(ref prompt) = config.system_prompt {
-            messages.push(ChatMessage {
-                role: Role::System,
-                content: MessageContent::Text(prompt.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-        }
+        let messages = {
+            let mut msgs = Vec::new();
+            if let Some(ref prompt) = config.system_prompt {
+                msgs.push(ChatMessage {
+                    role: Role::System,
+                    content: MessageContent::Text(prompt.clone()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
+            }
+            Arc::new(tokio::sync::Mutex::new(msgs))
+        };
 
         Self {
             config,
@@ -105,16 +107,19 @@ impl Agent {
         *self.state.lock().await
     }
 
-    pub async fn run(&mut self, user_input: &str) -> Result<String> {
-        self.messages.push(ChatMessage {
-            role: Role::User,
-            content: MessageContent::Text(user_input.to_string()),
-            tool_call_id: None,
-            tool_calls: None,
-        });
+    pub async fn run(&self, user_input: &str) -> Result<String> {
+        {
+            let mut msgs = self.messages.lock().await;
+            msgs.push(ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text(user_input.to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
 
         for _iteration in 0..self.config.max_iterations {
-            if self.should_compact() {
+            if self.should_compact().await {
                 self.compact().await?;
             }
 
@@ -122,13 +127,16 @@ impl Agent {
 
             let tool_defs = self.build_tool_definitions();
 
-            let request = ChatRequest {
-                model: self.config.model.clone(),
-                messages: self.messages.clone(),
-                tools: tool_defs,
-                max_tokens: self.config.max_tokens,
-                temperature: self.config.temperature,
-                system: None,
+            let request = {
+                let msgs = self.messages.lock().await;
+                ChatRequest {
+                    model: self.config.model.clone(),
+                    messages: msgs.clone(),
+                    tools: tool_defs,
+                    max_tokens: self.config.max_tokens,
+                    temperature: self.config.temperature,
+                    system: None,
+                }
             };
 
             self.set_state(AgentState::Thinking).await;
@@ -142,15 +150,21 @@ impl Agent {
             if response.message.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty()) {
                 self.set_state(AgentState::Acting).await;
 
-                self.messages.push(ChatMessage {
-                    role: Role::Assistant,
-                    content: MessageContent::Text(String::new()),
-                    tool_call_id: None,
-                    tool_calls: response.message.tool_calls.clone(),
-                });
+                {
+                    let mut msgs = self.messages.lock().await;
+                    msgs.push(ChatMessage {
+                        role: Role::Assistant,
+                        content: MessageContent::Text(String::new()),
+                        tool_call_id: None,
+                        tool_calls: response.message.tool_calls.clone(),
+                    });
+                }
 
                 let tool_messages = self.execute_tools(&response).await?;
-                self.messages.extend(tool_messages);
+                {
+                    let mut msgs = self.messages.lock().await;
+                    msgs.extend(tool_messages);
+                }
 
                 continue;
             }
@@ -215,25 +229,32 @@ impl Agent {
         Ok(messages)
     }
 
-    fn should_compact(&self) -> bool {
+    async fn should_compact(&self) -> bool {
         let context_limit = self.provider.context_window(&self.config.model);
         let strategy = self.compaction_strategy();
-        strategy.should_compact(&self.messages, context_limit, &self.config.compaction)
+        let msgs = self.messages.lock().await;
+        strategy.should_compact(&msgs, context_limit, &self.config.compaction)
     }
 
-    async fn compact(&mut self) -> Result<()> {
+    async fn compact(&self) -> Result<()> {
         self.set_state(AgentState::Compacting).await;
 
         let strategy = self.compaction_strategy();
         let context_limit = self.provider.context_window(&self.config.model);
         let provider_ref: Option<&dyn Provider> = Some(self.provider.as_ref());
 
-        let compacted = strategy
-            .compact(&self.messages, context_limit, &self.config.compaction, provider_ref)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let compacted = {
+            let msgs = self.messages.lock().await;
+            strategy
+                .compact(&msgs, context_limit, &self.config.compaction, provider_ref)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        };
 
-        self.messages = compacted.messages;
+        {
+            let mut msgs = self.messages.lock().await;
+            *msgs = compacted.messages;
+        }
         Ok(())
     }
 
@@ -430,7 +451,7 @@ mod tests {
             },
         ]));
 
-        let mut agent = Agent::new(
+        let agent = Agent::new(
             test_agent_config(),
             provider,
             test_tool_registry(),
@@ -478,7 +499,7 @@ mod tests {
             },
         ]));
 
-        let mut agent = Agent::new(
+        let agent = Agent::new(
             test_agent_config(),
             provider,
             test_tool_registry(),
@@ -520,7 +541,7 @@ mod tests {
             responses
         }));
 
-        let mut agent = Agent::new(
+        let agent = Agent::new(
             AgentConfig {
                 max_iterations: 2,
                 ..test_agent_config()
@@ -574,7 +595,7 @@ mod tests {
             },
         ]));
 
-        let mut agent = Agent::new(
+        let agent = Agent::new(
             config,
             provider,
             test_tool_registry(),
