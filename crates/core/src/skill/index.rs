@@ -32,7 +32,7 @@ impl SkillIndex {
             .filter(|s| {
                 s.triggers
                     .iter()
-                    .any(|t| t.to_lowercase().contains(&lower))
+                    .any(|t| lower.contains(&t.to_lowercase()))
             })
             .collect()
     }
@@ -128,6 +128,31 @@ mod tests {
         assert_eq!(matches[0].name, "testing");
 
         let matches = index.find_by_trigger("nonexistent");
+        assert_eq!(matches.len(), 0);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_find_by_trigger_partial_does_not_match() {
+        let (dir, index) = setup_temp_skills("partial", &[
+            (
+                "git.md",
+                "# Git Commands\n\n## Triggers\n- git\n- commit\n- branch\n",
+            ),
+            (
+                "rust.md",
+                "# Rust Tips\n\n## Triggers\n- rust\n- cargo\n- borrow\n",
+            ),
+        ]);
+
+        let matches = index.find_by_trigger("gi");
+        assert_eq!(matches.len(), 0);
+
+        let matches = index.find_by_trigger("ru");
+        assert_eq!(matches.len(), 0);
+
+        let matches = index.find_by_trigger("it");
         assert_eq!(matches.len(), 0);
 
         cleanup(&dir);
