@@ -1,6 +1,8 @@
 pub mod loader;
 pub mod index;
 
+pub use index::SkillIndex;
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

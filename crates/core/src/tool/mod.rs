@@ -1,4 +1,6 @@
 pub mod registry;
+pub mod builtin;
+pub mod dynamic;
 
 pub use registry::ToolRegistry;
 
