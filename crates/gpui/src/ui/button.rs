@@ -33,7 +33,7 @@ pub fn button(theme: UiTheme, variant: ButtonVariant, label: impl Into<SharedStr
         .border_color(border)
         .bg(background)
         .text_color(foreground)
-        .font_family(UiTheme::UI_FONT)
+        .font(UiTheme::ui_font())
         .font_weight(FontWeight::MEDIUM)
         .text_sm()
         .cursor_pointer()

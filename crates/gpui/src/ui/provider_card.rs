@@ -15,23 +15,47 @@ pub fn provider_card(theme: UiTheme, selected: bool) -> Div {
         .border_1()
         .border_color(border)
         .rounded(px(UiTheme::RADIUS))
-        .font_family(UiTheme::DISPLAY_FONT)
+        .font(UiTheme::ui_font())
         .cursor_pointer()
         .p(px(16.0))
 }
 
+pub fn provider_card_title(theme: UiTheme, text: impl Into<SharedString>) -> Div {
+    div()
+        .font(UiTheme::display_font())
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_sm()
+        .text_color(theme.foreground)
+        .child(text.into())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::provider_card;
     use super::super::theme::UiTheme;
+    use super::{provider_card, provider_card_title};
     use gpui::Styled;
 
     #[test]
-    fn provider_card_uses_display_font() {
+    fn provider_card_keeps_ui_font() {
         let mut card = provider_card(UiTheme::light(), true);
 
         assert_eq!(
             card.style()
+                .text
+                .as_ref()
+                .and_then(|text| text.font_family.as_ref())
+                .map(|font| font.as_str()),
+            Some(UiTheme::UI_FONT),
+        );
+    }
+
+    #[test]
+    fn provider_card_title_uses_display_font() {
+        let mut title = provider_card_title(UiTheme::light(), "Anthropic");
+
+        assert_eq!(
+            title
+                .style()
                 .text
                 .as_ref()
                 .and_then(|text| text.font_family.as_ref())

@@ -8,7 +8,7 @@ pub fn panel(theme: UiTheme) -> Div {
         .border_1()
         .border_color(theme.border)
         .rounded(px(UiTheme::RADIUS))
-        .font_family(UiTheme::UI_FONT)
+        .font(UiTheme::ui_font())
 }
 
 pub fn panel_with_padding(theme: UiTheme, padding: Pixels) -> Div {

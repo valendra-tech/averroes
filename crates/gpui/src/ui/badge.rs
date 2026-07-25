@@ -10,7 +10,7 @@ pub fn status_badge(theme: UiTheme, text: impl Into<SharedString>) -> Div {
         .border_color(theme.border)
         .bg(theme.accent)
         .text_color(theme.foreground)
-        .font_family(UiTheme::MONO_FONT)
+        .font(UiTheme::mono_font())
         .font_weight(FontWeight::MEDIUM)
         .text_xs()
         .px(px(8.0))

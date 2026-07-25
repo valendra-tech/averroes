@@ -1,4 +1,5 @@
-use gpui::{rgb, Rgba};
+use gpui::rgb;
+use gpui::{Font, FontFallbacks, Rgba};
 
 #[derive(Debug, Clone, Copy)]
 pub struct UiTheme {
@@ -37,6 +38,47 @@ impl UiTheme {
     pub const UI_FONT: &'static str = "Inter";
     pub const DISPLAY_FONT: &'static str = "Space Grotesk";
     pub const MONO_FONT: &'static str = "IBM Plex Mono";
+
+    fn font_with_fallbacks(family: &'static str, fallbacks: &[&'static str]) -> Font {
+        Font {
+            family: family.into(),
+            features: Default::default(),
+            fallbacks: Some(FontFallbacks::from_fonts(
+                fallbacks
+                    .iter()
+                    .map(|fallback| (*fallback).to_string())
+                    .collect(),
+            )),
+            weight: Default::default(),
+            style: Default::default(),
+        }
+    }
+
+    pub fn ui_font() -> Font {
+        Self::font_with_fallbacks(
+            Self::UI_FONT,
+            &[
+                "-apple-system",
+                "BlinkMacSystemFont",
+                "Segoe UI",
+                "sans-serif",
+            ],
+        )
+    }
+
+    pub fn display_font() -> Font {
+        Self::font_with_fallbacks(
+            Self::DISPLAY_FONT,
+            &["Inter", "-apple-system", "sans-serif"],
+        )
+    }
+
+    pub fn mono_font() -> Font {
+        Self::font_with_fallbacks(
+            Self::MONO_FONT,
+            &["SFMono-Regular", "Menlo", "Monaco", "monospace"],
+        )
+    }
 }
 
 impl Default for UiTheme {
@@ -46,7 +88,7 @@ impl Default for UiTheme {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct Theme {
+pub struct LegacyTheme {
     pub bg: Rgba,
     pub surface: Rgba,
     pub border: Rgba,
@@ -57,7 +99,9 @@ pub struct Theme {
     pub error: Rgba,
 }
 
-impl Theme {
+pub type Theme = LegacyTheme;
+
+impl LegacyTheme {
     pub fn dark() -> Self {
         Self {
             bg: rgb(0x1e1e2e),
@@ -86,8 +130,63 @@ impl Theme {
     }
 }
 
-impl Default for Theme {
+impl Default for LegacyTheme {
     fn default() -> Self {
-        Self::dark()
+        Self::light()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Theme, UiTheme};
+    use gpui::Font;
+
+    fn assert_font(font: Font, family: &str, fallbacks: &[&str]) {
+        assert_eq!(font.family.as_str(), family);
+        let actual = font.fallbacks.expect("font fallbacks");
+        let expected = fallbacks
+            .iter()
+            .map(|fallback| fallback.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(actual.fallback_list(), expected.as_slice());
+    }
+
+    #[test]
+    fn font_helpers_define_platform_fallbacks() {
+        assert_font(
+            UiTheme::ui_font(),
+            UiTheme::UI_FONT,
+            &[
+                "-apple-system",
+                "BlinkMacSystemFont",
+                "Segoe UI",
+                "sans-serif",
+            ],
+        );
+        assert_font(
+            UiTheme::display_font(),
+            UiTheme::DISPLAY_FONT,
+            &["Inter", "-apple-system", "sans-serif"],
+        );
+        assert_font(
+            UiTheme::mono_font(),
+            UiTheme::MONO_FONT,
+            &["SFMono-Regular", "Menlo", "Monaco", "monospace"],
+        );
+    }
+
+    #[test]
+    fn legacy_theme_defaults_to_light_tokens() {
+        let legacy = Theme::default();
+        let light = UiTheme::light();
+
+        assert_eq!(legacy.bg, light.background);
+        assert_eq!(legacy.surface, light.card);
+        assert_eq!(legacy.border, light.border);
+        assert_eq!(legacy.fg, light.foreground);
+        assert_eq!(legacy.muted, light.muted_foreground);
+        assert_eq!(legacy.accent, light.primary);
+        assert_eq!(legacy.success, light.brand_coral);
+        assert_eq!(legacy.error, light.destructive);
     }
 }
