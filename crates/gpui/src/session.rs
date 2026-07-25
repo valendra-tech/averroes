@@ -66,8 +66,13 @@ impl SessionManager {
     }
 
     pub fn close(&mut self, id: &SessionId) -> SessionId {
+        self.try_close(id)
+            .unwrap_or_else(|| self.active().id.clone())
+    }
+
+    pub fn try_close(&mut self, id: &SessionId) -> Option<SessionId> {
         let Some(index) = self.tabs.iter().position(|tab| &tab.id == id) else {
-            return self.active().id.clone();
+            return None;
         };
 
         if self.tabs.len() == 1 {
@@ -75,7 +80,7 @@ impl SessionManager {
             let id = tab.id.clone();
             self.tabs[0] = tab;
             self.active = 0;
-            return id;
+            return Some(id);
         }
 
         self.tabs.remove(index);
@@ -85,7 +90,7 @@ impl SessionManager {
             self.active = index.saturating_sub(1);
         }
 
-        self.active().id.clone()
+        Some(self.active().id.clone())
     }
 
     pub fn rename_active(&mut self, title: impl Into<String>) {
@@ -160,6 +165,17 @@ mod tests {
         let unknown = SessionId("unknown".into());
 
         assert!(!manager.select(&unknown));
+        assert_eq!(manager.active().id, active);
+    }
+
+    #[test]
+    fn try_close_unknown_tab_returns_none_and_preserves_state() {
+        let mut manager = SessionManager::new();
+        let active = manager.active().id.clone();
+        let unknown = SessionId("unknown".into());
+
+        assert!(manager.try_close(&unknown).is_none());
+        assert_eq!(manager.tabs().len(), 1);
         assert_eq!(manager.active().id, active);
     }
 

@@ -84,13 +84,12 @@ impl AppConfig {
     }
 
     pub fn needs_setup(&self) -> bool {
-        self.provider.default.is_none()
-            || (self.provider.default.as_deref() == Some("anthropic")
-                && self.provider.anthropic.is_none())
-            || (self.provider.default.as_deref() == Some("openai")
-                && self.provider.openai.is_none())
-            || (self.provider.anthropic.is_none()
-                && self.provider.openai.is_none())
+        match self.provider.default.as_deref() {
+            None => true,
+            Some("anthropic") => self.provider.anthropic.is_none(),
+            Some("openai") => self.provider.openai.is_none(),
+            Some(_) => false,
+        }
     }
 
     pub fn save(&self) -> Result<(), ConfigError> {
@@ -203,25 +202,28 @@ pub fn create_provider(config: &AppConfig) -> Result<Arc<dyn Provider>, ConfigEr
                 .ok_or_else(|| ConfigError::Parse("OpenAI config missing".into()))?;
             let env_key = openai.api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
             let api_key = std::env::var(env_key)
-                .map_err(|_| ConfigError::Parse(format!("API key not found: {}", env_key)))?;
+                .map_err(|_| ConfigError::MissingApiKey { api_key_env: env_key.into() })?;
             let mut provider = OpenAiProvider::new(api_key);
             if let Some(ref model) = openai.default_model {
                 provider = provider.with_default_model(model);
             }
             Ok(Arc::new(provider))
         }
-        _ => {
+        "anthropic" => {
             let anthropic = config.provider.anthropic.as_ref()
                 .ok_or_else(|| ConfigError::Parse("Anthropic config missing".into()))?;
             let env_key = anthropic.api_key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY");
             let api_key = std::env::var(env_key)
-                .map_err(|_| ConfigError::Parse(format!("API key not found: {}", env_key)))?;
+                .map_err(|_| ConfigError::MissingApiKey { api_key_env: env_key.into() })?;
             let mut provider = AnthropicProvider::new(api_key);
             if let Some(ref model) = anthropic.default_model {
                 provider = provider.with_default_model(model);
             }
             Ok(Arc::new(provider))
         }
+        _ => Err(ConfigError::UnknownProvider {
+            provider: default.into(),
+        }),
     }
 }
 
@@ -231,6 +233,10 @@ pub enum ConfigError {
     Io { path: PathBuf, source: std::io::Error },
     #[error("Parse error: {0}")]
     Parse(String),
+    #[error("Unknown provider: {provider}")]
+    UnknownProvider { provider: String },
+    #[error("API key not found: {api_key_env}")]
+    MissingApiKey { api_key_env: String },
 }
 
 #[cfg(test)]
@@ -250,5 +256,43 @@ mod tests {
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: AppConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.runtime.max_concurrent_calls, Some(10));
+    }
+
+    #[test]
+    fn unknown_provider_is_not_treated_as_anthropic() {
+        let mut config = AppConfig::default();
+        config.provider.default = Some("unknown".into());
+
+        assert!(!config.needs_setup());
+        let error = match create_provider(&config) {
+            Ok(_) => panic!("unknown provider unexpectedly created a provider"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ConfigError::UnknownProvider { provider } if provider == "unknown"
+        ));
+    }
+
+    #[test]
+    fn missing_api_key_error_preserves_configured_environment_variable() {
+        let env_key = "AVERROES_TEST_MISSING_PROVIDER_KEY";
+        let mut config = AppConfig::default();
+        config.provider.default = Some("openai".into());
+        config.provider.openai = Some(OpenAiConfig {
+            api_key_env: Some(env_key.into()),
+            default_model: None,
+        });
+
+        let error = match create_provider(&config) {
+            Ok(_) => panic!("missing test key unexpectedly created a provider"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ConfigError::MissingApiKey { api_key_env } if api_key_env == env_key
+        ));
     }
 }

@@ -51,7 +51,9 @@ impl ChatView {
 
         match event.keystroke.key.as_str() {
             "enter" => {
-                self.send_current_message(cx);
+                if !self.thinking {
+                    self.send_current_message(cx);
+                }
             }
             "backspace" => {
                 self.input_text.pop();

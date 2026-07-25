@@ -1,30 +1,60 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+
+struct ResetSignal {
+    stop: Mutex<bool>,
+    wake: Condvar,
+}
 
 pub struct ResourceGovernor {
     concurrent_semaphore: Arc<Semaphore>,
     current_concurrent: AtomicUsize,
     token_budget_per_minute: u64,
     tokens_used_this_minute: Arc<AtomicU64>,
-    shutdown_flag: Arc<AtomicBool>,
-    _reset_thread: Option<std::thread::JoinHandle<()>>,
+    reset_signal: Arc<ResetSignal>,
+    reset_thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(test)]
+    reset_thread_finished: Arc<AtomicBool>,
 }
 
 impl ResourceGovernor {
     pub fn new(max_concurrent: usize, token_budget: u64) -> Self {
         let tokens_used = Arc::new(AtomicU64::new(0));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let reset_signal = Arc::new(ResetSignal {
+            stop: Mutex::new(false),
+            wake: Condvar::new(),
+        });
+        #[cfg(test)]
+        let reset_thread_finished = Arc::new(AtomicBool::new(false));
 
         let tokens = tokens_used.clone();
-        let flag = shutdown.clone();
+        let signal = reset_signal.clone();
+        #[cfg(test)]
+        let finished = reset_thread_finished.clone();
         let handle = std::thread::spawn(move || {
-            while !flag.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_secs(60));
-                if !flag.load(Ordering::Relaxed) {
-                    tokens.store(0, Ordering::SeqCst);
+            let mut stop = signal.stop.lock().unwrap();
+            loop {
+                if *stop {
+                    #[cfg(test)]
+                    finished.store(true, Ordering::SeqCst);
+                    break;
                 }
+                let (next_stop, _) = signal
+                    .wake
+                    .wait_timeout(stop, Duration::from_secs(60))
+                    .unwrap();
+                stop = next_stop;
+                if *stop {
+                    #[cfg(test)]
+                    finished.store(true, Ordering::SeqCst);
+                    break;
+                }
+                tokens.store(0, Ordering::SeqCst);
             }
         });
 
@@ -33,8 +63,10 @@ impl ResourceGovernor {
             current_concurrent: AtomicUsize::new(0),
             token_budget_per_minute: token_budget,
             tokens_used_this_minute: tokens_used,
-            shutdown_flag: shutdown,
-            _reset_thread: Some(handle),
+            reset_signal,
+            reset_thread: Some(handle),
+            #[cfg(test)]
+            reset_thread_finished,
         }
     }
 
@@ -55,12 +87,24 @@ impl ResourceGovernor {
     }
 
     pub fn try_spend_tokens(&self, count: u64) -> bool {
-        let prev = self.tokens_used_this_minute.fetch_add(count, Ordering::SeqCst);
-        if prev + count > self.token_budget_per_minute {
-            self.tokens_used_this_minute.fetch_sub(count, Ordering::SeqCst);
-            false
-        } else {
-            true
+        let mut current = self.tokens_used_this_minute.load(Ordering::SeqCst);
+        loop {
+            let Some(next) = current.checked_add(count) else {
+                return false;
+            };
+            if next > self.token_budget_per_minute {
+                return false;
+            }
+
+            match self.tokens_used_this_minute.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
         }
     }
 
@@ -74,13 +118,18 @@ impl ResourceGovernor {
     }
 
     pub fn shutdown(&self) {
-        self.shutdown_flag.store(true, Ordering::SeqCst);
+        let mut stop = self.reset_signal.stop.lock().unwrap();
+        *stop = true;
+        self.reset_signal.wake.notify_one();
     }
 }
 
 impl Drop for ResourceGovernor {
     fn drop(&mut self) {
-        self.shutdown_flag.store(true, Ordering::SeqCst);
+        self.shutdown();
+        if let Some(handle) = self.reset_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -92,7 +141,7 @@ pub struct CallPermit<'a> {
 
 impl<'a> CallPermit<'a> {
     pub fn record_tokens(&mut self, count: u64) {
-        self.tokens_consumed += count;
+        self.tokens_consumed = self.tokens_consumed.saturating_add(count);
         self.governor.try_spend_tokens(count);
     }
 }
@@ -108,6 +157,17 @@ impl<'a> Drop for CallPermit<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_joins_reset_thread_promptly() {
+        let governor = ResourceGovernor::new(1, 1);
+        let finished = governor.reset_thread_finished.clone();
+
+        governor.shutdown();
+        drop(governor);
+
+        assert!(finished.load(Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn test_acquire_and_release_permit() {

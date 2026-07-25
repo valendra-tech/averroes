@@ -49,8 +49,11 @@ impl RootView {
                 }
             }
             Err(RuntimeError::Configuration(error)) => self.show_error(error),
-            Err(RuntimeError::Provider(error)) => {
-                self.show_error(provider_error_message(&error));
+            Err(RuntimeError::Provider {
+                message,
+                api_key_env,
+            }) => {
+                self.show_error(provider_error_message(&message, api_key_env.as_deref()));
             }
         }
     }
@@ -76,13 +79,11 @@ impl RootView {
     }
 }
 
-fn provider_error_message(error: &str) -> String {
-    let key_hint = if error.to_ascii_lowercase().contains("openai") {
-        "OPENAI_API_KEY"
-    } else {
-        "ANTHROPIC_API_KEY"
-    };
-    format!("{}: set {} and restart", error, key_hint)
+fn provider_error_message(error: &str, api_key_env: Option<&str>) -> String {
+    match api_key_env {
+        Some(api_key_env) => format!("{}: set {} and restart", error, api_key_env),
+        None => error.to_string(),
+    }
 }
 
 impl Render for RootView {

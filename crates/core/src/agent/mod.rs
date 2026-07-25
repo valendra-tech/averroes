@@ -147,6 +147,16 @@ impl Agent {
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
+            if let Some(usage) = response.usage.as_ref() {
+                let tokens = usage
+                    .input_tokens
+                    .saturating_add(usage.output_tokens);
+                if !self.governor.try_spend_tokens(tokens) {
+                    self.set_state(AgentState::Errored).await;
+                    return Err(anyhow::anyhow!("Token budget exhausted"));
+                }
+            }
+
             if response.message.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty()) {
                 self.set_state(AgentState::Acting).await;
 
@@ -288,7 +298,7 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::types::{Role as ProviderRole, ToolCall, FunctionCall};
+    use crate::provider::types::{FunctionCall, Role as ProviderRole, TokenUsage, ToolCall};
     use async_trait::async_trait;
     use std::sync::Arc;
 
@@ -463,6 +473,40 @@ mod tests {
         let result = agent.run("hi").await.unwrap();
         assert_eq!(result, "Hello, world!");
         assert_eq!(agent.state().await, AgentState::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_agent_rejects_response_when_token_budget_is_exhausted() {
+        let response = ChatResponse {
+            message: ChatMessage {
+                role: ProviderRole::Assistant,
+                content: MessageContent::Text("budgeted response".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            usage: Some(TokenUsage {
+                input_tokens: 3,
+                output_tokens: 2,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }),
+            stop_reason: None,
+        };
+        let provider = Arc::new(TestProvider::new(vec![response.clone(), response]));
+        let governor = Arc::new(ResourceGovernor::new(1, 5));
+        let agent = Agent::new(
+            test_agent_config(),
+            provider,
+            test_tool_registry(),
+            governor.clone(),
+            "token-budget-session".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        assert_eq!(agent.run("first").await.unwrap(), "budgeted response");
+        assert!(agent.run("second").await.is_err());
+        assert_eq!(agent.state().await, AgentState::Errored);
+        assert_eq!(governor.tokens_available(), 0);
     }
 
     #[tokio::test]

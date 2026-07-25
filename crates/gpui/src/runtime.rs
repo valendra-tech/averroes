@@ -1,7 +1,7 @@
 use crate::session::SessionId;
 use averroes_core::agent::{Agent, AgentConfig};
 use averroes_core::compaction::{CompactionConfig, CompactionStrategyType};
-use averroes_core::config::{create_provider, AppConfig};
+use averroes_core::config::{create_provider, AppConfig, ConfigError};
 use averroes_core::provider::Provider;
 use averroes_core::runtime::ResourceGovernor;
 use averroes_core::tool::{builtin, ToolRegistry};
@@ -25,8 +25,11 @@ pub enum RuntimeError {
     NeedsSetup,
     #[error("configuration error: {0}")]
     Configuration(String),
-    #[error("provider error: {0}")]
-    Provider(String),
+    #[error("provider error: {message}")]
+    Provider {
+        message: String,
+        api_key_env: Option<String>,
+    },
 }
 
 impl AgentFactory {
@@ -43,8 +46,10 @@ impl AgentFactory {
                 .map_err(|error| RuntimeError::Configuration(error.to_string()))?,
         );
 
-        let provider =
-            create_provider(&config).map_err(|error| RuntimeError::Provider(error.to_string()))?;
+        let provider = match create_provider(&config) {
+            Ok(provider) => provider,
+            Err(error) => return Err(provider_runtime_error(error)),
+        };
 
         let tools = Arc::new(ToolRegistry::new());
         builtin::register_all(&tools);
@@ -104,6 +109,17 @@ impl AgentFactory {
     }
 }
 
+fn provider_runtime_error(error: ConfigError) -> RuntimeError {
+    let message = error.to_string();
+    match error {
+        ConfigError::MissingApiKey { api_key_env } => RuntimeError::Provider {
+            message,
+            api_key_env: Some(api_key_env),
+        },
+        _ => RuntimeError::Configuration(message),
+    }
+}
+
 fn runtime_limits(config: &AppConfig) -> (usize, u64) {
     (
         config
@@ -146,10 +162,55 @@ mod tests {
     use crate::session::SessionManager;
     use averroes_core::agent::AgentConfig;
     use averroes_core::config::AppConfig;
-    use averroes_core::provider::{openai::OpenAiProvider, Provider};
+    use averroes_core::provider::types::{MessageContent, Role};
+    use averroes_core::provider::{
+        openai::OpenAiProvider, ChatMessage, ChatRequest, ChatResponse, ChatStream, Provider,
+        ProviderError,
+    };
     use averroes_core::runtime::ResourceGovernor;
     use averroes_core::tool::ToolRegistry;
+    use async_trait::async_trait;
     use std::sync::Arc;
+
+    struct MockProvider;
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+        ) -> averroes_core::provider::Result<ChatResponse> {
+            Ok(ChatResponse {
+                message: ChatMessage {
+                    role: Role::Assistant,
+                    content: MessageContent::Text("mock response".into()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                usage: None,
+                stop_reason: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> averroes_core::provider::Result<ChatStream> {
+            Err(ProviderError::Other("stream unused in test".into()))
+        }
+
+        fn context_window(&self, _model: &str) -> usize {
+            200_000
+        }
+
+        fn supports_tools(&self, _model: &str) -> bool {
+            true
+        }
+
+        fn default_model(&self) -> &str {
+            "mock-model"
+        }
+    }
 
     fn test_factory() -> AgentFactory {
         AgentFactory {
@@ -197,6 +258,27 @@ mod tests {
             .unwrap_err();
 
         assert!(result.to_string().contains("Max iterations"));
+    }
+
+    #[test]
+    fn spawn_agent_run_returns_mock_provider_response() {
+        let factory = AgentFactory {
+            config: AppConfig::default(),
+            provider: Arc::new(MockProvider),
+            tools: Arc::new(ToolRegistry::new()),
+            governor: Arc::new(ResourceGovernor::new(10, 200_000)),
+            runtime: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+        };
+        let sessions = SessionManager::new();
+        let agent = factory.new_agent(&sessions.active().id);
+
+        let result = factory
+            .runtime
+            .block_on(factory.spawn_agent_run(agent, "hello".into()))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result, "mock response");
     }
 
     #[test]
