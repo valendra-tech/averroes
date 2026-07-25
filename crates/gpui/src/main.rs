@@ -6,9 +6,7 @@ mod views;
 use app::AverroesApp;
 use averroes_core::agent::{Agent, AgentConfig};
 use averroes_core::compaction::{CompactionConfig, CompactionStrategyType};
-use averroes_core::provider::anthropic::AnthropicProvider;
-use averroes_core::provider::openai::OpenAiProvider;
-use averroes_core::provider::Provider;
+use averroes_core::config::{AppConfig, create_provider};
 use averroes_core::runtime::ResourceGovernor;
 use averroes_core::tool::ToolRegistry;
 use averroes_core::tool::builtin;
@@ -18,18 +16,29 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 fn create_agent() -> Option<Arc<Agent>> {
-    let provider: Arc<dyn Provider> = if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        Arc::new(AnthropicProvider::new(key))
-    } else if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        Arc::new(OpenAiProvider::new(key))
-    } else {
+    let config = AppConfig::load().ok()?;
+    if config.needs_setup() {
         return None;
-    };
+    }
+    let provider = create_provider(&config).ok()?;
 
     let tool_registry = Arc::new(ToolRegistry::new());
     builtin::register_all(&tool_registry);
 
-    let governor = Arc::new(ResourceGovernor::new(10, 200_000));
+    let governor = Arc::new(ResourceGovernor::new(
+        config.runtime.max_concurrent_calls.unwrap_or(10),
+        config.runtime.token_budget_per_minute.unwrap_or(200_000),
+    ));
+
+    let compaction_config = CompactionConfig {
+        strategy: match config.compaction.strategy.as_deref() {
+            Some("trim") => CompactionStrategyType::Trim,
+            Some("summary") => CompactionStrategyType::Summary,
+            _ => CompactionStrategyType::Hybrid,
+        },
+        threshold: config.compaction.threshold.unwrap_or(0.8),
+        ..Default::default()
+    };
 
     let agent_config = AgentConfig {
         name: "gpui".into(),
@@ -43,11 +52,7 @@ fn create_agent() -> Option<Arc<Agent>> {
             "web_fetch".into(),
         ],
         max_iterations: 30,
-        compaction: CompactionConfig {
-            strategy: CompactionStrategyType::Hybrid,
-            threshold: 0.8,
-            ..Default::default()
-        },
+        compaction: compaction_config,
         ..Default::default()
     };
 
@@ -70,24 +75,44 @@ fn main() {
 
     Application::new().run(|cx: &mut App| {
         cx.activate(true);
-
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
 
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1200.0), px(800.0)),
-                    cx,
-                ))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Averroes".into()),
+        if agent.is_none() {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                        None,
+                        size(px(520.0), px(520.0)),
+                        cx,
+                    ))),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Averroes Setup".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |_window, cx| cx.new(|cx| AverroesApp::new(cx, agent)),
-        )
-        .unwrap();
+                },
+                |_window, cx| {
+                    cx.new(|cx| views::setup_wizard::SetupWizardView::new(cx))
+                },
+            )
+            .unwrap();
+        } else {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                        None,
+                        size(px(1200.0), px(800.0)),
+                        cx,
+                    ))),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Averroes".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                |_window, cx| cx.new(|cx| AverroesApp::new(cx, agent)),
+            )
+            .unwrap();
+        }
     });
 }

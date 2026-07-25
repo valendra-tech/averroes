@@ -2,12 +2,10 @@ mod config;
 mod session;
 mod tui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use averroes_core::agent::{Agent, AgentConfig};
 use averroes_core::compaction::{CompactionConfig, CompactionStrategyType};
-use averroes_core::provider::anthropic::AnthropicProvider;
-use averroes_core::provider::openai::OpenAiProvider;
-use averroes_core::provider::Provider;
+use averroes_core::config::SetupWizard;
 use averroes_core::runtime::ResourceGovernor;
 use averroes_core::skill::{SkillIndex};
 use averroes_core::skill::loader::SkillLoader;
@@ -37,52 +35,21 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = config::AppConfig::load()?;
+    let mut config = config::AppConfig::load()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    let provider: Arc<dyn Provider> = if let Some(ref anthropic) = config.provider.anthropic {
-        let key_env = anthropic
-            .api_key_env
-            .as_deref()
-            .unwrap_or("ANTHROPIC_API_KEY");
-        let api_key = std::env::var(key_env).unwrap_or_else(|_| {
-            eprintln!("Error: {} not set", key_env);
-            std::process::exit(1);
-        });
-        let mut provider = AnthropicProvider::new(api_key);
-        if let Some(ref model) = anthropic.default_model {
-            provider = provider.with_default_model(model);
-        }
-        Arc::new(provider)
-    } else if let Some(ref openai) = config.provider.openai {
-        let key_env = openai
-            .api_key_env
-            .as_deref()
-            .unwrap_or("OPENAI_API_KEY");
-        let api_key = std::env::var(key_env).unwrap_or_else(|_| {
-            eprintln!("Error: {} not set", key_env);
-            std::process::exit(1);
-        });
-        let mut provider = OpenAiProvider::new(api_key);
-        if let Some(ref model) = openai.default_model {
-            provider = provider.with_default_model(model);
-        }
-        Arc::new(provider)
-    } else if config.provider.default.as_deref() == Some("anthropic") {
-        let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| {
-            eprintln!("Error: ANTHROPIC_API_KEY not set");
-            std::process::exit(1);
-        });
-        Arc::new(AnthropicProvider::new(api_key))
-    } else if config.provider.default.as_deref() == Some("openai") {
-        let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| {
-            eprintln!("Error: OPENAI_API_KEY not set");
-            std::process::exit(1);
-        });
-        Arc::new(OpenAiProvider::new(api_key))
-    } else {
-        eprintln!("Error: No provider configured. Set provider.default or add an anthropic/openai section in config.");
-        std::process::exit(1);
-    };
+    if config.needs_setup() {
+        eprintln!("\n  Welcome to Averroes! Let's configure your setup.\n");
+        let wizard = run_setup_wizard()?;
+        wizard.save_config()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        config = wizard.to_config();
+        eprintln!("\n  Config saved. Starting...\n");
+    }
+
+    let provider = config::create_provider(&config)
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| "Failed to create provider. Check your API key.")?;
 
     let tool_registry = Arc::new(ToolRegistry::new());
     builtin::register_all(&tool_registry);
@@ -184,4 +151,41 @@ fn read_line() -> io::Result<String> {
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     Ok(input.trim().to_string())
+}
+
+fn prompt(label: &str) -> io::Result<String> {
+    print!("  {} ", label);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn run_setup_wizard() -> Result<SetupWizard> {
+    let mut wizard = SetupWizard::new();
+
+    let choice = prompt("Provider? [1] Anthropic  [2] OpenAI (default: 1)")?;
+    wizard.provider = match choice.as_str() {
+        "2" => "openai".into(),
+        _ => "anthropic".into(),
+    };
+
+    let env_name = match wizard.provider.as_str() {
+        "openai" => "OPENAI_API_KEY",
+        _ => "ANTHROPIC_API_KEY",
+    };
+
+    eprintln!("  API key: set the `{}` environment variable.", env_name);
+    let key_input = prompt(&format!("API key env var name? [default: {}]", env_name))?;
+    wizard.api_key_env = if key_input.is_empty() {
+        env_name.into()
+    } else {
+        key_input
+    };
+
+    let default = wizard.default_model().to_string();
+    let model = prompt(&format!("Model? [default: {}]", default))?;
+    wizard.model = if model.is_empty() { default } else { model };
+
+    Ok(wizard)
 }
