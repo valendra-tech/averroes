@@ -1,6 +1,7 @@
 mod app;
 mod shortcuts;
 mod theme;
+mod ui;
 mod views;
 
 use app::AverroesApp;
@@ -211,4 +212,39 @@ fn main() {
         )
         .unwrap();
     });
+}
+
+#[cfg(test)]
+mod ui_api_tests {
+    use super::ui::{
+        button, field_label, field_surface, panel, panel_with_padding, provider_card,
+        status_badge, ButtonVariant, UiTheme,
+    };
+    use gpui::{px, rgb};
+
+    #[test]
+    fn tokenfactory_primitives_are_composable() {
+        let theme = UiTheme::light();
+
+        assert_eq!(theme.background, rgb(0xfff9f4));
+        assert_eq!(theme.foreground, rgb(0x20131a));
+        assert_eq!(theme.card, rgb(0xffffff));
+        assert_eq!(theme.primary, rgb(0xb83a27));
+        assert_eq!(theme.brand_orange, rgb(0xf15a2a));
+        assert_eq!(theme.brand_coral, rgb(0xe94b2f));
+        assert_eq!(theme.brand_magenta, rgb(0xd94b83));
+        assert_eq!(theme.muted_foreground, rgb(0x725f5b));
+        assert_eq!(theme.border, rgb(0xead8ce));
+        assert_eq!(theme.accent, rgb(0xffe4d5));
+        assert_eq!(theme.destructive, rgb(0xb42318));
+        assert_eq!(UiTheme::RADIUS, 6.0);
+
+        let _ = panel(theme);
+        let _ = panel_with_padding(theme, px(12.0));
+        let _ = button(theme, ButtonVariant::Primary, "Run");
+        let _ = field_label(theme, "Provider");
+        let _ = field_surface(theme, true, false);
+        let _ = provider_card(theme, true);
+        let _ = status_badge(theme, "Ready");
+    }
 }
