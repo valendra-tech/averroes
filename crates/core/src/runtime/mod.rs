@@ -1,7 +1,7 @@
 pub mod governor;
 pub mod pool;
 
-use governor::ResourceGovernor;
+pub use governor::ResourceGovernor;
 use pool::ProviderConnectionPool;
 use std::sync::Arc;
 use tokio::runtime::Runtime as TokioRuntime;

@@ -4,6 +4,7 @@ use crate::provider::types::ChatMessage;
 use crate::provider::Provider;
 use async_trait::async_trait;
 
+#[derive(Debug, Clone)]
 pub struct CompactionConfig {
     pub strategy: CompactionStrategyType,
     pub threshold: f64,

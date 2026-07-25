@@ -5,7 +5,7 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use types::TokenUsage;
 
-use crate::provider::types::ChatMessage;
+pub use crate::provider::types::ChatMessage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
