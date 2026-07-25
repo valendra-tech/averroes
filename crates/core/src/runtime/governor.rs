@@ -1,28 +1,40 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::task::{AbortHandle, JoinHandle};
 
 pub struct ResourceGovernor {
     concurrent_semaphore: Arc<Semaphore>,
     current_concurrent: AtomicUsize,
     token_budget_per_minute: u64,
     tokens_used_this_minute: Arc<AtomicU64>,
-    _reset_abort: AbortHandle,
+    shutdown_flag: Arc<AtomicBool>,
+    _reset_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ResourceGovernor {
     pub fn new(max_concurrent: usize, token_budget: u64) -> Self {
         let tokens_used = Arc::new(AtomicU64::new(0));
-        let reset_handle = spawn_token_reset(tokens_used.clone());
-        let _reset_abort = reset_handle.abort_handle();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let tokens = tokens_used.clone();
+        let flag = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(60));
+                if !flag.load(Ordering::Relaxed) {
+                    tokens.store(0, Ordering::SeqCst);
+                }
+            }
+        });
+
         Self {
             concurrent_semaphore: Arc::new(Semaphore::new(max_concurrent)),
             current_concurrent: AtomicUsize::new(0),
             token_budget_per_minute: token_budget,
             tokens_used_this_minute: tokens_used,
-            _reset_abort,
+            shutdown_flag: shutdown,
+            _reset_thread: Some(handle),
         }
     }
 
@@ -62,18 +74,14 @@ impl ResourceGovernor {
     }
 
     pub fn shutdown(&self) {
-        self._reset_abort.abort();
+        self.shutdown_flag.store(true, Ordering::SeqCst);
     }
 }
 
-fn spawn_token_reset(tokens_used: Arc<AtomicU64>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        loop {
-            tick.tick().await;
-            tokens_used.store(0, Ordering::SeqCst);
-        }
-    })
+impl Drop for ResourceGovernor {
+    fn drop(&mut self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+    }
 }
 
 pub struct CallPermit<'a> {
@@ -143,7 +151,6 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
-        // Should not exceed budget (5x10x20 = 1000 exactly)
         assert!(gov.tokens_available() <= 1000);
     }
 }
