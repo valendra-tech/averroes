@@ -37,7 +37,29 @@ impl ChatView {
         self.theme = theme;
     }
 
-    fn send_message(&mut self, cx: &mut Context<Self>) {
+    fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+
+        match event.keystroke.key.as_str() {
+            "enter" => {
+                self.send_current_message(cx);
+            }
+            "backspace" => {
+                self.input_text.pop();
+                cx.notify();
+            }
+            _ => {
+                if let Some(ref ch) = event.keystroke.key_char {
+                    self.input_text.push_str(ch);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn send_current_message(&mut self, cx: &mut Context<Self>) {
         let text = std::mem::take(&mut self.input_text);
         if text.is_empty() {
             return;
@@ -74,7 +96,7 @@ impl ChatView {
 }
 
 impl Render for ChatView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
 
         div()
@@ -147,6 +169,9 @@ impl Render for ChatView {
                     .border_color(theme.border)
                     .p_3()
                     .gap_2()
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                        this.handle_key_down(event, cx);
+                    }))
                     .child(
                         div()
                             .flex_1()
@@ -159,19 +184,25 @@ impl Render for ChatView {
                             .child(if self.input_text.is_empty() {
                                 String::from("Type a message...")
                             } else {
-                                self.input_text.clone()
+                                format!("{}|", self.input_text)
                             }),
                     )
                     .child(
                         div()
                             .px_4()
                             .py_2()
-                            .bg(theme.accent)
+                            .bg(if self.thinking { theme.muted } else { theme.accent })
                             .text_color(theme.bg)
                             .rounded_md()
                             .text_sm()
                             .cursor_pointer()
-                            .child("Send"),
+                            .id(ElementId::Name("btn-send".into()))
+                            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                if !this.thinking {
+                                    this.send_current_message(cx);
+                                }
+                            }))
+                            .child(if self.thinking { "..." } else { "Send" }),
                     ),
             )
     }

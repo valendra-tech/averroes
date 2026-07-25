@@ -47,6 +47,9 @@ fn main() -> Result<()> {
         eprintln!("\n  Config saved. Starting...\n");
     }
 
+    let rt = tokio::runtime::Runtime::new()?;
+    let _guard = rt.enter();
+
     let provider = config::create_provider(&config)
         .map_err(|e| anyhow::anyhow!("{}", e))
         .with_context(|| "Failed to create provider. Check your API key.")?;
@@ -112,8 +115,6 @@ fn main() -> Result<()> {
 
     let store = session::SessionStore::open()?;
     let session_id = store.create_session("interactive")?;
-
-    let rt = tokio::runtime::Runtime::new()?;
 
     if let Some(message) = cli.message {
         let result = rt.block_on(agent.run(&message))?;

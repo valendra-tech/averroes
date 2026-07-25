@@ -60,10 +60,20 @@ impl AverroesApp {
         });
         cx.notify();
     }
+
+    fn switch_to_chat(&mut self, cx: &mut Context<Self>) {
+        self.active_view = ActiveView::Chat;
+        cx.notify();
+    }
+
+    fn switch_to_settings(&mut self, cx: &mut Context<Self>) {
+        self.active_view = ActiveView::Settings;
+        cx.notify();
+    }
 }
 
 impl Render for AverroesApp {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
 
         div()
@@ -111,6 +121,20 @@ impl Render for AverroesApp {
                                 theme.muted
                             })
                             .cursor_pointer()
+                            .hover(|style| {
+                                if !matches!(self.active_view, ActiveView::Chat) {
+                                    style.bg(theme.border)
+                                } else {
+                                    style
+                                }
+                            })
+                            .id(ElementId::Name("tab-chat".into()))
+                            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.switch_to_chat(cx);
+                            }))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
                             .child("Chat"),
                     )
                     .child(
@@ -124,6 +148,20 @@ impl Render for AverroesApp {
                                 },
                             )
                             .cursor_pointer()
+                            .hover(|style| {
+                                if !matches!(self.active_view, ActiveView::Settings) {
+                                    style.bg(theme.border)
+                                } else {
+                                    style
+                                }
+                            })
+                            .id(ElementId::Name("tab-settings".into()))
+                            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.switch_to_settings(cx);
+                            }))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
                             .child("Settings"),
                     ),
             )

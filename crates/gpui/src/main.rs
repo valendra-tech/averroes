@@ -66,53 +66,82 @@ fn create_agent() -> Option<Arc<Agent>> {
     )))
 }
 
+struct RootView {
+    setup: Option<Entity<views::setup_wizard::SetupWizardView>>,
+    app: Option<Entity<AverroesApp>>,
+}
+
+impl RootView {
+    fn new(cx: &mut Context<Self>) -> Self {
+        let agent = create_agent();
+
+        if agent.is_some() {
+            let app = cx.new(|cx| AverroesApp::new(cx, agent));
+            Self {
+                setup: None,
+                app: Some(app),
+            }
+        } else {
+            let setup = cx.new(|cx| views::setup_wizard::SetupWizardView::new(cx));
+            Self {
+                setup: Some(setup),
+                app: None,
+            }
+        }
+    }
+}
+
+impl Render for RootView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(ref app) = self.app {
+            return app.clone().into_any_element();
+        }
+
+        if let Some(ref setup) = self.setup {
+            let is_done = setup.read(cx).is_done();
+            if is_done {
+                let agent = create_agent();
+                let app_entity = cx.new(|cx| AverroesApp::new(cx, agent));
+                self.app = Some(app_entity);
+                self.setup = None;
+                cx.notify();
+                return div().into_any_element();
+            }
+            return setup.clone().into_any_element();
+        }
+
+        div().into_any_element()
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let agent = create_agent();
-
     Application::new().run(|cx: &mut App| {
         cx.activate(true);
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+        ]);
 
-        if agent.is_none() {
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                        None,
-                        size(px(520.0), px(520.0)),
-                        cx,
-                    ))),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Averroes Setup".into()),
-                        ..Default::default()
-                    }),
+        cx.on_action(|_: &Quit, cx| cx.quit());
+
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(1200.0), px(800.0)),
+                    cx,
+                ))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Averroes".into()),
                     ..Default::default()
-                },
-                |_window, cx| {
-                    cx.new(|cx| views::setup_wizard::SetupWizardView::new(cx))
-                },
-            )
-            .unwrap();
-        } else {
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                        None,
-                        size(px(1200.0), px(800.0)),
-                        cx,
-                    ))),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Averroes".into()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                |_window, cx| cx.new(|cx| AverroesApp::new(cx, agent)),
-            )
-            .unwrap();
-        }
+                }),
+                ..Default::default()
+            },
+            |_window, cx| cx.new(|cx| RootView::new(cx)),
+        )
+        .unwrap();
     });
 }

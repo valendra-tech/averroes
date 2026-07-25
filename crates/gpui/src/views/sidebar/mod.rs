@@ -7,6 +7,7 @@ pub struct Sidebar {
     collapsed: bool,
     theme: Theme,
     sessions: Vec<String>,
+    selected_index: Option<usize>,
 }
 
 impl Sidebar {
@@ -15,6 +16,7 @@ impl Sidebar {
             collapsed: false,
             theme: Theme::default(),
             sessions: vec!["Session 1".into()],
+            selected_index: Some(0),
         }
     }
 
@@ -25,10 +27,15 @@ impl Sidebar {
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
     }
+
+    fn select_session(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.selected_index = Some(index);
+        cx.notify();
+    }
 }
 
 impl Render for Sidebar {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
 
         if self.collapsed {
@@ -57,7 +64,8 @@ impl Render for Sidebar {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .children(self.sessions.iter().map(|s| {
+                    .children(self.sessions.iter().enumerate().map(|(i, s)| {
+                        let is_selected = self.selected_index == Some(i);
                         div()
                             .px_2()
                             .py_1()
@@ -65,7 +73,18 @@ impl Render for Sidebar {
                             .text_color(theme.fg)
                             .text_sm()
                             .cursor_pointer()
-                            .hover(|style| style.bg(theme.border))
+                            .bg(if is_selected { theme.border } else { theme.surface })
+                            .hover(|style| {
+                                if !is_selected {
+                                    style.bg(theme.border)
+                                } else {
+                                    style
+                                }
+                            })
+                            .id(ElementId::NamedInteger("session".into(), i as u64))
+                            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                                this.select_session(i, cx);
+                            }))
                             .child(s.clone())
                     })),
             )
