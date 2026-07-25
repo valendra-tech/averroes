@@ -7,93 +7,82 @@ mod ui;
 mod views;
 
 use app::AverroesApp;
-use averroes_core::agent::{Agent, AgentConfig};
-use averroes_core::compaction::{CompactionConfig, CompactionStrategyType};
-use averroes_core::config::{AppConfig, create_provider};
-use averroes_core::runtime::ResourceGovernor;
-use averroes_core::tool::ToolRegistry;
-use averroes_core::tool::builtin;
 use gpui::*;
+use runtime::{AgentFactory, RuntimeError};
+use session::SessionManager;
 use shortcuts::Quit;
-use std::path::PathBuf;
 use std::sync::Arc;
-
-fn create_agent() -> (Option<Arc<Agent>>, Option<String>) {
-    let config = match AppConfig::load() {
-        Ok(c) => c,
-        Err(_) => return (None, None),
-    };
-    if config.needs_setup() {
-        return (None, None);
-    }
-    match create_provider(&config) {
-        Ok(provider) => {
-            let tool_registry = Arc::new(ToolRegistry::new());
-            builtin::register_all(&tool_registry);
-
-            let governor = Arc::new(ResourceGovernor::new(
-                config.runtime.max_concurrent_calls.unwrap_or(10),
-                config.runtime.token_budget_per_minute.unwrap_or(200_000),
-            ));
-
-            let compaction_config = CompactionConfig {
-                strategy: match config.compaction.strategy.as_deref() {
-                    Some("trim") => CompactionStrategyType::Trim,
-                    Some("summary") => CompactionStrategyType::Summary,
-                    _ => CompactionStrategyType::Hybrid,
-                },
-                threshold: config.compaction.threshold.unwrap_or(0.8),
-                ..Default::default()
-            };
-
-            let agent_config = AgentConfig {
-                name: "gpui".into(),
-                model: provider.default_model().to_string(),
-                tools: vec![
-                    "bash".into(), "file_read".into(), "file_write".into(),
-                    "glob".into(), "grep".into(), "web_fetch".into(),
-                ],
-                max_iterations: 30,
-                compaction: compaction_config,
-                ..Default::default()
-            };
-
-            (Some(Arc::new(Agent::new(
-                agent_config, provider, tool_registry, governor,
-                "gpui-session".into(),
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            ))), None)
-        }
-        Err(e) => {
-            let key_hint = match config.provider.default.as_deref() {
-                Some("openai") => "OPENAI_API_KEY",
-                _ => "ANTHROPIC_API_KEY",
-            };
-            (None, Some(format!("{}: set {} and restart", e, key_hint)))
-        }
-    }
-}
 
 struct RootView {
     setup: Option<Entity<views::setup_wizard::SetupWizardView>>,
     app: Option<Entity<AverroesApp>>,
     error: Option<String>,
+    factory: Option<Arc<AgentFactory>>,
+    sessions: SessionManager,
 }
 
 impl RootView {
     fn new(cx: &mut Context<Self>) -> Self {
-        let (agent, error) = create_agent();
+        let mut root = Self {
+            setup: None,
+            app: None,
+            error: None,
+            factory: None,
+            sessions: SessionManager::new(),
+        };
+        root.load_factory(cx);
+        root
+    }
 
-        if let Some(agent) = agent {
-            let app = cx.new(|cx| AverroesApp::new(cx, Some(agent)));
-            Self { setup: None, app: Some(app), error: None }
-        } else if error.is_some() {
-            Self { setup: None, app: None, error }
-        } else {
-            let setup = cx.new(|cx| views::setup_wizard::SetupWizardView::new(cx));
-            Self { setup: Some(setup), app: None, error: None }
+    fn load_factory(&mut self, cx: &mut Context<Self>) {
+        self.app = None;
+        self.factory = None;
+        self.error = None;
+
+        match AgentFactory::load() {
+            Ok(factory) => self.install_factory(factory, cx),
+            Err(RuntimeError::NeedsSetup) => {
+                if self.setup.is_none() {
+                    self.setup = Some(cx.new(|cx| {
+                        views::setup_wizard::SetupWizardView::new(cx)
+                    }));
+                }
+            }
+            Err(RuntimeError::Configuration(error)) => self.show_error(error),
+            Err(RuntimeError::Provider(error)) => {
+                self.show_error(provider_error_message(&error));
+            }
         }
     }
+
+    fn install_factory(&mut self, factory: AgentFactory, cx: &mut Context<Self>) {
+        let factory = Arc::new(factory);
+        let session_id = self.sessions.active().id.clone();
+        let agent = factory.new_agent(&session_id);
+        let app_factory = Arc::clone(&factory);
+        let app = cx.new(|cx| AverroesApp::new(cx, Some(agent), app_factory));
+
+        self.setup = None;
+        self.error = None;
+        self.factory = Some(factory);
+        self.app = Some(app);
+    }
+
+    fn show_error(&mut self, message: String) {
+        self.setup = None;
+        self.app = None;
+        self.factory = None;
+        self.error = Some(message);
+    }
+}
+
+fn provider_error_message(error: &str) -> String {
+    let key_hint = if error.to_ascii_lowercase().contains("openai") {
+        "OPENAI_API_KEY"
+    } else {
+        "ANTHROPIC_API_KEY"
+    };
+    format!("{}: set {} and restart", error, key_hint)
 }
 
 impl Render for RootView {
@@ -151,8 +140,11 @@ impl Render for RootView {
                                     .join(".config")
                                     .join("averroes");
                                     let _ = std::fs::remove_file(config_dir.join("config.toml"));
-                                    let setup = cx.new(|cx| views::setup_wizard::SetupWizardView::new(cx));
+                                    let setup =
+                                        cx.new(|cx| views::setup_wizard::SetupWizardView::new(cx));
                                     this.setup = Some(setup);
+                                    this.app = None;
+                                    this.factory = None;
                                     this.error = None;
                                     cx.notify();
                                 }))
@@ -165,15 +157,7 @@ impl Render for RootView {
         if let Some(ref setup) = self.setup {
             let is_done = setup.read(cx).is_done();
             if is_done {
-                let (agent, error) = create_agent();
-                if let Some(agent) = agent {
-                    let app_entity = cx.new(|cx| AverroesApp::new(cx, Some(agent)));
-                    self.app = Some(app_entity);
-                    self.setup = None;
-                } else if let Some(err) = error {
-                    self.error = Some(err);
-                    self.setup = None;
-                }
+                self.load_factory(cx);
                 cx.notify();
                 return div().into_any_element();
             }

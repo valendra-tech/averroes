@@ -1,5 +1,6 @@
 use gpui::*;
 
+use crate::runtime::AgentFactory;
 use crate::theme::Theme;
 use crate::views::{chat::ChatView, settings::SettingsView, sidebar::Sidebar};
 use averroes_core::agent::Agent;
@@ -20,11 +21,15 @@ enum ActiveView {
 }
 
 impl AverroesApp {
-    pub fn new(cx: &mut Context<Self>, agent: Option<Arc<Agent>>) -> Self {
+    pub fn new(
+        cx: &mut Context<Self>,
+        agent: Option<Arc<Agent>>,
+        factory: Arc<AgentFactory>,
+    ) -> Self {
         let theme = Theme::default();
 
         let sidebar = cx.new(|cx| Sidebar::new(cx));
-        let chat = cx.new(|cx| ChatView::new(cx, agent));
+        let chat = cx.new(|cx| ChatView::new(cx, agent, factory));
         let settings = cx.new(|cx| SettingsView::new(cx));
 
         Self {

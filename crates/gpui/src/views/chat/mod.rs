@@ -2,6 +2,7 @@ pub mod message;
 
 use gpui::*;
 
+use crate::runtime::AgentFactory;
 use crate::theme::Theme;
 use message::MessageBubble;
 use averroes_core::agent::Agent;
@@ -13,10 +14,15 @@ pub struct ChatView {
     theme: Theme,
     thinking: bool,
     agent: Option<Arc<Agent>>,
+    factory: Arc<AgentFactory>,
 }
 
 impl ChatView {
-    pub fn new(_cx: &mut Context<Self>, agent: Option<Arc<Agent>>) -> Self {
+    pub fn new(
+        _cx: &mut Context<Self>,
+        agent: Option<Arc<Agent>>,
+        factory: Arc<AgentFactory>,
+    ) -> Self {
         let mut messages = Vec::new();
         if agent.is_some() {
             messages.push(MessageBubble::assistant("Averroes AI ready."));
@@ -30,6 +36,7 @@ impl ChatView {
             theme: Theme::default(),
             thinking: false,
             agent,
+            factory,
         }
     }
 
@@ -70,14 +77,22 @@ impl ChatView {
             cx.notify();
 
             let agent = Arc::clone(agent);
+            let factory = Arc::clone(&self.factory);
             self.thinking = true;
 
             cx.spawn(async move |this, cx| {
-                let result = agent.run(&text).await;
+                let result = factory.spawn_agent_run(agent, text).await;
                 match result {
-                    Ok(response) => {
+                    Ok(Ok(response)) => {
                         _ = this.update(cx, |chat, cx| {
                             chat.messages.push(MessageBubble::assistant(response));
+                            chat.thinking = false;
+                            cx.notify();
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        _ = this.update(cx, |chat, cx| {
+                            chat.messages.push(MessageBubble::assistant(format!("Error: {}", e)));
                             chat.thinking = false;
                             cx.notify();
                         });

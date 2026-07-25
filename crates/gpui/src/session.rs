@@ -89,7 +89,20 @@ impl SessionManager {
     }
 
     pub fn rename_active(&mut self, title: impl Into<String>) {
-        self.tabs[self.active].title = title.into();
+        let id = self.active().id.clone();
+        self.rename(&id, title);
+    }
+
+    pub fn set_dirty(&mut self, id: &SessionId, dirty: bool) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| &tab.id == id) {
+            tab.dirty = dirty;
+        }
+    }
+
+    pub fn rename(&mut self, id: &SessionId, title: impl Into<String>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| &tab.id == id) {
+            tab.title = title.into();
+        }
     }
 }
 
@@ -148,5 +161,35 @@ mod tests {
 
         assert!(!manager.select(&unknown));
         assert_eq!(manager.active().id, active);
+    }
+
+    #[test]
+    fn set_dirty_updates_the_requested_tab() {
+        let mut manager = SessionManager::new();
+        let first = manager.active().id.clone();
+        let second = manager.new_session();
+
+        manager.set_dirty(&first, true);
+
+        assert!(manager.tabs().iter().find(|tab| tab.id == first).unwrap().dirty);
+        assert!(!manager.tabs().iter().find(|tab| tab.id == second).unwrap().dirty);
+    }
+
+    #[test]
+    fn rename_updates_the_requested_tab() {
+        let mut manager = SessionManager::new();
+        let first = manager.active().id.clone();
+        let second = manager.new_session();
+
+        manager.rename(&first, "First session");
+
+        assert_eq!(
+            manager.tabs().iter().find(|tab| tab.id == first).unwrap().title,
+            "First session"
+        );
+        assert_eq!(
+            manager.tabs().iter().find(|tab| tab.id == second).unwrap().title,
+            "New session"
+        );
     }
 }
