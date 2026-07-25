@@ -15,78 +15,80 @@ use shortcuts::Quit;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-fn create_agent() -> Option<Arc<Agent>> {
-    let config = AppConfig::load().ok()?;
+fn create_agent() -> (Option<Arc<Agent>>, Option<String>) {
+    let config = match AppConfig::load() {
+        Ok(c) => c,
+        Err(_) => return (None, None),
+    };
     if config.needs_setup() {
-        return None;
+        return (None, None);
     }
-    let provider = create_provider(&config).ok()?;
+    match create_provider(&config) {
+        Ok(provider) => {
+            let tool_registry = Arc::new(ToolRegistry::new());
+            builtin::register_all(&tool_registry);
 
-    let tool_registry = Arc::new(ToolRegistry::new());
-    builtin::register_all(&tool_registry);
+            let governor = Arc::new(ResourceGovernor::new(
+                config.runtime.max_concurrent_calls.unwrap_or(10),
+                config.runtime.token_budget_per_minute.unwrap_or(200_000),
+            ));
 
-    let governor = Arc::new(ResourceGovernor::new(
-        config.runtime.max_concurrent_calls.unwrap_or(10),
-        config.runtime.token_budget_per_minute.unwrap_or(200_000),
-    ));
+            let compaction_config = CompactionConfig {
+                strategy: match config.compaction.strategy.as_deref() {
+                    Some("trim") => CompactionStrategyType::Trim,
+                    Some("summary") => CompactionStrategyType::Summary,
+                    _ => CompactionStrategyType::Hybrid,
+                },
+                threshold: config.compaction.threshold.unwrap_or(0.8),
+                ..Default::default()
+            };
 
-    let compaction_config = CompactionConfig {
-        strategy: match config.compaction.strategy.as_deref() {
-            Some("trim") => CompactionStrategyType::Trim,
-            Some("summary") => CompactionStrategyType::Summary,
-            _ => CompactionStrategyType::Hybrid,
-        },
-        threshold: config.compaction.threshold.unwrap_or(0.8),
-        ..Default::default()
-    };
+            let agent_config = AgentConfig {
+                name: "gpui".into(),
+                model: provider.default_model().to_string(),
+                tools: vec![
+                    "bash".into(), "file_read".into(), "file_write".into(),
+                    "glob".into(), "grep".into(), "web_fetch".into(),
+                ],
+                max_iterations: 30,
+                compaction: compaction_config,
+                ..Default::default()
+            };
 
-    let agent_config = AgentConfig {
-        name: "gpui".into(),
-        model: provider.default_model().to_string(),
-        tools: vec![
-            "bash".into(),
-            "file_read".into(),
-            "file_write".into(),
-            "glob".into(),
-            "grep".into(),
-            "web_fetch".into(),
-        ],
-        max_iterations: 30,
-        compaction: compaction_config,
-        ..Default::default()
-    };
-
-    Some(Arc::new(Agent::new(
-        agent_config,
-        provider,
-        tool_registry,
-        governor,
-        "gpui-session".into(),
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    )))
+            (Some(Arc::new(Agent::new(
+                agent_config, provider, tool_registry, governor,
+                "gpui-session".into(),
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ))), None)
+        }
+        Err(e) => {
+            let key_hint = match config.provider.default.as_deref() {
+                Some("openai") => "OPENAI_API_KEY",
+                _ => "ANTHROPIC_API_KEY",
+            };
+            (None, Some(format!("{}: set {} and restart", e, key_hint)))
+        }
+    }
 }
 
 struct RootView {
     setup: Option<Entity<views::setup_wizard::SetupWizardView>>,
     app: Option<Entity<AverroesApp>>,
+    error: Option<String>,
 }
 
 impl RootView {
     fn new(cx: &mut Context<Self>) -> Self {
-        let agent = create_agent();
+        let (agent, error) = create_agent();
 
-        if agent.is_some() {
-            let app = cx.new(|cx| AverroesApp::new(cx, agent));
-            Self {
-                setup: None,
-                app: Some(app),
-            }
+        if let Some(agent) = agent {
+            let app = cx.new(|cx| AverroesApp::new(cx, Some(agent)));
+            Self { setup: None, app: Some(app), error: None }
+        } else if error.is_some() {
+            Self { setup: None, app: None, error }
         } else {
             let setup = cx.new(|cx| views::setup_wizard::SetupWizardView::new(cx));
-            Self {
-                setup: Some(setup),
-                app: None,
-            }
+            Self { setup: Some(setup), app: None, error: None }
         }
     }
 }
@@ -97,13 +99,78 @@ impl Render for RootView {
             return app.clone().into_any_element();
         }
 
+        if let Some(ref error) = self.error {
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .bg(rgb(0x1e1e2e))
+                .text_color(rgb(0xcdd6f4))
+                .font_family("SF Mono")
+                .justify_center()
+                .items_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .bg(rgb(0x313244))
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(0xf38ba8))
+                        .p_8()
+                        .gap_4()
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0xf38ba8))
+                                .child("Connection Error"),
+                        )
+                        .child(
+                            div().text_sm().text_color(rgb(0x6c7086))
+                                .child(error.clone()),
+                        )
+                        .child(
+                            div()
+                                .px_4()
+                                .py_2()
+                                .bg(rgb(0xf38ba8))
+                                .text_color(rgb(0x1e1e2e))
+                                .rounded_md()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .cursor_pointer()
+                                .id(ElementId::Name("reset-config".into()))
+                                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                    let config_dir = std::path::PathBuf::from(
+                                        std::env::var("HOME").unwrap_or_else(|_| ".".into()),
+                                    )
+                                    .join(".config")
+                                    .join("averroes");
+                                    let _ = std::fs::remove_file(config_dir.join("config.toml"));
+                                    let setup = cx.new(|cx| views::setup_wizard::SetupWizardView::new(cx));
+                                    this.setup = Some(setup);
+                                    this.error = None;
+                                    cx.notify();
+                                }))
+                                .child("Reset Config"),
+                        ),
+                )
+                .into_any_element();
+        }
+
         if let Some(ref setup) = self.setup {
             let is_done = setup.read(cx).is_done();
             if is_done {
-                let agent = create_agent();
-                let app_entity = cx.new(|cx| AverroesApp::new(cx, agent));
-                self.app = Some(app_entity);
-                self.setup = None;
+                let (agent, error) = create_agent();
+                if let Some(agent) = agent {
+                    let app_entity = cx.new(|cx| AverroesApp::new(cx, Some(agent)));
+                    self.app = Some(app_entity);
+                    self.setup = None;
+                } else if let Some(err) = error {
+                    self.error = Some(err);
+                    self.setup = None;
+                }
                 cx.notify();
                 return div().into_any_element();
             }
