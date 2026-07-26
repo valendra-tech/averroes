@@ -2,7 +2,7 @@ use gpui::*;
 
 use crate::runtime::AgentFactory;
 use crate::session::{SessionId, SessionManager};
-use crate::shortcuts::{CloseSession, FocusInput, NewSession, SendMessage, ToggleSettings};
+use crate::shortcuts::{CloseSession, FocusInput, NewSession, Quit, SendMessage, ToggleSettings};
 use crate::ui::tabs::{SessionTabs, SessionTabsEvent};
 use crate::ui::UiTheme;
 use crate::views::chat::{ChatView, ChatViewEvent};
@@ -115,29 +115,30 @@ impl AverroesApp {
 
     fn restore_sessions(store: &WorkspaceStore) -> SessionManager {
         let workspace_id = store.active_workspace().map(|w| w.id.clone());
-        let mut manager = SessionManager::new(workspace_id);
         let open_tabs = store.load_open_tabs();
         if open_tabs.is_empty() {
-            return manager;
+            return SessionManager::new(workspace_id);
         }
         let session_store = SessionStore::with_dir(store.sessions_dir());
-        let mut first = true;
+        let mut manager = SessionManager::new_empty(workspace_id.clone());
         for id in &open_tabs {
-            let sid = if first {
-                first = false;
-                manager.tabs()[0].id.clone()
-            } else {
-                manager.new_session()
-            };
-            let _ = manager.try_close(&sid);
-            let new_id = SessionId(id.clone());
-            if let Ok(msgs) = session_store.load(id) {
-                let title = msgs.first().map(|m| {
-                    let t = m.text().chars().take(40).collect::<String>();
-                    if t.is_empty() { "New session".into() } else { t }
-                }).unwrap_or_else(|| "New session".into());
-                manager.rename(&new_id, title);
-            }
+            let title = session_store
+                .load(id)
+                .ok()
+                .and_then(|msgs| {
+                    msgs.first().map(|m| {
+                        let t = m.text().chars().take(40).collect::<String>();
+                        if t.is_empty() { "New session".into() } else { t }
+                    })
+                })
+                .unwrap_or_else(|| "New session".into());
+            manager.add_tab(SessionId(id.clone()), title);
+        }
+        if manager.tabs().is_empty() {
+            return SessionManager::new(workspace_id);
+        }
+        if let Some(first_id) = manager.tabs().first().map(|t| t.id.clone()) {
+            manager.select(&first_id);
         }
         manager
     }
@@ -333,6 +334,14 @@ impl AverroesApp {
         self.toggle_settings(cx);
     }
 
+    fn handle_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
+        self.persist_tabs();
+        for chat in self.session_views.values() {
+            chat.update(cx, |chat, _cx| chat.save_messages());
+        }
+        cx.quit();
+    }
+
     fn handle_chat_event(&mut self, event: &ChatViewEvent, cx: &mut Context<Self>) {
         match event {
             ChatViewEvent::Submitted { session_id, text } => {
@@ -432,6 +441,7 @@ impl Render for AverroesApp {
             .on_action(cx.listener(Self::handle_focus_input))
             .on_action(cx.listener(Self::handle_send_message))
             .on_action(cx.listener(Self::handle_toggle_settings))
+            .on_action(cx.listener(Self::handle_quit))
             .child(self.session_tabs.clone())
             .children({
                 let mut children: Vec<gpui::Div> = Vec::new();

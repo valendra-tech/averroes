@@ -190,7 +190,7 @@ impl ChatView {
         }
     }
 
-    fn save_messages(&self) {
+    pub(crate) fn save_messages(&self) {
         let core_messages: Vec<ChatMessage> = self
             .messages
             .iter()

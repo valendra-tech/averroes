@@ -39,6 +39,14 @@ impl SessionManager {
         }
     }
 
+    pub fn new_empty(workspace_id: Option<String>) -> Self {
+        Self {
+            tabs: Vec::new(),
+            active: 0,
+            workspace_id,
+        }
+    }
+
     pub fn tabs(&self) -> &[SessionTab] {
         &self.tabs
     }
