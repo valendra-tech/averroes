@@ -569,74 +569,60 @@ impl ChatView {
                             .child("Your AI workspace. Ask anything, attach context, run tools."),
                     )
                     .child({
-                        let is_empty = self.messages.is_empty();
                         let active_name = self.active_workspace_name();
                         let root_str = self.workspace_root.display().to_string();
+                        let selector_open = self.workspace_selector_open;
+                        let selector = div()
+                            .relative()
+                            .child(
+                                div()
+                                    .id(ElementId::Name("chat-ws-selector".into()))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_xs()
+                                    .text_color(theme.foreground)
+                                    .font(UiTheme::mono_font())
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.workspace_selector_open = !this.workspace_selector_open;
+                                        cx.notify();
+                                    }))
+                                    .child("\u{1F4C1}")
+                                    .child(format!("{} \u{2014} {}", active_name, root_str)),
+                            );
 
-                        if !is_empty {
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .font(UiTheme::mono_font())
-                                .child("\u{1F4C1}")
-                                .child(format!("{} \u{2014} {}", active_name, root_str))
-                        } else {
-                            let selector_open = self.workspace_selector_open;
-                            let selector = div()
-                                .relative()
-                                .child(
-                                    div()
-                                        .id(ElementId::Name("chat-ws-selector".into()))
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_2()
-                                        .text_xs()
-                                        .text_color(theme.foreground)
-                                        .font(UiTheme::mono_font())
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _event, _window, cx| {
-                                            this.workspace_selector_open = !this.workspace_selector_open;
-                                            cx.notify();
-                                        }))
-                                        .child("\u{1F4C1}")
-                                        .child(format!("{} \u{2014} {}", active_name, root_str)),
-                                );
-
-                            if selector_open {
-                                let dropdown = {
-                                    let workspace_id = self.workspace_id.clone();
-                                    let session_id = self.session_id.clone();
-                                    let mut items: Vec<gpui::AnyElement> = Vec::new();
-                                    for ws in &self.workspaces {
-                                        let ws_id = ws.id.clone();
-                                        let ws_name = ws.name.clone();
-                                        let ws_root = ws.root.clone();
-                                        let is_active = workspace_id.as_deref() == Some(&ws_id);
-                                        let sid = session_id.clone();
-                                        items.push(
-                                            div()
-                                                .id(ElementId::Name(format!("chat-ws-item-{}", ws_id).into()))
-                                                .px(px(8.0))
-                                                .py(px(4.0))
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .justify_between()
-                                                .text_sm()
-                                                .text_color(theme.foreground)
-                                                .cursor_pointer()
-                                                .hover(|style| style.bg(theme.accent))
-                                                .on_click(cx.listener(move |this, _event, _window, cx| {
-                                                    this.workspace_id = Some(ws_id.clone());
-                                                    this.workspace_root = ws_root.clone();
-                                                    this.workspace_selector_open = false;
-                                                    cx.emit(ChatViewEvent::WorkspaceChanged {
-                                                        session_id: sid.clone(),
+                        if selector_open {
+                            let dropdown = {
+                                let workspace_id = self.workspace_id.clone();
+                                let session_id = self.session_id.clone();
+                                let mut items: Vec<gpui::AnyElement> = Vec::new();
+                                for ws in &self.workspaces {
+                                    let ws_id = ws.id.clone();
+                                    let ws_name = ws.name.clone();
+                                    let ws_root = ws.root.clone();
+                                    let is_active = workspace_id.as_deref() == Some(&ws_id);
+                                    let sid = session_id.clone();
+                                    items.push(
+                                        div()
+                                            .id(ElementId::Name(format!("chat-ws-item-{}", ws_id).into()))
+                                            .px(px(8.0))
+                                            .py(px(4.0))
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .justify_between()
+                                            .text_sm()
+                                            .text_color(theme.foreground)
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(theme.accent))
+                                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                                this.workspace_id = Some(ws_id.clone());
+                                                this.workspace_root = ws_root.clone();
+                                                this.workspace_selector_open = false;
+                                                cx.emit(ChatViewEvent::WorkspaceChanged {
+                                                    session_id: sid.clone(),
                                                         workspace_id: ws_id.clone(),
                                                     });
                                                     cx.notify();
@@ -669,7 +655,6 @@ impl ChatView {
                             } else {
                                 selector
                             }
-                        }
                     })
                     .child(
                         composer_surface(theme, true, false)
@@ -1264,6 +1249,22 @@ impl Render for ChatView {
             }))
             .text_color(theme.foreground)
             .font(UiTheme::ui_font())
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(24.0))
+                    .pt(px(16.0))
+                    .pb(px(4.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .font(UiTheme::mono_font())
+                    .child("\u{1F4C1}")
+                    .child(format!("{} \u{2014} {}", self.active_workspace_name(), self.workspace_root.display())),
+            )
             .child({
                 let scroll_offset = self.scroll_handle.offset();
                 let max_offset = self.scroll_handle.max_offset();

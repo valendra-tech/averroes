@@ -29,11 +29,7 @@ impl SkillIndex {
         let lower = text.to_lowercase();
         self.skills
             .values()
-            .filter(|s| {
-                s.triggers
-                    .iter()
-                    .any(|t| lower.contains(&t.to_lowercase()))
-            })
+            .filter(|s| s.triggers.iter().any(|t| lower.contains(&t.to_lowercase())))
             .collect()
     }
 
@@ -81,16 +77,19 @@ mod tests {
 
     #[test]
     fn test_list_skills() {
-        let (dir, index) = setup_temp_skills("list", &[
-            (
-                "git.md",
-                "# Git Commands\n\n## Triggers\n- git\n- commit\n- branch\n",
-            ),
-            (
-                "rust.md",
-                "# Rust Tips\n\n## Triggers\n- rust\n- cargo\n- borrow\n",
-            ),
-        ]);
+        let (dir, index) = setup_temp_skills(
+            "list",
+            &[
+                (
+                    "git.md",
+                    "# Git Commands\n\n## Triggers\n- git\n- commit\n- branch\n",
+                ),
+                (
+                    "rust.md",
+                    "# Rust Tips\n\n## Triggers\n- rust\n- cargo\n- borrow\n",
+                ),
+            ],
+        );
 
         let list = index.list();
         assert_eq!(list.len(), 2);
@@ -104,20 +103,23 @@ mod tests {
 
     #[test]
     fn test_find_by_trigger() {
-        let (dir, index) = setup_temp_skills("trigger", &[
-            (
-                "git.md",
-                "# Git Commands\n\n## Triggers\n- git\n- commit\n- branch\n",
-            ),
-            (
-                "rust.md",
-                "# Rust Tips\n\n## Triggers\n- rust\n- cargo\n- borrow\n",
-            ),
-            (
-                "testing.md",
-                "# Testing Guide\n\n## Triggers\n- test\n- assert\n- verify\n",
-            ),
-        ]);
+        let (dir, index) = setup_temp_skills(
+            "trigger",
+            &[
+                (
+                    "git.md",
+                    "# Git Commands\n\n## Triggers\n- git\n- commit\n- branch\n",
+                ),
+                (
+                    "rust.md",
+                    "# Rust Tips\n\n## Triggers\n- rust\n- cargo\n- borrow\n",
+                ),
+                (
+                    "testing.md",
+                    "# Testing Guide\n\n## Triggers\n- test\n- assert\n- verify\n",
+                ),
+            ],
+        );
 
         let matches = index.find_by_trigger("rust");
         assert_eq!(matches.len(), 1);
@@ -135,16 +137,19 @@ mod tests {
 
     #[test]
     fn test_find_by_trigger_partial_does_not_match() {
-        let (dir, index) = setup_temp_skills("partial", &[
-            (
-                "git.md",
-                "# Git Commands\n\n## Triggers\n- git\n- commit\n- branch\n",
-            ),
-            (
-                "rust.md",
-                "# Rust Tips\n\n## Triggers\n- rust\n- cargo\n- borrow\n",
-            ),
-        ]);
+        let (dir, index) = setup_temp_skills(
+            "partial",
+            &[
+                (
+                    "git.md",
+                    "# Git Commands\n\n## Triggers\n- git\n- commit\n- branch\n",
+                ),
+                (
+                    "rust.md",
+                    "# Rust Tips\n\n## Triggers\n- rust\n- cargo\n- borrow\n",
+                ),
+            ],
+        );
 
         let matches = index.find_by_trigger("gi");
         assert_eq!(matches.len(), 0);
@@ -160,10 +165,13 @@ mod tests {
 
     #[test]
     fn test_load_skill() {
-        let (dir, index) = setup_temp_skills("load", &[(
-            "config.md",
-            "# Configuration\n\nSome content here.\n\n## Triggers\n- config\n",
-        )]);
+        let (dir, index) = setup_temp_skills(
+            "load",
+            &[(
+                "config.md",
+                "# Configuration\n\nSome content here.\n\n## Triggers\n- config\n",
+            )],
+        );
 
         let content = index.load("config").unwrap();
         assert!(content.contains("Configuration"));
@@ -174,10 +182,10 @@ mod tests {
 
     #[test]
     fn test_load_missing_skill() {
-        let (dir, index) = setup_temp_skills("missing", &[(
-            "basic.md",
-            "# Basic\n\n## Triggers\n- basic\n",
-        )]);
+        let (dir, index) = setup_temp_skills(
+            "missing",
+            &[("basic.md", "# Basic\n\n## Triggers\n- basic\n")],
+        );
 
         let result = index.load("nonexistent");
         assert!(result.is_err());

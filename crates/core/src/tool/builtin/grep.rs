@@ -53,17 +53,22 @@ impl Tool for GrepTool {
 
         let mut results: Vec<String> = Vec::new();
 
-        let mut entries = tokio::fs::read_dir(&ctx.working_dir).await.map_err(|e| {
-            ToolError::Execution {
-                tool: self.name().into(),
-                message: format!("Failed to read working directory: {e}"),
-            }
-        })?;
+        let mut entries =
+            tokio::fs::read_dir(&ctx.working_dir)
+                .await
+                .map_err(|e| ToolError::Execution {
+                    tool: self.name().into(),
+                    message: format!("Failed to read working directory: {e}"),
+                })?;
 
-        while let Some(entry) = entries.next_entry().await.map_err(|e| ToolError::Execution {
-            tool: self.name().into(),
-            message: format!("Failed to read directory entry: {e}"),
-        })? {
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| ToolError::Execution {
+                tool: self.name().into(),
+                message: format!("Failed to read directory entry: {e}"),
+            })?
+        {
             let path = entry.path();
 
             if !path.is_file() {
@@ -91,7 +96,12 @@ impl Tool for GrepTool {
 
                         for (line_num, line_content) in content.lines().enumerate() {
                             if re.is_match(line_content) {
-                                results.push(format!("{}:{}: {}", rel_path, line_num + 1, line_content));
+                                results.push(format!(
+                                    "{}:{}: {}",
+                                    rel_path,
+                                    line_num + 1,
+                                    line_content
+                                ));
                             }
                         }
                     }

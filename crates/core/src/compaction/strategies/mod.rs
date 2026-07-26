@@ -1,7 +1,7 @@
-pub mod trim;
-pub mod summary;
 pub mod hybrid;
+pub mod summary;
+pub mod trim;
 
-pub use trim::TrimStrategy;
-pub use summary::SummaryStrategy;
 pub use hybrid::HybridStrategy;
+pub use summary::SummaryStrategy;
+pub use trim::TrimStrategy;

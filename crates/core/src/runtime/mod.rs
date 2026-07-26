@@ -1,7 +1,7 @@
 pub mod governor;
 pub mod pool;
 
-pub use governor::ResourceGovernor;
+pub use governor::{CallPermit, ResourceGovernor, TokenReservation};
 use pool::ProviderConnectionPool;
 use std::sync::Arc;
 use tokio::runtime::Runtime as TokioRuntime;
@@ -39,8 +39,15 @@ impl Runtime {
             config.token_budget_per_minute,
         ));
         let pool = ProviderConnectionPool::new();
-        Self { tokio, governor, pool, config }
+        Self {
+            tokio,
+            governor,
+            pool,
+            config,
+        }
     }
 
-    pub fn config(&self) -> &RuntimeConfig { &self.config }
+    pub fn config(&self) -> &RuntimeConfig {
+        &self.config
+    }
 }

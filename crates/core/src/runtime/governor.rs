@@ -1,10 +1,193 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
+
+#[cfg(test)]
+struct ReserveHook {
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+struct TokenBucket {
+    epoch: u64,
+    usage: Mutex<BucketUsage>,
+}
+
+struct BucketUsage {
+    used: u64,
+    exhausted: bool,
+}
+
+impl TokenBucket {
+    fn new(epoch: u64) -> Self {
+        Self {
+            epoch,
+            usage: Mutex::new(BucketUsage {
+                used: 0,
+                exhausted: false,
+            }),
+        }
+    }
+
+    fn try_reserve(&self, count: u64, limit: u64) -> bool {
+        let mut usage = self.usage.lock().unwrap();
+        if usage.exhausted {
+            return false;
+        }
+
+        let Some(next) = usage.used.checked_add(count) else {
+            return false;
+        };
+        if next > limit {
+            return false;
+        }
+
+        usage.used = next;
+        true
+    }
+
+    fn release(&self, count: u64) {
+        let mut usage = self.usage.lock().unwrap();
+        if !usage.exhausted {
+            usage.used = usage.used.saturating_sub(count);
+        }
+    }
+
+    fn exhaust(&self, limit: u64) {
+        let mut usage = self.usage.lock().unwrap();
+        usage.used = usage.used.max(limit);
+        usage.exhausted = true;
+    }
+
+    fn used(&self) -> u64 {
+        self.usage.lock().unwrap().used
+    }
+}
+
+struct TokenBudget {
+    limit: u64,
+    current: Mutex<Arc<TokenBucket>>,
+    #[cfg(test)]
+    reserve_hook: Mutex<Option<Arc<ReserveHook>>>,
+}
+
+impl TokenBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            current: Mutex::new(Arc::new(TokenBucket::new(0))),
+            #[cfg(test)]
+            reserve_hook: Mutex::new(None),
+        }
+    }
+
+    fn reserve(self: &Arc<Self>, count: u64) -> Option<TokenReservation> {
+        // Keep reset from swapping the bucket between selection and increment.
+        let current = self.current.lock().unwrap();
+        let bucket = current.clone();
+        #[cfg(test)]
+        if let Some(hook) = self.reserve_hook.lock().unwrap().clone() {
+            hook.entered.wait();
+            hook.release.wait();
+        }
+        if bucket.try_reserve(count, self.limit) {
+            Some(TokenReservation {
+                budget: self.clone(),
+                bucket,
+                reserved: count,
+                armed: true,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn available(&self) -> u64 {
+        let current = self.current.lock().unwrap();
+        self.limit.saturating_sub(current.used())
+    }
+
+    fn reset(&self) {
+        let mut current = self.current.lock().unwrap();
+        let next_epoch = current.epoch.saturating_add(1);
+        *current = Arc::new(TokenBucket::new(next_epoch));
+    }
+}
+
+/// A releasable token reservation tied to one accounting window.
+pub struct TokenReservation {
+    budget: Arc<TokenBudget>,
+    bucket: Arc<TokenBucket>,
+    reserved: u64,
+    armed: bool,
+}
+
+impl TokenReservation {
+    /// Commit the reservation without releasing its tokens on drop.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Reconcile the reservation with provider-reported usage.
+    ///
+    /// Returns `false` when the usage cannot fit in the active budget. In that
+    /// case the active bucket is exhausted instead of releasing the consumed
+    /// reservation.
+    pub fn reconcile(&mut self, actual: u64) -> bool {
+        if !self.armed {
+            return true;
+        }
+
+        let current = self.budget.current.lock().unwrap();
+        let current_bucket = current.clone();
+
+        if Arc::ptr_eq(&self.bucket, &current_bucket) {
+            if actual <= self.reserved {
+                self.bucket.release(self.reserved - actual);
+                self.reserved = actual;
+                self.armed = false;
+                return true;
+            }
+
+            let extra = actual - self.reserved;
+            if self.bucket.try_reserve(extra, self.budget.limit) {
+                self.reserved = actual;
+                self.armed = false;
+                return true;
+            }
+
+            self.bucket.exhaust(self.budget.limit);
+            self.reserved = 0;
+            self.armed = false;
+            return false;
+        }
+
+        self.bucket.release(self.reserved);
+        self.reserved = 0;
+        let charged = if actual == 0 {
+            true
+        } else if current_bucket.try_reserve(actual, self.budget.limit) {
+            true
+        } else {
+            current_bucket.exhaust(self.budget.limit);
+            false
+        };
+        self.armed = false;
+        charged
+    }
+}
+
+impl Drop for TokenReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.bucket.release(self.reserved);
+        }
+    }
+}
 
 struct ResetSignal {
     stop: Mutex<bool>,
@@ -13,9 +196,8 @@ struct ResetSignal {
 
 pub struct ResourceGovernor {
     concurrent_semaphore: Arc<Semaphore>,
-    current_concurrent: AtomicUsize,
-    token_budget_per_minute: u64,
-    tokens_used_this_minute: Arc<AtomicU64>,
+    current_concurrent: Arc<AtomicUsize>,
+    token_budget: Arc<TokenBudget>,
     reset_signal: Arc<ResetSignal>,
     reset_thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(test)]
@@ -24,7 +206,7 @@ pub struct ResourceGovernor {
 
 impl ResourceGovernor {
     pub fn new(max_concurrent: usize, token_budget: u64) -> Self {
-        let tokens_used = Arc::new(AtomicU64::new(0));
+        let token_budget = Arc::new(TokenBudget::new(token_budget));
         let reset_signal = Arc::new(ResetSignal {
             stop: Mutex::new(false),
             wake: Condvar::new(),
@@ -32,7 +214,7 @@ impl ResourceGovernor {
         #[cfg(test)]
         let reset_thread_finished = Arc::new(AtomicBool::new(false));
 
-        let tokens = tokens_used.clone();
+        let tokens = token_budget.clone();
         let signal = reset_signal.clone();
         #[cfg(test)]
         let finished = reset_thread_finished.clone();
@@ -54,15 +236,14 @@ impl ResourceGovernor {
                     finished.store(true, Ordering::SeqCst);
                     break;
                 }
-                tokens.store(0, Ordering::SeqCst);
+                tokens.reset();
             }
         });
 
         Self {
             concurrent_semaphore: Arc::new(Semaphore::new(max_concurrent)),
-            current_concurrent: AtomicUsize::new(0),
-            token_budget_per_minute: token_budget,
-            tokens_used_this_minute: tokens_used,
+            current_concurrent: Arc::new(AtomicUsize::new(0)),
+            token_budget,
             reset_signal,
             reset_thread: Some(handle),
             #[cfg(test)]
@@ -70,67 +251,39 @@ impl ResourceGovernor {
         }
     }
 
-    pub async fn acquire_call_permit(&self) -> CallPermit<'_> {
+    pub async fn acquire_call_permit(&self) -> CallPermit {
         let permit = self
             .concurrent_semaphore
             .clone()
             .acquire_owned()
             .await
             .expect("Semaphore closed");
-        self.current_concurrent
-            .fetch_add(1, Ordering::Relaxed);
+        self.current_concurrent.fetch_add(1, Ordering::Relaxed);
         CallPermit {
             _permit: permit,
-            governor: self,
+            current_concurrent: self.current_concurrent.clone(),
+            token_budget: self.token_budget.clone(),
             tokens_consumed: 0,
         }
     }
 
-    pub fn try_reserve_tokens(&self, count: u64) -> bool {
-        let mut current = self.tokens_used_this_minute.load(Ordering::SeqCst);
-        loop {
-            let Some(next) = current.checked_add(count) else {
-                return false;
-            };
-            if next > self.token_budget_per_minute {
-                return false;
-            }
-
-            match self.tokens_used_this_minute.compare_exchange_weak(
-                current,
-                next,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => current = actual,
-            }
-        }
+    /// Reserve tokens until the returned guard is reconciled, disarmed, or dropped.
+    pub fn reserve_tokens(&self, count: u64) -> Option<TokenReservation> {
+        self.token_budget.reserve(count)
     }
 
-    pub fn release_tokens(&self, count: u64) {
-        let mut current = self.tokens_used_this_minute.load(Ordering::SeqCst);
-        loop {
-            let next = current.saturating_sub(count);
-            match self.tokens_used_this_minute.compare_exchange_weak(
-                current,
-                next,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return,
-                Err(actual) => current = actual,
-            }
-        }
-    }
-
+    /// Permanently charge tokens without creating a releasable reservation.
     pub fn try_spend_tokens(&self, count: u64) -> bool {
-        self.try_reserve_tokens(count)
+        self.reserve_tokens(count)
+            .map(|mut reservation| {
+                reservation.disarm();
+                true
+            })
+            .unwrap_or(false)
     }
 
     pub fn tokens_available(&self) -> u64 {
-        let used = self.tokens_used_this_minute.load(Ordering::SeqCst);
-        self.token_budget_per_minute.saturating_sub(used)
+        self.token_budget.available()
     }
 
     pub fn active_calls(&self) -> usize {
@@ -153,24 +306,25 @@ impl Drop for ResourceGovernor {
     }
 }
 
-pub struct CallPermit<'a> {
+pub struct CallPermit {
     _permit: OwnedSemaphorePermit,
-    governor: &'a ResourceGovernor,
+    current_concurrent: Arc<AtomicUsize>,
+    token_budget: Arc<TokenBudget>,
     tokens_consumed: u64,
 }
 
-impl<'a> CallPermit<'a> {
+impl CallPermit {
     pub fn record_tokens(&mut self, count: u64) {
         self.tokens_consumed = self.tokens_consumed.saturating_add(count);
-        self.governor.try_spend_tokens(count);
+        if let Some(mut reservation) = self.token_budget.reserve(count) {
+            reservation.disarm();
+        }
     }
 }
 
-impl<'a> Drop for CallPermit<'a> {
+impl Drop for CallPermit {
     fn drop(&mut self) {
-        self.governor
-            .current_concurrent
-            .fetch_sub(1, Ordering::Relaxed);
+        self.current_concurrent.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -219,13 +373,111 @@ mod tests {
     #[test]
     fn test_token_reservation_and_release() {
         let governor = ResourceGovernor::new(1, 10);
+        let mut reservation = governor.reserve_tokens(7).unwrap();
 
-        assert!(governor.try_reserve_tokens(7));
         assert_eq!(governor.tokens_available(), 3);
-        governor.release_tokens(4);
+        assert!(reservation.reconcile(3));
         assert_eq!(governor.tokens_available(), 7);
-        assert!(governor.try_reserve_tokens(7));
-        assert!(!governor.try_reserve_tokens(1));
+        let second_reservation = governor.reserve_tokens(7).unwrap();
+        assert!(governor.reserve_tokens(1).is_none());
+        drop(second_reservation);
+    }
+
+    #[test]
+    fn pre_reset_reservation_release_does_not_subtract_new_window_tokens() {
+        let governor = ResourceGovernor::new(1, 10);
+
+        let old_reservation = governor.reserve_tokens(7).unwrap();
+        governor.token_budget.reset();
+        let new_reservation = governor.reserve_tokens(5).unwrap();
+
+        drop(old_reservation);
+
+        assert_eq!(governor.tokens_available(), 5);
+        drop(new_reservation);
+    }
+
+    #[test]
+    fn dropped_token_reservation_releases_tokens() {
+        let governor = ResourceGovernor::new(1, 10);
+        let reservation = governor.reserve_tokens(7).unwrap();
+
+        assert_eq!(governor.tokens_available(), 3);
+        drop(reservation);
+        assert_eq!(governor.tokens_available(), 10);
+    }
+
+    #[test]
+    fn reservation_reconciliation_charges_current_window_after_reset() {
+        let governor = ResourceGovernor::new(1, 10);
+        let mut old_reservation = governor.reserve_tokens(7).unwrap();
+
+        governor.token_budget.reset();
+        let current_reservation = governor.reserve_tokens(2).unwrap();
+
+        assert!(old_reservation.reconcile(5));
+        assert_eq!(governor.tokens_available(), 3);
+
+        drop(current_reservation);
+    }
+
+    #[test]
+    fn reservation_reconciliation_commits_same_window_usage() {
+        let governor = ResourceGovernor::new(1, 10);
+        let mut under_reservation = governor.reserve_tokens(7).unwrap();
+
+        assert!(under_reservation.reconcile(4));
+        assert_eq!(governor.tokens_available(), 6);
+
+        let mut over_reservation = governor.reserve_tokens(2).unwrap();
+        assert!(over_reservation.reconcile(6));
+        assert_eq!(governor.tokens_available(), 0);
+    }
+
+    #[test]
+    fn over_budget_reconciliation_keeps_budget_exhausted() {
+        let governor = ResourceGovernor::new(1, 10);
+        let mut reservation = governor.reserve_tokens(4).unwrap();
+
+        assert!(!reservation.reconcile(20));
+        assert_eq!(governor.tokens_available(), 0);
+        assert!(governor.reserve_tokens(1).is_none());
+    }
+
+    #[test]
+    fn reserve_and_reset_are_serialized() {
+        let governor = ResourceGovernor::new(1, 10);
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *governor.token_budget.reserve_hook.lock().unwrap() = Some(Arc::new(ReserveHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+
+        let reserve_budget = governor.token_budget.clone();
+        let reserve_thread = std::thread::spawn(move || reserve_budget.reserve(1).unwrap());
+        entered.wait();
+
+        let (reset_started_tx, reset_started_rx) = std::sync::mpsc::channel();
+        let reset_finished = Arc::new(AtomicBool::new(false));
+        let reset_finished_for_thread = reset_finished.clone();
+        let reset_budget = governor.token_budget.clone();
+        let reset_thread = std::thread::spawn(move || {
+            reset_started_tx.send(()).unwrap();
+            reset_budget.reset();
+            reset_finished_for_thread.store(true, Ordering::SeqCst);
+        });
+
+        reset_started_rx.recv().unwrap();
+        std::thread::yield_now();
+        assert!(!reset_finished.load(Ordering::SeqCst));
+
+        release.wait();
+        let reservation = reserve_thread.join().unwrap();
+        reset_thread.join().unwrap();
+        assert!(reset_finished.load(Ordering::SeqCst));
+        assert_eq!(governor.tokens_available(), 10);
+        drop(reservation);
     }
 
     #[tokio::test(flavor = "multi_thread")]

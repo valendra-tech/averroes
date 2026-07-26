@@ -12,8 +12,7 @@ struct PrioritizedTask {
 
 impl PartialEq for PrioritizedTask {
     fn eq(&self, other: &Self) -> bool {
-        self.task.priority == other.task.priority
-            && self.submitted_at == other.submitted_at
+        self.task.priority == other.task.priority && self.submitted_at == other.submitted_at
     }
 }
 

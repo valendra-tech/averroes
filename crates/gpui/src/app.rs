@@ -348,15 +348,14 @@ impl AverroesApp {
                 self.session_views.clear();
                 self.session_subscriptions.clear();
                 self.sessions = Self::restore_sessions(&self.workspace_store);
-                self.sync_navigation(cx);
                 self.active_view = ActiveView::Chat;
                 let active_id = self.sessions.active().id.clone();
                 self.add_session_view(active_id, cx);
                 self.refresh_home(cx);
+                self.sync_navigation(cx);
+                cx.notify();
             }
         }
-        self.sync_navigation(cx);
-        cx.notify();
     }
 
     fn handle_settings_event(&mut self, event: &SettingsEvent, cx: &mut Context<Self>) {

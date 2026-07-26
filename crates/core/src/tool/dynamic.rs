@@ -85,12 +85,18 @@ impl Tool for DynamicTool {
 
                 let exit_code = output.status.code().unwrap_or(-1);
                 if exit_code != 0 {
-                    Ok(ToolResult::error(combined).with_metadata(serde_json::json!({ "exit_code": exit_code })))
+                    Ok(ToolResult::error(combined)
+                        .with_metadata(serde_json::json!({ "exit_code": exit_code })))
                 } else {
-                    Ok(ToolResult::ok(combined).with_metadata(serde_json::json!({ "exit_code": exit_code })))
+                    Ok(ToolResult::ok(combined)
+                        .with_metadata(serde_json::json!({ "exit_code": exit_code })))
                 }
             }
-            DynamicToolHandler::HttpRequest { url, method, headers } => {
+            DynamicToolHandler::HttpRequest {
+                url,
+                method,
+                headers,
+            } => {
                 let interpolated_url = interpolate(url, params);
                 let client = reqwest::Client::new();
                 let mut request = match method.to_uppercase().as_str() {
@@ -131,9 +137,10 @@ impl Tool for DynamicTool {
                 let result = handler(params);
                 Ok(ToolResult::ok(result))
             }
-            DynamicToolHandler::MCP { server_name: _, tool_name: _ } => {
-                Ok(ToolResult::ok("MCP handler: not yet implemented"))
-            }
+            DynamicToolHandler::MCP {
+                server_name: _,
+                tool_name: _,
+            } => Ok(ToolResult::ok("MCP handler: not yet implemented")),
         }
     }
 }
@@ -153,7 +160,10 @@ pub fn interpolate(template: &str, params: &Value) -> String {
     result
 }
 
-pub fn register_dynamic_tools(registry: &crate::tool::ToolRegistry, configs: Vec<DynamicToolConfig>) {
+pub fn register_dynamic_tools(
+    registry: &crate::tool::ToolRegistry,
+    configs: Vec<DynamicToolConfig>,
+) {
     for config in configs {
         registry.register(DynamicTool::new(config));
     }

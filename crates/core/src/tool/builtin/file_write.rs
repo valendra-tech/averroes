@@ -54,23 +54,23 @@ impl Tool for FileWriteTool {
         let full_path = ctx.working_dir.join(file_path);
 
         if let Some(parent) = full_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ToolError::Execution {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| ToolError::Execution {
                     tool: self.name().into(),
                     message: format!(
                         "Failed to create parent directories for '{}': {e}",
                         full_path.display()
                     ),
-                }
-            })?;
+                })?;
         }
 
-        tokio::fs::write(&full_path, content).await.map_err(|e| {
-            ToolError::Execution {
+        tokio::fs::write(&full_path, content)
+            .await
+            .map_err(|e| ToolError::Execution {
                 tool: self.name().into(),
                 message: format!("Failed to write file '{}': {e}", full_path.display()),
-            }
-        })?;
+            })?;
 
         let byte_count = content.len();
         Ok(ToolResult::ok(format!(

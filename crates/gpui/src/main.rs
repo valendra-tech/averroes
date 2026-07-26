@@ -6,29 +6,30 @@ mod theme;
 mod ui;
 mod views;
 
+use crate::ui::{button, panel, ButtonVariant, UiTheme};
 use app::AverroesApp;
+use averroes_core::config::AppConfig;
 use gpui::*;
 use runtime::{AgentFactory, RuntimeError};
-use session::SessionManager;
-use shortcuts::Quit;
+use shortcuts::{CloseSession, FocusInput, NewSession, Quit, SendMessage, ToggleSettings};
 use std::sync::Arc;
 
 struct RootView {
     setup: Option<Entity<views::setup_wizard::SetupWizardView>>,
+    setup_subscription: Option<Subscription>,
     app: Option<Entity<AverroesApp>>,
     error: Option<String>,
     factory: Option<Arc<AgentFactory>>,
-    sessions: SessionManager,
 }
 
 impl RootView {
     fn new(cx: &mut Context<Self>) -> Self {
         let mut root = Self {
             setup: None,
+            setup_subscription: None,
             app: None,
             error: None,
             factory: None,
-            sessions: SessionManager::new(),
         };
         root.load_factory(cx);
         root
@@ -38,15 +39,13 @@ impl RootView {
         self.app = None;
         self.factory = None;
         self.error = None;
+        self.setup_subscription = None;
 
         match AgentFactory::load() {
             Ok(factory) => self.install_factory(factory, cx),
             Err(RuntimeError::NeedsSetup) => {
-                if self.setup.is_none() {
-                    self.setup = Some(cx.new(|cx| {
-                        views::setup_wizard::SetupWizardView::new(cx)
-                    }));
-                }
+                let config = AppConfig::load().unwrap_or_default();
+                self.install_setup(config, cx);
             }
             Err(RuntimeError::Configuration(error)) => self.show_error(error),
             Err(RuntimeError::Provider {
@@ -60,19 +59,32 @@ impl RootView {
 
     fn install_factory(&mut self, factory: AgentFactory, cx: &mut Context<Self>) {
         let factory = Arc::new(factory);
-        let session_id = self.sessions.active().id.clone();
-        let agent = factory.new_agent(&session_id);
         let app_factory = Arc::clone(&factory);
-        let app = cx.new(|cx| AverroesApp::new(cx, Some(agent), app_factory));
+        let app = cx.new(|cx| AverroesApp::new(cx, app_factory));
 
         self.setup = None;
+        self.setup_subscription = None;
         self.error = None;
         self.factory = Some(factory);
         self.app = Some(app);
     }
 
+    fn install_setup(&mut self, config: AppConfig, cx: &mut Context<Self>) {
+        let setup = cx.new(|cx| views::setup_wizard::SetupWizardView::new(cx, config));
+        let subscription = cx.subscribe(
+            &setup,
+            |this, _setup, _event: &views::setup_wizard::SetupWizardSaved, cx| {
+                this.load_factory(cx);
+                cx.notify();
+            },
+        );
+        self.setup = Some(setup);
+        self.setup_subscription = Some(subscription);
+    }
+
     fn show_error(&mut self, message: String) {
         self.setup = None;
+        self.setup_subscription = None;
         self.app = None;
         self.factory = None;
         self.error = Some(message);
@@ -93,75 +105,58 @@ impl Render for RootView {
         }
 
         if let Some(ref error) = self.error {
+            let theme = UiTheme::light();
             return div()
                 .flex()
                 .flex_col()
                 .size_full()
-                .bg(rgb(0x1e1e2e))
-                .text_color(rgb(0xcdd6f4))
-                .font_family("SF Mono")
+                .bg(theme.background)
+                .text_color(theme.foreground)
+                .font(UiTheme::ui_font())
                 .justify_center()
                 .items_center()
                 .child(
-                    div()
+                    panel(theme)
                         .flex()
                         .flex_col()
-                        .bg(rgb(0x313244))
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(rgb(0xf38ba8))
-                        .p_8()
-                        .gap_4()
+                        .w(px(520.0))
+                        .p(px(28.0))
+                        .gap(px(14.0))
                         .child(
                             div()
+                                .font(UiTheme::display_font())
                                 .text_lg()
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(0xf38ba8))
+                                .text_color(theme.destructive)
                                 .child("Connection Error"),
                         )
                         .child(
-                            div().text_sm().text_color(rgb(0x6c7086))
+                            div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
                                 .child(error.clone()),
                         )
                         .child(
-                            div()
-                                .px_4()
-                                .py_2()
-                                .bg(rgb(0xf38ba8))
-                                .text_color(rgb(0x1e1e2e))
-                                .rounded_md()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .cursor_pointer()
+                            button(theme, ButtonVariant::Danger, "Reset configuration")
                                 .id(ElementId::Name("reset-config".into()))
                                 .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                    let config_dir = std::path::PathBuf::from(
-                                        std::env::var("HOME").unwrap_or_else(|_| ".".into()),
-                                    )
-                                    .join(".config")
-                                    .join("averroes");
-                                    let _ = std::fs::remove_file(config_dir.join("config.toml"));
-                                    let setup =
-                                        cx.new(|cx| views::setup_wizard::SetupWizardView::new(cx));
-                                    this.setup = Some(setup);
+                                    if let Err(error) = AppConfig::reset() {
+                                        this.show_error(format!("Could not reset config: {error}"));
+                                        cx.notify();
+                                        return;
+                                    }
+                                    this.install_setup(AppConfig::default(), cx);
                                     this.app = None;
                                     this.factory = None;
                                     this.error = None;
                                     cx.notify();
-                                }))
-                                .child("Reset Config"),
+                                })),
                         ),
                 )
                 .into_any_element();
         }
 
         if let Some(ref setup) = self.setup {
-            let is_done = setup.read(cx).is_done();
-            if is_done {
-                self.load_factory(cx);
-                cx.notify();
-                return div().into_any_element();
-            }
             return setup.clone().into_any_element();
         }
 
@@ -178,6 +173,11 @@ fn main() {
         cx.activate(true);
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-n", NewSession, None),
+            KeyBinding::new("cmd-w", CloseSession, None),
+            KeyBinding::new("cmd-l", FocusInput, None),
+            KeyBinding::new("cmd-enter", SendMessage, None),
+            KeyBinding::new("cmd-,", ToggleSettings, None),
         ]);
 
         cx.on_action(|_: &Quit, cx| cx.quit());
@@ -191,7 +191,8 @@ fn main() {
                 ))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Averroes".into()),
-                    ..Default::default()
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(12.0), px(14.0))),
                 }),
                 ..Default::default()
             },
@@ -204,8 +205,8 @@ fn main() {
 #[cfg(test)]
 mod ui_api_tests {
     use super::ui::{
-        button, field_label, field_surface, panel, panel_with_padding, provider_card,
-        status_badge, ButtonVariant, UiTheme,
+        button, field_label, field_surface, panel, panel_with_padding, provider_card, status_badge,
+        ButtonVariant, UiTheme,
     };
     use gpui::{px, rgb};
 

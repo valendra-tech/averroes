@@ -1,5 +1,5 @@
-pub mod loader;
 pub mod index;
+pub mod loader;
 
 pub use index::SkillIndex;
 
@@ -20,7 +20,11 @@ pub enum SkillError {
     #[error("Skill '{0}' not found")]
     NotFound(String),
     #[error("I/O error reading {path}: {source}")]
-    Io { path: PathBuf, #[source] source: std::io::Error },
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("Parse error: {0}")]
     Parse(String),
     #[error("{0}")]

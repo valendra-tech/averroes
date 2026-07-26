@@ -3,9 +3,9 @@ pub mod file_read;
 pub mod file_write;
 pub mod glob;
 pub mod grep;
-pub mod web_fetch;
 pub mod list_skills;
 pub mod load_skill;
+pub mod web_fetch;
 
 use crate::skill::SkillIndex;
 use crate::tool::ToolRegistry;

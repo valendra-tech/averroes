@@ -1,13 +1,13 @@
-pub mod registry;
 pub mod builtin;
 pub mod dynamic;
+pub mod registry;
 
 pub use registry::ToolRegistry;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct ToolContext {
@@ -28,11 +28,21 @@ pub struct ToolResult {
 
 impl ToolResult {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { success: true, content: content.into(), error: None, metadata: None }
+        Self {
+            success: true,
+            content: content.into(),
+            error: None,
+            metadata: None,
+        }
     }
 
     pub fn error(message: impl Into<String>) -> Self {
-        Self { success: false, content: String::new(), error: Some(message.into()), metadata: None }
+        Self {
+            success: false,
+            content: String::new(),
+            error: Some(message.into()),
+            metadata: None,
+        }
     }
 
     pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
@@ -48,8 +58,12 @@ pub trait Tool: Send + Sync {
     fn parameters(&self) -> serde_json::Value;
     async fn execute(&self, ctx: &ToolContext, params: &serde_json::Value) -> Result<ToolResult>;
 
-    fn is_read_only(&self) -> bool { false }
-    fn requires_confirmation(&self) -> bool { false }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    fn requires_confirmation(&self) -> bool {
+        false
+    }
 }
 
 pub type ToolRef = Arc<dyn Tool>;

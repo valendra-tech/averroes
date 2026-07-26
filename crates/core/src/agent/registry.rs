@@ -42,8 +42,8 @@ mod tests {
     use super::*;
     use crate::agent::Agent;
     use crate::agent::AgentConfig;
-    use crate::provider::{ChatMessage, ChatRequest, ChatResponse, Provider};
     use crate::provider::types::{MessageContent, Role};
+    use crate::provider::{ChatMessage, ChatRequest, ChatResponse, Provider};
     use crate::runtime::ResourceGovernor;
     use crate::tool::ToolRegistry;
     use async_trait::async_trait;

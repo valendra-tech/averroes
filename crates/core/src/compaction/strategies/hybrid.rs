@@ -24,12 +24,13 @@ impl CompactionStrategy for HybridStrategy {
         context_limit: usize,
         config: &CompactionConfig,
         provider: Option<&dyn Provider>,
+        model: &str,
     ) -> Result<CompactedContext> {
         let original_count = messages.len();
 
         if messages.len() <= config.keep_last + 2 {
             return TrimStrategy
-                .compact(messages, context_limit, config, provider)
+                .compact(messages, context_limit, config, provider, model)
                 .await;
         }
 
@@ -38,7 +39,7 @@ impl CompactionStrategy for HybridStrategy {
         let recent = &messages[split_idx..];
 
         let summary_result = SummaryStrategy
-            .compact(old, context_limit, config, provider)
+            .compact(old, context_limit, config, provider, model)
             .await?;
 
         let mut compacted = summary_result.messages;
@@ -85,7 +86,7 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt
-            .block_on(strategy.compact(&messages, 100_000, &config, None))
+            .block_on(strategy.compact(&messages, 100_000, &config, None, "test-model"))
             .unwrap();
 
         assert!(result.compacted_count < result.original_count);

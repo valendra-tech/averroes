@@ -50,10 +50,11 @@ impl SkillLoader {
             source: e,
         })?;
         let mut content = String::new();
-        file.read_to_string(&mut content).map_err(|e| SkillError::Io {
-            path: meta.path.clone(),
-            source: e,
-        })?;
+        file.read_to_string(&mut content)
+            .map_err(|e| SkillError::Io {
+                path: meta.path.clone(),
+                source: e,
+            })?;
         Ok(content)
     }
 }
@@ -139,7 +140,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let content = "# Test Skill\n\nA skill for testing.\n\n## Triggers\n\n- test\n- verify\n- check\n";
+        let content =
+            "# Test Skill\n\nA skill for testing.\n\n## Triggers\n\n- test\n- verify\n- check\n";
         create_temp_skill_file(&dir, "test-skill.md", content);
 
         let loader = SkillLoader::new(vec![dir.clone()]);

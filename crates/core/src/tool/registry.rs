@@ -9,7 +9,9 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: DashMap::new() }
+        Self {
+            tools: DashMap::new(),
+        }
     }
 
     /// Register a tool with the registry. If a tool with the same name already
@@ -35,14 +37,23 @@ impl ToolRegistry {
         self.tools.remove(name).map(|(_, v)| v)
     }
 
-    pub async fn execute(&self, name: &str, ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
-        let tool = self.get(name).ok_or_else(|| ToolError::NotFound { tool: name.to_string() })?;
+    pub async fn execute(
+        &self,
+        name: &str,
+        ctx: &ToolContext,
+        params: &Value,
+    ) -> Result<ToolResult> {
+        let tool = self.get(name).ok_or_else(|| ToolError::NotFound {
+            tool: name.to_string(),
+        })?;
         tool.execute(ctx, params).await
     }
 }
 
 impl Default for ToolRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -57,9 +68,13 @@ mod tests {
 
     #[async_trait]
     impl Tool for EchoTool {
-        fn name(&self) -> &str { "echo" }
+        fn name(&self) -> &str {
+            "echo"
+        }
 
-        fn description(&self) -> &str { "Echoes back the input" }
+        fn description(&self) -> &str {
+            "Echoes back the input"
+        }
 
         fn parameters(&self) -> serde_json::Value {
             json!({
@@ -74,7 +89,11 @@ mod tests {
             })
         }
 
-        async fn execute(&self, _ctx: &ToolContext, params: &serde_json::Value) -> Result<ToolResult> {
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            params: &serde_json::Value,
+        ) -> Result<ToolResult> {
             let text = params["text"].as_str().unwrap_or("");
             Ok(ToolResult::ok(text))
         }
@@ -101,7 +120,9 @@ mod tests {
     async fn test_execute() {
         let registry = ToolRegistry::new();
         registry.register(EchoTool);
-        let result = registry.execute("echo", &test_ctx(), &json!({"text": "hello"})).await;
+        let result = registry
+            .execute("echo", &test_ctx(), &json!({"text": "hello"}))
+            .await;
         assert!(result.is_ok());
         let tool_result = result.unwrap();
         assert!(tool_result.success);
@@ -111,7 +132,9 @@ mod tests {
     #[tokio::test]
     async fn test_not_found() {
         let registry = ToolRegistry::new();
-        let result = registry.execute("nonexistent", &test_ctx(), &json!({})).await;
+        let result = registry
+            .execute("nonexistent", &test_ctx(), &json!({}))
+            .await;
         assert!(matches!(result, Err(ToolError::NotFound { .. })));
     }
 
@@ -122,10 +145,20 @@ mod tests {
         struct NoopTool;
         #[async_trait]
         impl Tool for NoopTool {
-            fn name(&self) -> &str { "noop" }
-            fn description(&self) -> &str { "Does nothing" }
-            fn parameters(&self) -> serde_json::Value { json!({"type": "object", "properties": {}}) }
-            async fn execute(&self, _ctx: &ToolContext, _params: &serde_json::Value) -> Result<ToolResult> {
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn description(&self) -> &str {
+                "Does nothing"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                json!({"type": "object", "properties": {}})
+            }
+            async fn execute(
+                &self,
+                _ctx: &ToolContext,
+                _params: &serde_json::Value,
+            ) -> Result<ToolResult> {
                 Ok(ToolResult::ok("ok"))
             }
         }
@@ -161,10 +194,20 @@ mod tests {
         struct FailingTool;
         #[async_trait]
         impl Tool for FailingTool {
-            fn name(&self) -> &str { "failing" }
-            fn description(&self) -> &str { "Always fails" }
-            fn parameters(&self) -> serde_json::Value { json!({"type": "object", "properties": {}}) }
-            async fn execute(&self, _ctx: &ToolContext, _params: &serde_json::Value) -> Result<ToolResult> {
+            fn name(&self) -> &str {
+                "failing"
+            }
+            fn description(&self) -> &str {
+                "Always fails"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                json!({"type": "object", "properties": {}})
+            }
+            async fn execute(
+                &self,
+                _ctx: &ToolContext,
+                _params: &serde_json::Value,
+            ) -> Result<ToolResult> {
                 Err(ToolError::InvalidParams {
                     tool: "failing".into(),
                     message: "bad input".into(),

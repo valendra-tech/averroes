@@ -38,10 +38,18 @@ impl SubAgentHandle {
 #[derive(Debug, Clone)]
 pub enum SubAgentEvent {
     Thinking(String),
-    ToolCall { tool: String, params: serde_json::Value },
-    ToolResult { tool: String, result: String },
+    ToolCall {
+        tool: String,
+        params: serde_json::Value,
+    },
+    ToolResult {
+        tool: String,
+        result: String,
+    },
     PartialOutput(String),
-    Completed { output: String },
+    Completed {
+        output: String,
+    },
     Error(String),
 }
 

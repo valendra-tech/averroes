@@ -37,6 +37,7 @@ impl CompactionStrategy for TrimStrategy {
         _context_limit: usize,
         config: &CompactionConfig,
         _provider: Option<&dyn crate::provider::Provider>,
+        _model: &str,
     ) -> Result<CompactedContext> {
         let original_count = messages.len();
         let keep = config.keep_last.min(messages.len());
@@ -82,7 +83,9 @@ mod tests {
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(strategy.compact(&messages, 100_000, &config, None)).unwrap();
+        let result = rt
+            .block_on(strategy.compact(&messages, 100_000, &config, None, "test-model"))
+            .unwrap();
 
         assert_eq!(result.original_count, 51);
         assert_eq!(result.compacted_count, 5);

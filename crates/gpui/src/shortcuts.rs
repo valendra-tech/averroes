@@ -6,8 +6,8 @@ actions!(
         Quit,
         SendMessage,
         NewSession,
-        ToggleSidebar,
-        ToggleTheme,
+        CloseSession,
+        ToggleSettings,
         FocusInput,
     ]
 );

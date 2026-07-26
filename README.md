@@ -13,7 +13,6 @@ High-performance AI harness for building code assistant applications in Rust.
 | Crate | Description |
 |-------|-------------|
 | `averroes-core` | Shared harness — provider trait, agent runtime, tool system, skill loader, compaction, resource governor |
-| `averroes-cli` | Terminal frontend (ratatui + crossterm) |
 | `averroes-gpui` | Desktop frontend (GPUI) |
 
 ## Quickstart
@@ -25,14 +24,14 @@ cargo build --workspace
 # Run tests
 cargo test --workspace
 
-# CLI
-cargo run -p averroes-cli -- --help
+# GPUI desktop workspace
+cargo run -p averroes-gpui
 ```
 
 ## Architecture
 
 ```
-User Input → [CLI | GPUI] → averroes-core::Agent::run()
+User Input → GPUI → averroes-core::Agent::run()
   → Skill resolution (indexed markdown skills)
   → Provider::chat() (streaming)
   → Tool calls loop (agent decides which tools to invoke)
@@ -43,7 +42,7 @@ User Input → [CLI | GPUI] → averroes-core::Agent::run()
 
 ## Configuration
 
-CLI config at `~/.config/averroes/config.toml`:
+Shared configuration at `~/.config/averroes/config.toml`:
 
 ```toml
 [provider]
@@ -84,6 +83,17 @@ Description of what this skill does.
 ```
 
 The agent uses `list_skills` and `load_skill` tools to discover and load relevant skills while keeping context lean.
+
+## GPUI Workspace
+
+The desktop frontend is a native GPUI application with a light TokenFactory-inspired visual system:
+
+- Closable session tabs with `+` new-session behavior.
+- A per-session composer with `+`, `Build`, provider/model, `Max`, and `Send` controls.
+- Shared setup and settings for provider, model, and API-key environment variables.
+- Runtime status and keyboard shortcuts: `cmd-n`, `cmd-w`, `cmd-l`, `cmd-enter`, and `cmd-,`.
+
+The GPUI frontend and core runtime use the same configuration file; no GPUI-specific provider configuration is created.
 
 ## Builtin Tools
 

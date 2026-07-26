@@ -50,12 +50,13 @@ impl Tool for FileReadTool {
 
         let full_path = ctx.working_dir.join(file_path);
 
-        let content = tokio::fs::read_to_string(&full_path).await.map_err(|e| {
-            ToolError::Execution {
-                tool: self.name().into(),
-                message: format!("Failed to read file '{}': {e}", full_path.display()),
-            }
-        })?;
+        let content =
+            tokio::fs::read_to_string(&full_path)
+                .await
+                .map_err(|e| ToolError::Execution {
+                    tool: self.name().into(),
+                    message: format!("Failed to read file '{}': {e}", full_path.display()),
+                })?;
 
         let all_lines: Vec<&str> = content.lines().collect();
         let total_lines = all_lines.len();
@@ -92,7 +93,11 @@ impl Tool for FileReadTool {
 
         let selected = &all_lines[start_idx..end_idx];
         let line_range_header = if selected.len() == total_lines {
-            format!("File '{}' ({} lines total):\n", full_path.display(), total_lines)
+            format!(
+                "File '{}' ({} lines total):\n",
+                full_path.display(),
+                total_lines
+            )
         } else {
             format!(
                 "File '{}' (lines {}-{} of {}):\n",
@@ -109,11 +114,13 @@ impl Tool for FileReadTool {
             body.push_str(&format!("{line_num}: {line}\n"));
         }
 
-        Ok(ToolResult::ok(format!("{line_range_header}{body}")).with_metadata(json!({
-            "total_lines": total_lines,
-            "start": start_idx + 1,
-            "end": end_idx,
-            "file_path": full_path.display().to_string()
-        })))
+        Ok(
+            ToolResult::ok(format!("{line_range_header}{body}")).with_metadata(json!({
+                "total_lines": total_lines,
+                "start": start_idx + 1,
+                "end": end_idx,
+                "file_path": full_path.display().to_string()
+            })),
+        )
     }
 }

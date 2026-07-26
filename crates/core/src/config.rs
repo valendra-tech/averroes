@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::provider::{Provider, anthropic::AnthropicProvider, openai::OpenAiProvider};
+use crate::provider::{
+    anthropic::AnthropicProvider, generic::GenericProvider, openai::OpenAiProvider, Provider,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -21,6 +23,7 @@ pub struct ProviderSection {
     pub default: Option<String>,
     pub anthropic: Option<AnthropicConfig>,
     pub openai: Option<OpenAiConfig>,
+    pub generic: Option<GenericConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +36,13 @@ pub struct AnthropicConfig {
 pub struct OpenAiConfig {
     pub api_key_env: Option<String>,
     pub default_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenericConfig {
+    pub api_key_env: Option<String>,
+    pub default_model: Option<String>,
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,10 +84,11 @@ impl AppConfig {
     pub fn load() -> Result<Self, ConfigError> {
         let config_path = config_path()?;
         if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)
-                .map_err(|e| ConfigError::Io { path: config_path.clone(), source: e })?;
-            toml::from_str(&content)
-                .map_err(|e| ConfigError::Parse(e.to_string()))
+            let content = std::fs::read_to_string(&config_path).map_err(|e| ConfigError::Io {
+                path: config_path.clone(),
+                source: e,
+            })?;
+            toml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))
         } else {
             Ok(AppConfig::default())
         }
@@ -88,6 +99,7 @@ impl AppConfig {
             None => true,
             Some("anthropic") => self.provider.anthropic.is_none(),
             Some("openai") => self.provider.openai.is_none(),
+            Some("generic") => self.provider.generic.is_none(),
             Some(_) => false,
         }
     }
@@ -95,14 +107,27 @@ impl AppConfig {
     pub fn save(&self) -> Result<(), ConfigError> {
         let config_path = config_path()?;
         if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ConfigError::Io { path: parent.to_path_buf(), source: e })?;
+            std::fs::create_dir_all(parent).map_err(|e| ConfigError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
         }
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| ConfigError::Parse(e.to_string()))?;
-        std::fs::write(&config_path, content)
-            .map_err(|e| ConfigError::Io { path: config_path, source: e })?;
+        let content =
+            toml::to_string_pretty(self).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        std::fs::write(&config_path, content).map_err(|e| ConfigError::Io {
+            path: config_path,
+            source: e,
+        })?;
         Ok(())
+    }
+
+    pub fn reset() -> Result<(), ConfigError> {
+        let path = config_path()?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(ConfigError::Io { path, source }),
+        }
     }
 }
 
@@ -118,12 +143,14 @@ impl Default for AppConfig {
 }
 
 fn config_path() -> Result<PathBuf, ConfigError> {
-    Ok(dirs::config_dir()
+    Ok(dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
         .join("averroes")
         .join("config.toml"))
 }
 
+#[derive(Debug, Clone)]
 pub struct SetupWizard {
     pub provider: String,
     pub api_key: String,
@@ -133,18 +160,20 @@ pub struct SetupWizard {
 
 impl SetupWizard {
     pub fn new() -> Self {
-        Self {
+        let mut wizard = Self {
             provider: "anthropic".into(),
             api_key: String::new(),
             api_key_env: String::new(),
             model: String::new(),
-        }
+        };
+        wizard.select_provider("anthropic");
+        wizard
     }
 
     pub fn default_model(&self) -> &str {
         if self.model.is_empty() {
             match self.provider.as_str() {
-                "openai" => "gpt-4o",
+                "openai" | "generic" => "gpt-4o",
                 _ => "claude-sonnet-4-20250514",
             }
         } else {
@@ -152,8 +181,74 @@ impl SetupWizard {
         }
     }
 
-    pub fn to_config(&self) -> AppConfig {
-        let mut config = AppConfig::default();
+    pub fn select_provider(&mut self, provider: &str) {
+        let provider = match provider {
+            p if p.eq_ignore_ascii_case("openai") => "openai",
+            p if p.eq_ignore_ascii_case("generic") => "generic",
+            _ => "anthropic",
+        };
+        let previous_default_env = match self.provider.as_str() {
+            "openai" => "OPENAI_API_KEY",
+            "generic" => "OPENAI_API_KEY",
+            _ => "ANTHROPIC_API_KEY",
+        };
+
+        self.provider = provider.into();
+        self.model = match provider {
+            "openai" => "gpt-4o".into(),
+            "generic" => "gpt-4o".into(),
+            _ => "claude-sonnet-4-20250514".into(),
+        };
+        if self.api_key_env.is_empty() || self.api_key_env == previous_default_env {
+            self.api_key_env = match provider {
+                "openai" | "generic" => "OPENAI_API_KEY".into(),
+                _ => "ANTHROPIC_API_KEY".into(),
+            };
+        }
+    }
+
+    pub fn from_config(config: &AppConfig) -> Self {
+        let provider = config.provider.default.as_deref().unwrap_or("anthropic");
+        let mut wizard = Self::new();
+        wizard.select_provider(provider);
+
+        match provider {
+            "openai" => {
+                if let Some(provider) = config.provider.openai.as_ref() {
+                    if let Some(api_key_env) = provider.api_key_env.clone() {
+                        wizard.api_key_env = api_key_env;
+                    }
+                    if let Some(model) = provider.default_model.clone() {
+                        wizard.model = model;
+                    }
+                }
+            }
+            "generic" => {
+                if let Some(provider) = config.provider.generic.as_ref() {
+                    if let Some(api_key_env) = provider.api_key_env.clone() {
+                        wizard.api_key_env = api_key_env;
+                    }
+                    if let Some(model) = provider.default_model.clone() {
+                        wizard.model = model;
+                    }
+                }
+            }
+            _ => {
+                if let Some(provider) = config.provider.anthropic.as_ref() {
+                    if let Some(api_key_env) = provider.api_key_env.clone() {
+                        wizard.api_key_env = api_key_env;
+                    }
+                    if let Some(model) = provider.default_model.clone() {
+                        wizard.model = model;
+                    }
+                }
+            }
+        }
+
+        wizard
+    }
+
+    pub fn apply_to_config(&self, config: &mut AppConfig) {
         config.provider.default = Some(self.provider.clone());
 
         match self.provider.as_str() {
@@ -167,6 +262,23 @@ impl SetupWizard {
                     default_model: Some(self.default_model().into()),
                 });
             }
+            "generic" => {
+                let base_url = config
+                    .provider
+                    .generic
+                    .as_ref()
+                    .and_then(|g| g.base_url.clone())
+                    .unwrap_or_else(|| "https://api.openai.com/v1".into());
+                config.provider.generic = Some(GenericConfig {
+                    api_key_env: Some(if self.api_key_env.is_empty() {
+                        "OPENAI_API_KEY".into()
+                    } else {
+                        self.api_key_env.clone()
+                    }),
+                    default_model: Some(self.default_model().into()),
+                    base_url: Some(base_url),
+                });
+            }
             _ => {
                 config.provider.anthropic = Some(AnthropicConfig {
                     api_key_env: Some(if self.api_key_env.is_empty() {
@@ -178,7 +290,11 @@ impl SetupWizard {
                 });
             }
         }
+    }
 
+    pub fn to_config(&self) -> AppConfig {
+        let mut config = AppConfig::default();
+        self.apply_to_config(&mut config);
         config
     }
 
@@ -198,23 +314,63 @@ pub fn create_provider(config: &AppConfig) -> Result<Arc<dyn Provider>, ConfigEr
 
     match default {
         "openai" => {
-            let openai = config.provider.openai.as_ref()
+            let openai = config
+                .provider
+                .openai
+                .as_ref()
                 .ok_or_else(|| ConfigError::Parse("OpenAI config missing".into()))?;
             let env_key = openai.api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
             let api_key = std::env::var(env_key)
-                .map_err(|_| ConfigError::MissingApiKey { api_key_env: env_key.into() })?;
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| ConfigError::MissingApiKey {
+                    api_key_env: env_key.into(),
+                })?;
             let mut provider = OpenAiProvider::new(api_key);
             if let Some(ref model) = openai.default_model {
                 provider = provider.with_default_model(model);
             }
             Ok(Arc::new(provider))
         }
-        "anthropic" => {
-            let anthropic = config.provider.anthropic.as_ref()
-                .ok_or_else(|| ConfigError::Parse("Anthropic config missing".into()))?;
-            let env_key = anthropic.api_key_env.as_deref().unwrap_or("ANTHROPIC_API_KEY");
+        "generic" => {
+            let generic = config
+                .provider
+                .generic
+                .as_ref()
+                .ok_or_else(|| ConfigError::Parse("Generic provider config missing".into()))?;
+            let env_key = generic.api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
             let api_key = std::env::var(env_key)
-                .map_err(|_| ConfigError::MissingApiKey { api_key_env: env_key.into() })?;
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| ConfigError::MissingApiKey {
+                    api_key_env: env_key.into(),
+                })?;
+            let base_url = generic
+                .base_url
+                .as_deref()
+                .unwrap_or("https://api.openai.com/v1");
+            let mut provider = GenericProvider::new(api_key, base_url.to_string());
+            if let Some(ref model) = generic.default_model {
+                provider = provider.with_default_model(model);
+            }
+            Ok(Arc::new(provider))
+        }
+        "anthropic" => {
+            let anthropic = config
+                .provider
+                .anthropic
+                .as_ref()
+                .ok_or_else(|| ConfigError::Parse("Anthropic config missing".into()))?;
+            let env_key = anthropic
+                .api_key_env
+                .as_deref()
+                .unwrap_or("ANTHROPIC_API_KEY");
+            let api_key = std::env::var(env_key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| ConfigError::MissingApiKey {
+                    api_key_env: env_key.into(),
+                })?;
             let mut provider = AnthropicProvider::new(api_key);
             if let Some(ref model) = anthropic.default_model {
                 provider = provider.with_default_model(model);
@@ -230,7 +386,10 @@ pub fn create_provider(config: &AppConfig) -> Result<Arc<dyn Provider>, ConfigEr
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("IO error at {path}: {source}")]
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("Parse error: {0}")]
     Parse(String),
     #[error("Unknown provider: {provider}")]
@@ -294,5 +453,70 @@ mod tests {
             error,
             ConfigError::MissingApiKey { api_key_env } if api_key_env == env_key
         ));
+    }
+
+    #[test]
+    fn empty_api_key_environment_variable_is_treated_as_missing() {
+        let env_key = "AVERROES_TEST_EMPTY_PROVIDER_KEY";
+        std::env::set_var(env_key, "");
+        let mut config = AppConfig::default();
+        config.provider.default = Some("openai".into());
+        config.provider.openai = Some(OpenAiConfig {
+            api_key_env: Some(env_key.into()),
+            default_model: None,
+        });
+
+        let error = match create_provider(&config) {
+            Ok(_) => panic!("empty environment variable unexpectedly created a provider"),
+            Err(error) => error,
+        };
+        std::env::remove_var(env_key);
+
+        assert!(matches!(
+            error,
+            ConfigError::MissingApiKey { api_key_env } if api_key_env == env_key
+        ));
+    }
+
+    #[test]
+    fn selecting_openai_updates_env_var_and_model_defaults() {
+        let mut wizard = SetupWizard::new();
+
+        wizard.select_provider("openai");
+
+        assert_eq!(wizard.provider, "openai");
+        assert_eq!(wizard.api_key_env, "OPENAI_API_KEY");
+        assert_eq!(wizard.default_model(), "gpt-4o");
+    }
+
+    #[test]
+    fn selecting_anthropic_updates_env_var_and_model_defaults() {
+        let mut wizard = SetupWizard::new();
+
+        wizard.select_provider("anthropic");
+
+        assert_eq!(wizard.provider, "anthropic");
+        assert_eq!(wizard.api_key_env, "ANTHROPIC_API_KEY");
+        assert_eq!(wizard.default_model(), "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn applying_setup_changes_preserves_unrelated_configuration() {
+        let mut config = AppConfig::default();
+        config.runtime.max_concurrent_calls = Some(3);
+        config.compaction.threshold = Some(0.6);
+        config.skills.paths = Some(vec!["/tmp/skills".into()]);
+
+        let mut wizard = SetupWizard::new();
+        wizard.select_provider("openai");
+        wizard.apply_to_config(&mut config);
+
+        assert_eq!(config.provider.default.as_deref(), Some("openai"));
+        assert_eq!(config.runtime.max_concurrent_calls, Some(3));
+        assert_eq!(config.compaction.threshold, Some(0.6));
+        assert_eq!(
+            config.skills.paths.as_deref(),
+            Some(["/tmp/skills".into()].as_slice())
+        );
     }
 }

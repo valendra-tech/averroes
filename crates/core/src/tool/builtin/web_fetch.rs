@@ -49,12 +49,14 @@ impl Tool for WebFetchTool {
                 message: format!("Failed to create HTTP client: {e}"),
             })?;
 
-        let response = client.get(url_str).send().await.map_err(|e| {
-            ToolError::Execution {
+        let response = client
+            .get(url_str)
+            .send()
+            .await
+            .map_err(|e| ToolError::Execution {
                 tool: self.name().into(),
                 message: format!("Failed to fetch URL: {e}"),
-            }
-        })?;
+            })?;
 
         let status_code = response.status().as_u16();
 

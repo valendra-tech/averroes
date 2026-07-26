@@ -22,6 +22,7 @@ pub fn field_surface(theme: UiTheme, focused: bool, invalid: bool) -> Div {
     };
 
     div()
+        .w_full()
         .bg(theme.card)
         .border_1()
         .border_color(border)

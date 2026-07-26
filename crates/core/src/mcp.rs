@@ -5,7 +5,10 @@ pub struct McpClient {
 
 impl McpClient {
     pub fn new(server_name: String, endpoint: String) -> Self {
-        Self { server_name, endpoint }
+        Self {
+            server_name,
+            endpoint,
+        }
     }
 
     pub async fn list_tools(&self) -> anyhow::Result<Vec<McpToolDef>> {

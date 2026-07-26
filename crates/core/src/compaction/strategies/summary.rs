@@ -22,16 +22,14 @@ fn rough_token_count(msg: &ChatMessage) -> usize {
 fn message_text(msg: &ChatMessage) -> String {
     match &msg.content {
         MessageContent::Text(t) => t.clone(),
-        MessageContent::Parts(parts) => {
-            parts
-                .iter()
-                .filter_map(|p| match p {
-                    crate::provider::types::ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                crate::provider::types::ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
@@ -45,11 +43,12 @@ fn fallback_concat(messages: &[ChatMessage]) -> String {
 
 async fn generate_summary(
     provider: &dyn Provider,
+    model: &str,
     messages: &[ChatMessage],
 ) -> std::result::Result<String, crate::compaction::CompactionError> {
     let text = fallback_concat(messages);
     let request = ChatRequest {
-        model: provider.default_model().to_string(),
+        model: model.to_string(),
         messages: vec![ChatMessage {
             role: Role::User,
             content: MessageContent::Text(format!(
@@ -62,7 +61,9 @@ async fn generate_summary(
         tools: vec![],
         max_tokens: None,
         temperature: Some(0.3),
-        system: Some("You are a summarization assistant. Produce a brief, accurate summary.".into()),
+        system: Some(
+            "You are a summarization assistant. Produce a brief, accurate summary.".into(),
+        ),
     };
 
     let response = provider.chat(request).await?;
@@ -87,6 +88,7 @@ impl CompactionStrategy for SummaryStrategy {
         _context_limit: usize,
         _config: &CompactionConfig,
         provider: Option<&dyn Provider>,
+        model: &str,
     ) -> Result<CompactedContext> {
         let original_count = messages.len();
 
@@ -103,7 +105,7 @@ impl CompactionStrategy for SummaryStrategy {
         let middle = &messages[1..messages.len() - 1];
 
         let summary_text = if let Some(provider) = provider {
-            generate_summary(provider, middle).await?
+            generate_summary(provider, model, middle).await?
         } else {
             fallback_concat(middle)
         };
@@ -129,5 +131,94 @@ impl CompactionStrategy for SummaryStrategy {
 
     fn estimate_tokens(&self, messages: &[ChatMessage]) -> usize {
         messages.iter().map(rough_token_count).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{ChatResponse, ChatStream, ProviderError};
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    struct CapturingProvider {
+        requested_model: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl Provider for CapturingProvider {
+        async fn chat(&self, request: ChatRequest) -> crate::provider::Result<ChatResponse> {
+            *self.requested_model.lock().unwrap() = Some(request.model);
+            Ok(ChatResponse {
+                message: ChatMessage {
+                    role: Role::Assistant,
+                    content: MessageContent::Text("summary".into()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                usage: None,
+                stop_reason: None,
+            })
+        }
+
+        async fn chat_stream(&self, _request: ChatRequest) -> crate::provider::Result<ChatStream> {
+            Err(ProviderError::Other("stream unused in test".into()))
+        }
+
+        fn context_window(&self, _model: &str) -> usize {
+            100_000
+        }
+
+        fn supports_tools(&self, _model: &str) -> bool {
+            false
+        }
+
+        fn default_model(&self) -> &str {
+            "provider-default"
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_uses_selected_model() {
+        let requested_model = Arc::new(Mutex::new(None));
+        let provider = CapturingProvider {
+            requested_model: requested_model.clone(),
+        };
+        let messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: MessageContent::Text("system".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text("middle".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                content: MessageContent::Text("last".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        SummaryStrategy
+            .compact(
+                &messages,
+                100_000,
+                &CompactionConfig::default(),
+                Some(&provider),
+                "selected-model",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            requested_model.lock().unwrap().as_deref(),
+            Some("selected-model")
+        );
     }
 }
