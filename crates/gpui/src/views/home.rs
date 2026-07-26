@@ -183,13 +183,37 @@ impl Render for HomeView {
             )
             .children(rail_entries)
             .child(
-                button(theme, ButtonVariant::Ghost, "+ Add workspace")
+                div()
                     .id(ElementId::Name("home-add-ws".into()))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(12.0))
+                    .py(px(6.0))
                     .w_full()
                     .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.accent).text_color(theme.foreground))
+                    .rounded(px(UiTheme::RADIUS))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         cx.emit(HomeEvent::AddWorkspace);
-                    })),
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(20.0))
+                            .h(px(20.0))
+                            .rounded(px(3.0))
+                            .text_color(theme.primary)
+                            .text_lg()
+                            .font_weight(FontWeight::LIGHT)
+                            .child("+"),
+                    )
+                    .child("Add workspace"),
             );
 
         let rail = if self.workspaces.is_empty() {
