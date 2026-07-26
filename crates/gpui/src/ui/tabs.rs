@@ -2,6 +2,7 @@ use crate::session::{SessionId, SessionTab};
 use crate::ui::icon::plus_icon;
 use crate::ui::theme::UiTheme;
 use gpui::*;
+use gpui::prelude::FluentBuilder;
 
 pub const NEW_SESSION_ID: &str = "session-tab-new";
 
@@ -137,11 +138,13 @@ impl Render for SessionTabs {
                         rgba(0x00000000)
                     })
                     .bg(if is_active { theme.accent } else { theme.card })
+                    .text_sm()
                     .text_color(if is_active {
                         theme.foreground
                     } else {
                         theme.muted_foreground
                     })
+                    .when(is_active, |el| el.font_weight(FontWeight::BOLD))
                     .cursor_pointer()
                     .group(group.clone())
                     .hover(move |style| {
@@ -187,7 +190,6 @@ impl Render for SessionTabs {
                     .h(px(28.0))
                     .rounded(px(UiTheme::RADIUS))
                     .text_color(theme.primary)
-                    .text_lg()
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.accent))
                     .id(ElementId::Name(NEW_SESSION_ID.into()))

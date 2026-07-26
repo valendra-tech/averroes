@@ -583,7 +583,7 @@ impl ChatView {
                                     .items_center()
                                     .gap_2()
                                     .text_xs()
-                                    .text_color(theme.foreground)
+                                    .text_color(theme.muted_foreground)
                                     .font(UiTheme::mono_font())
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _event, _window, cx| {
@@ -1404,7 +1404,8 @@ impl Render for ChatView {
                     .child(if self.composer.processing {
                         div()
                             .text_xs()
-                            .text_color(theme.brand_magenta)
+                            .text_color(theme.primary)
+                            .font_weight(FontWeight::BOLD)
                             .font(UiTheme::mono_font())
                             .child("thinking…")
                     } else {

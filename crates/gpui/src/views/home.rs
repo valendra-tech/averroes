@@ -176,9 +176,9 @@ impl Render for HomeView {
                     .pt(px(12.0))
                     .pb(px(8.0))
                     .px(px(12.0))
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.foreground)
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.muted_foreground)
                     .child("Workspaces"),
             )
             .children(rail_entries)
