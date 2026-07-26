@@ -1056,13 +1056,24 @@ impl Render for ChatView {
                                     div()
                                         .relative()
                                         .child(
-                                            button(theme, ButtonVariant::Secondary, "+")
+                                            div()
                                                 .id(self.element_id("composer-add"))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .w(px(28.0))
+                                                .h(px(28.0))
+                                                .rounded(px(UiTheme::RADIUS))
+                                                .text_color(theme.muted_foreground)
+                                                .text_lg()
+                                                .cursor_pointer()
+                                                .hover(|style| style.bg(theme.accent).text_color(theme.foreground))
                                                 .on_click(cx.listener(
                                                     |this, _event, _window, cx| {
                                                         this.toggle_attachment_menu(cx);
                                                     },
-                                                )),
+                                                ))
+                                                .child("+"),
                                         )
                                         .when(self.attachment_menu_open, |element| {
                                             element.child(
