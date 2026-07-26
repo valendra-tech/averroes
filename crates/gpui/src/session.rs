@@ -107,6 +107,12 @@ impl SessionManager {
         }
     }
 
+    pub fn set_workspace_id(&mut self, id: &SessionId, workspace_id: String) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| &tab.id == id) {
+            tab.workspace_id = Some(workspace_id);
+        }
+    }
+
     pub fn rename(&mut self, id: &SessionId, title: impl Into<String>) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| &tab.id == id) {
             tab.title = title.into();

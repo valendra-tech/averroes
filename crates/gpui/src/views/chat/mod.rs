@@ -34,7 +34,7 @@ pub struct ChatView {
     factory: Arc<AgentFactory>,
     store: SessionStore,
     workspace_root: PathBuf,
-    workspace_id: Option<String>,
+    pub(crate) workspace_id: Option<String>,
     workspaces: Vec<WorkspaceConfig>,
     workspace_selector_open: bool,
     scroll_handle: ScrollHandle,
@@ -202,7 +202,7 @@ impl ChatView {
                 }
             })
             .collect();
-        let _ = self.store.save(self.session_id.as_str(), &core_messages, None);
+        let _ = self.store.save(self.session_id.as_str(), &core_messages, self.workspace_id.as_deref());
     }
 
     fn append_stream_text(&mut self, text: &str) {

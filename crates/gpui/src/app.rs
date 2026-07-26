@@ -321,6 +321,11 @@ impl AverroesApp {
         match event {
             ChatViewEvent::Submitted { session_id, text } => {
                 self.sessions.set_dirty(session_id, true);
+                if let Some(chat) = self.session_views.get(session_id) {
+                    if let Some(wid) = chat.read(cx).workspace_id.clone() {
+                        self.sessions.set_workspace_id(session_id, wid);
+                    }
+                }
                 if self.sessions.tabs().iter().find(|tab| &tab.id == session_id)
                     .is_some_and(|tab| tab.title == "New session")
                 {
