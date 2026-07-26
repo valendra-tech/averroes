@@ -59,6 +59,7 @@ impl AverroesApp {
 
         let agent = factory.new_agent(&active_id);
         let chat_factory = Arc::clone(&factory);
+        let workspaces = workspace_store.workspaces().to_vec();
         let chat = cx.new(|cx| {
             ChatView::new(
                 cx,
@@ -66,6 +67,8 @@ impl AverroesApp {
                 Some(agent),
                 chat_factory,
                 workspace_store.workspace_root(),
+                workspace_store.active_workspace().map(|w| w.id.clone()),
+                workspaces.clone(),
             )
         });
         let mut session_views = HashMap::new();
@@ -218,7 +221,11 @@ impl AverroesApp {
         let factory = Arc::clone(&self.factory);
         let session_id = id.clone();
         let root = self.workspace_store.workspace_root();
-        let chat = cx.new(|cx| ChatView::new(cx, session_id, Some(agent), factory, root));
+        let workspace_id = self.workspace_store.active_workspace().map(|w| w.id.clone());
+        let workspaces = self.workspace_store.workspaces().to_vec();
+        let chat = cx.new(|cx| {
+            ChatView::new(cx, session_id, Some(agent), factory, root, workspace_id, workspaces)
+        });
         let subscription = cx.subscribe(&chat, |this, _chat, event: &ChatViewEvent, cx| {
             this.handle_chat_event(event, cx)
         });
@@ -311,27 +318,42 @@ impl AverroesApp {
     }
 
     fn handle_chat_event(&mut self, event: &ChatViewEvent, cx: &mut Context<Self>) {
-        let ChatViewEvent::Submitted { session_id, text } = event;
-        self.sessions.set_dirty(session_id, true);
-        if self.sessions.tabs().iter().find(|tab| &tab.id == session_id)
-            .is_some_and(|tab| tab.title == "New session")
-        {
-            let provider = self.factory.provider.clone();
-            let runtime = self.factory.runtime.clone();
-            let session_id = session_id.clone();
-            let text = text.clone();
-            let fallback_text = text.clone();
-            cx.spawn(async move |this, cx| {
-                let title = runtime.spawn(async move {
-                    averroes_core::session::generate_session_title(provider.as_ref(), &text).await
-                }).await.unwrap_or(Err("join error".to_string()))
-                .unwrap_or_else(|_| session_title(&fallback_text));
-                _ = this.update(cx, |app, cx| {
-                    app.sessions.rename(&session_id, title);
-                    app.sync_navigation(cx);
-                    cx.notify();
-                });
-            }).detach();
+        match event {
+            ChatViewEvent::Submitted { session_id, text } => {
+                self.sessions.set_dirty(session_id, true);
+                if self.sessions.tabs().iter().find(|tab| &tab.id == session_id)
+                    .is_some_and(|tab| tab.title == "New session")
+                {
+                    let provider = self.factory.provider.clone();
+                    let runtime = self.factory.runtime.clone();
+                    let session_id = session_id.clone();
+                    let text = text.clone();
+                    let fallback_text = text.clone();
+                    cx.spawn(async move |this, cx| {
+                        let title = runtime.spawn(async move {
+                            averroes_core::session::generate_session_title(provider.as_ref(), &text).await
+                        }).await.unwrap_or(Err("join error".to_string()))
+                        .unwrap_or_else(|_| session_title(&fallback_text));
+                        _ = this.update(cx, |app, cx| {
+                            app.sessions.rename(&session_id, title);
+                            app.sync_navigation(cx);
+                            cx.notify();
+                        });
+                    }).detach();
+                }
+            }
+            ChatViewEvent::WorkspaceChanged { workspace_id, .. } => {
+                self.workspace_store.set_active(workspace_id);
+                self.session_store = SessionStore::with_dir(self.workspace_store.sessions_dir());
+                self.session_views.clear();
+                self.session_subscriptions.clear();
+                self.sessions = Self::restore_sessions(&self.workspace_store);
+                self.sync_navigation(cx);
+                self.active_view = ActiveView::Chat;
+                let active_id = self.sessions.active().id.clone();
+                self.add_session_view(active_id, cx);
+                self.refresh_home(cx);
+            }
         }
         self.sync_navigation(cx);
         cx.notify();

@@ -10,6 +10,7 @@ use crate::ui::{
 use averroes_core::agent::{Agent, AgentStreamEvent};
 use averroes_core::provider::types::ChatMessage;
 use averroes_core::session::SessionStore;
+use averroes_core::workspace::WorkspaceConfig;
 use gpui::prelude::*;
 use gpui::*;
 use message::MessageBubble;
@@ -20,6 +21,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub enum ChatViewEvent {
     Submitted { session_id: SessionId, text: String },
+    WorkspaceChanged { session_id: SessionId, workspace_id: String },
 }
 
 pub struct ChatView {
@@ -32,6 +34,9 @@ pub struct ChatView {
     factory: Arc<AgentFactory>,
     store: SessionStore,
     workspace_root: PathBuf,
+    workspace_id: Option<String>,
+    workspaces: Vec<WorkspaceConfig>,
+    workspace_selector_open: bool,
     scroll_handle: ScrollHandle,
     focus_handle: FocusHandle,
     focus_on_render: bool,
@@ -141,6 +146,8 @@ impl ChatView {
         agent: Option<Arc<Agent>>,
         factory: Arc<AgentFactory>,
         workspace_root: PathBuf,
+        workspace_id: Option<String>,
+        workspaces: Vec<WorkspaceConfig>,
     ) -> Self {
         let store = SessionStore::with_dir(workspace_root.join(".averroes").join("sessions"));
         let persisted: Vec<MessageBubble> = store
@@ -163,6 +170,9 @@ impl ChatView {
             factory,
             store,
             workspace_root,
+            workspace_id,
+            workspaces,
+            workspace_selector_open: false,
             scroll_handle: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             focus_on_render: false,
@@ -509,7 +519,6 @@ impl ChatView {
 
     fn render_welcome(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let theme = self.theme;
-        let root = self.workspace_root.clone();
         let session_id = self.session_id.to_string();
         let can_submit = self.composer.can_submit();
         let send_label = if self.composer.processing { "…" } else { "Send" };
@@ -559,18 +568,109 @@ impl ChatView {
                             .text_center()
                             .child("Your AI workspace. Ask anything, attach context, run tools."),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .font(UiTheme::mono_font())
-                            .child("\u{1F4C1}")
-                            .child(root.display().to_string()),
-                    )
+                    .child({
+                        let is_empty = self.messages.is_empty();
+                        let active_name = self.active_workspace_name();
+                        let root_str = self.workspace_root.display().to_string();
+
+                        if !is_empty {
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .font(UiTheme::mono_font())
+                                .child("\u{1F4C1}")
+                                .child(format!("{} \u{2014} {}", active_name, root_str))
+                        } else {
+                            let selector_open = self.workspace_selector_open;
+                            let selector = div()
+                                .relative()
+                                .child(
+                                    div()
+                                        .id(ElementId::Name("chat-ws-selector".into()))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_xs()
+                                        .text_color(theme.foreground)
+                                        .font(UiTheme::mono_font())
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _event, _window, cx| {
+                                            this.workspace_selector_open = !this.workspace_selector_open;
+                                            cx.notify();
+                                        }))
+                                        .child("\u{1F4C1}")
+                                        .child(format!("{} \u{2014} {}", active_name, root_str)),
+                                );
+
+                            if selector_open {
+                                let dropdown = {
+                                    let workspace_id = self.workspace_id.clone();
+                                    let session_id = self.session_id.clone();
+                                    let mut items: Vec<gpui::AnyElement> = Vec::new();
+                                    for ws in &self.workspaces {
+                                        let ws_id = ws.id.clone();
+                                        let ws_name = ws.name.clone();
+                                        let ws_root = ws.root.clone();
+                                        let is_active = workspace_id.as_deref() == Some(&ws_id);
+                                        let sid = session_id.clone();
+                                        items.push(
+                                            div()
+                                                .id(ElementId::Name(format!("chat-ws-item-{}", ws_id).into()))
+                                                .px(px(8.0))
+                                                .py(px(4.0))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .justify_between()
+                                                .text_sm()
+                                                .text_color(theme.foreground)
+                                                .cursor_pointer()
+                                                .hover(|style| style.bg(theme.accent))
+                                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                                    this.workspace_id = Some(ws_id.clone());
+                                                    this.workspace_root = ws_root.clone();
+                                                    this.workspace_selector_open = false;
+                                                    cx.emit(ChatViewEvent::WorkspaceChanged {
+                                                        session_id: sid.clone(),
+                                                        workspace_id: ws_id.clone(),
+                                                    });
+                                                    cx.notify();
+                                                }))
+                                                .child(ws_name.clone())
+                                                .child(if is_active {
+                                                    div().child("\u{2713}").into_any_element()
+                                                } else {
+                                                    div().into_any_element()
+                                                })
+                                                .into_any_element(),
+                                        );
+                                    }
+                                    div()
+                                        .absolute()
+                                        .top(px(24.0))
+                                        .left(px(0.0))
+                                        .bg(theme.card)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .rounded(px(UiTheme::RADIUS))
+                                        .shadow_sm()
+                                        .p(px(4.0))
+                                        .flex()
+                                        .flex_col()
+                                        .min_w(px(280.0))
+                                        .children(items)
+                                };
+                                selector.child(dropdown)
+                            } else {
+                                selector
+                            }
+                        }
+                    })
                     .child(
                         composer_surface(theme, true, false)
                             .w_full()
@@ -748,6 +848,14 @@ impl ChatView {
             .text_xs()
             .text_color(theme.foreground)
             .child(label.into())
+    }
+
+    fn active_workspace_name(&self) -> String {
+        self.workspace_id
+            .as_ref()
+            .and_then(|id| self.workspaces.iter().find(|w| &w.id == id))
+            .map(|w| w.name.clone())
+            .unwrap_or_else(|| "workspace".into())
     }
 }
 
