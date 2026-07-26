@@ -1071,26 +1071,30 @@ impl Render for ChatView {
                                                 .border_color(theme.border)
                                                 .rounded(px(UiTheme::RADIUS))
                                                 .shadow_md()
-                                                .p(px(4.0))
-                                                .flex()
-                                                .flex_col()
+                                                .overflow_hidden()
                                                 .child(
-                                                    button(theme, ButtonVariant::Ghost, "@ Context")
-                                                        .id(self.element_id("composer-context"))
-                                                        .on_click(cx.listener(
-                                                            |this, _event, _window, cx| {
-                                                                this.insert_context("@", cx);
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    button(theme, ButtonVariant::Ghost, "/ Command")
-                                                        .id(self.element_id("composer-command"))
-                                                        .on_click(cx.listener(
-                                                            |this, _event, _window, cx| {
-                                                                this.insert_context("/", cx);
-                                                            },
-                                                        )),
+                                                    div()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .p(px(4.0))
+                                                        .child(
+                                                            button(theme, ButtonVariant::Ghost, "@ Context")
+                                                                .id(self.element_id("composer-context"))
+                                                                .on_click(cx.listener(
+                                                                    |this, _event, _window, cx| {
+                                                                        this.insert_context("@", cx);
+                                                                    },
+                                                                )),
+                                                        )
+                                                        .child(
+                                                            button(theme, ButtonVariant::Ghost, "/ Command")
+                                                                .id(self.element_id("composer-command"))
+                                                                .on_click(cx.listener(
+                                                                    |this, _event, _window, cx| {
+                                                                        this.insert_context("/", cx);
+                                                                    },
+                                                                )),
+                                                        ),
                                                 ),
                                         );
                                     }
@@ -1135,26 +1139,30 @@ impl Render for ChatView {
                                                     .border_color(theme.border)
                                                     .rounded(px(UiTheme::RADIUS))
                                                     .shadow_md()
-                                                    .p(px(4.0))
-                                                    .flex()
-                                                    .flex_col()
+                                                    .overflow_hidden()
                                                     .child(
-                                                        button(theme, ButtonVariant::Ghost, "Build")
-                                                            .id(self.element_id("composer-mode-build"))
-                                                            .on_click(cx.listener(
-                                                                |this, _event, _window, cx| {
-                                                                    this.select_mode(ComposerMode::Build, cx);
-                                                                },
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        button(theme, ButtonVariant::Ghost, "Plan")
-                                                            .id(self.element_id("composer-mode-plan"))
-                                                            .on_click(cx.listener(
-                                                                |this, _event, _window, cx| {
-                                                                    this.select_mode(ComposerMode::Plan, cx);
-                                                                },
-                                                            )),
+                                                        div()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .p(px(4.0))
+                                                            .child(
+                                                                button(theme, ButtonVariant::Ghost, "Build")
+                                                                    .id(self.element_id("composer-mode-build"))
+                                                                    .on_click(cx.listener(
+                                                                        |this, _event, _window, cx| {
+                                                                            this.select_mode(ComposerMode::Build, cx);
+                                                                        },
+                                                                    )),
+                                                            )
+                                                            .child(
+                                                                button(theme, ButtonVariant::Ghost, "Plan")
+                                                                    .id(self.element_id("composer-mode-plan"))
+                                                                    .on_click(cx.listener(
+                                                                        |this, _event, _window, cx| {
+                                                                            this.select_mode(ComposerMode::Plan, cx);
+                                                                        },
+                                                                    )),
+                                                            ),
                                                     ),
                                             );
                                         }
@@ -1199,17 +1207,21 @@ impl Render for ChatView {
                                                 .border_color(theme.border)
                                                 .rounded(px(UiTheme::RADIUS))
                                                 .shadow_md()
-                                                .p(px(4.0))
-                                                .flex()
-                                                .flex_col()
+                                                .overflow_hidden()
                                                 .child(
-                                                    button(theme, ButtonVariant::Ghost, model.clone())
-                                                        .id(self.element_id("composer-model-configured"))
-                                                        .on_click(cx.listener(
-                                                            |this, _event, _window, cx| {
-                                                                this.select_model(cx);
-                                                            },
-                                                        )),
+                                                    div()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .p(px(4.0))
+                                                        .child(
+                                                            button(theme, ButtonVariant::Ghost, model.clone())
+                                                                .id(self.element_id("composer-model-configured"))
+                                                                .on_click(cx.listener(
+                                                                    |this, _event, _window, cx| {
+                                                                        this.select_model(cx);
+                                                                    },
+                                                                )),
+                                                        ),
                                                 ),
                                         );
                                     }
@@ -1253,26 +1265,30 @@ impl Render for ChatView {
                                                 .border_color(theme.border)
                                                 .rounded(px(UiTheme::RADIUS))
                                                 .shadow_md()
-                                                .p(px(4.0))
-                                                .flex()
-                                                .flex_col()
+                                                .overflow_hidden()
                                                 .child(
-                                                    button(theme, ButtonVariant::Ghost, "Max")
-                                                        .id(self.element_id("composer-effort-max"))
-                                                        .on_click(cx.listener(
-                                                            |this, _event, _window, cx| {
-                                                                this.select_effort(EffortLevel::Max, cx);
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    button(theme, ButtonVariant::Ghost, "Balanced")
-                                                        .id(self.element_id("composer-effort-balanced"))
-                                                        .on_click(cx.listener(
-                                                            |this, _event, _window, cx| {
-                                                                this.select_effort(EffortLevel::Balanced, cx);
-                                                            },
-                                                        )),
+                                                    div()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .p(px(4.0))
+                                                        .child(
+                                                            button(theme, ButtonVariant::Ghost, "Max")
+                                                                .id(self.element_id("composer-effort-max"))
+                                                                .on_click(cx.listener(
+                                                                    |this, _event, _window, cx| {
+                                                                        this.select_effort(EffortLevel::Max, cx);
+                                                                    },
+                                                                )),
+                                                        )
+                                                        .child(
+                                                            button(theme, ButtonVariant::Ghost, "Balanced")
+                                                                .id(self.element_id("composer-effort-balanced"))
+                                                                .on_click(cx.listener(
+                                                                    |this, _event, _window, cx| {
+                                                                        this.select_effort(EffortLevel::Balanced, cx);
+                                                                    },
+                                                                )),
+                                                        ),
                                                 ),
                                         );
                                     }
