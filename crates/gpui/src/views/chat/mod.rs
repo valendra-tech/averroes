@@ -829,11 +829,20 @@ impl ChatView {
             .border_1()
             .border_color(theme.border)
             .rounded(px(UiTheme::RADIUS))
-            .shadow_sm()
-            .p(px(8.0))
+            .shadow_md()
+            .p(px(6.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
             .text_xs()
             .text_color(theme.foreground)
-            .child(label.into())
+            .child(
+                div()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .text_color(theme.muted_foreground)
+                    .child(label.into()),
+            )
     }
 
     fn active_workspace_name(&self) -> String {
