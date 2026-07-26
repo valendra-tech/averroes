@@ -5,7 +5,7 @@ use crate::session::SessionId;
 use crate::ui::composer::{composer_surface, ComposerMode, ComposerState, EffortLevel};
 use crate::ui::theme::UiTheme;
 use crate::ui::{
-    button, chevron_down_icon, plus_icon, render_markdown, text_field_element,
+    button, plus_icon, render_markdown, text_field_element,
     utf16_range_to_byte_range, ButtonVariant, TextField,
 };
 use averroes_core::agent::{Agent, AgentStreamEvent};
@@ -889,14 +889,6 @@ impl Render for ChatView {
         }
 
         let model = self.selected_model.clone();
-        let mode_label = match self.composer.mode {
-            ComposerMode::Build => "Build",
-            ComposerMode::Plan => "Plan",
-        };
-        let effort_label = match self.composer.effort {
-            EffortLevel::Max => "Max",
-            EffortLevel::Balanced => "Balanced",
-        };
         let can_submit = self.composer.can_submit();
         let send_label = if self.composer.processing {
             "…"
@@ -1025,256 +1017,135 @@ impl Render for ChatView {
                     .child(text_field_element(cx.entity(), self.focus_handle.clone()))
                     .child(
                         div()
-                            .relative()
                             .flex()
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .mt(px(18.0))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .child({
-                                    let attachment_open = self.attachment_menu_open;
-                                    let mut container = div()
-                                        .relative()
-                                        .child(
-                                            div()
-                                                .id(self.element_id("composer-add"))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .w(px(28.0))
-                                                .h(px(28.0))
-                                                .rounded(px(UiTheme::RADIUS))
-                                                .text_color(theme.muted_foreground)
-                                                .cursor_pointer()
-                                                .hover(|style| style.bg(theme.accent).text_color(theme.foreground))
-                                                .on_click(cx.listener(
-                                                    |this, _event, _window, cx| {
-                                                        this.toggle_attachment_menu(cx);
-                                                    },
-                                                ))
-                                                .child(plus_icon(16.0)),
-                                        );
-                                    if attachment_open {
-                                        container = container.child(
-                                            div()
-                                                .absolute()
-                                                .top(px(-120.0))
-                                                .left(px(0.0))
-                                                .bg(theme.card)
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .rounded(px(UiTheme::RADIUS))
-                                                .shadow_md()
-                                                .p(px(4.0))
-                                                .child(
-                                                    button(theme, ButtonVariant::Ghost, "@ Context")
-                                                        .id(self.element_id("composer-context"))
-                                                        .on_click(cx.listener(
-                                                            |this, _event, _window, cx| {
-                                                                this.insert_context("@", cx);
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    button(theme, ButtonVariant::Ghost, "/ Command")
-                                                        .id(self.element_id("composer-command"))
-                                                        .on_click(cx.listener(
-                                                            |this, _event, _window, cx| {
-                                                                this.insert_context("/", cx);
-                                                            },
-                                                        )),
-                                                ),
-                                        );
-                                    }
-                                    container
-                                })
-                                .child(
-                                    {
-                                        let mode_open = self.mode_menu_open;
-                                        let mut container = div()
-                                            .relative()
+                            .mt(px(12.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .id(self.element_id("composer-add"))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .w(px(26.0))
+                                            .h(px(26.0))
+                                            .rounded(px(UiTheme::RADIUS))
+                                            .text_color(theme.muted_foreground)
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(theme.accent).text_color(theme.foreground))
+                                            .on_click(cx.listener(
+                                                |this, _event, _window, cx| {
+                                                    this.toggle_attachment_menu(cx);
+                                                },
+                                            ))
+                                            .child(plus_icon(14.0)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .rounded(px(UiTheme::RADIUS))
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .overflow_hidden()
                                             .child(
                                                 div()
-                                                    .id(self.element_id("composer-mode"))
-                                                    .flex()
-                                                    .flex_row()
-                                                    .items_center()
-                                                    .gap(px(4.0))
-                                                    .rounded(px(UiTheme::RADIUS))
-                                                    .text_color(theme.foreground)
-                                                    .text_sm()
+                                                    .id(self.element_id("composer-mode-build"))
+                                                    .px(px(10.0))
+                                                    .py(px(4.0))
+                                                    .text_xs()
                                                     .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(if matches!(self.composer.mode, ComposerMode::Build) { theme.card } else { theme.muted_foreground })
+                                                    .bg(if matches!(self.composer.mode, ComposerMode::Build) { theme.primary } else { rgba(0x00000000) })
                                                     .cursor_pointer()
-                                                    .hover(|style| style.bg(theme.accent))
-                                                    .px(px(12.0))
-                                                    .py(px(8.0))
-                                                    .on_click(cx.listener(
-                                                        |this, _event, _window, cx| {
-                                                            this.toggle_mode_menu(cx);
-                                                        },
-                                                    ))
-                                                    .child(mode_label)
-                                                    .child(chevron_down_icon(10.0)),
-                                            );
-                                        if mode_open {
-                                            container = container.child(
+                                                    .hover(|style| if !matches!(self.composer.mode, ComposerMode::Build) { style.bg(theme.accent) } else { style })
+                                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                                        this.select_mode(ComposerMode::Build, cx);
+                                                    }))
+                                                    .child("Build"),
+                                            )
+                                            .child(
                                                 div()
-                                                    .absolute()
-                                                    .top(px(-120.0))
-                                                    .left(px(0.0))
-                                                    .bg(theme.card)
-                                                    .border_1()
-                                                    .border_color(theme.border)
-                                                    .rounded(px(UiTheme::RADIUS))
-                                                    .shadow_md()
-                                                    .p(px(4.0))
-                                                    .child(
-                                                        button(theme, ButtonVariant::Ghost, "Build")
-                                                            .id(self.element_id("composer-mode-build"))
-                                                            .on_click(cx.listener(
-                                                                |this, _event, _window, cx| {
-                                                                    this.select_mode(ComposerMode::Build, cx);
-                                                                },
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        button(theme, ButtonVariant::Ghost, "Plan")
-                                                            .id(self.element_id("composer-mode-plan"))
-                                                            .on_click(cx.listener(
-                                                                |this, _event, _window, cx| {
-                                                                    this.select_mode(ComposerMode::Plan, cx);
-                                                                },
-                                                            )),
-                                                    ),
-                                            );
-                                        }
-                                        container
-                                    }
-                                )
-                                .child({
-                                    let model_open = self.model_menu_open;
-                                    let mut container = div()
-                                        .relative()
-                                        .child(
-                                            div()
-                                                .id(self.element_id("composer-model"))
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap(px(4.0))
-                                                .rounded(px(UiTheme::RADIUS))
-                                                .text_color(theme.foreground)
-                                                .text_sm()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .cursor_pointer()
-                                                .hover(|style| style.bg(theme.accent))
-                                                .px(px(12.0))
-                                                .py(px(8.0))
-                                                .on_click(cx.listener(
-                                                    |this, _event, _window, cx| {
-                                                        this.toggle_model_menu(cx);
-                                                    },
-                                                ))
-                                                .child(model.clone())
-                                                .child(chevron_down_icon(10.0)),
-                                        );
-                                    if model_open {
-                                        container = container.child(
-                                            div()
-                                                .absolute()
-                                                .top(px(-120.0))
-                                                .left(px(0.0))
-                                                .bg(theme.card)
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .rounded(px(UiTheme::RADIUS))
-                                                .shadow_md()
-                                                .p(px(4.0))
-                                                .child(
-                                                    button(theme, ButtonVariant::Ghost, model.clone())
-                                                        .id(self.element_id("composer-model-configured"))
-                                                        .on_click(cx.listener(
-                                                            |this, _event, _window, cx| {
-                                                                this.select_model(cx);
-                                                            },
-                                                        )),
-                                                ),
-                                        );
-                                    }
-                                    container
-                                })
-                                .child({
-                                    let effort_open = self.effort_menu_open;
-                                    let mut container = div()
-                                        .relative()
-                                        .child(
-                                            div()
-                                                .id(self.element_id("composer-effort"))
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap(px(4.0))
-                                                .rounded(px(UiTheme::RADIUS))
-                                                .text_color(theme.foreground)
-                                                .text_sm()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .cursor_pointer()
-                                                .hover(|style| style.bg(theme.accent))
-                                                .px(px(12.0))
-                                                .py(px(8.0))
-                                                .on_click(cx.listener(
-                                                    |this, _event, _window, cx| {
-                                                        this.toggle_effort_menu(cx);
-                                                    },
-                                                ))
-                                                .child(effort_label)
-                                                .child(chevron_down_icon(10.0)),
-                                        );
-                                    if effort_open {
-                                        container = container.child(
-                                            div()
-                                                .absolute()
-                                                .top(px(-120.0))
-                                                .left(px(0.0))
-                                                .bg(theme.card)
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .rounded(px(UiTheme::RADIUS))
-                                                .shadow_md()
-                                                .p(px(4.0))
-                                                .child(
-                                                    button(theme, ButtonVariant::Ghost, "Max")
-                                                        .id(self.element_id("composer-effort-max"))
-                                                        .on_click(cx.listener(
-                                                            |this, _event, _window, cx| {
-                                                                this.select_effort(EffortLevel::Max, cx);
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    button(theme, ButtonVariant::Ghost, "Balanced")
-                                                        .id(self.element_id("composer-effort-balanced"))
-                                                        .on_click(cx.listener(
-                                                            |this, _event, _window, cx| {
-                                                                this.select_effort(EffortLevel::Balanced, cx);
-                                                            },
-                                                        )),
-                                                ),
-                                        );
-                                    }
-                                    container
-                                }),
-                        )
-                        .child(send_button),
-                ),
-            );
+                                                    .id(self.element_id("composer-mode-plan"))
+                                                    .px(px(10.0))
+                                                    .py(px(4.0))
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(if matches!(self.composer.mode, ComposerMode::Plan) { theme.card } else { theme.muted_foreground })
+                                                    .bg(if matches!(self.composer.mode, ComposerMode::Plan) { theme.primary } else { rgba(0x00000000) })
+                                                    .cursor_pointer()
+                                                    .hover(|style| if !matches!(self.composer.mode, ComposerMode::Plan) { style.bg(theme.accent) } else { style })
+                                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                                        this.select_mode(ComposerMode::Plan, cx);
+                                                    }))
+                                                    .child("Plan"),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(self.element_id("composer-model"))
+                                            .px(px(10.0))
+                                            .py(px(4.0))
+                                            .rounded(px(UiTheme::RADIUS))
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.muted_foreground)
+                                            .font(UiTheme::mono_font())
+                                            .child(model.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .rounded(px(UiTheme::RADIUS))
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .overflow_hidden()
+                                            .child(
+                                                div()
+                                                    .id(self.element_id("composer-effort-max"))
+                                                    .px(px(10.0))
+                                                    .py(px(4.0))
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(if matches!(self.composer.effort, EffortLevel::Max) { theme.card } else { theme.muted_foreground })
+                                                    .bg(if matches!(self.composer.effort, EffortLevel::Max) { theme.primary } else { rgba(0x00000000) })
+                                                    .cursor_pointer()
+                                                    .hover(|style| if !matches!(self.composer.effort, EffortLevel::Max) { style.bg(theme.accent) } else { style })
+                                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                                        this.select_effort(EffortLevel::Max, cx);
+                                                    }))
+                                                    .child("Max"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(self.element_id("composer-effort-balanced"))
+                                                    .px(px(10.0))
+                                                    .py(px(4.0))
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(if matches!(self.composer.effort, EffortLevel::Balanced) { theme.card } else { theme.muted_foreground })
+                                                    .bg(if matches!(self.composer.effort, EffortLevel::Balanced) { theme.primary } else { rgba(0x00000000) })
+                                                    .cursor_pointer()
+                                                    .hover(|style| if !matches!(self.composer.effort, EffortLevel::Balanced) { style.bg(theme.accent) } else { style })
+                                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                                        this.select_effort(EffortLevel::Balanced, cx);
+                                                    }))
+                                                    .child("Balanced"),
+                                            ),
+                                    ),
+                            )
+                            .child(send_button),
+                    ),
 
+        );
         if let Some(menu) = ctx_menu {
             composer_input = composer_input.child(menu);
         }
