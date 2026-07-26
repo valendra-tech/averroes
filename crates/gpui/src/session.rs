@@ -2,7 +2,7 @@ use std::fmt;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SessionId(String);
+pub struct SessionId(pub String);
 
 impl SessionId {
     pub fn as_str(&self) -> &str {
@@ -21,18 +21,21 @@ pub struct SessionTab {
     pub id: SessionId,
     pub title: String,
     pub dirty: bool,
+    pub workspace_id: Option<String>,
 }
 
 pub struct SessionManager {
     tabs: Vec<SessionTab>,
     active: usize,
+    workspace_id: Option<String>,
 }
 
 impl SessionManager {
-    pub fn new() -> Self {
+    pub fn new(workspace_id: Option<String>) -> Self {
         Self {
-            tabs: vec![new_tab()],
+            tabs: vec![new_tab(workspace_id.clone())],
             active: 0,
+            workspace_id,
         }
     }
 
@@ -58,7 +61,7 @@ impl SessionManager {
     }
 
     pub fn new_session(&mut self) -> SessionId {
-        let tab = new_tab();
+        let tab = new_tab(self.workspace_id.clone());
         let id = tab.id.clone();
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -76,7 +79,7 @@ impl SessionManager {
         };
 
         if self.tabs.len() == 1 {
-            let tab = new_tab();
+            let tab = new_tab(self.workspace_id.clone());
             let id = tab.id.clone();
             self.tabs[0] = tab;
             self.active = 0;
@@ -113,15 +116,16 @@ impl SessionManager {
 
 impl Default for SessionManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
-fn new_tab() -> SessionTab {
+fn new_tab(workspace_id: Option<String>) -> SessionTab {
     SessionTab {
         id: SessionId(Uuid::new_v4().to_string()),
         title: "New session".into(),
         dirty: false,
+        workspace_id,
     }
 }
 
@@ -131,7 +135,7 @@ mod tests {
 
     #[test]
     fn new_session_selects_new_tab() {
-        let mut manager = SessionManager::new();
+        let mut manager = SessionManager::new(None);
         let id = manager.new_session();
         assert_eq!(manager.tabs().len(), 2);
         assert_eq!(manager.active().id, id);
@@ -140,7 +144,7 @@ mod tests {
 
     #[test]
     fn closing_active_tab_selects_nearest_remaining_tab() {
-        let mut manager = SessionManager::new();
+        let mut manager = SessionManager::new(None);
         let first = manager.active().id.clone();
         let second = manager.new_session();
         manager.new_session();
@@ -151,7 +155,7 @@ mod tests {
 
     #[test]
     fn closing_last_tab_keeps_one_fresh_session() {
-        let mut manager = SessionManager::new();
+        let mut manager = SessionManager::new(None);
         let id = manager.active().id.clone();
         manager.close(&id);
         assert_eq!(manager.tabs().len(), 1);
@@ -160,7 +164,7 @@ mod tests {
 
     #[test]
     fn selecting_unknown_tab_returns_false_and_preserves_active_tab() {
-        let mut manager = SessionManager::new();
+        let mut manager = SessionManager::new(None);
         let active = manager.active().id.clone();
         let unknown = SessionId("unknown".into());
 
@@ -170,7 +174,7 @@ mod tests {
 
     #[test]
     fn try_close_unknown_tab_returns_none_and_preserves_state() {
-        let mut manager = SessionManager::new();
+        let mut manager = SessionManager::new(None);
         let active = manager.active().id.clone();
         let unknown = SessionId("unknown".into());
 
@@ -181,31 +185,67 @@ mod tests {
 
     #[test]
     fn set_dirty_updates_the_requested_tab() {
-        let mut manager = SessionManager::new();
+        let mut manager = SessionManager::new(None);
         let first = manager.active().id.clone();
         let second = manager.new_session();
 
         manager.set_dirty(&first, true);
 
-        assert!(manager.tabs().iter().find(|tab| tab.id == first).unwrap().dirty);
-        assert!(!manager.tabs().iter().find(|tab| tab.id == second).unwrap().dirty);
+        assert!(
+            manager
+                .tabs()
+                .iter()
+                .find(|tab| tab.id == first)
+                .unwrap()
+                .dirty
+        );
+        assert!(
+            !manager
+                .tabs()
+                .iter()
+                .find(|tab| tab.id == second)
+                .unwrap()
+                .dirty
+        );
     }
 
     #[test]
     fn rename_updates_the_requested_tab() {
-        let mut manager = SessionManager::new();
+        let mut manager = SessionManager::new(None);
         let first = manager.active().id.clone();
         let second = manager.new_session();
 
         manager.rename(&first, "First session");
 
         assert_eq!(
-            manager.tabs().iter().find(|tab| tab.id == first).unwrap().title,
+            manager
+                .tabs()
+                .iter()
+                .find(|tab| tab.id == first)
+                .unwrap()
+                .title,
             "First session"
         );
         assert_eq!(
-            manager.tabs().iter().find(|tab| tab.id == second).unwrap().title,
+            manager
+                .tabs()
+                .iter()
+                .find(|tab| tab.id == second)
+                .unwrap()
+                .title,
             "New session"
         );
+    }
+
+    #[test]
+    fn session_tab_element_ids_use_stable_session_prefixes() {
+        let manager = SessionManager::new(None);
+        let id = &manager.active().id;
+
+        let ids = crate::ui::tabs::session_tab_ids(id);
+
+        assert_eq!(ids.tab, format!("session-tab-{id}"));
+        assert_eq!(ids.close, format!("session-tab-close-{id}"));
+        assert_eq!(crate::ui::tabs::NEW_SESSION_ID, "session-tab-new");
     }
 }

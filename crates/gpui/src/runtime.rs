@@ -1,11 +1,14 @@
 use crate::session::SessionId;
-use averroes_core::agent::{Agent, AgentConfig};
+use averroes_core::agent::{Agent, AgentConfig, AgentStreamEvent};
 use averroes_core::compaction::{CompactionConfig, CompactionStrategyType};
 use averroes_core::config::{create_provider, AppConfig, ConfigError};
 use averroes_core::provider::Provider;
 use averroes_core::runtime::ResourceGovernor;
 use averroes_core::tool::{builtin, ToolRegistry};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 const DEFAULT_COMPACTION_THRESHOLD: f64 = 0.8;
 const MAX_CONCURRENT_CALLS: usize = tokio::sync::Semaphore::MAX_PERMITS;
@@ -17,6 +20,60 @@ pub struct AgentFactory {
     pub governor: Arc<ResourceGovernor>,
     // ResourceGovernor stops its reset thread and Runtime shuts down after final Arc release.
     pub runtime: Arc<tokio::runtime::Runtime>,
+}
+
+pub struct AgentRunHandle {
+    handle: Option<tokio::task::JoinHandle<anyhow::Result<String>>>,
+}
+
+pub struct AgentStreamHandle {
+    handle: Option<tokio::task::JoinHandle<anyhow::Result<String>>>,
+    events: tokio::sync::mpsc::UnboundedReceiver<AgentStreamEvent>,
+}
+
+impl Future for AgentRunHandle {
+    type Output = Result<anyhow::Result<String>, tokio::task::JoinError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let result = match this.handle.as_mut() {
+            Some(handle) => Pin::new(handle).poll(cx),
+            None => panic!("polled completed agent run handle"),
+        };
+        if result.is_ready() {
+            this.handle = None;
+        }
+        result
+    }
+}
+
+impl Drop for AgentRunHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl AgentStreamHandle {
+    pub async fn next_event(&mut self) -> Option<AgentStreamEvent> {
+        self.events.recv().await
+    }
+
+    pub async fn finish(mut self) -> Result<anyhow::Result<String>, tokio::task::JoinError> {
+        self.handle
+            .take()
+            .expect("finished agent stream handle")
+            .await
+    }
+}
+
+impl Drop for AgentStreamHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -69,12 +126,21 @@ impl AgentFactory {
         })
     }
 
-    pub fn spawn_agent_run(
-        &self,
-        agent: Arc<Agent>,
-        prompt: String,
-    ) -> tokio::task::JoinHandle<anyhow::Result<String>> {
-        self.runtime.spawn(async move { agent.run(&prompt).await })
+    pub fn spawn_agent_run(&self, agent: Arc<Agent>, prompt: String) -> AgentRunHandle {
+        AgentRunHandle {
+            handle: Some(self.runtime.spawn(async move { agent.run(&prompt).await })),
+        }
+    }
+
+    pub fn spawn_agent_stream(&self, agent: Arc<Agent>, prompt: String) -> AgentStreamHandle {
+        let (sender, events) = tokio::sync::mpsc::unbounded_channel();
+        let handle = self
+            .runtime
+            .spawn(async move { agent.run_streaming(&prompt, sender).await });
+        AgentStreamHandle {
+            handle: Some(handle),
+            events,
+        }
     }
 
     pub fn new_agent(&self, session_id: &SessionId) -> Arc<Agent> {
@@ -160,16 +226,16 @@ fn compaction_config(config: &AppConfig) -> CompactionConfig {
 mod tests {
     use super::*;
     use crate::session::SessionManager;
-    use averroes_core::agent::AgentConfig;
+    use async_trait::async_trait;
+    use averroes_core::agent::{AgentConfig, AgentStreamEvent};
     use averroes_core::config::AppConfig;
     use averroes_core::provider::types::{MessageContent, Role};
     use averroes_core::provider::{
         openai::OpenAiProvider, ChatMessage, ChatRequest, ChatResponse, ChatStream, Provider,
-        ProviderError,
+        StreamEvent,
     };
     use averroes_core::runtime::ResourceGovernor;
     use averroes_core::tool::ToolRegistry;
-    use async_trait::async_trait;
     use std::sync::Arc;
 
     struct MockProvider;
@@ -196,7 +262,15 @@ mod tests {
             &self,
             _request: ChatRequest,
         ) -> averroes_core::provider::Result<ChatStream> {
-            Err(ProviderError::Other("stream unused in test".into()))
+            Ok(Box::new(futures::stream::iter(vec![
+                Ok(StreamEvent::TextDelta {
+                    text: "mock ".into(),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    text: "stream".into(),
+                }),
+                Ok(StreamEvent::MessageEnd { usage: None }),
+            ])))
         }
 
         fn context_window(&self, _model: &str) -> usize {
@@ -226,7 +300,7 @@ mod tests {
     fn new_agent_creates_a_fresh_agent_for_each_session() {
         let factory = test_factory();
 
-        let mut sessions = SessionManager::new();
+        let mut sessions = SessionManager::new(None);
         let first_id = sessions.active().id.clone();
         let second_id = sessions.new_session();
         let first = factory.new_agent(&first_id);
@@ -238,7 +312,7 @@ mod tests {
     #[test]
     fn spawn_agent_run_uses_the_factory_runtime() {
         let factory = test_factory();
-        let sessions = SessionManager::new();
+        let sessions = SessionManager::new(None);
         let agent = Arc::new(Agent::new(
             AgentConfig {
                 max_iterations: 0,
@@ -269,7 +343,7 @@ mod tests {
             governor: Arc::new(ResourceGovernor::new(10, 200_000)),
             runtime: Arc::new(tokio::runtime::Runtime::new().unwrap()),
         };
-        let sessions = SessionManager::new();
+        let sessions = SessionManager::new(None);
         let agent = factory.new_agent(&sessions.active().id);
 
         let result = factory
@@ -279,6 +353,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, "mock response");
+    }
+
+    #[test]
+    fn spawn_agent_stream_emits_deltas_before_completion() {
+        let factory = AgentFactory {
+            config: AppConfig::default(),
+            provider: Arc::new(MockProvider),
+            tools: Arc::new(ToolRegistry::new()),
+            governor: Arc::new(ResourceGovernor::new(10, 200_000)),
+            runtime: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+        };
+        let sessions = SessionManager::new(None);
+        let agent = factory.new_agent(&sessions.active().id);
+        let mut handle = factory.spawn_agent_stream(agent, "hello".into());
+
+        let (events, result) = factory.runtime.block_on(async {
+            let mut events = Vec::new();
+            while let Some(event) = handle.next_event().await {
+                events.push(event);
+            }
+            let result = handle.finish().await;
+            (events, result)
+        });
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentStreamEvent::TextDelta { text: first },
+                AgentStreamEvent::TextDelta { text: second }
+            ] if first == "mock " && second == "stream"
+        ));
+        assert_eq!(result.unwrap().unwrap(), "mock stream");
     }
 
     #[test]
