@@ -820,31 +820,6 @@ impl ChatView {
         cx.notify();
     }
 
-    fn toolbar_menu(theme: UiTheme, label: impl Into<SharedString>) -> Div {
-        div()
-            .absolute()
-            .bottom(px(42.0))
-            .left(px(0.0))
-            .bg(theme.card)
-            .border_1()
-            .border_color(theme.border)
-            .rounded(px(UiTheme::RADIUS))
-            .shadow_md()
-            .p(px(6.0))
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .text_xs()
-            .text_color(theme.foreground)
-            .child(
-                div()
-                    .px(px(6.0))
-                    .py(px(2.0))
-                    .text_color(theme.muted_foreground)
-                    .child(label.into()),
-            )
-    }
-
     fn active_workspace_name(&self) -> String {
         self.workspace_id
             .as_ref()
@@ -1062,8 +1037,9 @@ impl Render for ChatView {
                                 .flex_row()
                                 .items_center()
                                 .gap_2()
-                                .child(
-                                    div()
+                                .child({
+                                    let attachment_open = self.attachment_menu_open;
+                                    let mut container = div()
                                         .relative()
                                         .child(
                                             div()
@@ -1083,102 +1059,111 @@ impl Render for ChatView {
                                                     },
                                                 ))
                                                 .child(plus_icon(16.0)),
-                                        )
-                                        .when(self.attachment_menu_open, |element| {
-                                            element.child(
-                                                Self::toolbar_menu(theme, "Add context")
-                                                    .child(
-                                                        button(
-                                                            theme,
-                                                            ButtonVariant::Ghost,
-                                                            "@ Context",
-                                                        )
+                                        );
+                                    if attachment_open {
+                                        container = container.child(
+                                            div()
+                                                .absolute()
+                                                .bottom(px(42.0))
+                                                .left(px(0.0))
+                                                .bg(theme.card)
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .rounded(px(UiTheme::RADIUS))
+                                                .shadow_md()
+                                                .p(px(4.0))
+                                                .flex()
+                                                .flex_col()
+                                                .child(
+                                                    button(theme, ButtonVariant::Ghost, "@ Context")
                                                         .id(self.element_id("composer-context"))
                                                         .on_click(cx.listener(
                                                             |this, _event, _window, cx| {
                                                                 this.insert_context("@", cx);
                                                             },
                                                         )),
-                                                    )
-                                                    .child(
-                                                        button(
-                                                            theme,
-                                                            ButtonVariant::Ghost,
-                                                            "/ Command",
-                                                        )
+                                                )
+                                                .child(
+                                                    button(theme, ButtonVariant::Ghost, "/ Command")
                                                         .id(self.element_id("composer-command"))
                                                         .on_click(cx.listener(
                                                             |this, _event, _window, cx| {
                                                                 this.insert_context("/", cx);
                                                             },
                                                         )),
-                                                    ),
-                                            )
-                                        }),
-                                )
+                                                ),
+                                        );
+                                    }
+                                    container
+                                })
                                 .child(
-                                    div()
-                                        .relative()
-                                        .child(
-                                            div()
-                                                .id(self.element_id("composer-mode"))
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap(px(4.0))
-                                                .rounded(px(UiTheme::RADIUS))
-                                                .text_color(theme.foreground)
-                                                .text_sm()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .cursor_pointer()
-                                                .hover(|style| style.bg(theme.accent))
-                                                .px(px(12.0))
-                                                .py(px(8.0))
-                                                .on_click(cx.listener(
-                                                    |this, _event, _window, cx| {
-                                                        this.toggle_mode_menu(cx);
-                                                    },
-                                                ))
-                                                .child(mode_label)
-                                                .child(chevron_down_icon(10.0)),
-                                        )
-                                        .when(self.mode_menu_open, |element| {
-                                            element.child(
-                                                Self::toolbar_menu(theme, "Mode")
+                                    {
+                                        let mode_open = self.mode_menu_open;
+                                        let mut container = div()
+                                            .relative()
+                                            .child(
+                                                div()
+                                                    .id(self.element_id("composer-mode"))
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(4.0))
+                                                    .rounded(px(UiTheme::RADIUS))
+                                                    .text_color(theme.foreground)
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .cursor_pointer()
+                                                    .hover(|style| style.bg(theme.accent))
+                                                    .px(px(12.0))
+                                                    .py(px(8.0))
+                                                    .on_click(cx.listener(
+                                                        |this, _event, _window, cx| {
+                                                            this.toggle_mode_menu(cx);
+                                                        },
+                                                    ))
+                                                    .child(mode_label)
+                                                    .child(chevron_down_icon(10.0)),
+                                            );
+                                        if mode_open {
+                                            container = container.child(
+                                                div()
+                                                    .absolute()
+                                                    .bottom(px(42.0))
+                                                    .left(px(0.0))
+                                                    .bg(theme.card)
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .rounded(px(UiTheme::RADIUS))
+                                                    .shadow_md()
+                                                    .p(px(4.0))
+                                                    .flex()
+                                                    .flex_col()
                                                     .child(
-                                                        button(
-                                                            theme,
-                                                            ButtonVariant::Ghost,
-                                                            "Build",
-                                                        )
-                                                        .id(self.element_id("composer-mode-build"))
-                                                        .on_click(cx.listener(
-                                                            |this, _event, _window, cx| {
-                                                                this.select_mode(
-                                                                    ComposerMode::Build,
-                                                                    cx,
-                                                                );
-                                                            },
-                                                        )),
+                                                        button(theme, ButtonVariant::Ghost, "Build")
+                                                            .id(self.element_id("composer-mode-build"))
+                                                            .on_click(cx.listener(
+                                                                |this, _event, _window, cx| {
+                                                                    this.select_mode(ComposerMode::Build, cx);
+                                                                },
+                                                            )),
                                                     )
                                                     .child(
                                                         button(theme, ButtonVariant::Ghost, "Plan")
-                                                            .id(self
-                                                                .element_id("composer-mode-plan"))
+                                                            .id(self.element_id("composer-mode-plan"))
                                                             .on_click(cx.listener(
                                                                 |this, _event, _window, cx| {
-                                                                    this.select_mode(
-                                                                        ComposerMode::Plan,
-                                                                        cx,
-                                                                    );
+                                                                    this.select_mode(ComposerMode::Plan, cx);
                                                                 },
                                                             )),
                                                     ),
-                                            )
-                                        }),
+                                            );
+                                        }
+                                        container
+                                    }
                                 )
-                                .child(
-                                    div()
+                                .child({
+                                    let model_open = self.model_menu_open;
+                                    let mut container = div()
                                         .relative()
                                         .child(
                                             div()
@@ -1202,30 +1187,37 @@ impl Render for ChatView {
                                                 ))
                                                 .child(model.clone())
                                                 .child(chevron_down_icon(10.0)),
-                                        )
-                                        .when(self.model_menu_open, |element| {
-                                            element.child(
-                                                Self::toolbar_menu(theme, "Configured model")
-                                                    .child(
-                                                        button(
-                                                            theme,
-                                                            ButtonVariant::Ghost,
-                                                            model.clone(),
-                                                        )
-                                                        .id(self.element_id(
-                                                            "composer-model-configured",
-                                                        ))
+                                        );
+                                    if model_open {
+                                        container = container.child(
+                                            div()
+                                                .absolute()
+                                                .bottom(px(42.0))
+                                                .left(px(0.0))
+                                                .bg(theme.card)
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .rounded(px(UiTheme::RADIUS))
+                                                .shadow_md()
+                                                .p(px(4.0))
+                                                .flex()
+                                                .flex_col()
+                                                .child(
+                                                    button(theme, ButtonVariant::Ghost, model.clone())
+                                                        .id(self.element_id("composer-model-configured"))
                                                         .on_click(cx.listener(
                                                             |this, _event, _window, cx| {
                                                                 this.select_model(cx);
                                                             },
                                                         )),
-                                                    ),
-                                            )
-                                        }),
-                                )
-                                .child(
-                                    div()
+                                                ),
+                                        );
+                                    }
+                                    container
+                                })
+                                .child({
+                                    let effort_open = self.effort_menu_open;
+                                    let mut container = div()
                                         .relative()
                                         .child(
                                             div()
@@ -1249,43 +1241,43 @@ impl Render for ChatView {
                                                 ))
                                                 .child(effort_label)
                                                 .child(chevron_down_icon(10.0)),
-                                        )
-                                        .when(self.effort_menu_open, |element| {
-                                            element.child(
-                                                Self::toolbar_menu(theme, "Effort")
-                                                    .child(
-                                                        button(theme, ButtonVariant::Ghost, "Max")
-                                                            .id(self
-                                                                .element_id("composer-effort-max"))
-                                                            .on_click(cx.listener(
-                                                                |this, _event, _window, cx| {
-                                                                    this.select_effort(
-                                                                        EffortLevel::Max,
-                                                                        cx,
-                                                                    );
-                                                                },
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        button(
-                                                            theme,
-                                                            ButtonVariant::Ghost,
-                                                            "Balanced",
-                                                        )
-                                                        .id(self
-                                                            .element_id("composer-effort-balanced"))
+                                        );
+                                    if effort_open {
+                                        container = container.child(
+                                            div()
+                                                .absolute()
+                                                .bottom(px(42.0))
+                                                .left(px(0.0))
+                                                .bg(theme.card)
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .rounded(px(UiTheme::RADIUS))
+                                                .shadow_md()
+                                                .p(px(4.0))
+                                                .flex()
+                                                .flex_col()
+                                                .child(
+                                                    button(theme, ButtonVariant::Ghost, "Max")
+                                                        .id(self.element_id("composer-effort-max"))
                                                         .on_click(cx.listener(
                                                             |this, _event, _window, cx| {
-                                                                this.select_effort(
-                                                                    EffortLevel::Balanced,
-                                                                    cx,
-                                                                );
+                                                                this.select_effort(EffortLevel::Max, cx);
                                                             },
                                                         )),
-                                                    ),
-                                            )
-                                        }),
-                                ),
+                                                )
+                                                .child(
+                                                    button(theme, ButtonVariant::Ghost, "Balanced")
+                                                        .id(self.element_id("composer-effort-balanced"))
+                                                        .on_click(cx.listener(
+                                                            |this, _event, _window, cx| {
+                                                                this.select_effort(EffortLevel::Balanced, cx);
+                                                            },
+                                                        )),
+                                                ),
+                                        );
+                                    }
+                                    container
+                                }),
                         )
                         .child(send_button),
                 ),

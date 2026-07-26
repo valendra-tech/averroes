@@ -138,7 +138,7 @@ impl Render for SessionTabs {
                         rgba(0x00000000)
                     })
                     .bg(if is_active { theme.accent } else { theme.card })
-                    .text_sm()
+                    .text_xs()
                     .text_color(if is_active {
                         theme.foreground
                     } else {
