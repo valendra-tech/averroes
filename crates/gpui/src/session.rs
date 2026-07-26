@@ -107,6 +107,16 @@ impl SessionManager {
         }
     }
 
+    pub fn add_tab(&mut self, id: SessionId, title: String) {
+        self.tabs.push(SessionTab {
+            id,
+            title,
+            dirty: false,
+            workspace_id: self.workspace_id.clone(),
+        });
+        self.active = self.tabs.len() - 1;
+    }
+
     pub fn set_workspace_id(&mut self, id: &SessionId, workspace_id: String) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| &tab.id == id) {
             tab.workspace_id = Some(workspace_id);

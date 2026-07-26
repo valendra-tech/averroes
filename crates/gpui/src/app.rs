@@ -167,12 +167,28 @@ impl AverroesApp {
         match event {
             HomeEvent::OpenSession(id) => {
                 let sid = SessionId(id.clone());
-                if self.session_views.contains_key(&sid) {
-                    self.sessions.select(&sid);
-                    self.active_view = ActiveView::Chat;
-                    self.sync_navigation(cx);
-                    cx.notify();
+                if !self.sessions.tabs().iter().any(|t| &t.id == &sid) {
+                    let title = self
+                        .session_store
+                        .load(id)
+                        .ok()
+                        .and_then(|msgs| {
+                            msgs.first().map(|m| {
+                                let t = m.text().chars().take(40).collect::<String>();
+                                if t.is_empty() { "New session".into() } else { t }
+                            })
+                        })
+                        .unwrap_or_else(|| "New session".into());
+                    self.sessions.add_tab(sid.clone(), title);
                 }
+                if !self.session_views.contains_key(&sid) {
+                    self.add_session_view(sid.clone(), cx);
+                }
+                self.sessions.select(&sid);
+                self.active_view = ActiveView::Chat;
+                self.sync_navigation(cx);
+                self.persist_tabs();
+                cx.notify();
             }
             HomeEvent::NewSession => {
                 self.create_session(cx);
