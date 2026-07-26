@@ -72,10 +72,10 @@ impl Render for SessionTabs {
             .flex()
             .flex_row()
             .items_center()
-            .h(px(44.0))
+            .h(px(36.0))
             .pl(px(78.0))
             .pr(px(12.0))
-            .gap_2()
+            .gap_1()
             .bg(theme.card)
             .border_b_1()
             .border_color(theme.border)
@@ -128,8 +128,8 @@ impl Render for SessionTabs {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .px(px(10.0))
-                    .py(px(6.0))
+                    .px(px(8.0))
+                    .py(px(4.0))
                     .rounded(px(UiTheme::RADIUS))
                     .border_1()
                     .border_color(if is_active {
@@ -159,7 +159,12 @@ impl Render for SessionTabs {
                         this.select_session(session_id.clone(), cx);
                     }))
                     .child(marker)
-                    .child(title)
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_x_hidden()
+                            .child(title),
+                    )
                     .child(
                         div()
                             .flex()
