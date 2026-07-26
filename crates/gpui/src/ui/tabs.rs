@@ -1,4 +1,5 @@
 use crate::session::{SessionId, SessionTab};
+use crate::ui::icon::plus_icon;
 use crate::ui::theme::UiTheme;
 use gpui::*;
 
@@ -193,7 +194,7 @@ impl Render for SessionTabs {
                     .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                         this.create_session(cx);
                     }))
-                    .child("+"),
+                    .child(plus_icon(14.0)),
             )
     }
 }

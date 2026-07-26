@@ -1,5 +1,5 @@
 use crate::ui::UiTheme;
-use crate::ui::{button, ButtonVariant};
+use crate::ui::{button, plus_icon, ButtonVariant};
 use averroes_core::workspace::WorkspaceConfig;
 use gpui::*;
 use gpui::prelude::FluentBuilder;
@@ -200,19 +200,7 @@ impl Render for HomeView {
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         cx.emit(HomeEvent::AddWorkspace);
                     }))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(20.0))
-                            .h(px(20.0))
-                            .rounded(px(3.0))
-                            .text_color(theme.primary)
-                            .text_lg()
-                            .font_weight(FontWeight::LIGHT)
-                            .child("+"),
-                    )
+                    .child(plus_icon(16.0))
                     .child("Add workspace"),
             );
 

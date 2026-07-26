@@ -5,7 +5,8 @@ use crate::session::SessionId;
 use crate::ui::composer::{composer_surface, ComposerMode, ComposerState, EffortLevel};
 use crate::ui::theme::UiTheme;
 use crate::ui::{
-    button, render_markdown, text_field_element, utf16_range_to_byte_range, ButtonVariant, TextField,
+    button, chevron_down_icon, plus_icon, render_markdown, text_field_element,
+    utf16_range_to_byte_range, ButtonVariant, TextField,
 };
 use averroes_core::agent::{Agent, AgentStreamEvent};
 use averroes_core::provider::types::ChatMessage;
@@ -1065,7 +1066,6 @@ impl Render for ChatView {
                                                 .h(px(28.0))
                                                 .rounded(px(UiTheme::RADIUS))
                                                 .text_color(theme.muted_foreground)
-                                                .text_lg()
                                                 .cursor_pointer()
                                                 .hover(|style| style.bg(theme.accent).text_color(theme.foreground))
                                                 .on_click(cx.listener(
@@ -1073,7 +1073,7 @@ impl Render for ChatView {
                                                         this.toggle_attachment_menu(cx);
                                                     },
                                                 ))
-                                                .child("+"),
+                                                .child(plus_icon(16.0)),
                                         )
                                         .when(self.attachment_menu_open, |element| {
                                             element.child(
@@ -1111,13 +1111,27 @@ impl Render for ChatView {
                                     div()
                                         .relative()
                                         .child(
-                                            button(theme, ButtonVariant::Ghost, mode_label)
+                                            div()
                                                 .id(self.element_id("composer-mode"))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(4.0))
+                                                .rounded(px(UiTheme::RADIUS))
+                                                .text_color(theme.foreground)
+                                                .text_sm()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .cursor_pointer()
+                                                .hover(|style| style.bg(theme.accent))
+                                                .px(px(12.0))
+                                                .py(px(8.0))
                                                 .on_click(cx.listener(
                                                     |this, _event, _window, cx| {
                                                         this.toggle_mode_menu(cx);
                                                     },
-                                                )),
+                                                ))
+                                                .child(mode_label)
+                                                .child(chevron_down_icon(10.0)),
                                         )
                                         .when(self.mode_menu_open, |element| {
                                             element.child(
@@ -1158,13 +1172,27 @@ impl Render for ChatView {
                                     div()
                                         .relative()
                                         .child(
-                                            button(theme, ButtonVariant::Ghost, model.clone())
+                                            div()
                                                 .id(self.element_id("composer-model"))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(4.0))
+                                                .rounded(px(UiTheme::RADIUS))
+                                                .text_color(theme.foreground)
+                                                .text_sm()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .cursor_pointer()
+                                                .hover(|style| style.bg(theme.accent))
+                                                .px(px(12.0))
+                                                .py(px(8.0))
                                                 .on_click(cx.listener(
                                                     |this, _event, _window, cx| {
                                                         this.toggle_model_menu(cx);
                                                     },
-                                                )),
+                                                ))
+                                                .child(model.clone())
+                                                .child(chevron_down_icon(10.0)),
                                         )
                                         .when(self.model_menu_open, |element| {
                                             element.child(
@@ -1191,13 +1219,27 @@ impl Render for ChatView {
                                     div()
                                         .relative()
                                         .child(
-                                            button(theme, ButtonVariant::Ghost, effort_label)
+                                            div()
                                                 .id(self.element_id("composer-effort"))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(4.0))
+                                                .rounded(px(UiTheme::RADIUS))
+                                                .text_color(theme.foreground)
+                                                .text_sm()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .cursor_pointer()
+                                                .hover(|style| style.bg(theme.accent))
+                                                .px(px(12.0))
+                                                .py(px(8.0))
                                                 .on_click(cx.listener(
                                                     |this, _event, _window, cx| {
                                                         this.toggle_effort_menu(cx);
                                                     },
-                                                )),
+                                                ))
+                                                .child(effort_label)
+                                                .child(chevron_down_icon(10.0)),
                                         )
                                         .when(self.effort_menu_open, |element| {
                                             element.child(
