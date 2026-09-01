@@ -248,10 +248,16 @@ mod tests {
                     role: WorkMessageRole::Assistant,
                     text: "The chosen database is SQLite.".into(),
                     reasoning: "never expose this".into(),
+                    reasoning_complete: true,
+                    reasoning_expanded: false,
+                    tool_activities: Vec::new(),
+                    expanded_tool_groups: Vec::new(),
                 }],
                 checkpoints: Vec::new(),
                 tasks: Vec::new(),
                 sources: Vec::new(),
+                agent_threads: Vec::new(),
+                agent_thread_transcripts: std::collections::HashMap::new(),
             })
             .unwrap();
         let tool = GetDeepMemoryTool::new(database);

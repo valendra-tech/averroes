@@ -2,6 +2,7 @@ use crate::i18n;
 use crate::runtime::AppRuntime;
 use crate::session::SessionId;
 use crate::shortcuts::{CloseSession, FocusInput, NewSession, Quit, SendMessage, ToggleSettings};
+use crate::tool_details::{render_tool_detail, ToolDetailSection};
 use crate::tool_groups::{
     summarize_tool_names, ToolGroupEvent, ToolGroupRenderMode, ToolGroupTracker,
 };
@@ -23,7 +24,7 @@ use averroes_core::provider::{ModelInfo, ModelSource};
 use averroes_core::work::{
     now, CheckpointStatus, ConversationSearchResult, ConversationSummary, EmbeddingConfig,
     EmbeddingIndexStatus, TaskStatus, WorkCheckpoint, WorkConversation, WorkMessage,
-    WorkMessageRole, WorkProject, WorkSource, WorkTask,
+    WorkMessageRole, WorkProject, WorkSource, WorkTask, WorkToolActivity, WorkToolActivityState,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -57,6 +58,7 @@ use std::time::{Duration, Instant};
 const STREAM_UI_BATCH_WINDOW: Duration = Duration::from_millis(32);
 const STREAM_UI_MAX_EVENTS: usize = 64;
 const STREAM_MESSAGE_FADE_DURATION: Duration = Duration::from_millis(260);
+const CONVERSATION_SEARCH_DEBOUNCE: Duration = Duration::from_millis(280);
 
 fn stream_event_requires_immediate_flush(event: &AgentStreamEvent) -> bool {
     matches!(
@@ -104,6 +106,7 @@ enum ToolActivityState {
     Running,
     Completed,
     Failed,
+    Interrupted,
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +312,114 @@ impl ShellMessage {
     }
 }
 
+fn shell_tool_activity_from_work(activity: WorkToolActivity) -> ToolActivity {
+    let interrupted = activity.state == WorkToolActivityState::Running;
+    ToolActivity {
+        call_id: activity.call_id,
+        name: activity.name,
+        text_offset: activity.text_offset,
+        group_id: activity.group_id,
+        input: activity.input,
+        summary: if interrupted && activity.summary.is_empty() {
+            "Interrupted when Averroes closed".into()
+        } else {
+            activity.summary
+        },
+        output: activity.output,
+        state: match activity.state {
+            WorkToolActivityState::Running => ToolActivityState::Interrupted,
+            WorkToolActivityState::Completed => ToolActivityState::Completed,
+            WorkToolActivityState::Failed => ToolActivityState::Failed,
+            WorkToolActivityState::Interrupted => ToolActivityState::Interrupted,
+        },
+        started_at: activity
+            .duration_ms
+            .and_then(|milliseconds| {
+                Instant::now().checked_sub(Duration::from_millis(milliseconds))
+            })
+            .unwrap_or_else(Instant::now),
+        duration_ms: activity.duration_ms,
+        expanded: activity.expanded,
+        inside_reasoning: activity.inside_reasoning,
+    }
+}
+
+fn work_tool_activity_from_shell(activity: &ToolActivity) -> WorkToolActivity {
+    WorkToolActivity {
+        call_id: activity.call_id.clone(),
+        name: activity.name.clone(),
+        text_offset: activity.text_offset,
+        group_id: activity.group_id,
+        input: activity.input.clone(),
+        summary: activity.summary.clone(),
+        output: activity.output.clone(),
+        state: match activity.state {
+            ToolActivityState::Running => WorkToolActivityState::Running,
+            ToolActivityState::Completed => WorkToolActivityState::Completed,
+            ToolActivityState::Failed => WorkToolActivityState::Failed,
+            ToolActivityState::Interrupted => WorkToolActivityState::Interrupted,
+        },
+        duration_ms: activity.duration_ms,
+        expanded: activity.expanded,
+        inside_reasoning: activity.inside_reasoning,
+    }
+}
+
+fn shell_message_from_work(message: WorkMessage) -> ShellMessage {
+    let tool_groups = ToolGroupTracker::from_persisted_group_ids(
+        message
+            .tool_activities
+            .iter()
+            .filter_map(|activity| activity.group_id),
+    );
+    ShellMessage {
+        role: match message.role {
+            WorkMessageRole::User => MessageRole::User,
+            WorkMessageRole::Assistant => MessageRole::Assistant,
+            WorkMessageRole::Error => MessageRole::Error,
+        },
+        text: message.text,
+        reasoning: message.reasoning,
+        reasoning_complete: message.reasoning_complete,
+        reasoning_expanded: message.reasoning_expanded,
+        animate_in: false,
+        tool_activities: message
+            .tool_activities
+            .into_iter()
+            .map(shell_tool_activity_from_work)
+            .collect(),
+        tool_groups,
+        expanded_tool_groups: message.expanded_tool_groups.into_iter().collect(),
+    }
+}
+
+fn work_message_from_shell(message: &ShellMessage) -> WorkMessage {
+    WorkMessage {
+        role: match message.role {
+            MessageRole::User => WorkMessageRole::User,
+            MessageRole::Assistant => WorkMessageRole::Assistant,
+            MessageRole::Error => WorkMessageRole::Error,
+        },
+        text: message.text.clone(),
+        reasoning: message.reasoning.clone(),
+        reasoning_complete: message.reasoning_complete,
+        reasoning_expanded: message.reasoning_expanded,
+        tool_activities: message
+            .tool_activities
+            .iter()
+            .map(work_tool_activity_from_shell)
+            .collect(),
+        expanded_tool_groups: message.expanded_tool_groups.iter().copied().collect(),
+    }
+}
+
+fn restore_agent_thread_status(status: AgentThreadStatus) -> AgentThreadStatus {
+    match status {
+        AgentThreadStatus::Running => AgentThreadStatus::Interrupted,
+        other => other,
+    }
+}
+
 struct ShellSession {
     id: SessionId,
     title: String,
@@ -380,21 +491,7 @@ impl ShellSession {
             messages: conversation
                 .messages
                 .into_iter()
-                .map(|message| ShellMessage {
-                    role: match message.role {
-                        WorkMessageRole::User => MessageRole::User,
-                        WorkMessageRole::Assistant => MessageRole::Assistant,
-                        WorkMessageRole::Error => MessageRole::Error,
-                    },
-                    text: message.text,
-                    reasoning: message.reasoning,
-                    reasoning_complete: true,
-                    reasoning_expanded: false,
-                    animate_in: false,
-                    tool_activities: Vec::new(),
-                    tool_groups: ToolGroupTracker::default(),
-                    expanded_tool_groups: HashSet::new(),
-                })
+                .map(shell_message_from_work)
                 .collect(),
             agent: None,
             processing: false,
@@ -412,8 +509,26 @@ impl ShellSession {
             queue_autostart: false,
             pending_user_question: None,
             context_usage: conversation.context_usage,
-            agent_threads: Vec::new(),
-            agent_thread_transcripts: HashMap::new(),
+            agent_threads: conversation
+                .agent_threads
+                .into_iter()
+                .map(|mut thread| {
+                    thread.status = restore_agent_thread_status(thread.status);
+                    thread
+                })
+                .collect(),
+            agent_thread_transcripts: conversation
+                .agent_thread_transcripts
+                .into_iter()
+                .map(|(thread_id, messages)| {
+                    (
+                        thread_id,
+                        AgentThreadTranscript {
+                            messages: messages.into_iter().map(shell_message_from_work).collect(),
+                        },
+                    )
+                })
+                .collect(),
             context_busy: false,
             created_at: conversation.created_at,
         }
@@ -432,22 +547,25 @@ impl ShellSession {
             binding: self.binding.clone(),
             context_summary: self.context_summary.clone(),
             context_usage: self.context_usage,
-            messages: self
-                .messages
-                .iter()
-                .map(|message| WorkMessage {
-                    role: match message.role {
-                        MessageRole::User => WorkMessageRole::User,
-                        MessageRole::Assistant => WorkMessageRole::Assistant,
-                        MessageRole::Error => WorkMessageRole::Error,
-                    },
-                    text: message.text.clone(),
-                    reasoning: message.reasoning.clone(),
-                })
-                .collect(),
+            messages: self.messages.iter().map(work_message_from_shell).collect(),
             checkpoints: self.checkpoints.clone(),
             tasks: self.tasks.clone(),
             sources: self.sources.clone(),
+            agent_threads: self.agent_threads.clone(),
+            agent_thread_transcripts: self
+                .agent_thread_transcripts
+                .iter()
+                .map(|(thread_id, transcript)| {
+                    (
+                        thread_id.clone(),
+                        transcript
+                            .messages
+                            .iter()
+                            .map(work_message_from_shell)
+                            .collect(),
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -489,13 +607,9 @@ pub struct AverroesApp {
     embedding_model_labels: Vec<(SharedString, String)>,
     embedding_connection_id: Option<ConnectionId>,
     embedding_model_id: Option<String>,
-    agent_connection_select: Entity<SelectState<Vec<SharedString>>>,
-    agent_model_select: Entity<SelectState<Vec<SharedString>>>,
-    agent_connection_labels: Vec<(SharedString, ConnectionId)>,
-    agent_model_labels: Vec<(SharedString, String)>,
+    agent_model_select: Entity<SelectState<SearchableVec<SelectGroup<ModelChoice>>>>,
     agent_form_connection_id: Option<ConnectionId>,
     agent_form_model_id: Option<String>,
-    agent_id_input: Entity<InputState>,
     agent_name_input: Entity<InputState>,
     agent_description_input: Entity<InputState>,
     editing_agent_id: Option<String>,
@@ -688,25 +802,8 @@ impl AverroesApp {
             )
             .searchable(true)
         });
-        let agent_connection_labels = connection_labels.clone();
-        let agent_connection_select = cx.new(|cx| {
-            SelectState::new(
-                agent_connection_labels
-                    .iter()
-                    .map(|(label, _)| label.clone())
-                    .collect(),
-                None,
-                window,
-                cx,
-            )
-            .searchable(true)
-        });
-        let agent_model_labels = Vec::new();
         let agent_model_select = cx.new(|cx| {
-            SelectState::new(Vec::<SharedString>::new(), None, window, cx).searchable(true)
-        });
-        let agent_id_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.agent_id"))
+            SelectState::new(grouped_model_items(&model_choices), None, window, cx).searchable(true)
         });
         let agent_name_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.agent_name"))
@@ -725,6 +822,10 @@ impl AverroesApp {
         });
 
         let mut subscriptions = Vec::new();
+        subscriptions.push(cx.on_app_quit(|app, _cx| {
+            app.persist_all_sessions_on_quit();
+            async {}
+        }));
         subscriptions.push(cx.subscribe_in(
             &composer,
             window,
@@ -790,19 +891,11 @@ impl AverroesApp {
             },
         ));
         subscriptions.push(cx.subscribe_in(
-            &agent_connection_select,
-            window,
-            |this, _, event: &SelectEvent<Vec<SharedString>>, window, cx| {
-                let SelectEvent::Confirm(value) = event;
-                this.select_agent_connection(value.as_ref(), window, cx);
-            },
-        ));
-        subscriptions.push(cx.subscribe_in(
             &agent_model_select,
             window,
-            |this, _, event: &SelectEvent<Vec<SharedString>>, _, cx| {
+            |this, _, event: &SelectEvent<SearchableVec<SelectGroup<ModelChoice>>>, window, cx| {
                 let SelectEvent::Confirm(value) = event;
-                this.select_agent_model(value.as_ref(), cx);
+                this.select_agent_model(value.as_ref(), window, cx);
             },
         ));
         subscriptions.push(cx.subscribe_in(
@@ -817,12 +910,13 @@ impl AverroesApp {
         subscriptions.push(cx.subscribe_in(
             &conversation_search,
             window,
-            |this, _, event: &InputEvent, window, cx| {
+            |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.refresh_conversation_search(cx);
+                    this.schedule_semantic_conversation_search(cx);
                 }
                 if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
-                    this.search_conversations_semantically(window, cx);
+                    this.search_conversations_semantically(cx);
                 }
             },
         ));
@@ -902,13 +996,9 @@ impl AverroesApp {
             embedding_model_labels,
             embedding_connection_id,
             embedding_model_id,
-            agent_connection_select,
             agent_model_select,
-            agent_connection_labels,
-            agent_model_labels,
             agent_form_connection_id: None,
             agent_form_model_id: None,
-            agent_id_input,
             agent_name_input,
             agent_description_input,
             editing_agent_id: None,
@@ -1676,18 +1766,18 @@ impl AverroesApp {
     }
 
     fn refresh_agent_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.agent_model_labels =
-            agent_model_choices(&self.model_choices, self.agent_form_connection_id.as_ref());
-        let items = self
-            .agent_model_labels
-            .iter()
-            .map(|(label, _)| label.clone())
-            .collect::<Vec<_>>();
-        let selected = self.agent_form_model_id.as_ref().and_then(|id| {
-            self.agent_model_labels
-                .iter()
-                .find(|(_, candidate)| candidate == id)
-                .map(|(label, _)| label.clone())
+        let items = grouped_model_items(&self.model_choices);
+        let selected = self.agent_form_model_id.as_ref().and_then(|model_id| {
+            self.agent_form_connection_id
+                .as_ref()
+                .and_then(|connection_id| {
+                    self.model_choices
+                        .iter()
+                        .find(|choice| {
+                            &choice.connection_id == connection_id && &choice.info.id == model_id
+                        })
+                        .cloned()
+                })
         });
         self.agent_model_select.update(cx, |select, cx| {
             select.set_items(items, window, cx);
@@ -1698,58 +1788,19 @@ impl AverroesApp {
         });
     }
 
-    fn sync_agent_selectors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.agent_connection_labels = self
-            .runtime
-            .connections()
-            .into_iter()
-            .map(|profile| (profile.name.into(), profile.id))
-            .collect();
-        let items = self
-            .agent_connection_labels
-            .iter()
-            .map(|(label, _)| label.clone())
-            .collect::<Vec<_>>();
-        let selected = self.agent_form_connection_id.as_ref().and_then(|id| {
-            self.agent_connection_labels
-                .iter()
-                .find(|(_, candidate)| candidate == id)
-                .map(|(label, _)| label.clone())
-        });
-        self.agent_connection_select.update(cx, |select, cx| {
-            select.set_items(items, window, cx);
-            match selected.as_ref() {
-                Some(label) => select.set_selected_value(label, window, cx),
-                None => select.set_selected_index(None, window, cx),
-            }
-        });
+    fn sync_agent_model_selector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_agent_model_picker(window, cx);
     }
 
-    fn select_agent_connection(
+    fn select_agent_model(
         &mut self,
-        value: Option<&SharedString>,
+        value: Option<&ModelChoice>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.agent_form_connection_id = value.and_then(|value| {
-            self.agent_connection_labels
-                .iter()
-                .find(|(label, _)| label == value)
-                .map(|(_, id)| id.clone())
-        });
-        self.agent_form_model_id = None;
+        self.agent_form_connection_id = value.map(|choice| choice.connection_id.clone());
+        self.agent_form_model_id = value.map(|choice| choice.info.id.clone());
         self.refresh_agent_model_picker(window, cx);
-        cx.notify();
-    }
-
-    fn select_agent_model(&mut self, value: Option<&SharedString>, cx: &mut Context<Self>) {
-        self.agent_form_model_id = value.and_then(|value| {
-            self.agent_model_labels
-                .iter()
-                .find(|(label, _)| label == value)
-                .map(|(_, id)| id.clone())
-        });
         cx.notify();
     }
 
@@ -1762,14 +1813,12 @@ impl AverroesApp {
         self.editing_agent_id = Some(agent.id.clone());
         self.agent_form_connection_id = Some(ConnectionId(agent.connection_id.clone()));
         self.agent_form_model_id = Some(agent.model_id.clone());
-        self.agent_id_input
-            .update(cx, |input, cx| input.set_value(&agent.id, window, cx));
         self.agent_name_input
             .update(cx, |input, cx| input.set_value(&agent.name, window, cx));
         self.agent_description_input.update(cx, |input, cx| {
             input.set_value(&agent.description, window, cx)
         });
-        self.sync_agent_selectors(window, cx);
+        self.sync_agent_model_selector(window, cx);
         cx.notify();
     }
 
@@ -1777,22 +1826,14 @@ impl AverroesApp {
         self.editing_agent_id = None;
         self.agent_form_connection_id = None;
         self.agent_form_model_id = None;
-        for input in [
-            &self.agent_id_input,
-            &self.agent_name_input,
-            &self.agent_description_input,
-        ] {
+        for input in [&self.agent_name_input, &self.agent_description_input] {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
-        self.sync_agent_selectors(window, cx);
+        self.sync_agent_model_selector(window, cx);
         cx.notify();
     }
 
     fn save_agent_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self
-            .editing_agent_id
-            .clone()
-            .unwrap_or_else(|| self.agent_id_input.read(cx).value().trim().to_owned());
         let name = self.agent_name_input.read(cx).value().trim().to_owned();
         let description = self
             .agent_description_input
@@ -1800,6 +1841,14 @@ impl AverroesApp {
             .value()
             .trim()
             .to_owned();
+        if name.is_empty() {
+            self.show_error("Give the agent a name", cx);
+            return;
+        }
+        let id = self
+            .editing_agent_id
+            .clone()
+            .unwrap_or_else(|| agent_id_from_name(&name));
         let Some(connection_id) = self.agent_form_connection_id.clone() else {
             self.show_error("Choose a connection for this agent", cx);
             return;
@@ -1808,10 +1857,6 @@ impl AverroesApp {
             self.show_error("Choose a model for this agent", cx);
             return;
         };
-        if id.is_empty() || name.is_empty() {
-            self.show_error("Give the agent an id and a name", cx);
-            return;
-        }
         match self.runtime.save_agent(AgentProfile {
             id,
             name,
@@ -1862,7 +1907,23 @@ impl AverroesApp {
         cx.notify();
     }
 
-    fn search_conversations_semantically(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn schedule_semantic_conversation_search(&mut self, cx: &mut Context<Self>) {
+        let generation = self.conversation_search_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(CONVERSATION_SEARCH_DEBOUNCE)
+                .await;
+            _ = this.update(cx, |app, cx| {
+                if app.conversation_search_generation != generation {
+                    return;
+                }
+                app.search_conversations_semantically(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn search_conversations_semantically(&mut self, cx: &mut Context<Self>) {
         let query = self.conversation_search.read(cx).value().trim().to_owned();
         if query.is_empty() {
             return;
@@ -2007,6 +2068,27 @@ impl AverroesApp {
         self.persist_session(id, cx);
         if self.active().id == *id {
             self.remember_active_setup(cx);
+        }
+    }
+
+    fn persist_all_sessions_on_quit(&mut self) {
+        for session in &self.sessions {
+            // Keep the initial blank composer ephemeral. Otherwise every
+            // normal app close would create an empty conversation in SQLite.
+            if !session.persisted
+                && session.messages.is_empty()
+                && session.agent_threads.is_empty()
+                && session.agent_thread_transcripts.is_empty()
+            {
+                continue;
+            }
+            if let Err(error) = self.runtime.database.save_conversation(&session.snapshot()) {
+                tracing::error!(
+                    conversation_id = %session.id,
+                    error = %error,
+                    "Could not persist conversation while quitting"
+                );
+            }
         }
     }
 
@@ -3024,6 +3106,7 @@ impl AverroesApp {
                 self.conversation_list
                     .remeasure_items(message_index..message_index + 1);
             }
+            self.persist_session(session_id, cx);
             cx.notify();
         }
     }
@@ -3048,6 +3131,7 @@ impl AverroesApp {
                 self.conversation_list
                     .remeasure_items(message_index..message_index + 1);
             }
+            self.persist_session(session_id, cx);
             cx.notify();
         }
     }
@@ -3074,6 +3158,7 @@ impl AverroesApp {
                 self.conversation_list
                     .remeasure_items(message_index..message_index + 1);
             }
+            self.persist_session(session_id, cx);
             cx.notify();
         }
     }
@@ -3096,6 +3181,8 @@ impl AverroesApp {
             })
             .is_some();
         if toggled {
+            let session_id = self.active().id.clone();
+            self.persist_session(&session_id, cx);
             cx.notify();
         }
     }
@@ -3116,6 +3203,8 @@ impl AverroesApp {
             })
             .is_some();
         if toggled {
+            let session_id = self.active().id.clone();
+            self.persist_session(&session_id, cx);
             cx.notify();
         }
     }
@@ -4470,7 +4559,7 @@ impl AverroesApp {
         });
         self.model_choices = initial_model_choices(&self.runtime);
         self.refresh_model_picker(window, cx);
-        self.sync_agent_selectors(window, cx);
+        self.sync_agent_model_selector(window, cx);
     }
 
     fn save_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5303,6 +5392,10 @@ impl AverroesApp {
     }
 
     fn close_active_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let closing_session_id = self.active().id.clone();
+        if !self.active().messages.is_empty() {
+            self.persist_session(&closing_session_id, cx);
+        }
         self.sessions.remove(self.active_session);
         if self.sessions.is_empty() {
             self.sessions
@@ -5818,7 +5911,10 @@ impl AverroesApp {
                             .tooltip(i18n::text(cx, "sidebar.search"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.conversation_search_open = !this.conversation_search_open;
-                                if !this.conversation_search_open {
+                                if this.conversation_search_open {
+                                    this.refresh_conversation_search(cx);
+                                    this.schedule_semantic_conversation_search(cx);
+                                } else {
                                     this.conversation_search_results.clear();
                                 }
                                 cx.notify();
@@ -8350,7 +8446,6 @@ impl AverroesApp {
             })
             .collect::<Vec<_>>();
         let editing = self.editing_agent_id.is_some();
-        let connection_selected = self.agent_form_connection_id.is_some();
         let model_selected = self.agent_form_model_id.is_some();
         let notice = self.notice.clone().map(|notice| {
             div()
@@ -8424,6 +8519,8 @@ impl AverroesApp {
                             .w(px(330.0))
                             .h_full()
                             .min_h(px(0.0))
+                            .flex()
+                            .flex_col()
                             .overflow_y_scrollbar()
                             .p(px(18.0))
                             .rounded(px(12.0))
@@ -8447,12 +8544,7 @@ impl AverroesApp {
                                     .text_color(theme.muted)
                                     .child(i18n::text(cx, "settings.agent_description_help")),
                             )
-                            .child(form_label(i18n::text(cx, "settings.agent_id"), theme))
-                            .child(Input::new(&self.agent_id_input).w_full())
-                            .child(
-                                form_label(i18n::text(cx, "settings.agent_name"), theme)
-                                    .mt(px(13.0)),
-                            )
+                            .child(form_label(i18n::text(cx, "settings.agent_name"), theme))
                             .child(Input::new(&self.agent_name_input).w_full())
                             .child(
                                 form_label(i18n::text(cx, "settings.agent_description"), theme)
@@ -8460,55 +8552,31 @@ impl AverroesApp {
                             )
                             .child(Input::new(&self.agent_description_input).w_full())
                             .child(
-                                form_label(i18n::text(cx, "settings.agent_connection"), theme)
-                                    .mt(px(13.0)),
-                            )
-                            .child(
-                                Select::new(&self.agent_connection_select)
-                                    .w_full()
-                                    .placeholder(i18n::text(cx, "settings.choose_provider"))
-                                    .search_placeholder(i18n::text(
-                                        cx,
-                                        "settings.search_providers",
-                                    )),
-                            )
-                            .child(
                                 form_label(i18n::text(cx, "settings.agent_model"), theme)
                                     .mt(px(13.0)),
                             )
                             .child(
                                 Select::new(&self.agent_model_select)
                                     .w_full()
-                                    .disabled(
-                                        !connection_selected || self.agent_model_labels.is_empty(),
-                                    )
-                                    .placeholder(i18n::text(cx, "settings.choose_model"))
-                                    .search_placeholder(i18n::text(cx, "settings.search_models")),
+                                    .h(px(28.0))
+                                    .small()
+                                    .appearance(false)
+                                    .placeholder(i18n::text(cx, "composer.model"))
+                                    .search_placeholder(i18n::text(cx, "composer.search_models"))
+                                    .disabled(self.model_choices.is_empty()),
                             )
                             .when_some(notice, |this, notice| this.child(notice))
                             .child(
-                                div()
-                                    .mt(px(18.0))
-                                    .flex()
-                                    .gap(px(8.0))
-                                    .child(
-                                        Button::new("clear-agent-form")
-                                            .secondary()
-                                            .label(i18n::text(cx, "settings.new_agent"))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.clear_agent_form(window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("save-agent")
-                                            .primary()
-                                            .icon(IconName::CircleCheck)
-                                            .label(i18n::text(cx, "settings.save_agent"))
-                                            .disabled(!connection_selected || !model_selected)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.save_agent_profile(window, cx)
-                                            })),
-                                    ),
+                                div().mt(px(18.0)).flex_none().flex().gap(px(8.0)).child(
+                                    Button::new("save-agent")
+                                        .primary()
+                                        .icon(IconName::CircleCheck)
+                                        .label(i18n::text(cx, "settings.save_agent"))
+                                        .disabled(!model_selected)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.save_agent_profile(window, cx)
+                                        })),
+                                ),
                             ),
                     ),
             )
@@ -9126,10 +9194,18 @@ impl AverroesApp {
                     ))
                     .child(
                         div()
+                            .id("about-averroes-card")
                             .mt(px(22.0))
                             .p(px(22.0))
                             .bg(theme.surface_subtle)
                             .rounded(px(14.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.surface_hover))
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.open_url(
+                                    "https://github.com/valendra-tech/valendra-landing-web",
+                                );
+                            }))
                             .flex()
                             .items_center()
                             .gap(px(18.0))
@@ -9169,10 +9245,16 @@ impl AverroesApp {
                     )
                     .child(
                         div()
+                            .id("about-valendra-card")
                             .mt(px(14.0))
                             .p(px(18.0))
                             .bg(theme.surface_subtle)
                             .rounded(px(12.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.surface_hover))
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.open_url("https://valendra.tech");
+                            }))
                             .flex()
                             .items_center()
                             .gap(px(12.0))
@@ -9440,27 +9522,23 @@ fn initial_model_choices(runtime: &AppRuntime) -> Vec<ModelChoice> {
         .collect()
 }
 
-fn agent_model_choices(
-    choices: &[ModelChoice],
-    connection_id: Option<&ConnectionId>,
-) -> Vec<(SharedString, String)> {
-    let Some(connection_id) = connection_id else {
-        return Vec::new();
-    };
-
-    choices
-        .iter()
-        .filter(|choice| &choice.connection_id == connection_id && choice.info.capabilities.chat)
-        .map(|choice| {
-            let model = &choice.info;
-            let label = if model.display_name.trim().is_empty() || model.display_name == model.id {
-                model.id.clone()
-            } else {
-                format!("{} · {}", model.display_name, model.id)
-            };
-            (label.into(), model.id.clone())
-        })
-        .collect()
+fn agent_id_from_name(name: &str) -> String {
+    let mut id = String::new();
+    for character in name.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            id.push(character.to_ascii_lowercase());
+        } else if !id.is_empty() && !id.ends_with('-') {
+            id.push('-');
+        }
+    }
+    while id.ends_with('-') {
+        id.pop();
+    }
+    if id.is_empty() {
+        "agent".to_owned()
+    } else {
+        id
+    }
 }
 
 fn embedding_model_choices(
@@ -9681,6 +9759,17 @@ fn format_tool_input(input: &serde_json::Value) -> String {
     serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string())
 }
 
+fn tool_input_for_display(input: &str) -> String {
+    if input.trim().is_empty() {
+        // A tool with no parameters still has a meaningful argument payload.
+        // Showing an explicit empty object also makes older persisted activity
+        // records inspectable instead of leaving a blank section.
+        "{}".into()
+    } else {
+        input.into()
+    }
+}
+
 fn tool_display_name(name: &str) -> String {
     match name {
         "bash" | "shell" | "terminal" => "Shell".into(),
@@ -9747,6 +9836,7 @@ fn localized_tool_activity_state_label(cx: &App, state: ToolActivityState) -> Sh
         ToolActivityState::Running => "tool.running",
         ToolActivityState::Completed => "tool.done",
         ToolActivityState::Failed => "tool.failed",
+        ToolActivityState::Interrupted => "tool.interrupted",
     };
     i18n::text(cx, key)
 }
@@ -9756,6 +9846,7 @@ fn tool_activity_state_color(state: ToolActivityState, theme: UiTheme) -> gpui::
         ToolActivityState::Running => theme.warning,
         ToolActivityState::Completed => theme.success,
         ToolActivityState::Failed => theme.destructive,
+        ToolActivityState::Interrupted => theme.muted,
     }
 }
 
@@ -9826,6 +9917,7 @@ fn agent_thread_status_label(status: AgentThreadStatus) -> &'static str {
         AgentThreadStatus::Running => "Running",
         AgentThreadStatus::Completed => "Done",
         AgentThreadStatus::Failed => "Failed",
+        AgentThreadStatus::Interrupted => "Interrupted",
     }
 }
 
@@ -9834,6 +9926,7 @@ fn agent_thread_status_color(status: AgentThreadStatus, theme: UiTheme) -> gpui:
         AgentThreadStatus::Running => theme.warning,
         AgentThreadStatus::Completed => theme.success,
         AgentThreadStatus::Failed => theme.destructive,
+        AgentThreadStatus::Interrupted => theme.muted,
     }
 }
 
@@ -10067,6 +10160,12 @@ fn render_tool_group_summary(
                 .map(|index| activities[*index].state)
                 .find(|state| *state == ToolActivityState::Running)
         })
+        .or_else(|| {
+            activity_indices
+                .iter()
+                .map(|index| activities[*index].state)
+                .find(|state| *state == ToolActivityState::Interrupted)
+        })
         .unwrap_or(ToolActivityState::Completed);
 
     div()
@@ -10153,7 +10252,7 @@ fn render_tool_activity(
                 .duration_ms
                 .map(format_tool_duration)
                 .unwrap_or_else(|| i18n::text(cx, "tool.running").to_string());
-            let input = activity.input.clone();
+            let input = tool_input_for_display(&activity.input);
             let output = if activity.output.is_empty() {
                 activity.summary.clone()
             } else {
@@ -10174,40 +10273,34 @@ fn render_tool_activity(
                                 .text_color(theme.faint)
                                 .child(i18n::text(cx, "tool.arguments")),
                         )
-                        .child(
-                            div()
-                                .max_h(px(180.0))
-                                .overflow_y_scrollbar()
-                                .font(UiTheme::mono_font())
-                                .text_size(px(11.0))
-                                .text_color(theme.muted)
-                                .whitespace_normal()
-                                .child(input),
-                        )
+                        .child(render_tool_detail(
+                            activity_id.clone(),
+                            input,
+                            ToolDetailSection::Arguments,
+                            theme.muted,
+                            11.0,
+                        ))
                         .child(
                             div()
                                 .text_size(px(10.0))
                                 .text_color(theme.faint)
                                 .child(i18n::text(cx, "tool.result")),
                         )
-                        .child(
-                            div()
-                                .max_h(px(220.0))
-                                .overflow_y_scrollbar()
-                                .font(UiTheme::mono_font())
-                                .text_size(px(11.0))
-                                .text_color(if activity.state == ToolActivityState::Failed {
-                                    theme.destructive
-                                } else {
-                                    theme.muted
-                                })
-                                .whitespace_normal()
-                                .child(if output.is_empty() {
-                                    i18n::text(cx, "tool.no_output").to_string()
-                                } else {
-                                    output.clone()
-                                }),
-                        ),
+                        .child(render_tool_detail(
+                            activity_id.clone(),
+                            if output.is_empty() {
+                                i18n::text(cx, "tool.no_output").to_string()
+                            } else {
+                                output.clone()
+                            },
+                            ToolDetailSection::Result,
+                            if activity.state == ToolActivityState::Failed {
+                                theme.destructive
+                            } else {
+                                theme.muted
+                            },
+                            11.0,
+                        )),
                 )
             } else {
                 None
@@ -10685,44 +10778,34 @@ fn render_agent_thread_tool_activity(
                     .text_color(theme.faint)
                     .child(i18n::text(cx, "tool.arguments")),
             )
-            .when(!activity.input.is_empty(), |this| {
-                this.child(
-                    div()
-                        .id(SharedString::from(format!("{activity_id}-input")))
-                        .max_h(px(130.0))
-                        .overflow_y_scrollbar()
-                        .font(UiTheme::mono_font())
-                        .text_size(px(10.0))
-                        .text_color(theme.faint)
-                        .whitespace_normal()
-                        .child(activity.input.clone()),
-                )
-            })
+            .child(render_tool_detail(
+                activity_id.clone(),
+                tool_input_for_display(&activity.input),
+                ToolDetailSection::Arguments,
+                theme.faint,
+                10.0,
+            ))
             .child(
                 div()
                     .text_size(px(10.0))
                     .text_color(theme.faint)
                     .child(i18n::text(cx, "tool.result")),
             )
-            .child(
-                div()
-                    .id(SharedString::from(format!("{activity_id}-output")))
-                    .max_h(px(180.0))
-                    .overflow_y_scrollbar()
-                    .font(UiTheme::mono_font())
-                    .text_size(px(10.0))
-                    .text_color(if activity.state == ToolActivityState::Failed {
-                        theme.destructive
-                    } else {
-                        theme.muted
-                    })
-                    .whitespace_normal()
-                    .child(if output.is_empty() {
-                        i18n::text(cx, "tool.no_output").to_string()
-                    } else {
-                        output
-                    }),
-            )
+            .child(render_tool_detail(
+                activity_id.clone(),
+                if output.is_empty() {
+                    i18n::text(cx, "tool.no_output").to_string()
+                } else {
+                    output
+                },
+                ToolDetailSection::Result,
+                if activity.state == ToolActivityState::Failed {
+                    theme.destructive
+                } else {
+                    theme.muted
+                },
+                10.0,
+            ))
     });
 
     div()
@@ -11857,48 +11940,9 @@ mod workspace_grouping_tests {
     }
 
     #[test]
-    fn agent_model_choices_are_filtered_by_connection_and_keep_model_ids_visible() {
-        let choices = vec![
-            ModelChoice {
-                connection_id: ConnectionId("openai".into()),
-                connection_name: "OpenAI".into(),
-                info: test_model("gpt-5.6", "GPT-5.6", true),
-            },
-            ModelChoice {
-                connection_id: ConnectionId("openai".into()),
-                connection_name: "OpenAI".into(),
-                info: test_model("text-embedding-3-small", "Text embedding", false),
-            },
-            ModelChoice {
-                connection_id: ConnectionId("copilot".into()),
-                connection_name: "Copilot".into(),
-                info: test_model("claude-sonnet-5", "Claude Sonnet 5", true),
-            },
-        ];
-
-        let models = agent_model_choices(&choices, Some(&ConnectionId("openai".into())));
-
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].1, "gpt-5.6");
-        assert!(models[0].0.contains("gpt-5.6"));
-    }
-
-    fn test_model(id: &str, display_name: &str, chat: bool) -> ModelInfo {
-        ModelInfo {
-            id: id.into(),
-            display_name: display_name.into(),
-            provider: "test".into(),
-            description: None,
-            capabilities: averroes_core::provider::ModelCapabilities {
-                chat,
-                embeddings: !chat,
-                vision: false,
-                tools: chat,
-            },
-            source: ModelSource::Live,
-            featured: false,
-            default_reasoning_effort: None,
-            available_reasoning_efforts: Vec::new(),
-        }
+    fn agent_id_is_derived_from_name() {
+        assert_eq!(agent_id_from_name("Research & News"), "research-news");
+        assert_eq!(agent_id_from_name("  Mi agente  "), "mi-agente");
+        assert_eq!(agent_id_from_name("!!!"), "agent");
     }
 }

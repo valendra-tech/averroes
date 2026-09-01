@@ -21,7 +21,9 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             updated_at INTEGER NOT NULL,
             binding_json TEXT NOT NULL DEFAULT '{}',
             context_summary TEXT,
-            context_usage_json TEXT NOT NULL DEFAULT '{}'
+            context_usage_json TEXT NOT NULL DEFAULT '{}',
+            agent_threads_json TEXT NOT NULL DEFAULT '[]',
+            agent_thread_transcripts_json TEXT NOT NULL DEFAULT '{}'
         );
         -- Pinned is a presentation group, not a recency signal. Keep the
         -- storage index aligned with the query used by the sidebar/search.
@@ -35,6 +37,10 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             role TEXT NOT NULL,
             text TEXT NOT NULL,
             reasoning TEXT NOT NULL DEFAULT '',
+            reasoning_complete INTEGER NOT NULL DEFAULT 1,
+            reasoning_expanded INTEGER NOT NULL DEFAULT 0,
+            tool_activities_json TEXT NOT NULL DEFAULT '[]',
+            expanded_tool_groups_json TEXT NOT NULL DEFAULT '[]',
             UNIQUE(conversation_id, position)
         );
         CREATE INDEX IF NOT EXISTS messages_conversation_id
@@ -118,6 +124,42 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    if !conversation_has_column(connection, "agent_threads_json")? {
+        connection.execute(
+            "ALTER TABLE conversations ADD COLUMN agent_threads_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+    if !conversation_has_column(connection, "agent_thread_transcripts_json")? {
+        connection.execute(
+            "ALTER TABLE conversations ADD COLUMN agent_thread_transcripts_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )?;
+    }
+    if !table_has_column(connection, "messages", "reasoning_complete")? {
+        connection.execute(
+            "ALTER TABLE messages ADD COLUMN reasoning_complete INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    if !table_has_column(connection, "messages", "reasoning_expanded")? {
+        connection.execute(
+            "ALTER TABLE messages ADD COLUMN reasoning_expanded INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !table_has_column(connection, "messages", "tool_activities_json")? {
+        connection.execute(
+            "ALTER TABLE messages ADD COLUMN tool_activities_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+    if !table_has_column(connection, "messages", "expanded_tool_groups_json")? {
+        connection.execute(
+            "ALTER TABLE messages ADD COLUMN expanded_tool_groups_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
     if !table_has_column(connection, "conversation_embeddings", "connection_id")? {
         connection.execute(
             "ALTER TABLE conversation_embeddings ADD COLUMN connection_id TEXT NOT NULL DEFAULT ''",
@@ -141,7 +183,7 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX conversation_embeddings_model
              ON conversation_embeddings(connection_id, model_id, conversation_id);",
     )?;
-    connection.pragma_update(None, "user_version", 10)?;
+    connection.pragma_update(None, "user_version", 11)?;
     Ok(())
 }
 

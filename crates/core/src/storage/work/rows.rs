@@ -1,6 +1,14 @@
 use super::types::{CheckpointStatus, TaskStatus, WorkMessage, WorkMessageRole};
 use super::{WorkCheckpoint, WorkConversation, WorkDatabaseError, WorkSource, WorkTask};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, types::Type, Connection, OptionalExtension, Transaction};
+use serde::de::DeserializeOwned;
+
+fn json_column<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T> {
+    let value = row.get::<_, String>(index)?;
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
+    })
+}
 
 pub(super) fn replace_messages(
     transaction: &Transaction<'_>,
@@ -9,17 +17,21 @@ pub(super) fn replace_messages(
     if content_equal(transaction, conversation)? {
         return Ok(());
     }
-    transaction.execute(
-        "DELETE FROM conversation_embeddings WHERE conversation_id = ?1",
-        params![conversation.id],
-    )?;
+    if !indexed_messages_equal(transaction, conversation)? {
+        transaction.execute(
+            "DELETE FROM conversation_embeddings WHERE conversation_id = ?1",
+            params![conversation.id],
+        )?;
+    }
     transaction.execute(
         "DELETE FROM messages WHERE conversation_id = ?1",
         params![conversation.id],
     )?;
     let mut statement = transaction.prepare(
-        "INSERT INTO messages (conversation_id, position, role, text, reasoning)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO messages
+            (conversation_id, position, role, text, reasoning, reasoning_complete,
+             reasoning_expanded, tool_activities_json, expanded_tool_groups_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
     for (position, message) in conversation.messages.iter().enumerate() {
         statement.execute(params![
@@ -28,12 +40,19 @@ pub(super) fn replace_messages(
             message.role.as_str(),
             message.text,
             message.reasoning,
+            message.reasoning_complete as i64,
+            message.reasoning_expanded as i64,
+            serde_json::to_string(&message.tool_activities)?,
+            serde_json::to_string(&message.expanded_tool_groups)?,
         ])?;
     }
     Ok(())
 }
 
-pub(super) fn messages_equal(
+/// Presentation-only changes (for example expanding a tool result) must not
+/// invalidate semantic embeddings. The index currently contains the visible
+/// message text and reasoning, so compare only those fields here.
+fn indexed_messages_equal(
     connection: &Connection,
     conversation: &WorkConversation,
 ) -> Result<bool, WorkDatabaseError> {
@@ -42,10 +61,46 @@ pub(super) fn messages_equal(
          WHERE conversation_id = ?1 ORDER BY position",
     )?;
     let rows = statement.query_map(params![conversation.id], |row| {
+        Ok((
+            WorkMessageRole::parse(&row.get::<_, String>(0)?),
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let stored = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let current = conversation
+        .messages
+        .iter()
+        .map(|message| {
+            (
+                message.role,
+                message.text.clone(),
+                message.reasoning.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(stored == current)
+}
+
+pub(super) fn messages_equal(
+    connection: &Connection,
+    conversation: &WorkConversation,
+) -> Result<bool, WorkDatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT role, text, reasoning, reasoning_complete, reasoning_expanded,
+                tool_activities_json, expanded_tool_groups_json
+         FROM messages
+         WHERE conversation_id = ?1 ORDER BY position",
+    )?;
+    let rows = statement.query_map(params![conversation.id], |row| {
         Ok(WorkMessage {
             role: WorkMessageRole::parse(&row.get::<_, String>(0)?),
             text: row.get(1)?,
             reasoning: row.get(2)?,
+            reasoning_complete: row.get::<_, i64>(3)? != 0,
+            reasoning_expanded: row.get::<_, i64>(4)? != 0,
+            tool_activities: json_column(row, 5)?,
+            expanded_tool_groups: json_column(row, 6)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()? == conversation.messages)
@@ -58,15 +113,28 @@ pub(super) fn content_equal(
     if !messages_equal(connection, conversation)? {
         return Ok(false);
     }
-    let stored_context = connection
+    let stored = connection
         .query_row(
-            "SELECT context_summary FROM conversations WHERE id = ?1",
+            "SELECT context_summary, agent_threads_json, agent_thread_transcripts_json
+             FROM conversations WHERE id = ?1",
             params![conversation.id],
-            |row| row.get::<_, Option<String>>(0),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
-        .optional()?
-        .flatten();
-    Ok(stored_context == conversation.context_summary)
+        .optional()?;
+    let Some((stored_context, stored_agents, stored_transcripts)) = stored else {
+        return Ok(false);
+    };
+    let stored_agents = serde_json::from_str::<serde_json::Value>(&stored_agents)?;
+    let stored_transcripts = serde_json::from_str::<serde_json::Value>(&stored_transcripts)?;
+    Ok(stored_context == conversation.context_summary
+        && stored_agents == serde_json::to_value(&conversation.agent_threads)?
+        && stored_transcripts == serde_json::to_value(&conversation.agent_thread_transcripts)?)
 }
 
 pub(super) fn load_messages(
@@ -74,7 +142,9 @@ pub(super) fn load_messages(
     conversation_id: &str,
 ) -> Result<Vec<WorkMessage>, WorkDatabaseError> {
     let mut statement = connection.prepare(
-        "SELECT role, text, reasoning FROM messages
+        "SELECT role, text, reasoning, reasoning_complete, reasoning_expanded,
+                tool_activities_json, expanded_tool_groups_json
+         FROM messages
          WHERE conversation_id = ?1 ORDER BY position",
     )?;
     let rows = statement.query_map(params![conversation_id], |row| {
@@ -82,6 +152,10 @@ pub(super) fn load_messages(
             role: WorkMessageRole::parse(&row.get::<_, String>(0)?),
             text: row.get(1)?,
             reasoning: row.get(2)?,
+            reasoning_complete: row.get::<_, i64>(3)? != 0,
+            reasoning_expanded: row.get::<_, i64>(4)? != 0,
+            tool_activities: json_column(row, 5)?,
+            expanded_tool_groups: json_column(row, 6)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
