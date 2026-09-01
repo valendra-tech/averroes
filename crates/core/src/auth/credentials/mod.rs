@@ -131,6 +131,16 @@ impl CredentialVault {
         &self.paths.vault
     }
 
+    /// Initialize and touch the platform credential store before the UI is
+    /// shown. The vault key is not a provider credential; creating it here
+    /// guarantees that first launch cannot silently skip the Keychain access
+    /// path because there is no item to read yet.
+    pub fn ensure_access(&self) -> Result<(), VaultError> {
+        let key = self.load_or_create_key()?;
+        validate_key(&key)?;
+        Ok(())
+    }
+
     fn load_or_create_key(&self) -> Result<Zeroizing<Vec<u8>>, VaultError> {
         if let Some(key) = self.key_provider.load()? {
             validate_key(&key)?;
@@ -334,6 +344,14 @@ mod tests {
         assert_eq!(&*fixture.vault.get(&id).unwrap(), "sk-secret");
         let file = std::fs::read_to_string(&fixture.paths.vault).unwrap();
         assert!(!file.contains("sk-secret"));
+    }
+
+    #[test]
+    fn ensure_access_initializes_the_platform_key_without_creating_a_vault_file() {
+        let fixture = fixture();
+        fixture.vault.ensure_access().unwrap();
+        assert_eq!(fixture.keys.save_count(), 1);
+        assert!(!fixture.paths.vault.exists());
     }
 
     #[test]

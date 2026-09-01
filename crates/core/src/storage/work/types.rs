@@ -14,6 +14,18 @@ pub struct WorkProject {
     pub last_opened_at: i64,
 }
 
+/// A virtual project/folder that groups conversations inside one workspace.
+/// It is intentionally not a filesystem path: the workspace remains the
+/// execution context, while this entity is only a navigation organization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkConversationFolder {
+    pub id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkMessageRole {
