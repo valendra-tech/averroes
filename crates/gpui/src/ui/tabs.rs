@@ -72,11 +72,11 @@ impl Render for SessionTabs {
             .flex()
             .flex_row()
             .items_center()
-            .h(px(36.0))
+            .h(px(42.0))
             .pl(px(78.0))
             .pr(px(12.0))
             .gap_1()
-            .bg(theme.card)
+            .bg(theme.surface_subtle)
             .border_b_1()
             .border_color(theme.border)
             .font(UiTheme::ui_font())
@@ -88,6 +88,7 @@ impl Render for SessionTabs {
                     .w(px(28.0))
                     .h(px(28.0))
                     .rounded(px(UiTheme::RADIUS))
+                    .bg(theme.card)
                     .text_color(theme.primary)
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.accent))
@@ -101,7 +102,7 @@ impl Render for SessionTabs {
                 let ids = session_tab_ids(&tab.id);
                 let tab_id = ids.tab;
                 let close_id = ids.close;
-                let session_id = tab.id.clone();
+                let select_id = tab.id.clone();
                 let close_session_id = tab.id.clone();
                 let title = tab.title.clone();
                 let is_active = tab.id == active_id;
@@ -137,26 +138,26 @@ impl Render for SessionTabs {
                     } else {
                         rgba(0x00000000)
                     })
-                    .bg(if is_active { theme.accent } else { theme.card })
+                    .bg(if is_active { theme.card } else { theme.surface_subtle })
                     .text_xs()
                     .text_color(if is_active {
                         theme.foreground
                     } else {
                         theme.muted_foreground
                     })
-                    .when(is_active, |el| el.font_weight(FontWeight::BOLD))
+                    .font_weight(FontWeight::SEMIBOLD)
                     .cursor_pointer()
                     .group(group.clone())
                     .hover(move |style| {
                         if is_active {
-                            style
+                            style.shadow_sm()
                         } else {
-                            style.border_color(theme.border)
+                            style.bg(theme.surface_hover).border_color(theme.border)
                         }
                     })
                     .id(ElementId::Name(tab_id.into()))
                     .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                        this.select_session(session_id.clone(), cx);
+                        this.select_session(select_id.clone(), cx);
                     }))
                     .child(marker)
                     .child(

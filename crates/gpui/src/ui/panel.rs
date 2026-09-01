@@ -8,6 +8,7 @@ pub fn panel(theme: UiTheme) -> Div {
         .border_1()
         .border_color(theme.border)
         .rounded(px(UiTheme::RADIUS))
+        .shadow_sm()
         .font(UiTheme::ui_font())
 }
 

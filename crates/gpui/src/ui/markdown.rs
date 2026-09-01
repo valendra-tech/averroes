@@ -5,11 +5,50 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 pub fn render_markdown(theme: UiTheme, content: &str) -> Div {
     let parser = Parser::new_ext(content, Options::all());
     let elements = build_document(parser, theme);
+    div().flex().flex_col().gap(px(6.0)).children(elements)
+}
+
+/// Makes provider reasoning readable without changing the stored value.
+///
+/// Some OpenAI-compatible gateways concatenate summary chunks with `****` and
+/// omit the line break between them. That marker is transport noise rather
+/// than useful Markdown. Keep the original reasoning in the conversation and
+/// only repair it at the last moment before rendering.
+pub fn normalize_reasoning_for_display(content: &str) -> String {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    normalized
+        .split("****")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Renders a response while it is still arriving from a provider.
+///
+/// Markdown is block-oriented, and parsing the complete accumulated response
+/// on every delta is one of the most expensive operations in the streaming UI.
+/// Keep the live path deliberately cheap: the final render switches to the
+/// complete Markdown renderer as soon as the provider closes the block. This
+/// also avoids repeatedly rebuilding large code blocks and list trees while
+/// only a few characters have changed.
+pub fn render_streaming_markdown(theme: UiTheme, content: &str) -> Div {
+    render_plain_text(theme, content)
+}
+
+fn render_plain_text(theme: UiTheme, content: &str) -> Div {
     div()
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .children(elements)
+        .w_full()
+        .min_w(px(0.0))
+        .text_sm()
+        .text_color(theme.foreground)
+        .children(content.split('\n').map(|line| {
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .whitespace_normal()
+                .child(line.trim_end_matches('\r').to_string())
+        }))
 }
 
 fn build_document<'a>(parser: Parser<'a>, theme: UiTheme) -> Vec<Div> {
@@ -41,7 +80,7 @@ fn build_document<'a>(parser: Parser<'a>, theme: UiTheme) -> Vec<Div> {
                         current_block.push(
                             div()
                                 .text_xs()
-                                .text_color(theme.muted_foreground)
+                                .text_color(theme.muted)
                                 .font(UiTheme::mono_font())
                                 .mb(px(2.0))
                                 .child(lang.to_string()),
@@ -65,8 +104,11 @@ fn build_document<'a>(parser: Parser<'a>, theme: UiTheme) -> Vec<Div> {
                 TagEnd::Paragraph => {
                     if !buffer.trim().is_empty() {
                         let block = build_text_block(
-                            &buffer, &inline_stack, theme,
-                            heading_level.take(), in_blockquote,
+                            &buffer,
+                            &inline_stack,
+                            theme,
+                            heading_level.take(),
+                            in_blockquote,
                         );
                         current_block.push(block);
                     }
@@ -76,8 +118,11 @@ fn build_document<'a>(parser: Parser<'a>, theme: UiTheme) -> Vec<Div> {
                 TagEnd::Heading(_) => {
                     if !buffer.trim().is_empty() {
                         let block = build_text_block(
-                            &buffer, &inline_stack, theme,
-                            heading_level.take(), in_blockquote,
+                            &buffer,
+                            &inline_stack,
+                            theme,
+                            heading_level.take(),
+                            in_blockquote,
                         );
                         current_block.push(block);
                     }
@@ -129,14 +174,13 @@ fn build_document<'a>(parser: Parser<'a>, theme: UiTheme) -> Vec<Div> {
                                 .flex()
                                 .flex_row()
                                 .gap_2()
-                                .child(
-                                    div()
-                                        .text_color(theme.muted_foreground)
-                                        .flex_none()
-                                        .child("\u{2022}"),
-                                )
+                                .child(div().text_color(theme.muted).flex_none().child("\u{2022}"))
                                 .child(build_text_block(
-                                    &buffer, &inline_stack, theme, None, false,
+                                    &buffer,
+                                    &inline_stack,
+                                    theme,
+                                    None,
+                                    false,
                                 )),
                         );
                         buffer.clear();
@@ -165,7 +209,11 @@ fn build_document<'a>(parser: Parser<'a>, theme: UiTheme) -> Vec<Div> {
             Event::Code(code) => {
                 if !buffer.is_empty() {
                     current_block.push(build_text_block(
-                        &std::mem::take(&mut buffer), &inline_stack, theme, heading_level, in_blockquote,
+                        &std::mem::take(&mut buffer),
+                        &inline_stack,
+                        theme,
+                        heading_level,
+                        in_blockquote,
                     ));
                 }
                 current_block.push(
@@ -191,17 +239,15 @@ fn build_document<'a>(parser: Parser<'a>, theme: UiTheme) -> Vec<Div> {
             Event::Rule => {
                 if !buffer.trim().is_empty() {
                     current_block.push(build_text_block(
-                        &buffer, &inline_stack, theme, None, false,
+                        &buffer,
+                        &inline_stack,
+                        theme,
+                        None,
+                        false,
                     ));
                     buffer.clear();
                 }
-                current_block.push(
-                    div()
-                        .w_full()
-                        .h(px(1.0))
-                        .bg(theme.border)
-                        .my(px(8.0)),
-                );
+                current_block.push(div().w_full().h(px(1.0)).bg(theme.border).my(px(8.0)));
             }
 
             _ => {}
@@ -209,9 +255,7 @@ fn build_document<'a>(parser: Parser<'a>, theme: UiTheme) -> Vec<Div> {
     }
 
     if !buffer.trim().is_empty() {
-        current_block.push(build_text_block(
-            &buffer, &inline_stack, theme, None, false,
-        ));
+        current_block.push(build_text_block(&buffer, &inline_stack, theme, None, false));
     }
 
     if !current_block.is_empty() {
@@ -278,14 +322,10 @@ fn build_text_block(
                 div()
                     .w(px(3.0))
                     .flex_none()
-                    .bg(theme.brand_magenta)
+                    .bg(theme.focus_ring)
                     .rounded(px(2.0)),
             )
-            .child(
-                block
-                    .pl(px(10.0))
-                    .text_color(theme.muted_foreground),
-            );
+            .child(block.pl(px(10.0)).text_color(theme.muted));
     }
 
     let lines: Vec<Div> = text
@@ -300,4 +340,23 @@ fn build_text_block(
         .collect();
 
     block.children(lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_reasoning_for_display;
+
+    #[test]
+    fn reasoning_display_separates_concatenated_provider_chunks() {
+        assert_eq!(
+            normalize_reasoning_for_display("First point****Second point\r\n\r\nThird point"),
+            "First point\n\nSecond point\n\nThird point"
+        );
+    }
+
+    #[test]
+    fn reasoning_display_keeps_all_content() {
+        let content = "A\n\nB\n\nC";
+        assert_eq!(normalize_reasoning_for_display(content), content);
+    }
 }

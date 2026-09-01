@@ -6,18 +6,9 @@ use crate::provider::{ChatRequest, Provider};
 
 pub struct SummaryStrategy;
 
-fn rough_token_count(msg: &ChatMessage) -> usize {
-    match &msg.content {
-        MessageContent::Text(t) => t.len() / 4,
-        MessageContent::Parts(parts) => parts
-            .iter()
-            .map(|p| match p {
-                crate::provider::types::ContentPart::Text { text } => text.len() / 4,
-                _ => 200,
-            })
-            .sum(),
-    }
-}
+const MAX_SUMMARY_INPUT_CHARS: usize = 64_000;
+const MAX_SUMMARY_OUTPUT_CHARS: usize = 8_000;
+const SUMMARY_TRUNCATION_MARKER: &str = "\n[…older context omitted from summary input…]\n";
 
 fn message_text(msg: &ChatMessage) -> String {
     match &msg.content {
@@ -46,42 +37,57 @@ async fn generate_summary(
     model: &str,
     messages: &[ChatMessage],
 ) -> std::result::Result<String, crate::compaction::CompactionError> {
-    let text = fallback_concat(messages);
+    let text = bounded_summary_input(messages);
     let request = ChatRequest {
         model: model.to_string(),
         messages: vec![ChatMessage {
             role: Role::User,
             content: MessageContent::Text(format!(
-                "Please provide a concise summary of the following conversation:\n\n{}",
+                "Rewrite the following conversation into a compact understood context.\n\nReturn only these sections, with concise factual bullets:\nObjective:\nDecisions:\nConstraints:\nOpen questions:\nCurrent state:\nNext action:\n\nDo not reproduce the transcript, hidden reasoning, or tool payloads. Do not invent missing facts. Keep it under 1,200 words.\n\n{}",
                 text
             )),
             tool_call_id: None,
             tool_calls: None,
         }],
         tools: vec![],
-        max_tokens: None,
         temperature: Some(0.3),
         system: Some(
-            "You are a summarization assistant. Produce a brief, accurate summary.".into(),
+            "You are the conversation context editor. Preserve only useful state for continuing the work.".into(),
         ),
+        reasoning_effort: None,
     };
 
     let response = provider.chat(request).await?;
     Ok(message_text(&response.message))
 }
 
-#[async_trait]
-impl CompactionStrategy for SummaryStrategy {
-    fn should_compact(
-        &self,
-        messages: &[ChatMessage],
-        context_limit: usize,
-        config: &CompactionConfig,
-    ) -> bool {
-        let estimated = self.estimate_tokens(messages);
-        estimated > (config.threshold * context_limit as f64) as usize && messages.len() > 2
+fn bounded_summary_input(messages: &[ChatMessage]) -> String {
+    let text = fallback_concat(messages);
+    let max_chars = MAX_SUMMARY_INPUT_CHARS;
+    let text_chars = text.chars().count();
+    if max_chars == 0 {
+        return String::new();
+    }
+    if text_chars <= max_chars {
+        return text;
     }
 
+    let marker_len = SUMMARY_TRUNCATION_MARKER.chars().count();
+    if max_chars <= marker_len + 2 {
+        return text.chars().take(max_chars).collect();
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    let available = max_chars - marker_len;
+    let head_len = available / 2;
+    let tail_len = available - head_len;
+    let head = chars[..head_len].iter().collect::<String>();
+    let tail = chars[chars.len() - tail_len..].iter().collect::<String>();
+    format!("{head}{SUMMARY_TRUNCATION_MARKER}{tail}")
+}
+
+#[async_trait]
+impl CompactionStrategy for SummaryStrategy {
     async fn compact(
         &self,
         messages: &[ChatMessage],
@@ -109,6 +115,7 @@ impl CompactionStrategy for SummaryStrategy {
         } else {
             fallback_concat(middle)
         };
+        let summary_text = bounded_summary_output(&summary_text);
 
         let summary_msg = ChatMessage {
             role: Role::System,
@@ -128,10 +135,19 @@ impl CompactionStrategy for SummaryStrategy {
             original_count,
         })
     }
+}
 
-    fn estimate_tokens(&self, messages: &[ChatMessage]) -> usize {
-        messages.iter().map(rough_token_count).sum()
+fn bounded_summary_output(summary: &str) -> String {
+    let summary = summary.trim();
+    if summary.chars().count() <= MAX_SUMMARY_OUTPUT_CHARS {
+        return summary.to_owned();
     }
+    let mut output = summary
+        .chars()
+        .take(MAX_SUMMARY_OUTPUT_CHARS)
+        .collect::<String>();
+    output.push_str("\n[…context summary truncated…]");
+    output
 }
 
 #[cfg(test)]
@@ -157,6 +173,7 @@ mod tests {
                     tool_calls: None,
                 },
                 usage: None,
+                reasoning: None,
                 stop_reason: None,
             })
         }

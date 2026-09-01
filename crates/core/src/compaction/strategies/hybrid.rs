@@ -9,15 +9,6 @@ pub struct HybridStrategy;
 
 #[async_trait]
 impl CompactionStrategy for HybridStrategy {
-    fn should_compact(
-        &self,
-        messages: &[ChatMessage],
-        context_limit: usize,
-        config: &CompactionConfig,
-    ) -> bool {
-        TrimStrategy.should_compact(messages, context_limit, config)
-    }
-
     async fn compact(
         &self,
         messages: &[ChatMessage],
@@ -50,10 +41,6 @@ impl CompactionStrategy for HybridStrategy {
             messages: compacted,
             original_count,
         })
-    }
-
-    fn estimate_tokens(&self, messages: &[ChatMessage]) -> usize {
-        TrimStrategy.estimate_tokens(messages)
     }
 }
 

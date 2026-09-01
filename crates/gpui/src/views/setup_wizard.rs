@@ -213,7 +213,7 @@ impl SetupWizardView {
         self.input_selection.set_cursor(cursor);
         self.input_selection.unmark();
         self.error = None;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -233,7 +233,7 @@ impl SetupWizardView {
     ) {
         if event.keystroke.key == "escape" || event.keystroke.key == "enter" {
             self.focused_field = None;
-            window.blur();
+            window.blur(cx);
             cx.stop_propagation();
             cx.notify();
             return;

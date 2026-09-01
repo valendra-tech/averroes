@@ -1,26 +1,36 @@
 pub mod orchestration;
 pub mod registry;
 
+mod budget;
+mod context;
+mod streaming;
+mod tools;
+
+use crate::agent::orchestration::AgentRunner;
 use crate::compaction::strategies::{HybridStrategy, SummaryStrategy, TrimStrategy};
 use crate::compaction::{
     sanitize_tool_history, CompactionConfig, CompactionStrategy, CompactionStrategyType,
 };
-use crate::provider::types::{
-    ContentPart, FunctionCall, MessageContent, Role, TokenUsage, ToolCall,
-};
-use crate::provider::{
-    ChatMessage, ChatRequest, ChatResponse, ChatStream, Provider, ProviderError, StreamEvent,
-    ToolDefinition,
-};
-use crate::runtime::{CallPermit, ResourceGovernor, TokenReservation};
-use crate::tool::{ToolContext, ToolRegistry, ToolResult};
+use crate::provider::types::{MessageContent, Role};
+use crate::provider::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolDefinition};
+use crate::runtime::ResourceGovernor;
+use crate::skill::SkillIndex;
+use crate::tool::{ToolActivation, ToolRegistry};
 use anyhow::Result;
-use async_trait::async_trait;
-use futures::{Stream, StreamExt};
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+
+pub use context::ContextUsage;
+
+const MAX_AUTO_SKILLS: usize = 3;
+const MAX_AUTO_SKILL_CONTEXT_BYTES: usize = 32 * 1024;
+const MAX_SKILL_CATALOG_BYTES: usize = 8 * 1024;
+
+pub(super) fn is_delegation_tool(name: &str) -> bool {
+    matches!(name, "list_agents" | "call_agent" | "call_agents")
+}
+
+use budget::{message_text, usage_input_tokens, GovernedProvider, RunStateGuard};
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -31,7 +41,10 @@ pub struct AgentConfig {
     pub max_iterations: usize,
     pub compaction: CompactionConfig,
     pub temperature: Option<f32>,
-    pub max_tokens: Option<u32>,
+    pub reasoning_effort: Option<String>,
+    /// Child agents are deliberately leaf workers and cannot start another
+    /// delegation chain.
+    pub allow_delegation: bool,
 }
 
 impl Default for AgentConfig {
@@ -44,7 +57,8 @@ impl Default for AgentConfig {
             max_iterations: 50,
             compaction: CompactionConfig::default(),
             temperature: None,
-            max_tokens: None,
+            reasoning_effort: None,
+            allow_delegation: true,
         }
     }
 }
@@ -63,16 +77,83 @@ pub enum AgentState {
 
 #[derive(Debug, Clone)]
 pub enum AgentStreamEvent {
-    TextDelta { text: String },
+    TextDelta {
+        text: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
+    ReasoningFinished,
+    /// A provider has announced a tool call while its response is still
+    /// streaming. The UI can show the call immediately and update it when
+    /// execution begins.
+    ToolPreparing {
+        call_id: String,
+        name: String,
+        input: serde_json::Value,
+        /// Whether the provider announced this call while emitting the
+        /// assistant's reasoning stream. The UI uses this to keep the tool
+        /// inside the reasoning disclosure even after the provider closes
+        /// the message and execution starts.
+        inside_reasoning: bool,
+    },
+    ToolStarted {
+        call_id: Option<String>,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolFinished {
+        call_id: Option<String>,
+        name: String,
+        success: bool,
+        summary: String,
+        /// A bounded detail payload for the in-conversation tool inspector.
+        /// It is deliberately not persisted in `WorkSource` or conversation
+        /// history as a source entry.
+        output: String,
+        metadata: Option<serde_json::Value>,
+    },
+    ContextUpdated {
+        usage: ContextUsage,
+    },
+    CompactionStarted {
+        reason: String,
+    },
+    CompactionFinished {
+        reason: String,
+        original_messages: usize,
+        retained_messages: usize,
+        understood_context: Option<String>,
+    },
+    /// A delegated thread has been created and is about to receive its first
+    /// streamed event. Keeping the snapshot in the event lets the UI render
+    /// the child immediately, before its first token or tool call arrives.
+    DelegatedAgentStarted {
+        thread: crate::agent::orchestration::AgentThreadSnapshot,
+    },
+    /// Stream events emitted by a child agent. The wrapper is recursive so a
+    /// delegated agent can delegate again without flattening thread identity.
+    DelegatedAgentEvent {
+        thread_id: String,
+        event: Box<AgentStreamEvent>,
+    },
 }
 
 pub struct Agent {
     config: AgentConfig,
     runtime: Arc<std::sync::RwLock<AgentRuntime>>,
     tool_registry: Arc<ToolRegistry>,
+    tool_activation: Arc<ToolActivation>,
     state: Arc<Mutex<AgentState>>,
     run_lock: Arc<tokio::sync::Mutex<()>>,
     messages: Arc<tokio::sync::Mutex<Vec<ChatMessage>>>,
+    last_context_usage: Arc<Mutex<Option<ContextUsage>>>,
+    understood_context: Arc<std::sync::RwLock<Option<String>>>,
+    global_memory_prompt: Arc<std::sync::RwLock<Option<String>>>,
+    skill_index: Arc<std::sync::RwLock<Option<Arc<SkillIndex>>>>,
+    memory_search_backend:
+        Arc<std::sync::RwLock<Option<Arc<dyn crate::tool::MemorySearchBackend>>>>,
+    agent_runner: Arc<Mutex<Option<Arc<dyn AgentRunner>>>>,
     agent_id: String,
     session_id: String,
     working_dir: PathBuf,
@@ -83,259 +164,7 @@ struct AgentRuntime {
     provider: Arc<dyn Provider>,
     model: String,
     governor: Arc<ResourceGovernor>,
-}
-
-fn estimate_request_tokens(request: &ChatRequest) -> u64 {
-    let message_chars = request.messages.iter().fold(0u64, |total, message| {
-        let content_chars = match &message.content {
-            MessageContent::Text(text) => text.chars().count() as u64,
-            MessageContent::Parts(parts) => parts.iter().fold(0u64, |total, part| {
-                let chars = match part {
-                    ContentPart::Text { text } => text.chars().count() as u64,
-                    ContentPart::Image { source } => (source.media_type.chars().count() as u64)
-                        .saturating_add(source.data.chars().count() as u64),
-                    ContentPart::ToolUse { id, name, input } => (id.chars().count() as u64)
-                        .saturating_add(name.chars().count() as u64)
-                        .saturating_add(json_value_chars(input)),
-                    ContentPart::ToolResult {
-                        tool_use_id,
-                        content,
-                    } => (tool_use_id.chars().count() as u64)
-                        .saturating_add(content.chars().count() as u64),
-                };
-                total.saturating_add(chars)
-            }),
-        };
-        let tool_call_chars = message
-            .tool_calls
-            .as_ref()
-            .map(|tool_calls| {
-                tool_calls.iter().fold(0u64, |total, tool_call| {
-                    total
-                        .saturating_add(tool_call.id.chars().count() as u64)
-                        .saturating_add(tool_call.call_type.chars().count() as u64)
-                        .saturating_add(tool_call.function.name.chars().count() as u64)
-                        .saturating_add(tool_call.function.arguments.chars().count() as u64)
-                })
-            })
-            .unwrap_or(0);
-        total
-            .saturating_add(content_chars)
-            .saturating_add(tool_call_chars)
-    });
-    let tool_chars = request.tools.iter().fold(0u64, |total, tool| {
-        total
-            .saturating_add(tool.name.chars().count() as u64)
-            .saturating_add(tool.description.chars().count() as u64)
-            .saturating_add(json_value_chars(&tool.input_schema))
-    });
-    let system_chars = request
-        .system
-        .as_ref()
-        .map(|system| system.chars().count() as u64)
-        .unwrap_or(0);
-    let request_chars = message_chars
-        .saturating_add(tool_chars)
-        .saturating_add(system_chars);
-
-    (request_chars / 4).saturating_add(request.max_tokens.unwrap_or(4096) as u64)
-}
-
-fn json_value_chars(value: &serde_json::Value) -> u64 {
-    serde_json::to_string(value)
-        .map(|serialized| serialized.chars().count() as u64)
-        .unwrap_or(0)
-}
-
-fn actual_usage_tokens(usage: &TokenUsage) -> u64 {
-    // The governor counts every token category reported by a provider.
-    usage
-        .input_tokens
-        .saturating_add(usage.output_tokens)
-        .saturating_add(usage.cache_read_input_tokens.unwrap_or(0))
-        .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0))
-}
-
-fn message_text(message: &ChatMessage) -> String {
-    match &message.content {
-        MessageContent::Text(text) => text.clone(),
-        MessageContent::Parts(parts) => parts
-            .iter()
-            .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
-                ContentPart::ToolResult { content, .. } => Some(content.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
-
-struct GovernedProvider {
-    provider: Arc<dyn Provider>,
-    governor: Arc<ResourceGovernor>,
-}
-
-struct GovernedChatStream {
-    inner: Option<ChatStream>,
-    permit: Option<CallPermit>,
-    reservation: Option<TokenReservation>,
-    finished: bool,
-}
-
-impl Unpin for GovernedChatStream {}
-
-impl Stream for GovernedChatStream {
-    type Item = crate::provider::Result<StreamEvent>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if this.finished {
-            return Poll::Ready(None);
-        }
-
-        let poll = match this.inner.as_mut() {
-            Some(inner) => Pin::new(inner).poll_next(cx),
-            None => Poll::Ready(None),
-        };
-
-        match poll {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => {
-                this.finished = true;
-                this.inner.take();
-                if let Some(mut reservation) = this.reservation.take() {
-                    reservation.disarm();
-                }
-                this.permit.take();
-                Poll::Ready(None)
-            }
-            Poll::Ready(Some(Err(error))) => {
-                this.finished = true;
-                this.inner.take();
-                this.reservation.take();
-                this.permit.take();
-                Poll::Ready(Some(Err(error)))
-            }
-            Poll::Ready(Some(Ok(event))) => match &event {
-                StreamEvent::MessageEnd { usage } => {
-                    this.inner.take();
-                    let reconciled = if let Some(mut reservation) = this.reservation.take() {
-                        if let Some(usage) = usage {
-                            reservation.reconcile(actual_usage_tokens(usage))
-                        } else {
-                            reservation.disarm();
-                            true
-                        }
-                    } else {
-                        true
-                    };
-                    this.finished = true;
-                    this.permit.take();
-                    if reconciled {
-                        Poll::Ready(Some(Ok(event)))
-                    } else {
-                        Poll::Ready(Some(Err(ProviderError::Other(
-                            "Token budget exhausted after governed stream response".into(),
-                        ))))
-                    }
-                }
-                StreamEvent::Error { .. } => {
-                    this.finished = true;
-                    this.inner.take();
-                    this.reservation.take();
-                    this.permit.take();
-                    Poll::Ready(Some(Ok(event)))
-                }
-                _ => Poll::Ready(Some(Ok(event))),
-            },
-        }
-    }
-}
-
-struct RunStateGuard {
-    state: Arc<Mutex<AgentState>>,
-    finished: bool,
-}
-
-impl RunStateGuard {
-    fn new(state: Arc<Mutex<AgentState>>) -> Self {
-        Self {
-            state,
-            finished: false,
-        }
-    }
-
-    fn finish(&mut self) {
-        self.finished = true;
-    }
-}
-
-impl Drop for RunStateGuard {
-    fn drop(&mut self) {
-        if !self.finished {
-            *self.state.lock().unwrap() = AgentState::Cancelled;
-        }
-    }
-}
-
-#[async_trait]
-impl Provider for GovernedProvider {
-    async fn chat(&self, request: ChatRequest) -> crate::provider::Result<ChatResponse> {
-        let _permit = self.governor.acquire_call_permit().await;
-        let reserved_tokens = estimate_request_tokens(&request);
-        let Some(mut reservation) = self.governor.reserve_tokens(reserved_tokens) else {
-            return Err(ProviderError::Other(
-                "Token budget exhausted before compaction provider request".into(),
-            ));
-        };
-
-        let response = self.provider.chat(request).await?;
-        if let Some(usage) = response.usage.as_ref() {
-            if !reservation.reconcile(actual_usage_tokens(usage)) {
-                return Err(ProviderError::Other(
-                    "Token budget exhausted after compaction provider response".into(),
-                ));
-            }
-        } else {
-            reservation.disarm();
-        }
-
-        Ok(response)
-    }
-
-    async fn chat_stream(
-        &self,
-        request: ChatRequest,
-    ) -> crate::provider::Result<crate::provider::ChatStream> {
-        let permit = self.governor.acquire_call_permit().await;
-        let reserved_tokens = estimate_request_tokens(&request);
-        let Some(reservation) = self.governor.reserve_tokens(reserved_tokens) else {
-            return Err(ProviderError::Other(
-                "Token budget exhausted before compaction provider request".into(),
-            ));
-        };
-
-        let stream = self.provider.chat_stream(request).await?;
-        Ok(Box::new(GovernedChatStream {
-            inner: Some(stream),
-            permit: Some(permit),
-            reservation: Some(reservation),
-            finished: false,
-        }))
-    }
-
-    fn context_window(&self, model: &str) -> usize {
-        self.provider.context_window(model)
-    }
-
-    fn supports_tools(&self, model: &str) -> bool {
-        self.provider.supports_tools(model)
-    }
-
-    fn default_model(&self) -> &str {
-        self.provider.default_model()
-    }
+    reasoning_effort: Option<String>,
 }
 
 impl Agent {
@@ -361,6 +190,8 @@ impl Agent {
             }
             Arc::new(tokio::sync::Mutex::new(msgs))
         };
+        let reasoning_effort = config.reasoning_effort.clone();
+        let tool_activation = Arc::new(ToolActivation::new(config.tools.iter().cloned()));
 
         Self {
             config,
@@ -368,11 +199,19 @@ impl Agent {
                 provider,
                 model,
                 governor,
+                reasoning_effort,
             })),
             tool_registry,
+            tool_activation,
             state: Arc::new(Mutex::new(AgentState::Idle)),
             run_lock: Arc::new(tokio::sync::Mutex::new(())),
             messages,
+            last_context_usage: Arc::new(Mutex::new(None)),
+            understood_context: Arc::new(std::sync::RwLock::new(None)),
+            global_memory_prompt: Arc::new(std::sync::RwLock::new(None)),
+            skill_index: Arc::new(std::sync::RwLock::new(None)),
+            memory_search_backend: Arc::new(std::sync::RwLock::new(None)),
+            agent_runner: Arc::new(Mutex::new(None)),
             agent_id,
             session_id,
             working_dir,
@@ -387,6 +226,102 @@ impl Agent {
         *self.state.lock().unwrap()
     }
 
+    /// Returns the latest provider usage. Before the first provider response,
+    /// token usage is intentionally unknown.
+    pub async fn context_usage(&self) -> ContextUsage {
+        let runtime = self.runtime_snapshot();
+        let context_limit = runtime.provider.context_window(&runtime.model);
+        if let Some(usage) = self.last_context_usage.lock().unwrap().as_ref() {
+            return *usage;
+        }
+        ContextUsage::unknown(context_limit)
+    }
+
+    /// Generates a short conversation title with the selected provider.
+    ///
+    /// Title generation is intentionally separate from the agent history, so
+    /// it cannot pollute the conversation context or appear as an assistant
+    /// message. It still goes through the governor to share provider limits
+    /// with normal requests.
+    pub async fn generate_title(&self, user_message: &str) -> Result<String> {
+        let runtime = self.runtime_snapshot();
+        let provider = GovernedProvider {
+            provider: runtime.provider,
+            governor: runtime.governor,
+        };
+        crate::storage::session::generate_session_title(&provider, &runtime.model, user_message)
+            .await
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// Compacts the agent history immediately and returns the resulting
+    /// context usage. This is deliberately serialized with normal runs so a
+    /// manual compaction can never mutate the request while it is in flight.
+    pub async fn force_compact(&self) -> Result<ContextUsage> {
+        let _run_lock = self.run_lock.lock().await;
+        let runtime = self.runtime_snapshot();
+        *self.last_context_usage.lock().unwrap() = None;
+        self.compact_with_runtime(&runtime).await?;
+        self.set_state(AgentState::Idle);
+        let usage = self.context_usage().await;
+        *self.last_context_usage.lock().unwrap() = Some(usage);
+        Ok(usage)
+    }
+
+    /// Returns the number of messages currently held by the agent. The UI
+    /// uses this around manual compaction to report the actual reduction.
+    pub async fn message_count(&self) -> usize {
+        self.messages.lock().await.len()
+    }
+
+    /// Restores the provider-reported usage associated with a persisted
+    /// conversation. Unknown usage is intentionally not turned into a guess.
+    pub fn set_context_usage(&self, usage: ContextUsage) {
+        *self.last_context_usage.lock().unwrap() =
+            (usage.input_tokens.is_some() || usage.output_tokens.is_some()).then_some(usage);
+    }
+
+    /// Returns the latest compact, model-generated understanding of this
+    /// conversation. It is kept separate from visible messages so a later
+    /// request can carry the useful state without replaying stale detail.
+    pub fn understood_context(&self) -> Option<String> {
+        self.understood_context.read().unwrap().clone()
+    }
+
+    /// Restores a previously generated conversation understanding when the
+    /// UI reopens an existing session.
+    pub fn set_understood_context(&self, context: Option<String>) {
+        *self.understood_context.write().unwrap() = context
+            .map(|context| context.trim().to_owned())
+            .filter(|context| !context.is_empty());
+    }
+
+    pub async fn restore_conversation_history(&self, history: Vec<ChatMessage>) {
+        let _run_lock = self.run_lock.lock().await;
+        let mut messages = self.messages.lock().await;
+        let history = crate::compaction::sanitize_tool_history(history);
+        let system_message = messages
+            .first()
+            .filter(|message| message.role == Role::System)
+            .cloned();
+        messages.clear();
+        if let Some(system_message) = system_message {
+            messages.push(system_message);
+        }
+        messages.extend(
+            history.into_iter().filter(|message| {
+                matches!(&message.role, Role::User | Role::Assistant | Role::Tool)
+            }),
+        );
+    }
+
+    /// Returns a snapshot suitable for continuing a delegated thread. Tool
+    /// messages are retained here because they complete the assistant
+    /// function calls required by the Responses API.
+    pub async fn conversation_history(&self) -> Vec<ChatMessage> {
+        self.messages.lock().await.clone()
+    }
+
     pub fn reconfigure_provider(
         &self,
         provider: Arc<dyn Provider>,
@@ -397,6 +332,150 @@ impl Agent {
         runtime.provider = provider;
         runtime.model = model;
         runtime.governor = governor;
+    }
+
+    pub fn set_reasoning_effort(&self, effort: Option<String>) {
+        let mut runtime = self.runtime.write().unwrap();
+        runtime.reasoning_effort = effort;
+    }
+
+    /// Installs the workspace skill index on this agent and refreshes the
+    /// scoped skill tools without changing the agent's conversation history.
+    pub fn set_skill_index(&self, index: Option<Arc<SkillIndex>>) {
+        if let Some(index) = index.as_ref() {
+            crate::tool::builtin::register_skill_tools(&self.tool_registry, index.clone());
+        }
+        *self.skill_index.write().unwrap() = index;
+    }
+
+    pub fn set_memory_search_backend(
+        &self,
+        backend: Option<Arc<dyn crate::tool::MemorySearchBackend>>,
+    ) {
+        *self.memory_search_backend.write().unwrap() = backend;
+    }
+
+    /// Replaces the globally scoped prompt fragment. It is injected into every
+    /// request without being persisted in the conversation's message history.
+    pub fn set_global_memory_prompt(&self, prompt: Option<String>) {
+        *self.global_memory_prompt.write().unwrap() = prompt
+            .map(|prompt| prompt.trim().to_owned())
+            .filter(|prompt| !prompt.is_empty());
+    }
+
+    async fn resolve_skill_context(&self, user_input: &str) -> Option<String> {
+        let index = self.skill_index.read().ok()?.clone()?;
+        let user_input = user_input.to_owned();
+        tokio::task::spawn_blocking(move || {
+            if index.is_empty() {
+                return None;
+            }
+
+            let mut context = String::from(concat!(
+                "## Workspace Skills\n\n",
+                "Compare the user's request with this workspace skill catalogue. ",
+                "When a skill is relevant, load it and follow its instructions for this turn.\n\n",
+            ));
+            let mut catalog_count = 0;
+            for skill in index.list() {
+                let description = skill.description.trim();
+                let entry = if description.is_empty() {
+                    format!("- `{}`\n", skill.name)
+                } else {
+                    format!("- `{}`: {description}\n", skill.name)
+                };
+                if context.len().saturating_add(entry.len()) > MAX_SKILL_CATALOG_BYTES {
+                    break;
+                }
+                context.push_str(&entry);
+                catalog_count += 1;
+            }
+
+            let matches = index.find_relevant(&user_input);
+            let mut loaded = Vec::new();
+
+            for skill in matches.into_iter().take(MAX_AUTO_SKILLS) {
+                let name = skill.name.clone();
+                let description = skill.description.clone();
+                let content = match index.load(&name) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        crate::observability::diagnostics::record(
+                            crate::observability::diagnostics::DiagnosticLevel::Warning,
+                            "skills.resolution",
+                            format!("Could not auto-load skill '{name}': {error}."),
+                        );
+                        continue;
+                    }
+                };
+
+                let heading = format!("\n### Loaded skill: {name}\n");
+                let description_context = if description.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("{description}\n\n")
+                };
+                let remaining = MAX_AUTO_SKILL_CONTEXT_BYTES
+                    .saturating_sub(
+                        context
+                            .len()
+                            .saturating_add(heading.len())
+                            .saturating_add(description_context.len()),
+                    );
+                if remaining == 0 {
+                    break;
+                }
+                let content = if content.len() > remaining {
+                    let truncated = truncate_utf8(&content, remaining);
+                    format!(
+                        "{truncated}\n\n[Skill content truncated for context safety.]\n"
+                    )
+                } else {
+                    content
+                };
+                context.push_str(&heading);
+                context.push_str(&description_context);
+                context.push_str(&content);
+                context.push_str("\n\n");
+                loaded.push(name);
+            }
+
+            if loaded.is_empty() {
+                crate::observability::diagnostics::record(
+                    crate::observability::diagnostics::DiagnosticLevel::Info,
+                    "skills.resolution",
+                    format!(
+                        "Exposed the workspace skill catalogue ({} of {} skill(s)); no skill was auto-loaded for this request.",
+                        catalog_count,
+                        index.len()
+                    ),
+                );
+                Some(context)
+            } else {
+                crate::observability::diagnostics::record(
+                    crate::observability::diagnostics::DiagnosticLevel::Success,
+                    "skills.resolution",
+                    format!(
+                        "Exposed {} skill(s) and automatically loaded {} workspace skill(s): {}.",
+                        catalog_count,
+                        loaded.len(),
+                        loaded.join(", ")
+                    ),
+                );
+                Some(context)
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    pub fn set_agent_runner(&self, runner: Arc<dyn AgentRunner>) {
+        *self.agent_runner.lock().unwrap() = Some(runner);
+    }
+
+    pub(crate) fn agent_runner(&self) -> Option<Arc<dyn AgentRunner>> {
+        self.agent_runner.lock().unwrap().clone()
     }
 
     fn runtime_snapshot(&self) -> AgentRuntime {
@@ -422,6 +501,7 @@ impl Agent {
     ) -> Result<String> {
         let _run_lock = self.run_lock.lock().await;
         let mut run_state = RunStateGuard::new(self.state.clone());
+        let skill_context = self.resolve_skill_context(user_input).await;
 
         {
             let mut msgs = self.messages.lock().await;
@@ -433,10 +513,14 @@ impl Agent {
             });
         }
 
+        let mut context_retries = 0;
         for _iteration in 0..self.config.max_iterations {
             let runtime = self.runtime_snapshot();
             if self.should_compact_with_runtime(&runtime).await {
-                if let Err(error) = self.compact_with_runtime(&runtime).await {
+                if let Err(error) = self
+                    .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
+                    .await
+                {
                     self.set_state(AgentState::Errored);
                     run_state.finish();
                     return Err(error);
@@ -445,7 +529,8 @@ impl Agent {
 
             let runtime = self.runtime_snapshot();
             let messages = self.messages.lock().await.clone();
-            let request = self.build_request(messages, runtime.model.clone());
+            let request =
+                self.build_request(messages, runtime.model.clone(), skill_context.clone());
 
             self.set_state(AgentState::Thinking);
 
@@ -458,12 +543,39 @@ impl Agent {
             };
             let response = match response_result {
                 Ok(response) => response,
+                Err(error)
+                    if is_context_error(&error)
+                        && context_retries < 2
+                        && self.should_compact_with_runtime(&runtime).await =>
+                {
+                    context_retries += 1;
+                    crate::observability::diagnostics::record(
+                        crate::observability::diagnostics::DiagnosticLevel::Warning,
+                        "agent.compaction",
+                        format!("Provider rejected the context; compacting and retrying: {error}"),
+                    );
+                    if let Err(compaction_error) = self
+                        .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
+                        .await
+                    {
+                        self.set_state(AgentState::Errored);
+                        run_state.finish();
+                        return Err(compaction_error);
+                    }
+                    continue;
+                }
                 Err(error) => {
                     self.set_state(AgentState::Errored);
                     run_state.finish();
                     return Err(error);
                 }
             };
+
+            self.record_context_usage(
+                &response,
+                runtime.provider.context_window(&runtime.model),
+                stream_events.as_ref(),
+            );
 
             if response
                 .message
@@ -473,18 +585,19 @@ impl Agent {
             {
                 self.set_state(AgentState::Acting);
 
-                let tool_messages = match self.execute_tools(&response).await {
-                    Ok(messages) => messages,
-                    Err(error) => {
-                        self.set_state(AgentState::Errored);
-                        run_state.finish();
-                        return Err(error);
-                    }
-                };
+                let tool_execution =
+                    match self.execute_tools(&response, stream_events.as_ref()).await {
+                        Ok(execution) => execution,
+                        Err(error) => {
+                            self.set_state(AgentState::Errored);
+                            run_state.finish();
+                            return Err(error);
+                        }
+                    };
                 {
                     let mut msgs = self.messages.lock().await;
                     msgs.push(response.message.clone());
-                    msgs.extend(tool_messages);
+                    msgs.extend(tool_execution.messages);
                 }
 
                 continue;
@@ -509,183 +622,51 @@ impl Agent {
         runtime: &AgentRuntime,
         request: ChatRequest,
     ) -> Result<ChatResponse> {
-        let governor = runtime.governor.clone();
-        let _permit = governor.acquire_call_permit().await;
-        let reserved_tokens = estimate_request_tokens(&request);
-        let Some(mut reservation) = governor.reserve_tokens(reserved_tokens) else {
-            return Err(anyhow::anyhow!(
-                "Token budget exhausted before provider request"
-            ));
-        };
-
-        let response = runtime
+        let _permit = runtime.governor.acquire_call_permit().await;
+        runtime
             .provider
             .chat(request)
             .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-
-        if let Some(usage) = response.usage.as_ref() {
-            if !reservation.reconcile(actual_usage_tokens(usage)) {
-                return Err(anyhow::anyhow!(
-                    "Token budget exhausted after provider response"
-                ));
-            }
-        } else {
-            reservation.disarm();
-        }
-
-        Ok(response)
-    }
-
-    async fn chat_stream_with_events(
-        &self,
-        runtime: &AgentRuntime,
-        request: ChatRequest,
-        events: &tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>,
-    ) -> Result<ChatResponse> {
-        let governed = GovernedProvider {
-            provider: runtime.provider.clone(),
-            governor: runtime.governor.clone(),
-        };
-        let mut stream = governed
-            .chat_stream(request)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let mut text = String::new();
-        let mut tool_calls = Vec::new();
-        let mut usage = None;
-
-        while let Some(event) = stream.next().await {
-            match event.map_err(|error| anyhow::anyhow!(error.to_string()))? {
-                StreamEvent::TextDelta { text: delta } => {
-                    text.push_str(&delta);
-                    let _ = events.send(AgentStreamEvent::TextDelta { text: delta });
-                }
-                StreamEvent::ToolCallDelta {
-                    id,
-                    name,
-                    arguments_delta,
-                } => {
-                    if id.is_empty() {
-                        continue;
-                    }
-                    if let Some(tool_call) = tool_calls
-                        .iter_mut()
-                        .find(|call: &&mut ToolCall| call.id == id)
-                    {
-                        if !name.is_empty() {
-                            tool_call.function.name = name;
-                        }
-                        tool_call.function.arguments.push_str(&arguments_delta);
-                    } else {
-                        tool_calls.push(ToolCall {
-                            id,
-                            call_type: "function".into(),
-                            function: FunctionCall {
-                                name,
-                                arguments: arguments_delta,
-                            },
-                        });
-                    }
-                }
-                StreamEvent::MessageEnd {
-                    usage: stream_usage,
-                } => {
-                    usage = stream_usage;
-                    break;
-                }
-                StreamEvent::Error { message } => {
-                    return Err(anyhow::anyhow!(message));
-                }
-                StreamEvent::ToolCallEnd { .. } | StreamEvent::MessageStart { .. } => {}
-            }
-        }
-
-        Ok(ChatResponse {
-            message: ChatMessage {
-                role: Role::Assistant,
-                content: MessageContent::Text(text),
-                tool_call_id: None,
-                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-            },
-            usage,
-            stop_reason: None,
-        })
-    }
-
-    async fn execute_tools(&self, response: &ChatResponse) -> Result<Vec<ChatMessage>> {
-        let tool_calls = match &response.message.tool_calls {
-            Some(tc) => tc,
-            None => return Ok(Vec::new()),
-        };
-
-        let ctx = ToolContext {
-            working_dir: self.working_dir.clone(),
-            session_id: self.session_id.clone(),
-            agent_id: self.agent_id.clone(),
-        };
-
-        let mut messages = Vec::new();
-
-        for tc in tool_calls {
-            let params: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
-                Ok(v) => v,
-                Err(e) => {
-                    messages.push(ChatMessage {
-                        role: Role::Tool,
-                        content: MessageContent::Text(format!("invalid arguments: {}", e)),
-                        tool_call_id: Some(tc.id.clone()),
-                        tool_calls: None,
-                    });
-                    continue;
-                }
-            };
-
-            let result = match self
-                .tool_registry
-                .execute(&tc.function.name, &ctx, &params)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => ToolResult::error(e.to_string()),
-            };
-
-            let content = if result.success {
-                result.content
-            } else {
-                result
-                    .error
-                    .unwrap_or_else(|| String::from("unknown error"))
-            };
-
-            messages.push(ChatMessage {
-                role: Role::Tool,
-                content: MessageContent::Text(content),
-                tool_call_id: Some(tc.id.clone()),
-                tool_calls: None,
-            });
-        }
-
-        Ok(messages)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 
     async fn should_compact_with_runtime(&self, runtime: &AgentRuntime) -> bool {
         let context_limit = runtime.provider.context_window(&runtime.model);
-        let msgs = self.messages.lock().await.clone();
-        let message_count = msgs.len();
-        let request = self.build_request(msgs, runtime.model.clone());
+        let message_count = self.messages.lock().await.len();
         let minimum_messages = match self.config.compaction.strategy {
             CompactionStrategyType::Trim | CompactionStrategyType::Hybrid => {
                 self.config.compaction.keep_last + 2
             }
             CompactionStrategyType::Summary => 2,
         };
-        estimate_request_tokens(&request)
-            > (self.config.compaction.threshold * context_limit as f64) as u64
-            && message_count > minimum_messages
+        let usage_pressure = self
+            .last_context_usage
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|usage| usage.input_tokens)
+            .is_some_and(|input_tokens| {
+                input_tokens as f64 > self.config.compaction.threshold * context_limit as f64
+                    && message_count > minimum_messages
+            });
+        usage_pressure
     }
 
     async fn compact_with_runtime(&self, runtime: &AgentRuntime) -> Result<()> {
+        self.compact_with_runtime_with_events(runtime, None).await
+    }
+
+    async fn compact_with_runtime_with_events(
+        &self,
+        runtime: &AgentRuntime,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+    ) -> Result<()> {
+        let reason = "Provider-reported context usage is high.".to_string();
+        if let Some(events) = events {
+            let _ = events.send(AgentStreamEvent::CompactionStarted {
+                reason: reason.clone(),
+            });
+        }
         self.set_state(AgentState::Compacting);
 
         let strategy = self.compaction_strategy();
@@ -701,9 +682,13 @@ impl Agent {
             }
         };
 
-        let mut compacted = {
-            let msgs = self.messages.lock().await.clone();
-            strategy
+        let (compaction_result, original_messages) = {
+            let mut msgs = self.messages.lock().await.clone();
+            if let Some(context) = self.understood_context.read().unwrap().clone() {
+                insert_understood_context(&mut msgs, &context);
+            }
+            let original_messages = msgs.len();
+            let result = strategy
                 .compact(
                     &msgs,
                     context_limit,
@@ -711,28 +696,80 @@ impl Agent {
                     provider_ref,
                     runtime.model.as_str(),
                 )
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                .await;
+            (result, original_messages)
+        };
+        let mut compacted = match compaction_result {
+            Ok(compacted) => compacted,
+            Err(error) if self.config.compaction.strategy != CompactionStrategyType::Trim => {
+                crate::observability::diagnostics::record(
+                    crate::observability::diagnostics::DiagnosticLevel::Warning,
+                    "agent.compaction",
+                    format!(
+                        "Summary compaction failed ({error}); falling back to deterministic trim."
+                    ),
+                );
+                let mut msgs = self.messages.lock().await.clone();
+                if let Some(context) = self.understood_context.read().unwrap().clone() {
+                    insert_understood_context(&mut msgs, &context);
+                }
+                TrimStrategy
+                    .compact(
+                        &msgs,
+                        context_limit,
+                        &self.config.compaction,
+                        None,
+                        runtime.model.as_str(),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            }
+            Err(error) => return Err(anyhow::anyhow!(error.to_string())),
         };
         compacted.messages = sanitize_tool_history(compacted.messages);
-        compacted.compacted_count = compacted.messages.len();
 
-        let compacted_request =
-            self.build_request(compacted.messages.clone(), runtime.model.clone());
-        let compacted_tokens = estimate_request_tokens(&compacted_request);
-        if compacted_tokens > context_limit as u64 {
-            return Err(anyhow::anyhow!(
-                "Compacted context still exceeds context window: {}/{} tokens",
-                compacted_tokens,
-                context_limit
-            ));
+        let understood_context = extract_understood_context(&compacted.messages);
+        compacted.messages.retain(|message| {
+            !message_text(message).starts_with("[Previous conversation summary]")
+        });
+        compacted.compacted_count = compacted.messages.len();
+        if understood_context.is_some() {
+            *self.understood_context.write().unwrap() = understood_context.clone();
         }
 
         {
             let mut msgs = self.messages.lock().await;
             *msgs = compacted.messages;
         }
+        if let Some(events) = events {
+            let _ = events.send(AgentStreamEvent::CompactionFinished {
+                reason,
+                original_messages,
+                retained_messages: compacted.compacted_count,
+                understood_context,
+            });
+        }
         Ok(())
+    }
+
+    fn record_context_usage(
+        &self,
+        response: &ChatResponse,
+        context_limit: usize,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+    ) {
+        let Some(provider_usage) = response.usage.as_ref() else {
+            return;
+        };
+        let usage = ContextUsage::from_usage(
+            usage_input_tokens(provider_usage),
+            provider_usage.output_tokens,
+            context_limit,
+        );
+        *self.last_context_usage.lock().unwrap() = Some(usage);
+        if let Some(events) = events {
+            let _ = events.send(AgentStreamEvent::ContextUpdated { usage });
+        }
     }
 
     fn compaction_strategy(&self) -> Box<dyn CompactionStrategy> {
@@ -748,9 +785,10 @@ impl Agent {
     }
 
     fn build_tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.config
-            .tools
+        self.tool_activation
+            .names()
             .iter()
+            .filter(|name| self.config.allow_delegation || !is_delegation_tool(name))
             .filter_map(|name| {
                 self.tool_registry.get(name).map(|tool| ToolDefinition {
                     name: tool.name().to_string(),
@@ -761,26 +799,93 @@ impl Agent {
             .collect()
     }
 
-    fn build_request(&self, messages: Vec<ChatMessage>, model: String) -> ChatRequest {
+    fn build_request(
+        &self,
+        mut messages: Vec<ChatMessage>,
+        model: String,
+        skill_context: Option<String>,
+    ) -> ChatRequest {
+        let runtime = self.runtime_snapshot();
+        if let Some(context) = self.understood_context.read().unwrap().clone() {
+            insert_understood_context(&mut messages, &context);
+        }
+        if let Some(global_memory) = self.global_memory_prompt.read().unwrap().clone() {
+            insert_system_context(&mut messages, global_memory);
+        }
         ChatRequest {
             model,
             messages,
             tools: self.build_tool_definitions(),
-            max_tokens: self.config.max_tokens,
             temperature: self.config.temperature,
-            system: None,
+            system: skill_context,
+            reasoning_effort: runtime.reasoning_effort,
         }
     }
+}
+
+fn insert_system_context(messages: &mut Vec<ChatMessage>, context: String) {
+    let position = usize::from(
+        messages
+            .first()
+            .is_some_and(|message| message.role == Role::System),
+    );
+    messages.insert(
+        position,
+        ChatMessage {
+            role: Role::System,
+            content: MessageContent::Text(context),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+    );
+}
+
+fn insert_understood_context(messages: &mut Vec<ChatMessage>, context: &str) {
+    insert_system_context(
+        messages,
+        format!("[Understood conversation context]\n\n{context}"),
+    );
+}
+
+fn extract_understood_context(messages: &[ChatMessage]) -> Option<String> {
+    messages.iter().find_map(|message| {
+        let text = message_text(message);
+        text.strip_prefix("[Previous conversation summary]")
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn is_context_error(error: &anyhow::Error) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("context")
+        && (text.contains("exceed") || text.contains("window") || text.contains("limit"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider::types::{FunctionCall, Role as ProviderRole, TokenUsage, ToolCall};
+    use crate::provider::{ProviderError, StreamEvent};
+    use crate::tool::{ToolContext, ToolResult};
     use async_trait::async_trait;
-    use futures::StreamExt;
+    use futures::{Stream, StreamExt};
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
     struct TestProvider {
@@ -800,7 +905,13 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
-    struct StreamProvider;
+    struct StreamProvider {
+        with_reasoning: bool,
+    }
+
+    struct ReasoningToolStreamProvider {
+        calls: AtomicUsize,
+    }
 
     struct ErrorStreamProvider;
 
@@ -867,6 +978,20 @@ mod tests {
         }
     }
 
+    impl StreamProvider {
+        fn new(with_reasoning: bool) -> Self {
+            Self { with_reasoning }
+        }
+    }
+
+    impl ReasoningToolStreamProvider {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
     #[async_trait]
     impl Provider for TestProvider {
         async fn chat(&self, _r: ChatRequest) -> crate::provider::Result<ChatResponse> {
@@ -881,6 +1006,7 @@ mod tests {
                     tool_calls: None,
                 },
                 usage: None,
+                reasoning: None,
                 stop_reason: None,
             }))
         }
@@ -972,6 +1098,7 @@ mod tests {
                     tool_calls: None,
                 },
                 usage: None,
+                reasoning: None,
                 stop_reason: None,
             })
         }
@@ -1006,7 +1133,15 @@ mod tests {
             &self,
             _r: ChatRequest,
         ) -> crate::provider::Result<crate::provider::ChatStream> {
-            Ok(Box::new(futures::stream::iter(vec![
+            let mut events = Vec::new();
+            if self.with_reasoning {
+                events.push(Ok(StreamEvent::ReasoningDelta {
+                    text:
+                        "**Inspecting** the request.\n\n- Check the context\n- Prepare the answer"
+                            .into(),
+                }));
+            }
+            events.extend([
                 Ok(StreamEvent::TextDelta {
                     text: "part".into(),
                 }),
@@ -1018,7 +1153,58 @@ mod tests {
                         cache_creation_input_tokens: None,
                     }),
                 }),
-            ])))
+            ]);
+            Ok(Box::new(futures::stream::iter(events)))
+        }
+
+        fn context_window(&self, _m: &str) -> usize {
+            200_000
+        }
+
+        fn supports_tools(&self, _m: &str) -> bool {
+            true
+        }
+
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ReasoningToolStreamProvider {
+        async fn chat(&self, _r: ChatRequest) -> crate::provider::Result<ChatResponse> {
+            unimplemented!()
+        }
+
+        async fn chat_stream(
+            &self,
+            _r: ChatRequest,
+        ) -> crate::provider::Result<crate::provider::ChatStream> {
+            let first_response = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            let events = if first_response {
+                vec![
+                    Ok(StreamEvent::ReasoningDelta {
+                        text: "I need to inspect this first.\n".into(),
+                    }),
+                    Ok(StreamEvent::ToolCallDelta {
+                        id: "call-1".into(),
+                        name: "echo".into(),
+                        arguments_delta: r#"{"text":"ok"}"#.into(),
+                    }),
+                    Ok(StreamEvent::ToolCallEnd {
+                        id: "call-1".into(),
+                    }),
+                    Ok(StreamEvent::MessageEnd { usage: None }),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta {
+                        text: "done".into(),
+                    }),
+                    Ok(StreamEvent::MessageEnd { usage: None }),
+                ]
+            };
+            Ok(Box::new(futures::stream::iter(events)))
         }
 
         fn context_window(&self, _m: &str) -> usize {
@@ -1161,6 +1347,7 @@ mod tests {
                     tool_calls: None,
                 },
                 usage: None,
+                reasoning: None,
                 stop_reason: None,
             })
         }
@@ -1338,12 +1525,10 @@ mod tests {
             model: "gpt-5".into(),
             max_iterations: 10,
             temperature: Some(0.5),
-            max_tokens: Some(4096),
             ..Default::default()
         };
         assert_eq!(config.name, "custom");
         assert_eq!(config.temperature, Some(0.5));
-        assert_eq!(config.max_tokens, Some(4096));
     }
 
     #[test]
@@ -1391,6 +1576,7 @@ mod tests {
                 tool_calls: None,
             },
             usage: None,
+            reasoning: None,
             stop_reason: None,
         }]));
 
@@ -1420,6 +1606,7 @@ mod tests {
                     tool_calls: None,
                 },
                 usage: None,
+                reasoning: None,
                 stop_reason: None,
             }])),
             test_tool_registry(),
@@ -1438,6 +1625,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restored_history_keeps_the_agent_system_prompt() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "restored-history".into(),
+            PathBuf::from("/tmp"),
+        );
+        agent
+            .restore_conversation_history(vec![
+                ChatMessage {
+                    role: ProviderRole::System,
+                    content: MessageContent::Text("untrusted replacement".into()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                ChatMessage {
+                    role: ProviderRole::User,
+                    content: MessageContent::Text("Earlier question".into()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                ChatMessage {
+                    role: ProviderRole::Assistant,
+                    content: MessageContent::Text("Earlier answer".into()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+            ])
+            .await;
+
+        let messages = agent.messages.lock().await;
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, ProviderRole::System);
+        assert_eq!(
+            messages[0].content,
+            MessageContent::Text("You are a test agent.".into())
+        );
+        assert_eq!(messages[1].role, ProviderRole::User);
+        assert_eq!(messages[2].role, ProviderRole::Assistant);
+    }
+
+    #[tokio::test]
     async fn reconfiguring_agent_replaces_resource_governor() {
         let new_governor = Arc::new(ResourceGovernor::new(1, 100));
         let provider: Arc<dyn Provider> = Arc::new(TestProvider::new(vec![ChatResponse {
@@ -1453,11 +1684,11 @@ mod tests {
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
             }),
+            reasoning: None,
             stop_reason: None,
         }]));
         let agent = Agent::new(
             AgentConfig {
-                max_tokens: Some(1),
                 ..Default::default()
             },
             Arc::new(TestProvider::new(vec![])),
@@ -1474,17 +1705,16 @@ mod tests {
         assert!(Arc::ptr_eq(&runtime.governor, &new_governor));
 
         assert_eq!(agent.run("hello").await.unwrap(), "reconfigured response");
-        assert_eq!(new_governor.tokens_available(), 98);
+        assert_eq!(new_governor.tokens_available(), 100);
     }
 
     #[tokio::test]
-    async fn test_agent_rejects_request_before_provider_when_reservation_exceeds_budget() {
+    async fn test_agent_does_not_gate_requests_on_the_legacy_token_budget() {
         let provider = Arc::new(TestProvider::new(vec![]));
         let agent = Agent::new(
             AgentConfig {
                 system_prompt: None,
                 tools: Vec::new(),
-                max_tokens: Some(1),
                 ..Default::default()
             },
             provider.clone(),
@@ -1494,17 +1724,15 @@ mod tests {
             PathBuf::from("/tmp"),
         );
 
-        let error = agent.run("request").await.unwrap_err();
+        let response = agent.run("request").await.unwrap();
 
-        assert!(error
-            .to_string()
-            .contains("Token budget exhausted before provider request"));
-        assert_eq!(*provider.call_count.lock().unwrap(), 0);
-        assert_eq!(agent.state().await, AgentState::Errored);
+        assert_eq!(response, "fallback");
+        assert_eq!(*provider.call_count.lock().unwrap(), 1);
+        assert_eq!(agent.state().await, AgentState::Completed);
     }
 
     #[tokio::test]
-    async fn test_agent_rejects_response_when_token_budget_is_exhausted() {
+    async fn test_agent_keeps_provider_responses_when_legacy_token_budget_is_exhausted() {
         let response = ChatResponse {
             message: ChatMessage {
                 role: ProviderRole::Assistant,
@@ -1518,6 +1746,7 @@ mod tests {
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
             }),
+            reasoning: None,
             stop_reason: None,
         };
         let provider = Arc::new(TestProvider::new(vec![response.clone(), response]));
@@ -1526,7 +1755,6 @@ mod tests {
             AgentConfig {
                 system_prompt: None,
                 tools: Vec::new(),
-                max_tokens: Some(4),
                 ..Default::default()
             },
             provider,
@@ -1537,9 +1765,9 @@ mod tests {
         );
 
         assert_eq!(agent.run("first").await.unwrap(), "budgeted response");
-        assert!(agent.run("second").await.is_err());
-        assert_eq!(agent.state().await, AgentState::Errored);
-        assert_eq!(governor.tokens_available(), 0);
+        assert_eq!(agent.run("second").await.unwrap(), "budgeted response");
+        assert_eq!(agent.state().await, AgentState::Completed);
+        assert_eq!(governor.tokens_available(), 5);
     }
 
     #[tokio::test]
@@ -1553,7 +1781,6 @@ mod tests {
             AgentConfig {
                 system_prompt: None,
                 tools: Vec::new(),
-                max_tokens: Some(1),
                 ..Default::default()
             },
             provider,
@@ -1566,7 +1793,7 @@ mod tests {
         let task_agent = agent.clone();
         let task = tokio::spawn(async move { task_agent.run("request").await });
         started.notified().await;
-        assert!(governor.tokens_available() < 10_000);
+        assert_eq!(governor.tokens_available(), 10_000);
 
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
@@ -1581,7 +1808,6 @@ mod tests {
             AgentConfig {
                 system_prompt: None,
                 tools: Vec::new(),
-                max_tokens: Some(1),
                 ..Default::default()
             },
             Arc::new(PanickingProvider),
@@ -1597,7 +1823,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_tokens_count_toward_budget_usage() {
+    async fn cache_usage_is_not_double_counted_as_context_input() {
         let provider = Arc::new(TestProvider::new(vec![ChatResponse {
             message: ChatMessage {
                 role: ProviderRole::Assistant,
@@ -1611,6 +1837,7 @@ mod tests {
                 cache_read_input_tokens: Some(5),
                 cache_creation_input_tokens: Some(7),
             }),
+            reasoning: None,
             stop_reason: None,
         }]));
         let governor = Arc::new(ResourceGovernor::new(1, 100));
@@ -1618,7 +1845,6 @@ mod tests {
             AgentConfig {
                 system_prompt: None,
                 tools: Vec::new(),
-                max_tokens: Some(1),
                 ..Default::default()
             },
             provider,
@@ -1630,7 +1856,8 @@ mod tests {
 
         agent.run("x").await.unwrap();
 
-        assert_eq!(governor.tokens_available(), 88);
+        assert_eq!(governor.tokens_available(), 100);
+        assert_eq!(agent.context_usage().await.input_tokens, Some(0));
     }
 
     fn stream_request() -> ChatRequest {
@@ -1638,16 +1865,16 @@ mod tests {
             model: "test-model".into(),
             messages: Vec::new(),
             tools: Vec::new(),
-            max_tokens: Some(1),
             temperature: None,
             system: None,
+            reasoning_effort: None,
         }
     }
 
     #[tokio::test]
-    async fn governed_stream_holds_permit_and_reconciles_at_message_end() {
-        let provider = Arc::new(StreamProvider);
-        let governor = Arc::new(ResourceGovernor::new(1, 100));
+    async fn governed_stream_keeps_a_completed_response_above_the_legacy_budget() {
+        let provider = Arc::new(StreamProvider::new(false));
+        let governor = Arc::new(ResourceGovernor::new(1, 1));
         let governed = GovernedProvider {
             provider,
             governor: governor.clone(),
@@ -1656,7 +1883,7 @@ mod tests {
         let mut stream = governed.chat_stream(stream_request()).await.unwrap();
 
         assert_eq!(governor.active_calls(), 1);
-        assert!(governor.tokens_available() < 100);
+        assert_eq!(governor.tokens_available(), 1);
         assert!(stream.next().await.is_some());
         assert_eq!(governor.active_calls(), 1);
 
@@ -1665,7 +1892,7 @@ mod tests {
             Some(Ok(StreamEvent::MessageEnd { .. }))
         ));
         assert_eq!(governor.active_calls(), 0);
-        assert_eq!(governor.tokens_available(), 95);
+        assert_eq!(governor.tokens_available(), 1);
         assert!(stream.next().await.is_none());
     }
 
@@ -1676,7 +1903,7 @@ mod tests {
                 tools: Vec::new(),
                 ..Default::default()
             },
-            Arc::new(StreamProvider),
+            Arc::new(StreamProvider::new(true)),
             test_tool_registry(),
             test_governor(),
             "stream-session".into(),
@@ -1691,14 +1918,69 @@ mod tests {
         }
 
         assert_eq!(response, "part");
-        assert!(matches!(
-            events.as_slice(),
-            [AgentStreamEvent::TextDelta { text }] if text == "part"
-        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::TextDelta { text } if text == "part"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::ReasoningDelta { text }
+                if text.contains("**Inspecting**")
+        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentStreamEvent::ReasoningFinished)));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::ContextUpdated { usage }
+                if usage.input_tokens == Some(2) && usage.output_tokens == Some(3)
+        )));
     }
 
     #[tokio::test]
-    async fn governed_stream_commits_estimate_when_usage_is_missing() {
+    async fn streaming_marks_tools_announced_during_reasoning() {
+        let agent = Agent::new(
+            AgentConfig {
+                tools: vec!["echo".into()],
+                max_iterations: 2,
+                ..Default::default()
+            },
+            Arc::new(ReasoningToolStreamProvider::new()),
+            test_tool_registry(),
+            test_governor(),
+            "reasoning-tool-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        agent.run_streaming("inspect", sender).await.unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+
+        let preparing = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentStreamEvent::ToolPreparing {
+                        inside_reasoning: true,
+                        ..
+                    }
+                )
+            })
+            .expect("the tool should retain its reasoning association");
+        let reasoning_finished = events
+            .iter()
+            .position(|event| matches!(event, AgentStreamEvent::ReasoningFinished))
+            .expect("the reasoning phase should eventually finish");
+
+        assert!(preparing < reasoning_finished);
+    }
+
+    #[tokio::test]
+    async fn governed_stream_does_not_charge_when_usage_is_missing() {
         let provider = Arc::new(IncompleteStreamProvider);
         let governor = Arc::new(ResourceGovernor::new(1, 100));
         let governed = GovernedProvider {
@@ -1712,12 +1994,12 @@ mod tests {
             stream.next().await,
             Some(Ok(StreamEvent::MessageEnd { usage: None }))
         ));
-        assert_eq!(governor.tokens_available(), 99);
+        assert_eq!(governor.tokens_available(), 100);
         assert_eq!(governor.active_calls(), 0);
     }
 
     #[tokio::test]
-    async fn governed_stream_commits_estimate_when_stream_ends_without_message_end() {
+    async fn governed_stream_does_not_charge_when_stream_usage_is_missing() {
         let provider = Arc::new(TruncatedStreamProvider);
         let governor = Arc::new(ResourceGovernor::new(1, 100));
         let governed = GovernedProvider {
@@ -1729,14 +2011,14 @@ mod tests {
 
         assert!(stream.next().await.is_some());
         assert!(stream.next().await.is_none());
-        assert_eq!(governor.tokens_available(), 99);
+        assert_eq!(governor.tokens_available(), 100);
         assert_eq!(governor.active_calls(), 0);
     }
 
     #[tokio::test]
     async fn governed_stream_releases_on_drop_and_provider_error() {
         let governor = Arc::new(ResourceGovernor::new(1, 100));
-        let provider = Arc::new(StreamProvider);
+        let provider = Arc::new(StreamProvider::new(false));
         let governed = GovernedProvider {
             provider,
             governor: governor.clone(),
@@ -1801,7 +2083,6 @@ mod tests {
             AgentConfig {
                 system_prompt: None,
                 tools: Vec::new(),
-                max_tokens: Some(1),
                 ..Default::default()
             },
             provider,
@@ -1837,8 +2118,8 @@ mod tests {
         seed_compaction_messages(&agent).await;
 
         let runtime = agent.runtime_snapshot();
-        assert!(agent.compact_with_runtime(&runtime).await.is_err());
-        assert_eq!(*provider.call_count.lock().unwrap(), 0);
+        assert!(agent.compact_with_runtime(&runtime).await.is_ok());
+        assert_eq!(*provider.call_count.lock().unwrap(), 1);
     }
 
     #[tokio::test]
@@ -1856,7 +2137,7 @@ mod tests {
         let runtime = agent.runtime_snapshot();
         agent.compact_with_runtime(&runtime).await.unwrap();
 
-        assert!(governor.tokens_available() < available_before);
+        assert_eq!(governor.tokens_available(), available_before);
         assert_eq!(*provider.call_count.lock().unwrap(), 1);
     }
 
@@ -1890,7 +2171,6 @@ mod tests {
             AgentConfig {
                 system_prompt: None,
                 tools: vec!["echo".into()],
-                max_tokens: None,
                 compaction: CompactionConfig {
                     strategy: CompactionStrategyType::Summary,
                     threshold: 0.8,
@@ -1924,9 +2204,57 @@ mod tests {
                 tool_calls: None,
             },
         ];
+        *agent.last_context_usage.lock().unwrap() = Some(ContextUsage::from_usage(9, 1, 10));
 
         let runtime = agent.runtime_snapshot();
         assert!(agent.should_compact_with_runtime(&runtime).await);
+
+        *agent.last_context_usage.lock().unwrap() = Some(ContextUsage::from_usage(7, 1, 10));
+        assert!(!agent.should_compact_with_runtime(&runtime).await);
+    }
+
+    #[tokio::test]
+    async fn compaction_does_not_use_history_signals_without_provider_usage() {
+        let agent = Agent::new(
+            AgentConfig {
+                system_prompt: None,
+                tools: vec!["echo".into()],
+                compaction: CompactionConfig {
+                    strategy: CompactionStrategyType::Summary,
+                    threshold: 0.8,
+                    keep_last: 1,
+                },
+                ..Default::default()
+            },
+            Arc::new(SmallContextProvider),
+            test_tool_registry(),
+            Arc::new(ResourceGovernor::new(1, 100_000)),
+            "no-usage-signal-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        *agent.messages.lock().await = vec![
+            ChatMessage {
+                role: ProviderRole::User,
+                content: MessageContent::Text("repeat this exact request".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ProviderRole::Assistant,
+                content: MessageContent::Text("repeat this exact answer".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ProviderRole::User,
+                content: MessageContent::Text("repeat this exact request".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let runtime = agent.runtime_snapshot();
+        assert!(!agent.should_compact_with_runtime(&runtime).await);
     }
 
     #[tokio::test]
@@ -1934,7 +2262,6 @@ mod tests {
         let agent = Agent::new(
             AgentConfig {
                 system_prompt: None,
-                max_tokens: None,
                 compaction: CompactionConfig {
                     strategy: CompactionStrategyType::Summary,
                     keep_last: 1,
@@ -1971,10 +2298,33 @@ mod tests {
         *agent.messages.lock().await = original.clone();
 
         let runtime = agent.runtime_snapshot();
-        let error = agent.compact_with_runtime(&runtime).await.unwrap_err();
+        agent.compact_with_runtime(&runtime).await.unwrap();
+        assert_ne!(*agent.messages.lock().await, original);
+    }
 
-        assert!(error.to_string().contains("context window"));
-        assert_eq!(*agent.messages.lock().await, original);
+    #[tokio::test]
+    async fn compaction_fits_a_large_latest_tool_payload_instead_of_failing() {
+        let provider = Arc::new(TestProvider::new(vec![]));
+        let agent = compaction_agent(
+            CompactionStrategyType::Summary,
+            provider.clone(),
+            Arc::new(ResourceGovernor::new(1, 2_000_000)),
+        );
+        let mut messages = compaction_messages();
+        messages.push(ChatMessage {
+            role: ProviderRole::User,
+            content: MessageContent::Text("large tool payload ".repeat(45_000)),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+        *agent.messages.lock().await = messages;
+
+        let runtime = agent.runtime_snapshot();
+        agent.compact_with_runtime(&runtime).await.unwrap();
+
+        let compacted = agent.messages.lock().await.clone();
+        assert_eq!(compacted.len(), 2);
+        assert_eq!(agent.understood_context().as_deref(), Some("fallback"));
     }
 
     #[tokio::test]
@@ -2015,6 +2365,7 @@ mod tests {
                     }]),
                 },
                 usage: None,
+                reasoning: None,
                 stop_reason: None,
             },
             ChatResponse {
@@ -2025,6 +2376,7 @@ mod tests {
                     tool_calls: None,
                 },
                 usage: None,
+                reasoning: None,
                 stop_reason: None,
             },
         ]));
@@ -2061,6 +2413,7 @@ mod tests {
                 }]),
             },
             usage: None,
+            reasoning: None,
             stop_reason: None,
         }]));
         let agent = Arc::new(Agent::new(
@@ -2068,7 +2421,6 @@ mod tests {
                 system_prompt: None,
                 tools: vec!["block".into()],
                 max_iterations: 1,
-                max_tokens: Some(1),
                 ..Default::default()
             },
             provider,
@@ -2111,6 +2463,7 @@ mod tests {
                         }]),
                     },
                     usage: None,
+                    reasoning: None,
                     stop_reason: None,
                 });
             }
@@ -2151,49 +2504,62 @@ mod tests {
     }
 
     #[test]
-    fn request_estimate_includes_tools_and_rich_content() {
-        let basic = ChatRequest {
-            model: "test-model".into(),
-            messages: Vec::new(),
-            tools: Vec::new(),
-            max_tokens: Some(1),
-            temperature: None,
-            system: None,
-        };
-        let rich = ChatRequest {
-            model: "test-model".into(),
-            messages: vec![ChatMessage {
-                role: ProviderRole::User,
-                content: MessageContent::Parts(vec![
-                    ContentPart::Image {
-                        source: crate::provider::types::ImageSource {
-                            media_type: "image/png".into(),
-                            data: "base64-image-data".into(),
-                        },
-                    },
-                    ContentPart::ToolUse {
-                        id: "tool-use-1".into(),
-                        name: "search".into(),
-                        input: serde_json::json!({"query": "important"}),
-                    },
-                ]),
-                tool_call_id: None,
-                tool_calls: None,
-            }],
-            tools: vec![ToolDefinition {
-                name: "search".into(),
-                description: "Searches a large indexed corpus".into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}}
-                }),
-            }],
-            max_tokens: Some(1),
-            temperature: None,
-            system: None,
-        };
+    fn delegated_tool_names_are_reserved_for_parent_agents() {
+        assert!(is_delegation_tool("list_agents"));
+        assert!(is_delegation_tool("call_agents"));
+        assert!(is_delegation_tool("call_agent"));
+        assert!(!is_delegation_tool("web_search_intrernal"));
+    }
 
-        assert!(estimate_request_tokens(&rich) > estimate_request_tokens(&basic));
+    #[tokio::test]
+    async fn test_agent_discovers_skill_tools_before_activating_them() {
+        let workspace = tempfile::tempdir().unwrap();
+        let skills = workspace.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("release.md"),
+            "# Release workflow\n\nAlways verify the changelog before publishing.\n",
+        )
+        .unwrap();
+        let index = Arc::new(
+            crate::skill::SkillIndex::build(crate::skill::SkillLoader::new(vec![skills])).unwrap(),
+        );
+        let registry = test_tool_registry();
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            registry.clone(),
+            test_governor(),
+            "session-skills".into(),
+            workspace.path().to_path_buf(),
+        );
+
+        assert!(agent
+            .build_tool_definitions()
+            .iter()
+            .all(|tool| { tool.name != "list_skills" && tool.name != "load_skill" }));
+
+        agent.set_skill_index(Some(index));
+
+        let definitions = agent.build_tool_definitions();
+        assert!(definitions.iter().all(|tool| tool.name != "list_skills"));
+        assert!(definitions.iter().all(|tool| tool.name != "load_skill"));
+        agent
+            .tool_activation
+            .enable(
+                &registry.catalog(),
+                vec!["list_skills".into(), "load_skill".into()],
+            )
+            .unwrap();
+        let definitions = agent.build_tool_definitions();
+        assert!(definitions.iter().any(|tool| tool.name == "list_skills"));
+        assert!(definitions.iter().any(|tool| tool.name == "load_skill"));
+        let context = agent
+            .resolve_skill_context("Please use the release skill for this task.")
+            .await
+            .unwrap();
+        assert!(context.contains("release"));
+        assert!(context.contains("Always verify the changelog"));
     }
 
     #[tokio::test]
@@ -2212,6 +2578,7 @@ mod tests {
                 tool_calls: None,
             },
             usage: None,
+            reasoning: None,
             stop_reason: None,
         }]));
 
@@ -2226,5 +2593,71 @@ mod tests {
 
         let result = agent.run("test").await.unwrap();
         assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn global_memory_is_injected_as_a_separate_system_message() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "global-memory-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        agent.set_global_memory_prompt(Some(
+            "## Confirmed Global Memory\n- [abcd1234] Prefer concise answers.".into(),
+        ));
+
+        let request = agent.build_request(
+            vec![ChatMessage {
+                role: ProviderRole::System,
+                content: MessageContent::Text("Base instructions".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            "test-model".into(),
+            None,
+        );
+
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].role, ProviderRole::System);
+        assert_eq!(request.messages[1].role, ProviderRole::System);
+        assert!(matches!(
+            &request.messages[1].content,
+            MessageContent::Text(content) if content.contains("Confirmed Global Memory")
+        ));
+    }
+
+    #[test]
+    fn understood_context_is_injected_as_system_context() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "understood-context-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        agent.set_understood_context(Some(
+            "Objective: ship the release.\nNext action: run the checks.".into(),
+        ));
+
+        let request = agent.build_request(
+            vec![ChatMessage {
+                role: ProviderRole::System,
+                content: MessageContent::Text("Base instructions".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            "test-model".into(),
+            None,
+        );
+
+        assert_eq!(request.messages.len(), 2);
+        assert!(matches!(
+            &request.messages[1].content,
+            MessageContent::Text(content) if content.contains("Understood conversation context")
+        ));
     }
 }

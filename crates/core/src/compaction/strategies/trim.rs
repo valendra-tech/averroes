@@ -1,36 +1,12 @@
 use async_trait::async_trait;
 
 use crate::compaction::{CompactedContext, CompactionConfig, CompactionStrategy, Result};
-use crate::provider::types::{ChatMessage, MessageContent};
+use crate::provider::types::ChatMessage;
 
 pub struct TrimStrategy;
 
-fn rough_token_count(msg: &ChatMessage) -> usize {
-    match &msg.content {
-        MessageContent::Text(t) => t.len() / 4,
-        MessageContent::Parts(parts) => parts
-            .iter()
-            .map(|p| match p {
-                crate::provider::types::ContentPart::Text { text } => text.len() / 4,
-                _ => 200,
-            })
-            .sum(),
-    }
-}
-
 #[async_trait]
 impl CompactionStrategy for TrimStrategy {
-    fn should_compact(
-        &self,
-        messages: &[ChatMessage],
-        context_limit: usize,
-        config: &CompactionConfig,
-    ) -> bool {
-        let estimated = self.estimate_tokens(messages);
-        estimated > (config.threshold * context_limit as f64) as usize
-            && messages.len() > config.keep_last + 2
-    }
-
     async fn compact(
         &self,
         messages: &[ChatMessage],
@@ -48,10 +24,6 @@ impl CompactionStrategy for TrimStrategy {
             messages: compacted,
             original_count,
         })
-    }
-
-    fn estimate_tokens(&self, messages: &[ChatMessage]) -> usize {
-        messages.iter().map(rough_token_count).sum()
     }
 }
 

@@ -4,16 +4,138 @@ pub mod registry;
 
 pub use registry::ToolRegistry;
 
+use crate::agent::orchestration::AgentRunner;
+use crate::work::ConversationSearchResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-#[derive(Debug, Clone)]
+#[async_trait]
+pub trait MemorySearchBackend: Send + Sync {
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> std::result::Result<Vec<ConversationSearchResult>, String>;
+}
+
+#[derive(Clone)]
 pub struct ToolContext {
     pub working_dir: PathBuf,
     pub session_id: String,
     pub agent_id: String,
+    /// The tool schemas advertised to the provider for the current request.
+    pub enabled_tools: Vec<EnabledTool>,
+    /// Compact descriptors for every tool registered in this agent's scoped
+    /// registry. Discovery tools can inspect it without exposing every schema
+    /// in every provider request.
+    pub available_tools: Vec<EnabledTool>,
+    /// Mutable per-conversation activation state shared by the agent loop and
+    /// its discovery tools.
+    pub tool_activation: Arc<ToolActivation>,
+    /// A deliberately reduced, read-only snapshot for delegated agents.
+    pub conversation_context: Vec<crate::provider::ChatMessage>,
+    pub agent_runner: Option<Arc<dyn AgentRunner>>,
+    pub memory_search_backend: Option<Arc<dyn MemorySearchBackend>>,
+    /// Receives live events from a tool's delegated child agent and forwards
+    /// them to the current conversation stream.
+    pub agent_event_sink:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::agent::AgentStreamEvent>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnabledTool {
+    pub name: String,
+    pub description: String,
+}
+
+impl std::fmt::Debug for ToolContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolContext")
+            .field("working_dir", &self.working_dir)
+            .field("session_id", &self.session_id)
+            .field("agent_id", &self.agent_id)
+            .field("enabled_tools", &self.enabled_tools.len())
+            .field("available_tools", &self.available_tools.len())
+            .field("conversation_context", &self.conversation_context.len())
+            .field("agent_runner", &self.agent_runner.is_some())
+            .field(
+                "memory_search_backend",
+                &self.memory_search_backend.is_some(),
+            )
+            .field("agent_event_sink", &self.agent_event_sink.is_some())
+            .finish()
+    }
+}
+
+/// The selected subset of a scoped registry whose full schemas are sent to a
+/// provider. It is intentionally independent from persisted bindings so a
+/// registry addition never requires a hard-coded allow-list migration.
+#[derive(Default)]
+pub struct ToolActivation {
+    names: RwLock<BTreeSet<String>>,
+}
+
+impl ToolActivation {
+    pub fn new(names: impl IntoIterator<Item = String>) -> Self {
+        let activation = Self::default();
+        activation.names.write().unwrap().extend(
+            names
+                .into_iter()
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty()),
+        );
+        activation
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.names.read().unwrap().iter().cloned().collect()
+    }
+
+    pub fn enabled(&self, catalog: &[EnabledTool]) -> Vec<EnabledTool> {
+        let catalog = catalog
+            .iter()
+            .map(|tool| (tool.name.as_str(), tool))
+            .collect::<BTreeMap<_, _>>();
+        self.names
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(|name| catalog.get(name.as_str()).cloned().cloned())
+            .collect()
+    }
+
+    pub fn enable(
+        &self,
+        catalog: &[EnabledTool],
+        requested: impl IntoIterator<Item = String>,
+    ) -> Result<Vec<EnabledTool>> {
+        let available = catalog
+            .iter()
+            .map(|tool| (tool.name.as_str(), tool))
+            .collect::<BTreeMap<_, _>>();
+        let requested = requested
+            .into_iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect::<BTreeSet<_>>();
+        let missing = requested
+            .iter()
+            .filter(|name| !available.contains_key(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(ToolError::InvalidParams {
+                tool: "enable_tools".into(),
+                message: format!("unknown tool name(s): {}", missing.join(", ")),
+            });
+        }
+        self.names.write().unwrap().extend(requested);
+        Ok(self.enabled(catalog))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +184,12 @@ pub trait Tool: Send + Sync {
         false
     }
     fn requires_confirmation(&self) -> bool {
+        false
+    }
+
+    /// Discovery roots are always exposed. All other registered tools can be
+    /// found through `discover_tools` and activated on demand.
+    fn is_bootstrap(&self) -> bool {
         false
     }
 }

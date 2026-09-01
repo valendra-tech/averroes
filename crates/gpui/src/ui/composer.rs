@@ -9,10 +9,28 @@ pub enum ComposerMode {
     Plan,
 }
 
+impl ComposerMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Build => "Build",
+            Self::Plan => "Plan",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffortLevel {
     Max,
     Balanced,
+}
+
+impl EffortLevel {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Max => "Max",
+            Self::Balanced => "Balanced",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,7 +135,7 @@ pub fn composer_surface(theme: UiTheme, focused: bool, processing: bool) -> Div 
         .text_color(theme.foreground)
         .border_1()
         .border_color(border)
-        .rounded(px(UiTheme::RADIUS))
+        .rounded(px(10.0))
         .shadow_sm()
         .opacity(if processing { 0.86 } else { 1.0 })
         .font(UiTheme::ui_font())
@@ -176,6 +194,14 @@ mod tests {
 
         assert_eq!(state.take_submission().as_deref(), Some("hello"));
         assert_eq!(state.selection, TextSelection::default());
+    }
+
+    #[test]
+    fn dropdown_labels_match_composer_choices() {
+        assert_eq!(ComposerMode::Build.label(), "Build");
+        assert_eq!(ComposerMode::Plan.label(), "Plan");
+        assert_eq!(EffortLevel::Max.label(), "Max");
+        assert_eq!(EffortLevel::Balanced.label(), "Balanced");
     }
 
     #[test]

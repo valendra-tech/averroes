@@ -2,6 +2,7 @@ pub mod index;
 pub mod loader;
 
 pub use index::SkillIndex;
+pub use loader::SkillLoader;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

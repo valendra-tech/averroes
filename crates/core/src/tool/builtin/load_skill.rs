@@ -1,3 +1,4 @@
+use crate::observability::diagnostics::{self, DiagnosticLevel};
 use crate::skill::SkillIndex;
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
@@ -39,14 +40,31 @@ impl Tool for LoadSkillTool {
                 tool: self.name().into(),
                 message: "name parameter is required".into(),
             })?;
+        diagnostics::record(
+            DiagnosticLevel::Info,
+            "skills.tool",
+            format!("load_skill requested for '{name}'."),
+        );
         match self.index.load(name) {
             Ok(content) => {
+                diagnostics::record(
+                    DiagnosticLevel::Success,
+                    "skills.tool",
+                    format!("load_skill returned '{name}' ({} bytes).", content.len()),
+                );
                 Ok(ToolResult::ok(content).with_metadata(serde_json::json!({"skill": name})))
             }
-            Err(e) => Ok(ToolResult::error(format!(
-                "Failed to load skill '{}': {}",
-                name, e
-            ))),
+            Err(e) => {
+                diagnostics::record(
+                    DiagnosticLevel::Error,
+                    "skills.tool",
+                    format!("load_skill failed for '{name}': {e}."),
+                );
+                Ok(ToolResult::error(format!(
+                    "Failed to load skill '{}': {}",
+                    name, e
+                )))
+            }
         }
     }
 }

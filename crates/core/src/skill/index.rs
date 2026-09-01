@@ -1,4 +1,5 @@
 use super::{Result, SkillError, SkillMeta};
+use crate::observability::diagnostics::{self, DiagnosticLevel};
 use crate::skill::loader::SkillLoader;
 use std::collections::HashMap;
 
@@ -9,16 +10,39 @@ pub struct SkillIndex {
 
 impl SkillIndex {
     pub fn build(loader: SkillLoader) -> Result<Self> {
+        diagnostics::record(
+            DiagnosticLevel::Info,
+            "skills.index",
+            "Building the skill index from discovered files.",
+        );
         let discovered = loader.discover_skills()?;
         let mut skills = HashMap::new();
         for skill in discovered {
+            if skills.contains_key(&skill.name) {
+                diagnostics::record(
+                    DiagnosticLevel::Warning,
+                    "skills.index",
+                    format!(
+                        "Duplicate skill name '{}' found at {}; replacing the previous entry.",
+                        skill.name,
+                        skill.path.display()
+                    ),
+                );
+            }
             skills.insert(skill.name.clone(), skill);
         }
+        diagnostics::record(
+            DiagnosticLevel::Success,
+            "skills.index",
+            format!("Skill index ready with {} skill(s).", skills.len()),
+        );
         Ok(Self { skills, loader })
     }
 
     pub fn list(&self) -> Vec<&SkillMeta> {
-        self.skills.values().collect()
+        let mut skills = self.skills.values().collect::<Vec<_>>();
+        skills.sort_by(|left, right| left.name.cmp(&right.name));
+        skills
     }
 
     pub fn get(&self, name: &str) -> Option<&SkillMeta> {
@@ -33,10 +57,36 @@ impl SkillIndex {
             .collect()
     }
 
+    /// Finds skills explicitly triggered by the request or named directly by
+    /// the user. The latter keeps standard SKILL.md files useful even when
+    /// they do not include Averroes' optional `## Triggers` section.
+    pub fn find_relevant(&self, text: &str) -> Vec<&SkillMeta> {
+        let normalized_text = normalize_terms(text);
+        let padded_text = format!(" {normalized_text} ");
+        let mut matches = self.find_by_trigger(text);
+        for skill in self.skills.values() {
+            let name = normalize_terms(&skill.name);
+            if name.is_empty()
+                || !padded_text.contains(&format!(" {name} "))
+                || matches.iter().any(|matched| matched.name == skill.name)
+            {
+                continue;
+            }
+            matches.push(skill);
+        }
+        matches.sort_by(|left, right| left.name.cmp(&right.name));
+        matches
+    }
+
     pub fn load(&self, name: &str) -> Result<String> {
-        let meta = self
-            .get(name)
-            .ok_or_else(|| SkillError::NotFound(name.to_string()))?;
+        let Some(meta) = self.get(name) else {
+            diagnostics::record(
+                DiagnosticLevel::Warning,
+                "skills.index",
+                format!("Requested skill '{name}' is not present in the index."),
+            );
+            return Err(SkillError::NotFound(name.to_string()));
+        };
         self.loader.load_content(meta)
     }
 
@@ -47,6 +97,22 @@ impl SkillIndex {
     pub fn is_empty(&self) -> bool {
         self.skills.is_empty()
     }
+}
+
+fn normalize_terms(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -159,6 +225,20 @@ mod tests {
 
         let matches = index.find_by_trigger("it");
         assert_eq!(matches.len(), 0);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_find_relevant_matches_skill_name_without_triggers() {
+        let (dir, index) = setup_temp_skills(
+            "relevant-name",
+            &[("pdf.md", "# PDF workflow\n\nCreate PDFs safely.\n")],
+        );
+
+        let matches = index.find_relevant("Please use the PDF skill for this task.");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "pdf");
 
         cleanup(&dir);
     }

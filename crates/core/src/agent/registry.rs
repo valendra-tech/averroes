@@ -63,6 +63,7 @@ mod tests {
                     tool_calls: None,
                 },
                 usage: None,
+                reasoning: None,
                 stop_reason: None,
             })
         }

@@ -1,3 +1,4 @@
+use crate::observability::diagnostics::{self, DiagnosticLevel};
 use crate::skill::SkillIndex;
 use crate::tool::{Result, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -30,6 +31,11 @@ impl Tool for ListSkillsTool {
 
     async fn execute(&self, _ctx: &ToolContext, _params: &serde_json::Value) -> Result<ToolResult> {
         let skills = self.index.list();
+        diagnostics::record(
+            DiagnosticLevel::Info,
+            "skills.tool",
+            format!("list_skills requested; {} indexed skill(s).", skills.len()),
+        );
         let output: Vec<String> = skills
             .iter()
             .map(|s| format!("- **{}**: {}", s.name, s.description))

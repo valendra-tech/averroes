@@ -9,3 +9,19 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+
+# Rust 1.98 exposes an additional `From<std::fmt::Error>` implementation
+# through GPUI's structured logging dependencies. Stylo 0.19's derive output
+# relied on the old inference behaviour, so keep the tiny local compatibility
+# patch below while OxiBrowser's Blitz stack still targets Stylo 0.19.
+[patch.crates-io]
+stylo_derive = { path = "crates/vendor/stylo_derive" }
+# OxiBrowser currently applies the document base URL after parsing HTML. Blitz
+# resolves stylesheet URLs while parsing, so that ordering panics on relative
+# resources. Keep this focused upstream patch until it is released.
+oxibrowser-render = { path = "crates/vendor/oxibrowser-render" }
+# Page JavaScript runs on OxiBrowser's own OS thread. The published runtime
+# leaves that thread at the small platform default even though its Boa limits
+# permit deeply nested modern bundles; keep the bounded-stack hardening local
+# until it is available upstream.
+oxibrowser-core = { path = "crates/vendor/oxibrowser-core" }

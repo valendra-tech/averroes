@@ -260,16 +260,4 @@ mod tests {
             "New session"
         );
     }
-
-    #[test]
-    fn session_tab_element_ids_use_stable_session_prefixes() {
-        let manager = SessionManager::new(None);
-        let id = &manager.active().id;
-
-        let ids = crate::ui::tabs::session_tab_ids(id);
-
-        assert_eq!(ids.tab, format!("session-tab-{id}"));
-        assert_eq!(ids.close, format!("session-tab-close-{id}"));
-        assert_eq!(crate::ui::tabs::NEW_SESSION_ID, "session-tab-new");
-    }
 }

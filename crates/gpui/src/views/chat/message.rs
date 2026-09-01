@@ -3,6 +3,7 @@ use averroes_core::provider::types::{ChatMessage, MessageContent, Role as CoreRo
 pub struct MessageBubble {
     pub role: MessageRole,
     pub content: String,
+    pub reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +35,11 @@ impl From<ChatMessage> for MessageBubble {
                 .collect::<Vec<_>>()
                 .join("\n"),
         };
-        Self { role, content }
+        Self {
+            role,
+            content,
+            reasoning: None,
+        }
     }
 }
 
@@ -43,6 +48,7 @@ impl MessageBubble {
         Self {
             role: MessageRole::User,
             content: content.into(),
+            reasoning: None,
         }
     }
 
@@ -50,6 +56,18 @@ impl MessageBubble {
         Self {
             role: MessageRole::Assistant,
             content: content.into(),
+            reasoning: None,
+        }
+    }
+
+    pub fn assistant_with_reasoning(
+        content: impl Into<String>,
+        reasoning: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            reasoning: Some(reasoning.into()),
         }
     }
 
@@ -57,6 +75,7 @@ impl MessageBubble {
         Self {
             role: MessageRole::Error,
             content: content.into(),
+            reasoning: None,
         }
     }
 }

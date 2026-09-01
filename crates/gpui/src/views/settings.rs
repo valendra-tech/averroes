@@ -1,8 +1,7 @@
 use crate::ui::theme::UiTheme;
 use crate::ui::{
     button, field_label, field_surface, panel, provider_card, provider_card_title,
-    render_text_with_cursor, status_badge, utf16_range_to_byte_range, ButtonVariant,
-    TextSelection,
+    render_text_with_cursor, status_badge, utf16_range_to_byte_range, ButtonVariant, TextSelection,
 };
 use averroes_core::config::{AppConfig, SetupWizard};
 use gpui::*;
@@ -221,7 +220,7 @@ impl SettingsView {
         self.input_selection.set_cursor(cursor);
         self.input_selection.unmark();
         self.error = None;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -241,7 +240,7 @@ impl SettingsView {
     ) {
         if event.keystroke.key == "escape" || event.keystroke.key == "enter" {
             self.focused_field = None;
-            window.blur();
+            window.blur(cx);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -368,9 +367,10 @@ impl SettingsView {
                             None,
                             &text,
                         ),
-                        FocusField::Model => self
-                            .input_selection
-                            .replace_text(&mut self.wizard.model, None, &text),
+                        FocusField::Model => {
+                            self.input_selection
+                                .replace_text(&mut self.wizard.model, None, &text)
+                        }
                     }
                 }
                 true
@@ -388,11 +388,10 @@ impl SettingsView {
                             None,
                             ch,
                         ),
-                        FocusField::Model => self.input_selection.replace_text(
-                            &mut self.wizard.model,
-                            None,
-                            ch,
-                        ),
+                        FocusField::Model => {
+                            self.input_selection
+                                .replace_text(&mut self.wizard.model, None, ch)
+                        }
                     }
                     true
                 } else if key.len() == 1 {
@@ -407,11 +406,10 @@ impl SettingsView {
                             None,
                             &ch,
                         ),
-                        FocusField::Model => self.input_selection.replace_text(
-                            &mut self.wizard.model,
-                            None,
-                            &ch,
-                        ),
+                        FocusField::Model => {
+                            self.input_selection
+                                .replace_text(&mut self.wizard.model, None, &ch)
+                        }
                     }
                     true
                 } else {
@@ -448,9 +446,9 @@ impl Render for SettingsView {
             self.wizard.api_key_env.clone()
         };
         let model_value = self.wizard.default_model().to_string();
-        let env_available = std::env::var(&env_value)
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false);
+        // Legacy view kept for migration only. Credentials are never inspected
+        // through process environment variables.
+        let env_available = false;
         let save_label = if self.saved { "Saved" } else { "Save changes" };
 
         div()

@@ -27,3 +27,22 @@ dirs = "5"
 num_cpus = "1"
 uuid = { version = "1", features = ["v4"] }
 glob = "0.3"
+minijinja = "2"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+getrandom = "0.3"
+zeroize = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+sqlite-vector-rs = { git = "https://github.com/quinnjr/sqlite-vector-rs", version = "0.3.1", features = ["library"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+oxibrowser = { version = "0.20.0", default-features = false }
+oxibrowser-core = { version = "0.20.0", default-features = false }
+# OxiBrowser 0.20 was published with broad prerelease ranges. These exact
+# constraints keep its Blitz renderer on the dependency set it was built with.
+blitz-dom = "=0.3.0-beta.1"
+blitz-html = "=0.3.0-beta.1"
+blitz-paint = "=0.3.0-beta.1"
+blitz-traits = "=0.3.0-beta.1"
+
+[dev-dependencies]
+tempfile = "3"

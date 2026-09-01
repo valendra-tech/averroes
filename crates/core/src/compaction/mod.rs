@@ -36,13 +36,6 @@ pub struct CompactedContext {
 
 #[async_trait]
 pub trait CompactionStrategy: Send + Sync {
-    fn should_compact(
-        &self,
-        messages: &[ChatMessage],
-        context_limit: usize,
-        config: &CompactionConfig,
-    ) -> bool;
-
     async fn compact(
         &self,
         messages: &[ChatMessage],
@@ -51,8 +44,6 @@ pub trait CompactionStrategy: Send + Sync {
         provider: Option<&dyn Provider>,
         model: &str,
     ) -> Result<CompactedContext>;
-
-    fn estimate_tokens(&self, messages: &[ChatMessage]) -> usize;
 }
 
 pub type Result<T> = std::result::Result<T, CompactionError>;

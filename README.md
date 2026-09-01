@@ -1,103 +1,182 @@
 # Averroes
 
-High-performance AI harness for building code assistant applications in Rust.
+Averroes is a local-first AI workspace and agent harness written in Rust. It
+combines a high-performance core with a native GPUI desktop application for
+conversations, coding workspaces, provider integrations, tools, skills, and
+delegated agents.
 
-**Design principles:**
-- **Provider-agnostic** — trait-based abstraction over LLM providers (Anthropic, OpenAI, +)
-- **Resource-optimal** — Tokio async + Rayon thread pool, single HTTP/2 connection pool, resource governor
-- **Extensible** — trait-based core tools, dynamic tool registration, markdown-based skills
-- **Hierarchical agents** — main agent spawns sub-agents with scoped tasks and tools
+The project is named after Ibn Rushd (Averroes), the Andalusian philosopher,
+physician, and jurist from Córdoba whose work connected rigorous reasoning with
+practical knowledge. Averroes is developed by [Valendra.tech](https://valendra.tech)
+with care.
 
-## Packages
+## Highlights
 
-| Crate | Description |
-|-------|-------------|
-| `averroes-core` | Shared harness — provider trait, agent runtime, tool system, skill loader, compaction, resource governor |
-| `averroes-gpui` | Desktop frontend (GPUI) |
+- Streaming conversations with provider-independent agent orchestration.
+- A central model registry with provider hooks, live catalog refresh, and
+  manually registered models for providers without a model-list endpoint.
+- Multiple connections to the same provider, with credentials kept outside the
+  conversation data.
+- Workspace-aware `AGENTS.md` instructions and on-demand Markdown skills.
+- Built-in tools for files, shell sessions, web research, tasks, memory,
+  checkpoints, questions, and delegated agents.
+- Global memory for durable user-approved facts and deep memory for searching
+  older conversation context through the local embedding index.
+- SQLite persistence for conversations, messages, usage, sources, tool events,
+  tasks, checkpoints, and embedding metadata.
+- Live tool and reasoning activity in the UI, grouped without hiding the
+  underlying event order.
+- macOS update checks and release DMGs generated automatically from GitHub
+  Releases.
 
-## Quickstart
+## Repository layout
+
+| Path | Responsibility |
+| --- | --- |
+| `crates/core` | Provider, model, agent, tool, skill, memory, compaction, storage, and task domains |
+| `crates/gpui` | Native desktop application, settings, conversation UI, diagnostics, and updates |
+| `crates/vendor` | Small local patches for dependencies used by the browser/rendering stack |
+| `scripts/bundle-macos.sh` | Builds the release binary, `.app`, and drag-to-Applications DMG |
+| `.github/workflows` | macOS bundle and GitHub Release automation |
+| `assets` | Application and brand assets |
+
+## Supported providers
+
+Providers are selected and configured from the desktop Settings screen. The
+model picker is populated from the connection's catalog; provider defaults are
+not silently inserted.
+
+| Provider | Authentication / discovery |
+| --- | --- |
+| Codex | ChatGPT/Codex sign-in flow and authenticated account catalog |
+| GitHub Copilot | GitHub authentication and authenticated Copilot catalog |
+| QDivZero | API token and `/serving-endpoints` catalog for running chat workloads |
+| OpenAI | API token and OpenAI-compatible `/v1/models` catalog |
+| Anthropic | API token and Anthropic provider integration |
+| DeepSeek | API token and OpenAI-compatible API |
+| Groq | API token and OpenAI-compatible API |
+| Ollama | Local Ollama server; models can be refreshed or added manually |
+| Ollama Cloud | API token and Ollama Cloud's OpenAI-compatible API |
+| Compatible API | User-provided OpenAI-compatible base URL and API token |
+
+Connections that expose embeddings can also be selected for conversation
+search. Models with embedding capability are discovered from the live catalog;
+manual model metadata can declare `embeddings = true` when required.
+
+## Requirements
+
+- Rust stable with Cargo.
+- macOS for the `averroes-gpui` desktop application and DMG packaging.
+- A configured provider connection for model requests. Ollama can be used
+  locally without an API key.
+
+## Development
 
 ```bash
-# Build
+# Build every workspace crate
 cargo build --workspace
 
-# Run tests
+# Run the test suite
 cargo test --workspace
 
-# GPUI desktop workspace
+# Format and lint-style checks used by the project
+cargo fmt --all -- --check
+git diff --check
+
+# Start the desktop application
 cargo run -p averroes-gpui
 ```
 
-## Architecture
+Credentials are entered in the application and stored using the platform
+Keychain-backed vault where available. Do not commit API keys, provider tokens,
+or generated session data.
 
-```
-User Input → GPUI → averroes-core::Agent::run()
-  → Skill resolution (indexed markdown skills)
-  → Provider::chat() (streaming)
-  → Tool calls loop (agent decides which tools to invoke)
-  → Compaction (context window management)
-  → Sub-agent spawning (hierarchical delegation)
-  → Result streamed back to frontend
-```
+## Configuration and storage
 
-## Configuration
+The shared configuration is created under `~/.averroes/config`:
 
-Shared configuration at `~/.config/averroes/config.toml`:
+- `settings.toml` stores connection metadata, agent profiles, runtime settings,
+  compaction settings, and skill paths.
+- `providers.enc` stores encrypted provider credentials.
+- `averroes.db` is a private SQLite database containing persistent work data.
 
-```toml
-[provider]
-default = "anthropic"
+Workspace-specific session and tab state lives under the active workspace's
+`.averroes/` directory. The UI is the recommended way to edit configuration so
+that credentials, model catalogs, and connection metadata remain consistent.
 
-[provider.anthropic]
-api_key_env = "ANTHROPIC_API_KEY"
-default_model = "claude-sonnet-4-20250514"
+## Tools
 
-[provider.openai]
-api_key_env = "OPENAI_API_KEY"
-default_model = "gpt-4o"
+The registry is extensible and the agent discovers the complete registered
+catalog before enabling tools for a task. The built-in groups are:
 
-[runtime]
-max_concurrent_calls = 10
-token_budget_per_minute = 200000
+- Workspace: `bash`, `file_read`, `file_write`, `glob`, `grep`, `checkpoint`.
+- Web: `web_search`, `web_fetch` (the latter uses OxiBrowser and contributes
+  opened pages to conversation sources).
+- Discovery: `discover_tools`, `enable_tools`, `list_tools`.
+- Skills: `list_skills`, `load_skill`.
+- Tasks: `task_list`, `add_task`, `mark_task_as_done`.
+- Memory: `create_global_memory`, `delete_global_memory`,
+  `search_deep_memory`, `get_deep_memory`.
+- Agents and interaction: `list_agents`, `call_agents`, `ask_user`.
 
-[compaction]
-strategy = "hybrid"
-threshold = 0.8
+Delegated agents receive a focused objective, an explicit connection/model
+binding, and a stable thread identifier so their complete read-only execution
+can be inspected from the parent conversation. A delegated agent cannot spawn
+another delegated agent.
 
-[skills]
-paths = ["./skills", "~/.config/averroes/skills"]
-```
+## Skills and workspace instructions
 
-## Skills
+Before working in a project, Averroes loads applicable `AGENTS.md` instructions
+from the active workspace. Skills are discovered from workspace-local
+locations, including:
 
-Skills are markdown files stored under `skills/` directories. They are indexed at startup and loaded on demand by the agent:
-
-```markdown
-# Example Skill
-
-Description of what this skill does.
-
-## Triggers
-- keyword one
-- keyword two
+```text
+.averroes/skills/
+.agents/skills/
+.codex/skills/
+.claude/skills/
+skills/
 ```
 
-The agent uses `list_skills` and `load_skill` tools to discover and load relevant skills while keeping context lean.
+Skills are indexed at startup and loaded on demand, keeping the active prompt
+small while allowing the agent to use project-specific workflows.
 
-## GPUI Workspace
+## Memory, search, and compaction
 
-The desktop frontend is a native GPUI application with a light TokenFactory-inspired visual system:
+The conversation index is compiled with the selected embedding connection and
+stored in SQLite. Indexing can continue in the background while the application
+is idle, and semantic retrieval is used for deep-memory queries and relevant
+conversation context. If the optional `sqlite-vector-rs` extension is not
+available, the same SQLite-backed index uses the built-in search path.
 
-- Closable session tabs with `+` new-session behavior.
-- A per-session composer with `+`, `Build`, provider/model, `Max`, and `Send` controls.
-- Shared setup and settings for provider, model, and API-key environment variables.
-- Runtime status and keyboard shortcuts: `cmd-n`, `cmd-w`, `cmd-l`, `cmd-enter`, and `cmd-,`.
+Context compaction is internal runtime behavior. It uses provider-reported
+usage, preserves important objective and decision context, and is surfaced in
+the conversation when it occurs; there is no compaction tool for the agent to
+invoke.
 
-The GPUI frontend and core runtime use the same configuration file; no GPUI-specific provider configuration is created.
+## macOS releases
 
-## Builtin Tools
+Every published GitHub Release triggers
+`.github/workflows/macos-release.yml`. The workflow:
 
-`bash`, `file_read`, `file_write`, `glob`, `grep`, `web_fetch`, `list_skills`, `load_skill` — plus dynamic tool registration and MCP client stub.
+1. Checks out the published release tag.
+2. Builds the Rust application with the release version from that tag.
+3. Creates architecture-specific `.app` and `.dmg` artifacts.
+4. Includes an `/Applications` symlink in the DMG.
+5. Uploads both DMGs to the release.
+
+The application checks for newer releases at startup. When an update is
+available, the user can download and open the verified DMG from the update
+dialog. The current version is shown in Settings → About and in the sidebar.
+
+To build a DMG locally on macOS:
+
+```bash
+VERSION=1.2.3 scripts/bundle-macos.sh
+```
+
+The script requires `cargo`, `hdiutil`, `plutil`, and `ditto`. Code signing is
+optional and can be enabled with `CODESIGN_IDENTITY`.
 
 ## License
 
