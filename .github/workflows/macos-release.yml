@@ -60,13 +60,18 @@ jobs:
           KEYCHAIN_PATH="${RUNNER_TEMP}/averroes-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
 
+          {
+            echo "KEYCHAIN_PATH=${KEYCHAIN_PATH}"
+            echo "CERTIFICATE_PATH=${CERTIFICATE_PATH}"
+          } >> "${GITHUB_ENV}"
+
           printf '%s' "${APPLE_CERTIFICATE_BASE64}" | base64 -D > "${CERTIFICATE_PATH}"
           security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
           security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
           security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
           security import "${CERTIFICATE_PATH}" \
             -P "${APPLE_CERTIFICATE_PASSWORD}" \
-            -A \
+            -T /usr/bin/codesign \
             -t cert \
             -f pkcs12 \
             -k "${KEYCHAIN_PATH}"
@@ -77,11 +82,6 @@ jobs:
             "${KEYCHAIN_PATH}"
           security list-keychain -d user -s "${KEYCHAIN_PATH}"
           security find-identity -v -p codesigning "${KEYCHAIN_PATH}"
-
-          {
-            echo "KEYCHAIN_PATH=${KEYCHAIN_PATH}"
-            echo "CERTIFICATE_PATH=${CERTIFICATE_PATH}"
-          } >> "${GITHUB_ENV}"
 
       - name: Verify runner architecture
         env:
@@ -130,6 +130,7 @@ jobs:
             --wait
           xcrun stapler staple "${DMG_PATH}"
           xcrun stapler validate "${DMG_PATH}"
+          spctl --assess --type open --verbose=2 "${DMG_PATH}"
 
       - name: Verify signed app
         env:
