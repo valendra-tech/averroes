@@ -10,9 +10,6 @@ on:
       - "assets/**"
       - "scripts/bundle-macos.sh"
       - ".github/workflows/macos-bundle.yml"
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: read
@@ -36,6 +33,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
