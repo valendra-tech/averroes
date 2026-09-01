@@ -36,6 +36,9 @@ jobs:
 
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-${{ matrix.arch }}
+          cache-on-failure: true
 
       - name: Verify runner architecture
         env:
