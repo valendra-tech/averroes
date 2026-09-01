@@ -32,9 +32,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0
+          components: rustfmt
 
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-${{ matrix.arch }}
+          cache-on-failure: true
 
       - name: Verify runner architecture
         env:
