@@ -16,9 +16,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
+          - runner: macos-15-intel
             arch: x86_64
-          - runner: macos-14
+          - runner: macos-15
             arch: arm64
 
     steps:
@@ -26,19 +26,74 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
           persist-credentials: false
 
+      - name: Verify release commit is on main
+        run: |
+          RELEASE_COMMIT="$(git rev-parse HEAD)"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${RELEASE_COMMIT}" refs/remotes/origin/main; then
+            echo "Release tag does not point to a commit reachable from main." >&2
+            exit 1
+          fi
+
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.98.0
           components: rustfmt
 
       - name: Restore Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: macos-${{ matrix.arch }}
           cache-on-failure: true
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          umask 077
+          for variable in APPLE_CERTIFICATE_BASE64 APPLE_CERTIFICATE_PASSWORD APPLE_CODESIGN_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD; do
+            if [[ -z "${!variable}" ]]; then
+              echo "Missing required signing secret: ${variable}" >&2
+              exit 1
+            fi
+          done
+
+          CERTIFICATE_PATH="${RUNNER_TEMP}/developer-id-application.p12"
+          KEYCHAIN_PATH="${RUNNER_TEMP}/averroes-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+
+          {
+            echo "KEYCHAIN_PATH=${KEYCHAIN_PATH}"
+            echo "CERTIFICATE_PATH=${CERTIFICATE_PATH}"
+          } >> "${GITHUB_ENV}"
+
+          printf '%s' "${APPLE_CERTIFICATE_BASE64}" | base64 -D > "${CERTIFICATE_PATH}"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import "${CERTIFICATE_PATH}" \
+            -P "${APPLE_CERTIFICATE_PASSWORD}" \
+            -x \
+            -T /usr/bin/codesign \
+            -t cert \
+            -f pkcs12 \
+            -k "${KEYCHAIN_PATH}"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "${KEYCHAIN_PASSWORD}" \
+            "${KEYCHAIN_PATH}"
+          security list-keychain -d user -s "${KEYCHAIN_PATH}"
+          security find-identity -v -p codesigning "${KEYCHAIN_PATH}"
 
       - name: Verify runner architecture
         env:
@@ -62,7 +117,47 @@ jobs:
         id: bundle
         env:
           VERSION: ${{ github.event.release.tag_name }}
+          CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
         run: scripts/bundle-macos.sh
+
+      - name: Notarize and staple DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+          DMG_PATH: ${{ steps.bundle.outputs.dmg }}
+        run: |
+          for variable in APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD DMG_PATH CODESIGN_IDENTITY; do
+            if [[ -z "${!variable}" ]]; then
+              echo "Missing required notarization value: ${variable}" >&2
+              exit 1
+            fi
+          done
+
+          xcrun notarytool submit "${DMG_PATH}" \
+            --apple-id "${APPLE_ID}" \
+            --team-id "${APPLE_TEAM_ID}" \
+            --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
+            --wait
+          xcrun stapler staple "${DMG_PATH}"
+          xcrun stapler validate "${DMG_PATH}"
+          spctl --assess --type open --verbose=2 "${DMG_PATH}"
+
+      - name: Verify signed app
+        env:
+          DMG_PATH: ${{ steps.bundle.outputs.dmg }}
+        run: |
+          MOUNT_POINT="$(mktemp -d "${RUNNER_TEMP}/averroes-verify.XXXXXX")"
+          cleanup() {
+            hdiutil detach "${MOUNT_POINT}" -force >/dev/null 2>&1 || true
+            rm -rf "${MOUNT_POINT}"
+          }
+          trap cleanup EXIT
+
+          hdiutil attach -readonly -nobrowse -mountpoint "${MOUNT_POINT}" "${DMG_PATH}"
+          codesign --verify --deep --strict --verbose=2 "${MOUNT_POINT}/Averroes.app"
+          spctl --assess --type execute --verbose=2 "${MOUNT_POINT}/Averroes.app"
 
       - name: Upload DMG to published release
         env:
@@ -70,9 +165,17 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           DMG_PATH: ${{ steps.bundle.outputs.dmg }}
         run: |
-          if ! test -s "${DMG_PATH}"; then
-            echo "DMG is missing or empty: ${DMG_PATH}" >&2
-            exit 1
-          fi
+            if ! test -s "${DMG_PATH}"; then
+              echo "DMG is missing or empty: ${DMG_PATH}" >&2
+              exit 1
+            fi
 
-          gh release upload "${RELEASE_TAG}" "${DMG_PATH}" --clobber
+            gh release upload "${RELEASE_TAG}" "${DMG_PATH}" --clobber
+
+      - name: Clean up signing keychain
+        if: always()
+        run: |
+          if [[ -n "${KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "${KEYCHAIN_PATH}" || true
+          fi
+          rm -f "${CERTIFICATE_PATH:-}" "${RUNNER_TEMP}/developer-id-application.p12"
