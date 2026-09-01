@@ -134,6 +134,10 @@ mod tests {
             paths.vault,
             PathBuf::from("/Users/example/.averroes/config/providers.enc")
         );
+        assert_eq!(
+            paths.default_workspace_root(),
+            PathBuf::from("/Users/example/.averroes/default-workspace")
+        );
     }
 
     #[test]

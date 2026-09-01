@@ -722,6 +722,11 @@ impl AppRuntime {
         self.config.read().clone()
     }
 
+    pub fn ensure_secure_storage_access(&self) -> Result<(), RuntimeError> {
+        self.vault.ensure_access()?;
+        Ok(())
+    }
+
     pub fn connections(&self) -> Vec<ConnectionProfile> {
         self.config.read().connections.clone()
     }

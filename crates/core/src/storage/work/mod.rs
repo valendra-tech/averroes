@@ -7,6 +7,7 @@ mod schema;
 mod types;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,7 +26,9 @@ pub struct WorkDatabase {
 
 impl WorkDatabase {
     pub fn open(paths: &ConfigPaths) -> Result<Arc<Self>, WorkDatabaseError> {
-        Self::open_at(paths.root.join(DATABASE_FILE))
+        let database = Self::open_at(paths.root.join(DATABASE_FILE))?;
+        database.ensure_default_workspace(&paths.default_workspace_root())?;
+        Ok(database)
     }
 
     pub fn open_at(path: PathBuf) -> Result<Arc<Self>, WorkDatabaseError> {
@@ -106,6 +109,146 @@ impl WorkDatabase {
                 schema::project_from_row,
             )
             .map_err(Into::into)
+    }
+
+    /// Create the built-in workspace and attach legacy conversations that did
+    /// not have a workspace yet. `open_at` intentionally remains a low-level
+    /// database constructor for isolated tests and tooling.
+    pub fn ensure_default_workspace(&self, root: &Path) -> Result<WorkProject, WorkDatabaseError> {
+        create_private_dir(root).map_err(|error| WorkDatabaseError::Io(error.to_string()))?;
+        let project = self.open_project(root)?;
+        self.connection.lock().execute(
+            "UPDATE conversations SET project_id = ?1 WHERE project_id IS NULL",
+            params![project.id],
+        )?;
+        Ok(project)
+    }
+
+    pub fn touch_project(&self, project_id: &str) -> Result<(), WorkDatabaseError> {
+        self.connection.lock().execute(
+            "UPDATE projects SET last_opened_at = ?2 WHERE id = ?1",
+            params![project_id, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn conversation_folders(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<WorkConversationFolder>, WorkDatabaseError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT id, workspace_id, name, created_at, updated_at
+             FROM conversation_folders
+             WHERE workspace_id = ?1
+             ORDER BY name COLLATE NOCASE, id",
+        )?;
+        let rows =
+            statement.query_map(params![workspace_id], schema::conversation_folder_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn conversation_folder_ids(
+        &self,
+        workspace_id: &str,
+    ) -> Result<HashMap<String, String>, WorkDatabaseError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT members.conversation_id, members.folder_id
+             FROM conversation_folder_members members
+             JOIN conversation_folders folders ON folders.id = members.folder_id
+             WHERE folders.workspace_id = ?1",
+        )?;
+        let rows = statement.query_map(params![workspace_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .collect())
+    }
+
+    pub fn create_conversation_folder(
+        &self,
+        workspace_id: &str,
+        name: &str,
+    ) -> Result<WorkConversationFolder, WorkDatabaseError> {
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if name.is_empty() {
+            return Err(WorkDatabaseError::InvalidFolder(
+                "folder name cannot be empty".into(),
+            ));
+        }
+        let timestamp = now();
+        let folder = WorkConversationFolder {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: workspace_id.to_owned(),
+            name,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let connection = self.connection.lock();
+        connection.execute(
+            "INSERT INTO conversation_folders
+                (id, workspace_id, name, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                folder.id,
+                folder.workspace_id,
+                folder.name,
+                folder.created_at,
+                folder.updated_at
+            ],
+        )?;
+        Ok(folder)
+    }
+
+    pub fn set_conversation_folder(
+        &self,
+        conversation_id: &str,
+        folder_id: Option<&str>,
+    ) -> Result<(), WorkDatabaseError> {
+        let connection = self.connection.lock();
+        match folder_id {
+            Some(folder_id) => {
+                let valid = connection.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM conversations conversations
+                         JOIN conversation_folders folders
+                           ON folders.workspace_id = conversations.project_id
+                         WHERE conversations.id = ?1 AND folders.id = ?2
+                     )",
+                    params![conversation_id, folder_id],
+                    |row| row.get::<_, i64>(0),
+                )? != 0;
+                if !valid {
+                    return Err(WorkDatabaseError::InvalidFolder(
+                        "conversation and folder must belong to the same workspace".into(),
+                    ));
+                }
+                connection.execute(
+                    "INSERT INTO conversation_folder_members (conversation_id, folder_id)
+                     VALUES (?1, ?2)
+                     ON CONFLICT(conversation_id) DO UPDATE SET folder_id = excluded.folder_id",
+                    params![conversation_id, folder_id],
+                )?;
+            }
+            None => {
+                connection.execute(
+                    "DELETE FROM conversation_folder_members WHERE conversation_id = ?1",
+                    params![conversation_id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn delete_conversation_folder(&self, folder_id: &str) -> Result<bool, WorkDatabaseError> {
+        let deleted = self.connection.lock().execute(
+            "DELETE FROM conversation_folders WHERE id = ?1",
+            params![folder_id],
+        )?;
+        Ok(deleted > 0)
     }
 
     pub fn conversation_summaries(
@@ -776,6 +919,8 @@ pub enum WorkDatabaseError {
     InvalidPath(PathBuf),
     #[error("invalid global memory: {0}")]
     InvalidGlobalMemory(String),
+    #[error("invalid conversation folder: {0}")]
+    InvalidFolder(String),
 }
 
 #[cfg(test)]
@@ -797,6 +942,58 @@ mod tests {
         let second = database.open_project(&root).unwrap();
         assert_eq!(first.id, second.id);
         assert_eq!(database.projects().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn conversation_folders_are_scoped_to_their_workspace() {
+        let (directory, database) = database();
+        let first_root = directory.path().join("first");
+        let second_root = directory.path().join("second");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        let first = database.open_project(&first_root).unwrap();
+        let second = database.open_project(&second_root).unwrap();
+        let folder = database
+            .create_conversation_folder(&first.id, "Research")
+            .unwrap();
+
+        let conversation = WorkConversation {
+            id: "foldered-conversation".into(),
+            title: "Foldered".into(),
+            project_id: Some(first.id.clone()),
+            pinned: false,
+            unread: false,
+            created_at: now(),
+            updated_at: now(),
+            binding: SessionBinding::default(),
+            context_summary: None,
+            context_usage: crate::agent::ContextUsage::default(),
+            messages: Vec::new(),
+            checkpoints: Vec::new(),
+            tasks: Vec::new(),
+            sources: Vec::new(),
+            agent_threads: Vec::new(),
+            agent_thread_transcripts: std::collections::HashMap::new(),
+        };
+        database.save_conversation(&conversation).unwrap();
+
+        database
+            .set_conversation_folder(&conversation.id, Some(&folder.id))
+            .unwrap();
+        assert_eq!(
+            database.conversation_folder_ids(&first.id).unwrap()[&conversation.id],
+            folder.id
+        );
+        assert!(database
+            .set_conversation_folder(&conversation.id, Some(&second.id))
+            .is_err());
+        database
+            .set_conversation_folder(&conversation.id, None)
+            .unwrap();
+        assert!(database
+            .conversation_folder_ids(&first.id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

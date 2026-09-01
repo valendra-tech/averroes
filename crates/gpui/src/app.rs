@@ -23,12 +23,13 @@ use averroes_core::provider::types::{ChatMessage, MessageContent, Role};
 use averroes_core::provider::{ModelInfo, ModelSource};
 use averroes_core::work::{
     now, CheckpointStatus, ConversationSearchResult, ConversationSummary, EmbeddingConfig,
-    EmbeddingIndexStatus, TaskStatus, WorkCheckpoint, WorkConversation, WorkMessage,
-    WorkMessageRole, WorkProject, WorkSource, WorkTask, WorkToolActivity, WorkToolActivityState,
+    EmbeddingIndexStatus, TaskStatus, WorkCheckpoint, WorkConversation, WorkConversationFolder,
+    WorkMessage, WorkMessageRole, WorkProject, WorkSource, WorkTask, WorkToolActivity,
+    WorkToolActivityState,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, img, list, px, Anchor, Animation, AnimationExt as _, AnyElement, App, AppContext,
+    div, img, list, px, rgb, Anchor, Animation, AnimationExt as _, AnyElement, App, AppContext,
     ClipboardItem, Context, Entity, FollowMode, FontWeight, FutureExt as _, InteractiveElement,
     IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, Transformation, Window,
@@ -45,6 +46,7 @@ use gpui_component::select::{
 use gpui_component::text::TextView;
 use gpui_component::{Disableable, Icon, IconName, Root as ComponentRoot, Sizable, WindowExt as _};
 use semver::Version;
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -80,6 +82,7 @@ fn stream_event_requires_immediate_flush(event: &AgentStreamEvent) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
+    Home,
     Chat,
     Connections,
 }
@@ -185,35 +188,6 @@ impl SelectItem for ModelChoice {
         self.info.display_name.to_ascii_lowercase().contains(&query)
             || self.info.id.to_ascii_lowercase().contains(&query)
             || self.connection_name.to_ascii_lowercase().contains(&query)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WorkspaceChoice {
-    id: Option<String>,
-    name: SharedString,
-    root: PathBuf,
-}
-
-impl SelectItem for WorkspaceChoice {
-    type Value = Self;
-
-    fn title(&self) -> SharedString {
-        self.name.clone()
-    }
-
-    fn value(&self) -> &Self::Value {
-        self
-    }
-
-    fn matches(&self, query: &str) -> bool {
-        let query = query.to_ascii_lowercase();
-        self.name.to_ascii_lowercase().contains(&query)
-            || self
-                .root
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains(&query)
     }
 }
 
@@ -429,6 +403,7 @@ struct ShellSession {
     processing: bool,
     task: Option<Task<()>>,
     project_id: Option<String>,
+    pending_conversation_folder_id: Option<String>,
     workspace_root: Option<PathBuf>,
     pinned: bool,
     unread: bool,
@@ -458,6 +433,7 @@ impl ShellSession {
             processing: false,
             task: None,
             project_id: project.map(|project| project.id.clone()),
+            pending_conversation_folder_id: None,
             workspace_root: project.map(|project| project.root.clone()),
             pinned: false,
             unread: false,
@@ -497,6 +473,7 @@ impl ShellSession {
             processing: false,
             task: None,
             project_id: conversation.project_id,
+            pending_conversation_folder_id: None,
             workspace_root,
             pinned: conversation.pinned,
             unread: conversation.unread,
@@ -585,7 +562,6 @@ pub struct AverroesApp {
     remembered_binding: SessionBinding,
     composer: Entity<TextareaState>,
     connection_select: Entity<SelectState<Vec<SharedString>>>,
-    workspace_select: Entity<SelectState<Vec<WorkspaceChoice>>>,
     model_select: Entity<SelectState<SearchableVec<SelectGroup<ModelChoice>>>>,
     reasoning_select: Entity<SelectState<Vec<SharedString>>>,
     kind_select: Entity<SelectState<Vec<ConnectionKindChoice>>>,
@@ -633,6 +609,14 @@ pub struct AverroesApp {
     copilot_busy: bool,
     projects: Vec<WorkProject>,
     conversations: Vec<ConversationSummary>,
+    conversation_folders: Vec<WorkConversationFolder>,
+    conversation_folder_ids: HashMap<String, String>,
+    expanded_conversation_folders: HashSet<String>,
+    unfiled_conversations_expanded: bool,
+    folder_name_input: Entity<InputState>,
+    /// The workspace whose conversations are currently shown. `None` is the
+    /// welcome screen; a chat session always has a concrete workspace.
+    active_workspace_id: Option<String>,
     projects_expanded: bool,
     show_sources: bool,
     show_tool_activity: bool,
@@ -661,7 +645,6 @@ impl AverroesApp {
             .map(|(label, _)| label.clone())
             .collect::<Vec<_>>();
         let projects = runtime.database.projects().unwrap_or_default();
-        let workspace_items = workspace_choices(&projects);
         let stored_binding = runtime.database.last_binding().ok().flatten();
         let mut remembered_binding = stored_binding
             .filter(|binding| {
@@ -682,8 +665,6 @@ impl AverroesApp {
         });
         let connection_select =
             cx.new(|cx| SelectState::new(connection_items, None, window, cx).searchable(true));
-        let workspace_select =
-            cx.new(|cx| SelectState::new(workspace_items, None, window, cx).searchable(true));
         let model_choices = initial_model_choices(&runtime);
         let model_select = cx.new(|cx| {
             SelectState::new(grouped_model_items(&model_choices), None, window, cx).searchable(true)
@@ -811,6 +792,9 @@ impl AverroesApp {
         let agent_description_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.agent_description"))
         });
+        let folder_name_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.folder_name"))
+        });
         let manual_model_id_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.model_id"))
         });
@@ -841,14 +825,6 @@ impl AverroesApp {
             |this, _, event: &SelectEvent<Vec<SharedString>>, window, cx| {
                 let SelectEvent::Confirm(value) = event;
                 this.select_connection(value.as_ref(), window, cx);
-            },
-        ));
-        subscriptions.push(cx.subscribe_in(
-            &workspace_select,
-            window,
-            |this, _, event: &SelectEvent<Vec<WorkspaceChoice>>, _, cx| {
-                let SelectEvent::Confirm(value) = event;
-                this.select_workspace(value.as_ref(), cx);
             },
         ));
         subscriptions.push(cx.subscribe_in(
@@ -965,16 +941,19 @@ impl AverroesApp {
         // the user scrolls or a streamed delta arrives.
         let conversation_list = ListState::new(0, ListAlignment::Top, px(768.0));
         conversation_list.set_follow_mode(FollowMode::Tail);
+        let default_project = projects.first().cloned();
         let mut app = Self {
             runtime,
-            route: Route::Chat,
+            route: Route::Home,
             settings_tab: SettingsTab::Models,
-            sessions: vec![ShellSession::new(None, remembered_binding.clone())],
+            sessions: vec![ShellSession::new(
+                default_project.as_ref(),
+                remembered_binding.clone(),
+            )],
             active_session: 0,
             remembered_binding,
             composer,
             connection_select,
-            workspace_select,
             model_select,
             reasoning_select,
             kind_select,
@@ -1025,6 +1004,12 @@ impl AverroesApp {
             copilot_busy: false,
             projects,
             conversations,
+            conversation_folders: Vec::new(),
+            conversation_folder_ids: HashMap::new(),
+            expanded_conversation_folders: HashSet::new(),
+            unfiled_conversations_expanded: true,
+            folder_name_input,
+            active_workspace_id: None,
             projects_expanded: true,
             show_sources: true,
             show_tool_activity: true,
@@ -1662,6 +1647,129 @@ impl AverroesApp {
         }
     }
 
+    fn refresh_conversation_folders(&mut self) {
+        let Some(workspace_id) = self.active_workspace_id.as_deref() else {
+            self.conversation_folders.clear();
+            self.conversation_folder_ids.clear();
+            self.expanded_conversation_folders.clear();
+            return;
+        };
+        if let Ok(folders) = self.runtime.database.conversation_folders(workspace_id) {
+            let known_ids = folders
+                .iter()
+                .map(|folder| folder.id.clone())
+                .collect::<HashSet<_>>();
+            self.expanded_conversation_folders
+                .retain(|folder_id| known_ids.contains(folder_id));
+            self.expanded_conversation_folders
+                .extend(folders.iter().map(|folder| folder.id.clone()));
+            self.conversation_folders = folders;
+        }
+        if let Ok(folder_ids) = self.runtime.database.conversation_folder_ids(workspace_id) {
+            self.conversation_folder_ids = folder_ids;
+        }
+    }
+
+    fn open_create_conversation_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_workspace_id.is_none() {
+            return;
+        }
+        self.folder_name_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        let input = self.folder_name_input.clone();
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+            let confirm_input = input.clone();
+            let confirm_view = view.clone();
+            let confirm = Button::new("folder-create-confirm")
+                .primary()
+                .label(i18n::text(cx, "folder.create"))
+                .on_click(move |_, window, cx| {
+                    let name = confirm_input.read(cx).value().trim().to_owned();
+                    if confirm_view.update(cx, |app, cx| app.create_conversation_folder(&name, cx))
+                    {
+                        window.close_dialog(cx);
+                    }
+                });
+            dialog
+                .title(i18n::text(cx, "folder.create_title"))
+                .w(px(420.0))
+                .child(div().py(px(8.0)).child(Input::new(&input).w_full()))
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            Button::new("folder-create-cancel")
+                                .secondary()
+                                .label(i18n::text(cx, "dialog.cancel"))
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(confirm),
+                )
+        });
+    }
+
+    fn create_conversation_folder(&mut self, name: &str, cx: &mut Context<Self>) -> bool {
+        let Some(workspace_id) = self.active_workspace_id.clone() else {
+            return false;
+        };
+        match self
+            .runtime
+            .database
+            .create_conversation_folder(&workspace_id, name)
+        {
+            Ok(folder) => {
+                self.expanded_conversation_folders.insert(folder.id.clone());
+                self.conversation_folders.push(folder);
+                self.conversation_folders.sort_by(|left, right| {
+                    left.name
+                        .to_ascii_lowercase()
+                        .cmp(&right.name.to_ascii_lowercase())
+                });
+                self.notice = Some(Notice {
+                    success: true,
+                    text: i18n::text(cx, "folder.created").to_string(),
+                });
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.show_error(error.to_string(), cx);
+                false
+            }
+        }
+    }
+
+    fn set_conversation_folder(
+        &mut self,
+        conversation_id: &str,
+        folder_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        match self
+            .runtime
+            .database
+            .set_conversation_folder(conversation_id, folder_id)
+        {
+            Ok(()) => {
+                match folder_id {
+                    Some(folder_id) => {
+                        self.conversation_folder_ids
+                            .insert(conversation_id.to_owned(), folder_id.to_owned());
+                    }
+                    None => {
+                        self.conversation_folder_ids.remove(conversation_id);
+                    }
+                }
+                cx.notify();
+            }
+            Err(error) => self.show_error(error.to_string(), cx),
+        }
+    }
+
     fn refresh_embedding_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.embedding_connection_labels = self
             .runtime
@@ -1903,6 +2011,15 @@ impl AverroesApp {
                 .database
                 .search_conversations_text(&query, 24)
                 .unwrap_or_default()
+                .into_iter()
+                .filter(|result| {
+                    self.active_workspace_id
+                        .as_ref()
+                        .is_some_and(|workspace_id| {
+                            result.project_id.as_ref() == Some(workspace_id)
+                        })
+                })
+                .collect()
         };
         cx.notify();
     }
@@ -1940,7 +2057,16 @@ impl AverroesApp {
                     return;
                 }
                 if let Some(results) = result {
-                    app.conversation_search_results = results;
+                    app.conversation_search_results = results
+                        .into_iter()
+                        .filter(|result| {
+                            app.active_workspace_id
+                                .as_ref()
+                                .is_some_and(|workspace_id| {
+                                    result.project_id.as_ref() == Some(workspace_id)
+                                })
+                        })
+                        .collect();
                     cx.notify();
                 }
             });
@@ -2027,7 +2153,9 @@ impl AverroesApp {
         let snapshot = self.active().snapshot();
         match self.runtime.database.save_conversation(&snapshot) {
             Ok(()) => {
+                let active_index = self.active_session;
                 self.active_mut().persisted = true;
+                self.persist_pending_conversation_folder(active_index, cx);
                 self.refresh_navigation();
                 self.schedule_background_indexing(cx);
                 true
@@ -2051,6 +2179,7 @@ impl AverroesApp {
         match self.runtime.database.save_conversation(&snapshot) {
             Ok(()) => {
                 self.sessions[index].persisted = true;
+                self.persist_pending_conversation_folder(index, cx);
                 self.refresh_navigation();
                 self.schedule_background_indexing(cx);
             }
@@ -2062,6 +2191,40 @@ impl AverroesApp {
             }
         }
         cx.notify();
+    }
+
+    fn persist_pending_conversation_folder(
+        &mut self,
+        session_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(folder_id) = self
+            .sessions
+            .get(session_index)
+            .and_then(|session| session.pending_conversation_folder_id.clone())
+        else {
+            return;
+        };
+        let Some(conversation_id) = self
+            .sessions
+            .get(session_index)
+            .map(|session| session.id.to_string())
+        else {
+            return;
+        };
+        match self
+            .runtime
+            .database
+            .set_conversation_folder(&conversation_id, Some(&folder_id))
+        {
+            Ok(()) => {
+                if let Some(session) = self.sessions.get_mut(session_index) {
+                    session.pending_conversation_folder_id = None;
+                }
+                self.refresh_conversation_folders();
+            }
+            Err(error) => self.show_error(error.to_string(), cx),
+        }
     }
 
     fn persist_session_binding(&mut self, id: &SessionId, cx: &mut Context<Self>) {
@@ -2187,7 +2350,7 @@ impl AverroesApp {
         .detach();
     }
 
-    fn open_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: false,
             directories: true,
@@ -2206,6 +2369,10 @@ impl AverroesApp {
                     Ok(project) => {
                         app.refresh_navigation();
                         app.new_session_for_project(Some(project), window, cx);
+                        crate::refresh_application_menu(
+                            Borrow::borrow(&*cx),
+                            app.recent_projects_for_menu(),
+                        );
                     }
                     Err(error) => app.show_error(error.to_string(), cx),
                 }
@@ -2360,16 +2527,31 @@ impl AverroesApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(project) = project.as_ref() {
-            self.runtime.load_workspace_tools(&project.root);
-        }
+        let project = project
+            .or_else(|| {
+                self.active_workspace_id.as_ref().and_then(|id| {
+                    self.projects
+                        .iter()
+                        .find(|project| &project.id == id)
+                        .cloned()
+                })
+            })
+            .or_else(|| self.projects.first().cloned());
+        let Some(project) = project else {
+            self.show_error(i18n::text(cx, "notice.workspace_missing"), cx);
+            return;
+        };
+        self.active_workspace_id = Some(project.id.clone());
+        self.refresh_conversation_folders();
+        let _ = self.runtime.database.touch_project(&project.id);
+        self.runtime.load_workspace_tools(&project.root);
         let binding = inherited_session_binding(
             &self.active().binding,
             &self.remembered_binding,
             &self.runtime.default_agent_tools(),
         );
         self.sessions
-            .push(ShellSession::new(project.as_ref(), binding));
+            .push(ShellSession::new(Some(&project), binding));
         self.active_session = self.sessions.len() - 1;
         self.route = Route::Chat;
         self.show_sources = true;
@@ -2384,6 +2566,17 @@ impl AverroesApp {
         cx.notify();
     }
 
+    fn new_session_in_conversation_folder(
+        &mut self,
+        folder: WorkConversationFolder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_session_for_project(None, window, cx);
+        self.active_mut().pending_conversation_folder_id = Some(folder.id);
+        cx.notify();
+    }
+
     fn select_project(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let project = self
             .projects
@@ -2393,6 +2586,28 @@ impl AverroesApp {
         if let Some(project) = project {
             self.new_session_for_project(Some(project), window, cx);
         }
+    }
+
+    pub(crate) fn open_recent_project(
+        &mut self,
+        project_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_project(project_id, window, cx);
+    }
+
+    pub(crate) fn recent_projects_for_menu(&self) -> Vec<(String, String)> {
+        self.projects
+            .iter()
+            .take(12)
+            .map(|project| {
+                (
+                    project.id.clone(),
+                    format!("{}  —  {}", project.name, project.root.display()),
+                )
+            })
+            .collect()
     }
 
     fn select_conversation(
@@ -2413,6 +2628,12 @@ impl AverroesApp {
         match self.runtime.database.conversation(conversation_id) {
             Ok(Some(conversation)) => {
                 let mut session = ShellSession::from_work(conversation, &self.projects);
+                if session.project_id.is_none() {
+                    if let Some(project) = self.projects.first() {
+                        session.project_id = Some(project.id.clone());
+                        session.workspace_root = Some(project.root.clone());
+                    }
+                }
                 let binding_changed =
                     ensure_binding_tools(&mut session.binding, &self.runtime.default_agent_tools());
                 if let Some(root) = session.workspace_root.as_deref() {
@@ -2420,6 +2641,8 @@ impl AverroesApp {
                 }
                 self.sessions.push(session);
                 self.active_session = self.sessions.len() - 1;
+                self.active_workspace_id = self.active().project_id.clone();
+                self.refresh_conversation_folders();
                 self.route = Route::Chat;
                 self.show_sources = true;
                 self.show_context = false;
@@ -2731,12 +2954,6 @@ impl AverroesApp {
         }
         cx.notify();
         true
-    }
-
-    fn toggle_pin(&mut self, cx: &mut Context<Self>) {
-        let conversation_id = self.active().id.to_string();
-        let pinned = !self.active().pinned;
-        self.set_conversation_pinned(&conversation_id, pinned, cx);
     }
 
     fn set_conversation_pinned(
@@ -3923,37 +4140,6 @@ impl AverroesApp {
         cx.notify();
     }
 
-    fn select_workspace(&mut self, value: Option<&WorkspaceChoice>, cx: &mut Context<Self>) {
-        if self.active().processing || !self.active().messages.is_empty() {
-            return;
-        }
-
-        let project_id = value.and_then(|choice| choice.id.clone());
-        let project = project_id.as_ref().and_then(|id| {
-            self.projects
-                .iter()
-                .find(|project| &project.id == id)
-                .cloned()
-        });
-        if project_id.is_some() && project.is_none() {
-            self.show_error(i18n::text(cx, "notice.workspace_missing"), cx);
-            return;
-        }
-
-        let workspace_root = project.as_ref().map(|project| project.root.clone());
-        {
-            let session = self.active_mut();
-            session.project_id = project_id;
-            session.workspace_root = workspace_root.clone();
-            session.agent = None;
-        }
-        if let Some(root) = workspace_root {
-            self.runtime.load_workspace_tools(&root);
-        }
-        self.notice = None;
-        cx.notify();
-    }
-
     fn select_model(
         &mut self,
         value: Option<&ModelChoice>,
@@ -4037,22 +4223,6 @@ impl AverroesApp {
                 Some(label) => select.set_selected_value(label, window, cx),
                 None => select.set_selected_index(None, window, cx),
             });
-    }
-
-    fn sync_workspace_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let project_id = self.active().project_id.clone();
-        let items = workspace_choices(&self.projects);
-        let selected = items
-            .iter()
-            .find(|choice| choice.id.as_ref() == project_id.as_ref())
-            .cloned();
-        self.workspace_select.update(cx, |select, cx| {
-            select.set_items(items, window, cx);
-            match selected.as_ref() {
-                Some(choice) => select.set_selected_value(choice, window, cx),
-                None => select.set_selected_index(None, window, cx),
-            }
-        });
     }
 
     fn refresh_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5398,11 +5568,14 @@ impl AverroesApp {
         }
         self.sessions.remove(self.active_session);
         if self.sessions.is_empty() {
-            self.sessions
-                .push(ShellSession::new(None, self.remembered_binding.clone()));
+            self.sessions.push(ShellSession::new(
+                self.projects.first(),
+                self.remembered_binding.clone(),
+            ));
         }
         self.active_session = self.active_session.min(self.sessions.len() - 1);
         self.route = Route::Chat;
+        self.active_workspace_id = self.active().project_id.clone();
         self.show_context = false;
         self.selected_agent_thread = None;
         self.agent_thread_view = None;
@@ -5419,6 +5592,8 @@ impl AverroesApp {
         }
         self.active_session = index;
         self.route = Route::Chat;
+        self.active_workspace_id = self.active().project_id.clone();
+        self.refresh_conversation_folders();
         self.show_context = false;
         self.selected_agent_thread = None;
         self.agent_thread_view = None;
@@ -5434,7 +5609,6 @@ impl AverroesApp {
     fn sync_selectors_to_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let connection_id = self.active().binding.connection_id.clone();
         self.sync_connection_picker(window, cx);
-        self.sync_workspace_picker(window, cx);
         self.refresh_model_picker(window, cx);
         let is_codex = connection_id
             .as_ref()
@@ -5459,6 +5633,10 @@ impl AverroesApp {
     }
 
     fn handle_focus_input(&mut self, _: &FocusInput, window: &mut Window, cx: &mut Context<Self>) {
+        if self.route == Route::Home {
+            self.new_session(window, cx);
+            return;
+        }
         self.route = Route::Chat;
         self.mark_active_read(cx);
         self.composer
@@ -5587,6 +5765,135 @@ impl AverroesApp {
             .into_any_element()
     }
 
+    fn render_workspace_conversation_row(
+        &mut self,
+        conversation: ConversationSummary,
+        active_id: &str,
+        session_states: &HashMap<String, (bool, bool)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let conversation_id = conversation.id.clone();
+        let select_id = conversation_id.clone();
+        let selected = self.route == Route::Chat && conversation_id == active_id;
+        let (processing, session_unread) = session_states
+            .get(&conversation_id)
+            .copied()
+            .unwrap_or((false, false));
+        let unread = conversation.unread || session_unread;
+        let group = SharedString::from(format!("workspace-conversation-row-{conversation_id}"));
+        let actions = conversation_actions_button(
+            conversation_id.clone(),
+            format!("workspace-conversation-actions-{conversation_id}"),
+            Some(group.clone()),
+            Some(conversation.pinned),
+            processing,
+            unread,
+            self.conversation_folders.clone(),
+            cx,
+        );
+        div()
+            .id(SharedString::from(format!(
+                "workspace-conversation-{conversation_id}"
+            )))
+            .flex_none()
+            .w_full()
+            .h(px(29.0))
+            .pl(px(26.0))
+            .pr(px(9.0))
+            .flex()
+            .items_center()
+            .rounded(px(7.0))
+            .overflow_hidden()
+            .cursor_pointer()
+            .group(group)
+            .text_size(px(12.0))
+            .text_color(theme.muted)
+            .when(selected, |row| {
+                row.mt(px(1.0))
+                    .mb(px(1.0))
+                    .bg(theme.accent_soft)
+                    .text_color(theme.foreground)
+            })
+            .hover(|style| style.bg(theme.accent_soft))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(conversation.title),
+            )
+            .child(actions)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_conversation(&select_id, window, cx)
+            }))
+            .into_any_element()
+    }
+
+    fn render_attention_conversation_row(
+        &mut self,
+        conversation: ConversationSummary,
+        active_id: &str,
+        session_states: &HashMap<String, (bool, bool)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let conversation_id = conversation.id.clone();
+        let select_id = conversation_id.clone();
+        let selected = self.route == Route::Chat && conversation_id == active_id;
+        let (processing, session_unread) = session_states
+            .get(&conversation_id)
+            .copied()
+            .unwrap_or((false, false));
+        let unread = conversation.unread || session_unread;
+        let group = SharedString::from(format!("attention-conversation-row-{conversation_id}"));
+        let actions = conversation_actions_button(
+            conversation_id.clone(),
+            format!("attention-conversation-actions-{conversation_id}"),
+            Some(group.clone()),
+            Some(conversation.pinned),
+            processing,
+            unread,
+            self.conversation_folders.clone(),
+            cx,
+        );
+        div()
+            .id(SharedString::from(format!(
+                "attention-conversation-{conversation_id}"
+            )))
+            .flex_none()
+            .w_full()
+            .h(px(31.0))
+            .px(px(9.0))
+            .flex()
+            .items_center()
+            .rounded(px(7.0))
+            .overflow_hidden()
+            .cursor_pointer()
+            .group(group)
+            .text_size(px(13.0))
+            .when(selected, |row| {
+                row.mt(px(1.0)).mb(px(1.0)).bg(theme.accent_soft)
+            })
+            .hover(|style| style.bg(theme.accent_soft))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(conversation.title),
+            )
+            .child(actions)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_conversation(&select_id, window, cx)
+            }))
+            .into_any_element()
+    }
+
     fn render_rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = UiTheme::current(cx);
         let active_id = self.active().id.to_string();
@@ -5595,18 +5902,48 @@ impl AverroesApp {
             .iter()
             .map(|session| (session.id.to_string(), (session.processing, session.unread)))
             .collect::<HashMap<_, _>>();
-        let (global_conversations, mut workspace_conversations) =
+        let (mut global_conversations, mut workspace_conversations) =
             group_conversations_by_workspace(&self.conversations, &self.projects);
+        let is_home = self.route == Route::Home;
+        if is_home || self.active_workspace_id.is_some() {
+            // Conversations are scoped to the selected workspace. The home
+            // screen is deliberately a workspace picker, so it has no chat
+            // rows of its own.
+            global_conversations.clear();
+            if let Some(active_workspace_id) = self.active_workspace_id.as_ref() {
+                workspace_conversations.retain(|id, _| id == active_workspace_id);
+            } else {
+                workspace_conversations.clear();
+            }
+        }
+        let mut attention_conversations = self
+            .conversations
+            .iter()
+            .filter(|conversation| {
+                let (processing, session_unread) = session_states
+                    .get(&conversation.id)
+                    .copied()
+                    .unwrap_or((false, false));
+                let needs_attention = processing || conversation.unread || session_unread;
+                let belongs_to_visible_workspace = if is_home {
+                    conversation.project_id.is_some()
+                } else {
+                    self.active_workspace_id.as_ref() == conversation.project_id.as_ref()
+                };
+                needs_attention && belongs_to_visible_workspace
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_conversation_summaries(&mut attention_conversations);
+
         let mut pinned_rows = Vec::new();
-        let mut recent_rows = Vec::new();
         for conversation in global_conversations {
             let id = conversation.id.clone();
             let select_id = id.clone();
             let selected = self.route == Route::Chat && id == active_id;
-            let (processing, unread) = session_states
-                .get(&id)
-                .copied()
-                .unwrap_or((false, conversation.unread));
+            let (processing, session_unread) =
+                session_states.get(&id).copied().unwrap_or((false, false));
+            let unread = conversation.unread || session_unread;
             let group = SharedString::from(format!("conversation-row-{id}"));
             let actions = conversation_actions_button(
                 id.clone(),
@@ -5615,6 +5952,7 @@ impl AverroesApp {
                 Some(conversation.pinned),
                 processing,
                 unread,
+                Vec::new(),
                 cx,
             );
             let row = div()
@@ -5650,16 +5988,38 @@ impl AverroesApp {
                 .into_any_element();
             if conversation.pinned {
                 pinned_rows.push(row);
-            } else {
-                recent_rows.push(row);
             }
         }
+        let attention_rows = attention_conversations
+            .into_iter()
+            .map(|conversation| {
+                self.render_attention_conversation_row(
+                    conversation,
+                    &active_id,
+                    &session_states,
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>();
 
         let mut project_rows = Vec::new();
         if self.projects_expanded {
-            for project in self.projects.clone() {
+            let visible_projects = if is_home {
+                self.projects.clone()
+            } else {
+                self.projects
+                    .iter()
+                    .filter(|project| self.active_workspace_id.as_ref() == Some(&project.id))
+                    .cloned()
+                    .collect()
+            };
+            for project in visible_projects {
                 let id = project.id.clone();
-                let conversations = workspace_conversations.remove(&id).unwrap_or_default();
+                let conversations = if is_home {
+                    Vec::new()
+                } else {
+                    workspace_conversations.remove(&id).unwrap_or_default()
+                };
                 let conversation_count = conversations.len();
                 let new_work_project_id = id.clone();
                 let project_group = SharedString::from(format!("project-row-{id}"));
@@ -5693,104 +6053,150 @@ impl AverroesApp {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.new_session_for_project(Some(new_conversation_project.clone()), window, cx)
                 }));
-                project_rows.push(
-                    div()
-                        .id(SharedString::from(format!("project-{id}")))
-                        .flex_none()
-                        .w_full()
-                        .h(px(31.0))
-                        .px(px(8.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .rounded(px(7.0))
-                        .cursor_pointer()
-                        .group(project_group)
-                        .text_size(px(13.0))
-                        .hover(|style| style.bg(theme.accent_soft))
-                        .child(
-                            Icon::new(IconName::Folder)
-                                .size(px(15.0))
-                                .text_color(theme.muted),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .overflow_hidden()
-                                .child(project.name),
-                        )
-                        .child(
-                            div()
-                                .relative()
-                                .flex_none()
-                                .size(px(24.0))
-                                .child(project_conversation_count)
-                                .child(new_conversation_button),
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.select_project(&new_work_project_id, window, cx)
-                        }))
-                        .into_any_element(),
-                );
-                if conversations.is_empty() {
+                if is_home {
                     project_rows.push(
                         div()
-                            .h(px(27.0))
-                            .pl(px(33.0))
+                            .id(SharedString::from(format!("project-{id}")))
+                            .flex_none()
+                            .w_full()
+                            .h(px(31.0))
+                            .px(px(8.0))
                             .flex()
                             .items_center()
-                            .text_size(px(11.0))
-                            .text_color(theme.faint)
-                            .child(i18n::text(cx, "sidebar.no_conversations"))
+                            .gap(px(8.0))
+                            .rounded(px(7.0))
+                            .cursor_pointer()
+                            .group(project_group)
+                            .text_size(px(13.0))
+                            .hover(|style| style.bg(theme.accent_soft))
+                            .child(
+                                Icon::new(IconName::Folder)
+                                    .size(px(15.0))
+                                    .text_color(theme.muted),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .child(project.name),
+                            )
+                            .child(
+                                div()
+                                    .relative()
+                                    .flex_none()
+                                    .size(px(24.0))
+                                    .child(project_conversation_count)
+                                    .child(new_conversation_button),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select_project(&new_work_project_id, window, cx)
+                            }))
                             .into_any_element(),
                     );
+                }
+                if conversations.is_empty() && self.conversation_folders.is_empty() {
+                    if !is_home {
+                        project_rows.push(
+                            div()
+                                .h(px(27.0))
+                                .pl(px(9.0))
+                                .flex()
+                                .items_center()
+                                .text_size(px(11.0))
+                                .text_color(theme.faint)
+                                .child(i18n::text(cx, "sidebar.no_conversations"))
+                                .into_any_element(),
+                        );
+                    }
                     continue;
                 }
-                for conversation in conversations {
-                    let conversation_id = conversation.id.clone();
-                    let select_id = conversation_id.clone();
-                    let selected = self.route == Route::Chat && conversation_id == active_id;
-                    let (processing, unread) = session_states
-                        .get(&conversation_id)
-                        .copied()
-                        .unwrap_or((false, conversation.unread));
-                    let group =
-                        SharedString::from(format!("workspace-conversation-row-{conversation_id}"));
-                    let actions = conversation_actions_button(
-                        conversation_id.clone(),
-                        format!("workspace-conversation-actions-{conversation_id}"),
-                        Some(group.clone()),
-                        Some(conversation.pinned),
-                        processing,
-                        unread,
-                        cx,
-                    );
+                let mut remaining = conversations;
+                for folder in self.conversation_folders.clone() {
+                    let folder_id = folder.id.clone();
+                    let folder_conversations = remaining
+                        .iter()
+                        .filter(|conversation| {
+                            self.conversation_folder_ids.get(&conversation.id) == Some(&folder_id)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    remaining.retain(|conversation| {
+                        self.conversation_folder_ids.get(&conversation.id) != Some(&folder_id)
+                    });
+                    let folder_group =
+                        SharedString::from(format!("conversation-folder-row-{folder_id}"));
+                    let expanded = self.expanded_conversation_folders.contains(&folder_id);
+                    let folder_toggle_id = folder_id.clone();
+                    let folder_dot_color = conversation_folder_dot_color(&folder.name);
+                    let folder_group_for_hover = folder_group.clone();
+                    let folder_for_new_conversation = folder.clone();
+                    let folder_count = div()
+                        .absolute()
+                        .top(px(0.0))
+                        .right(px(0.0))
+                        .size(px(24.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(10.0))
+                        .text_color(theme.faint)
+                        .group_hover(folder_group_for_hover.clone(), |style| style.opacity(0.0))
+                        .child(folder_conversations.len().to_string());
+                    let new_conversation_button = Button::new(SharedString::from(format!(
+                        "new-conversation-in-folder-{folder_id}"
+                    )))
+                    .ghost()
+                    .small()
+                    .with_size(px(24.0))
+                    .icon(IconName::Plus)
+                    .tooltip(i18n::text(cx, "folder.new_conversation"))
+                    .absolute()
+                    .top(px(0.0))
+                    .right(px(0.0))
+                    .opacity(0.0)
+                    .group_hover(folder_group_for_hover, |style| style.opacity(1.0))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.new_session_in_conversation_folder(
+                            folder_for_new_conversation.clone(),
+                            window,
+                            cx,
+                        )
+                    }));
                     project_rows.push(
                         div()
                             .id(SharedString::from(format!(
-                                "workspace-conversation-{conversation_id}"
+                                "conversation-folder-{folder_id}"
                             )))
                             .flex_none()
                             .w_full()
                             .h(px(29.0))
-                            .pl(px(33.0))
-                            .pr(px(9.0))
+                            .px(px(9.0))
                             .flex()
                             .items_center()
+                            .gap(px(6.0))
                             .rounded(px(7.0))
-                            .overflow_hidden()
                             .cursor_pointer()
-                            .group(group)
+                            .group(folder_group)
                             .text_size(px(12.0))
                             .text_color(theme.muted)
-                            .when(selected, |row| {
-                                row.mt(px(1.0))
-                                    .mb(px(1.0))
-                                    .bg(theme.accent_soft)
-                                    .text_color(theme.foreground)
-                            })
                             .hover(|style| style.bg(theme.accent_soft))
+                            .child(
+                                Icon::new(if expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size(px(12.0)),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(px(7.0))
+                                    .rounded_full()
+                                    .bg(folder_dot_color),
+                            )
+                            .child(Icon::new(IconName::Folder).size(px(14.0)))
                             .child(
                                 div()
                                     .flex_1()
@@ -5798,14 +6204,96 @@ impl AverroesApp {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
-                                    .child(conversation.title),
+                                    .child(folder.name),
                             )
-                            .child(actions)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select_conversation(&select_id, window, cx)
+                            .child(
+                                div()
+                                    .relative()
+                                    .flex_none()
+                                    .size(px(24.0))
+                                    .child(folder_count)
+                                    .child(new_conversation_button),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let folder_toggle_id = folder_toggle_id.clone();
+                                if expanded {
+                                    this.expanded_conversation_folders.remove(&folder_toggle_id);
+                                } else {
+                                    this.expanded_conversation_folders.insert(folder_toggle_id);
+                                }
+                                cx.notify();
                             }))
                             .into_any_element(),
                     );
+                    if expanded {
+                        for conversation in folder_conversations {
+                            project_rows.push(self.render_workspace_conversation_row(
+                                conversation,
+                                &active_id,
+                                &session_states,
+                                cx,
+                            ));
+                        }
+                    }
+                }
+                if !remaining.is_empty() {
+                    let unfiled_expanded = self.unfiled_conversations_expanded;
+                    let unfiled_count = remaining.len();
+                    project_rows.push(
+                        div()
+                            .id(SharedString::from(format!("unfiled-conversations-{id}")))
+                            .flex_none()
+                            .w_full()
+                            .h(px(29.0))
+                            .px(px(9.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .rounded(px(7.0))
+                            .cursor_pointer()
+                            .text_size(px(12.0))
+                            .text_color(theme.faint)
+                            .hover(|style| style.bg(theme.accent_soft))
+                            .child(
+                                Icon::new(if unfiled_expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size(px(12.0)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(i18n::text(cx, "folder.unfiled")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.faint)
+                                    .child(unfiled_count.to_string()),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.unfiled_conversations_expanded =
+                                    !this.unfiled_conversations_expanded;
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                    if unfiled_expanded {
+                        for conversation in remaining {
+                            project_rows.push(self.render_workspace_conversation_row(
+                                conversation,
+                                &active_id,
+                                &session_states,
+                                cx,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -5881,6 +6369,46 @@ impl AverroesApp {
         } else {
             div().into_any_element()
         };
+        let active_project_indicator = self
+            .active_workspace_id
+            .as_ref()
+            .and_then(|project_id| {
+                self.projects
+                    .iter()
+                    .find(|project| &project.id == project_id)
+            })
+            .map(|project| {
+                div()
+                    .id("active-project-indicator")
+                    .flex_none()
+                    .mx(px(9.0))
+                    .mb(px(8.0))
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .rounded(px(9.0))
+                    .bg(theme.surface_subtle)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .text_size(px(10.0))
+                            .text_color(theme.faint)
+                            .child(Icon::new(IconName::Folder).size(px(13.0)))
+                            .child(i18n::text(cx, "sidebar.current_project")),
+                    )
+                    .child(
+                        div()
+                            .mt(px(3.0))
+                            .text_size(px(13.0))
+                            .text_color(theme.foreground)
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(project.name.clone()),
+                    )
+            })
+            .map(IntoElement::into_any_element);
 
         div()
             .flex_none()
@@ -5922,45 +6450,27 @@ impl AverroesApp {
                     ),
             )
             .child(search_panel)
+            .children(active_project_indicator)
             .child(
-                div()
-                    .flex_none()
-                    .px(px(9.0))
-                    .pb(px(8.0))
-                    .child(
-                        div()
-                            .id("new-work")
-                            .h(px(34.0))
-                            .px(px(8.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(9.0))
-                            .rounded(px(7.0))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme.accent_soft))
-                            .child(Icon::new(IconName::Plus).size(px(15.0)))
-                            .child(i18n::text(cx, "sidebar.new_work"))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.new_session(window, cx)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("open-workspace")
-                            .h(px(34.0))
-                            .px(px(8.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(9.0))
-                            .rounded(px(7.0))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme.accent_soft))
-                            .child(Icon::new(IconName::FolderOpen).size(px(15.0)))
-                            .child(i18n::text(cx, "sidebar.open_workspace"))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.open_workspace(window, cx)),
-                            ),
-                    ),
+                div().flex_none().px(px(9.0)).pb(px(8.0)).child(
+                    div()
+                        .id("new-work")
+                        .h(px(34.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(9.0))
+                        .rounded(px(7.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.accent_soft))
+                        .child(
+                            Icon::default()
+                                .path("icons/message-square-plus.svg")
+                                .size(px(15.0)),
+                        )
+                        .child(i18n::text(cx, "sidebar.new_work"))
+                        .on_click(cx.listener(|this, _, window, cx| this.new_session(window, cx))),
+                ),
             )
             .child(
                 div()
@@ -5977,6 +6487,14 @@ impl AverroesApp {
                         this.child(sidebar_empty(i18n::text(cx, "sidebar.no_pinned"), theme))
                     })
                     .children(pinned_rows)
+                    .when(!attention_rows.is_empty(), |this| {
+                        this.child(sidebar_heading(
+                            i18n::text(cx, "sidebar.attention"),
+                            theme,
+                            16.0,
+                        ))
+                        .children(attention_rows)
+                    })
                     .child(
                         div()
                             .mt(px(12.0))
@@ -5995,7 +6513,14 @@ impl AverroesApp {
                                     .flex()
                                     .items_center()
                                     .cursor_pointer()
-                                    .child(i18n::text(cx, "sidebar.projects"))
+                                    .child(i18n::text(
+                                        cx,
+                                        if is_home {
+                                            "home.recent_workspaces"
+                                        } else {
+                                            "sidebar.folders"
+                                        },
+                                    ))
                                     .child(
                                         Icon::new(if self.projects_expanded {
                                             IconName::ChevronDown
@@ -6009,28 +6534,35 @@ impl AverroesApp {
                                         cx.notify();
                                     })),
                             )
-                            .child(Icon::new(IconName::Ellipsis).size(px(15.0)))
                             .child(
-                                Button::new("create-project")
-                                    .ghost()
-                                    .small()
-                                    .icon(IconName::Plus)
-                                    .tooltip(i18n::text(cx, "sidebar.create_project"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_workspace(window, cx)
-                                    })),
+                                Button::new(if is_home {
+                                    "open-project-from-sidebar"
+                                } else {
+                                    "create-conversation-folder"
+                                })
+                                .ghost()
+                                .small()
+                                .icon(IconName::Plus)
+                                .tooltip(i18n::text(
+                                    cx,
+                                    if is_home {
+                                        "sidebar.open_workspace"
+                                    } else {
+                                        "folder.create"
+                                    },
+                                ))
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        if is_home {
+                                            this.open_workspace(window, cx);
+                                        } else {
+                                            this.open_create_conversation_folder(window, cx);
+                                        }
+                                    },
+                                )),
                             ),
                     )
-                    .children(project_rows)
-                    .child(sidebar_heading(
-                        i18n::text(cx, "sidebar.recent"),
-                        theme,
-                        16.0,
-                    ))
-                    .when(recent_rows.is_empty(), |this| {
-                        this.child(sidebar_empty(i18n::text(cx, "sidebar.recent_empty"), theme))
-                    })
-                    .children(recent_rows),
+                    .children(project_rows),
             )
             .child(
                 div()
@@ -6096,7 +6628,6 @@ impl AverroesApp {
         let session = self.active();
         let has_connection = session.binding.connection_id.is_some();
         let has_model = session.binding.model_id.is_some();
-        let workspace_locked = session.processing || !session.messages.is_empty();
         let attachment_chips = self
             .attachments
             .iter()
@@ -6213,19 +6744,6 @@ impl AverroesApp {
                             .items_center()
                             .gap(px(4.0))
                             .flex_none()
-                            .child(
-                                Select::new(&self.workspace_select)
-                                    .w(px(124.0))
-                                    .h(px(28.0))
-                                    .small()
-                                    .appearance(false)
-                                    .placeholder(i18n::text(cx, "composer.workspace"))
-                                    .search_placeholder(i18n::text(
-                                        cx,
-                                        "composer.search_workspaces",
-                                    ))
-                                    .disabled(workspace_locked || self.projects.is_empty()),
-                            )
                             .child(
                                 Select::new(&self.model_select)
                                     .w(px(148.0))
@@ -6364,6 +6882,145 @@ impl AverroesApp {
         .pb(px(22.0))
     }
 
+    fn render_home(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let project_cards = self
+            .projects
+            .clone()
+            .into_iter()
+            .map(|project| {
+                let project_id = project.id.clone();
+                div()
+                    .id(SharedString::from(format!("home-project-{}", project.id)))
+                    .w_full()
+                    .px(px(14.0))
+                    .py(px(11.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(11.0))
+                    .rounded(px(9.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.accent_soft))
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(px(16.0))
+                            .text_color(theme.muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(project.name),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(2.0))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.faint)
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(project.root.to_string_lossy().to_string()),
+                            ),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronRight)
+                            .size(px(14.0))
+                            .text_color(theme.faint),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_project(&project_id, window, cx)
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_y_scrollbar()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(700.0))
+                    .px(px(28.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(24.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(9.0))
+                            .child(img(averroes_logo_asset(cx)).size(px(88.0)))
+                            .child(
+                                div()
+                                    .text_size(px(28.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(i18n::text(cx, "home.title")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .text_color(theme.muted)
+                                    .child(i18n::text(cx, "home.subtitle")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_center()
+                            .gap(px(10.0))
+                            .child(
+                                Button::new("home-open-project")
+                                    .primary()
+                                    .label(i18n::text(cx, "home.open_project"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_workspace(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("home-new-conversation")
+                                    .secondary()
+                                    .label(i18n::text(cx, "home.new_conversation"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.new_session(window, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt(px(8.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(7.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.faint)
+                                    .child(i18n::text(cx, "home.recent_workspaces")),
+                            )
+                            .when(project_cards.is_empty(), |this| {
+                                this.child(sidebar_empty(
+                                    i18n::text(cx, "sidebar.no_conversations"),
+                                    theme,
+                                ))
+                            })
+                            .children(project_cards),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_chat(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.sync_conversation_list_state();
         if let Some(thread_id) = self.agent_thread_view.clone() {
@@ -6373,8 +7030,6 @@ impl AverroesApp {
         let brand_asset = averroes_logo_asset(cx);
         let session = self.active();
         let title = session.title.clone();
-        let pinned = session.pinned;
-        let processing = session.processing;
         let context_usage = session.context_usage;
         let context_busy = session.context_busy;
         let has_agent = session.agent.is_some();
@@ -6382,7 +7037,6 @@ impl AverroesApp {
         let is_empty = session.messages.is_empty();
         let checkpoints = session.checkpoints.clone();
         let tasks = session.tasks.clone();
-        let sources = session.sources.clone();
         let has_tool_activity = session
             .messages
             .iter()
@@ -6605,25 +7259,6 @@ impl AverroesApp {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        let has_sources = !sources.is_empty();
-        let web_source_rows = if self.show_sources {
-            sources
-                .iter()
-                .filter(|source| source.url.is_some())
-                .map(|source| render_source_row(source, theme))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let tool_source_chips = if self.show_sources {
-            sources
-                .iter()
-                .filter(|source| source.url.is_none())
-                .map(|source| render_source_tool_chip(&session_id, source, theme, cx))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
         let has_checkpoints = !checkpoint_rows.is_empty();
         let has_tasks = !task_rows.is_empty();
         let header_actions = conversation_actions_button(
@@ -6633,6 +7268,7 @@ impl AverroesApp {
             None,
             false,
             false,
+            Vec::new(),
             cx,
         );
         let conversation_entries = self.render_conversation_entries(cx);
@@ -6669,93 +7305,42 @@ impl AverroesApp {
                                     .text_ellipsis()
                                     .child(title),
                             )
-                            .child(header_actions),
-                    )
-                    .child(
-                        div()
-                            .mr(px(10.0))
-                            .text_size(px(11.0))
-                            .text_color(if processing {
-                                theme.warning
-                            } else {
-                                theme.faint
-                            })
-                            .child(if processing {
-                                render_activity_indicator(
-                                    format!("header-working-{}", session_id.as_str()),
-                                    theme,
-                                    3.0,
+                            .child(header_actions)
+                            .when(has_tool_activity, |this| {
+                                this.child(
+                                    Button::new("toggle-tool-activity")
+                                        .ghost()
+                                        .small()
+                                        .icon(if self.show_tool_activity {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .tooltip(if self.show_tool_activity {
+                                            "Hide tool activity"
+                                        } else {
+                                            "Show tool activity"
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.toggle_tool_activity_visibility(cx);
+                                        })),
                                 )
-                            } else {
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(theme.faint)
-                                    .child(i18n::text(cx, "chat.work"))
-                                    .into_any_element()
                             }),
                     )
-                    .child(
-                        Button::new("pin-conversation")
-                            .ghost()
-                            .small()
-                            .icon(if pinned {
-                                IconName::CircleCheck
-                            } else {
-                                IconName::Check
-                            })
-                            .tooltip(if pinned {
-                                i18n::text(cx, "chat.unpin")
-                            } else {
-                                i18n::text(cx, "chat.pin")
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_pin(cx))),
-                    )
-                    .when(has_sources, |this| {
-                        this.child(
-                            Button::new("toggle-sources")
-                                .ghost()
-                                .small()
-                                .icon(if self.show_sources {
-                                    IconName::PanelRightClose
-                                } else {
-                                    IconName::PanelRightOpen
-                                })
-                                .tooltip(i18n::text(cx, "chat.show_sources"))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.show_sources = !this.show_sources;
-                                    this.conversation_list.remeasure();
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .when(has_tool_activity, |this| {
-                        this.child(
-                            Button::new("toggle-tool-activity")
-                                .ghost()
-                                .small()
-                                .icon(if self.show_tool_activity {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                })
-                                .tooltip(if self.show_tool_activity {
-                                    "Hide tool activity"
-                                } else {
-                                    "Show tool activity"
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.toggle_tool_activity_visibility(cx);
-                                })),
-                        )
-                    })
                     .child(
                         div()
                             .id("context-usage-button")
                             .flex_none()
-                            .size(px(28.0))
-                            .rounded_full()
+                            .h(px(30.0))
+                            .px(px(9.0))
+                            .gap(px(6.0))
+                            .rounded(px(9.0))
                             .border_1()
-                            .border_color(theme.border)
+                            .border_color(if self.show_context {
+                                theme.focus_ring
+                            } else {
+                                theme.border
+                            })
                             .bg(if self.show_context {
                                 theme.accent_soft
                             } else {
@@ -6765,9 +7350,25 @@ impl AverroesApp {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .hover(|style| style.bg(theme.accent_soft))
-                            .text_size(px(9.0))
+                            .hover(|style| {
+                                style.bg(theme.accent_soft).border_color(theme.focus_ring)
+                            })
+                            .text_size(px(11.0))
                             .text_color(theme.muted)
+                            .child(
+                                Icon::new(if self.show_context {
+                                    IconName::PanelRightClose
+                                } else {
+                                    IconName::PanelRightOpen
+                                })
+                                .size(px(13.0))
+                                .text_color(theme.faint),
+                            )
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(i18n::text(cx, "chat.context")),
+                            )
                             .child(if context_busy {
                                 "…".to_string()
                             } else {
@@ -6843,155 +7444,7 @@ impl AverroesApp {
                             &agent_threads,
                             cx,
                         ))
-                    })
-                    .when(
-                        !self.show_context && self.show_sources && has_sources,
-                        |this| {
-                            this.child(
-                                div()
-                                    .flex_none()
-                                    .w(px(320.0))
-                                    .h_full()
-                                    .min_h(px(0.0))
-                                    .flex()
-                                    .flex_col()
-                                    .px(px(14.0))
-                                    .py(px(16.0))
-                                    .child(
-                                        div()
-                                            .id("sources-scroll")
-                                            .flex_1()
-                                            .min_h(px(0.0))
-                                            .overflow_y_scrollbar()
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap(px(10.0))
-                                                    .rounded(px(16.0))
-                                                    .border_1()
-                                                    .border_color(theme.border)
-                                                    .bg(theme.surface)
-                                                    .shadow_md()
-                                                    .p(px(14.0))
-                                                    .child(
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .pb(px(10.0))
-                                                            .child(
-                                                                div()
-                                                                    .flex_1()
-                                                                    .text_size(px(13.0))
-                                                                    .font_weight(FontWeight::MEDIUM)
-                                                                    .child(i18n::text(
-                                                                        cx,
-                                                                        "chat.results",
-                                                                    )),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .size(px(20.0))
-                                                                    .rounded_full()
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .hover(|style| style.bg(theme.surface_hover))
-                                                                    .child(
-                                                                        Icon::new(IconName::Plus)
-                                                                            .size(px(15.0))
-                                                                            .text_color(theme.faint),
-                                                                    ),
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .h(px(31.0))
-                                                            .flex()
-                                                            .items_center()
-                                                            .text_size(px(12.0))
-                                                            .text_color(theme.muted)
-                                                            .child(i18n::text(
-                                                                cx,
-                                                                "chat.create_file_or_site",
-                                                            )),
-                                                    )
-                                                    .child(div().h(px(1.0)).bg(theme.border))
-                                                    .child(
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .pt(px(2.0))
-                                                            .pb(px(1.0))
-                                                            .child(
-                                                                div()
-                                                                    .flex_1()
-                                                                    .text_size(px(13.0))
-                                                                    .font_weight(FontWeight::MEDIUM)
-                                                                    .child(i18n::text(
-                                                                        cx,
-                                                                        "chat.sources",
-                                                                    )),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .size(px(20.0))
-                                                                    .rounded_full()
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .hover(|style| style.bg(theme.surface_hover))
-                                                                    .child(
-                                                                        Icon::new(IconName::Plus)
-                                                                            .size(px(15.0))
-                                                                            .text_color(theme.faint),
-                                                                    ),
-                                                            ),
-                                                    )
-                                                    .when(
-                                                        !web_source_rows.is_empty()
-                                                            || !tool_source_chips.is_empty(),
-                                                        |this| {
-                                                            this.child(
-                                                                div()
-                                                                    .flex()
-                                                                    .flex_col()
-                                                                    .gap(px(2.0))
-                                                                    .children(web_source_rows)
-                                                                    .children(tool_source_chips)
-                                                                    .child(
-                                                                        div()
-                                                                            .flex()
-                                                                            .items_center()
-                                                                            .gap(px(8.0))
-                                                                            .h(px(31.0))
-                                                                            .px(px(7.0))
-                                                                            .rounded(px(7.0))
-                                                                            .text_size(px(12.0))
-                                                                            .text_color(theme.muted)
-                                                                            .hover(|style| {
-                                                                                style.bg(theme.surface_hover)
-                                                                            })
-                                                                            .child(
-                                                                                Icon::new(
-                                                                                    IconName::ExternalLink,
-                                                                                )
-                                                                                .size(px(14.0))
-                                                                                .text_color(theme.faint),
-                                                                            )
-                                                                            .child(i18n::text(
-                                                                                cx,
-                                                                                "chat.see_all_sources",
-                                                                            )),
-                                                                    ),
-                                                            )
-                                                        },
-                                                    ),
-                                            ),
-                                    ),
-                            )
-                        },
-                    ),
+                    }),
             )
             .into_any_element()
     }
@@ -7189,7 +7642,7 @@ impl AverroesApp {
         let progress = percentage.map(|percentage| {
             div()
                 .h(px(5.0))
-                .w(px((percentage as f32 * 2.46).min(246.0)))
+                .w(px((percentage as f32 * 2.68).min(268.0)))
                 .rounded_full()
                 .bg(if percentage >= 80 {
                     theme.warning
@@ -7342,20 +7795,32 @@ impl AverroesApp {
 
         div()
             .flex_none()
-            .w(px(286.0))
+            .w(px(304.0))
             .min_h(px(0.0))
-            .bg(theme.surface_subtle)
-            .p(px(16.0))
+            .bg(theme.background)
+            .border_l_1()
+            .border_color(theme.border)
+            .px(px(18.0))
+            .py(px(15.0))
             .overflow_y_scrollbar()
             .child(
                 div()
+                    .h(px(30.0))
                     .flex()
                     .items_center()
                     .child(
                         div()
                             .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
                             .text_size(px(13.0))
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(
+                                Icon::new(IconName::PanelRightClose)
+                                    .size(px(14.0))
+                                    .text_color(theme.faint),
+                            )
                             .child(i18n::text(cx, "chat.context")),
                     )
                     .child(
@@ -7370,22 +7835,46 @@ impl AverroesApp {
             )
             .child(
                 div()
-                    .mt(px(16.0))
-                    .p(px(12.0))
-                    .rounded(px(9.0))
+                    .mt(px(12.0))
+                    .p(px(14.0))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(theme.border)
                     .bg(theme.surface)
                     .child(
                         div()
-                            .text_size(px(11.0))
-                            .text_color(theme.muted)
-                            .child(i18n::text(cx, "chat.latest_usage")),
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.muted)
+                                    .child(i18n::text(cx, "chat.latest_usage")),
+                            )
+                            .child(
+                                div()
+                                    .px(px(7.0))
+                                    .py(px(3.0))
+                                    .rounded_full()
+                                    .bg(theme.surface_subtle)
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.faint)
+                                    .child(
+                                        percentage
+                                            .map(|percentage| format!("{percentage}%"))
+                                            .unwrap_or_else(|| "—".into()),
+                                    ),
+                            ),
                     )
                     .child(
                         div()
-                            .mt(px(10.0))
+                            .mt(px(14.0))
                             .flex()
                             .justify_between()
-                            .text_size(px(12.0))
+                            .text_size(px(11.0))
                             .child(
                                 div()
                                     .text_color(theme.muted)
@@ -7395,10 +7884,10 @@ impl AverroesApp {
                     )
                     .child(
                         div()
-                            .mt(px(6.0))
+                            .mt(px(8.0))
                             .flex()
                             .justify_between()
-                            .text_size(px(12.0))
+                            .text_size(px(11.0))
                             .child(
                                 div()
                                     .text_color(theme.muted)
@@ -7408,10 +7897,10 @@ impl AverroesApp {
                     )
                     .child(
                         div()
-                            .mt(px(6.0))
+                            .mt(px(8.0))
                             .flex()
                             .justify_between()
-                            .text_size(px(12.0))
+                            .text_size(px(11.0))
                             .child(
                                 div()
                                     .text_color(theme.muted)
@@ -7422,9 +7911,9 @@ impl AverroesApp {
                     .when_some(progress, |this, progress| {
                         this.child(
                             div()
-                                .mt(px(12.0))
-                                .h(px(5.0))
-                                .w(px(246.0))
+                                .mt(px(14.0))
+                                .h(px(6.0))
+                                .w_full()
                                 .rounded_full()
                                 .bg(theme.surface_hover)
                                 .child(progress),
@@ -7432,7 +7921,7 @@ impl AverroesApp {
                     })
                     .child(
                         div()
-                            .mt(px(8.0))
+                            .mt(px(9.0))
                             .text_size(px(10.0))
                             .text_color(theme.faint)
                             .child(if percentage.is_some() {
@@ -9304,6 +9793,7 @@ impl Render for AverroesApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = UiTheme::current(cx);
         let content = match self.route {
+            Route::Home => self.render_home(cx),
             Route::Chat => self.render_chat(cx),
             Route::Connections => self.render_connections(cx),
         };
@@ -9342,16 +9832,17 @@ fn conversation_actions_button(
     pinned: Option<bool>,
     processing: bool,
     unread: bool,
+    folder_options: Vec<WorkConversationFolder>,
     cx: &mut Context<AverroesApp>,
 ) -> AnyElement {
     let theme = UiTheme::current(cx);
     let app_view = cx.entity().downgrade();
     let pin_view = app_view.clone();
     let rename_view = app_view.clone();
-    let delete_view = app_view;
+    let delete_view = app_view.clone();
     let pin_id = conversation_id.clone();
     let rename_id = conversation_id.clone();
-    let delete_id = conversation_id;
+    let delete_id = conversation_id.clone();
     let wrapper_id = format!("{button_id}-wrapper");
     let spinner_id = SharedString::from(format!("{button_id}-spinner"));
     let indicator = if processing {
@@ -9393,13 +9884,15 @@ fn conversation_actions_button(
                 .opacity(0.0)
                 .group_hover(group, |style| style.opacity(1.0))
         })
-        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _window, cx| {
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
             let pin_view = pin_view.clone();
             let rename_view = rename_view.clone();
             let delete_view = delete_view.clone();
             let pin_id = pin_id.clone();
             let rename_id = rename_id.clone();
             let delete_id = delete_id.clone();
+            let folder_view = app_view.clone();
+            let folder_conversation_id = conversation_id.clone();
             let menu = menu.min_w(px(178.0));
             let menu = if let Some(pinned) = pinned {
                 menu.item(
@@ -9430,6 +9923,73 @@ fn conversation_actions_button(
                 )
             } else {
                 menu
+            };
+            let menu = if folder_options.is_empty() {
+                menu
+            } else {
+                let folder_view = folder_view.clone();
+                let folder_conversation_id = folder_conversation_id.clone();
+                let folder_options_for_submenu = folder_options.clone();
+                menu.submenu_with_icon(
+                    Some(Icon::new(IconName::Folder)),
+                    i18n::text(cx, "folder.assign"),
+                    window,
+                    cx,
+                    move |submenu, _window, cx| {
+                        let remove_folder_view = folder_view.clone();
+                        let remove_folder_conversation_id = folder_conversation_id.clone();
+                        let submenu = submenu.item(
+                            PopupMenuItem::new(i18n::text(cx, "folder.no_folder"))
+                                .icon(Icon::new(IconName::FolderOpen))
+                                .on_click(move |_, _, cx| {
+                                    if let Err(error) = remove_folder_view.update(cx, |app, cx| {
+                                        app.set_conversation_folder(
+                                            &remove_folder_conversation_id,
+                                            None,
+                                            cx,
+                                        );
+                                    }) {
+                                        diagnostics::record(
+                                            DiagnosticLevel::Error,
+                                            "conversation.folder",
+                                            format!(
+                                                "Folder action could not reach the app: {error}"
+                                            ),
+                                        );
+                                    }
+                                }),
+                        );
+                        folder_options_for_submenu.iter().cloned().fold(
+                            submenu,
+                            |submenu, folder| {
+                                let folder_view = folder_view.clone();
+                                let folder_conversation_id = folder_conversation_id.clone();
+                                let folder_id = folder.id.clone();
+                                submenu.item(
+                                    PopupMenuItem::new(folder.name)
+                                        .icon(Icon::new(IconName::Folder))
+                                        .on_click(move |_, _, cx| {
+                                            if let Err(error) = folder_view.update(cx, |app, cx| {
+                                                app.set_conversation_folder(
+                                                    &folder_conversation_id,
+                                                    Some(&folder_id),
+                                                    cx,
+                                                );
+                                            }) {
+                                                diagnostics::record(
+                                                    DiagnosticLevel::Error,
+                                                    "conversation.folder",
+                                                    format!(
+                                                    "Folder action could not reach the app: {error}"
+                                                ),
+                                                );
+                                            }
+                                        }),
+                                )
+                            },
+                        )
+                    },
+                )
             };
             let rename_view = rename_view.clone();
             let delete_view = delete_view.clone();
@@ -9485,20 +10045,6 @@ fn conversation_actions_button(
         .when(processing || unread, |wrapper| wrapper.child(status))
         .child(trigger)
         .into_any_element()
-}
-
-fn workspace_choices(projects: &[WorkProject]) -> Vec<WorkspaceChoice> {
-    let mut choices = vec![WorkspaceChoice {
-        id: None,
-        name: "No workspace".into(),
-        root: PathBuf::new(),
-    }];
-    choices.extend(projects.iter().map(|project| WorkspaceChoice {
-        id: Some(project.id.clone()),
-        name: project.name.clone().into(),
-        root: project.root.clone(),
-    }));
-    choices
 }
 
 fn initial_model_choices(runtime: &AppRuntime) -> Vec<ModelChoice> {
@@ -9928,6 +10474,28 @@ fn agent_thread_status_color(status: AgentThreadStatus, theme: UiTheme) -> gpui:
         AgentThreadStatus::Failed => theme.destructive,
         AgentThreadStatus::Interrupted => theme.muted,
     }
+}
+
+/// Returns a stable accent for a conversation folder without persisting any
+/// presentation state. Keeping the palette small makes the sidebar feel
+/// coherent while hashing the name ensures that the same folder keeps its
+/// identity after restarting the app.
+fn conversation_folder_dot_color(name: &str) -> gpui::Rgba {
+    const COLORS: [u32; 8] = [
+        0x5b8def, // blue
+        0x35b7a4, // teal
+        0xd98a5a, // orange
+        0x9c7aef, // purple
+        0xd26a8a, // pink
+        0x56a96f, // green
+        0xc3a44b, // amber
+        0x4ca3c7, // cyan
+    ];
+
+    let hash = name.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    rgb(COLORS[(hash as usize) % COLORS.len()])
 }
 
 fn flatten_background<T>(
@@ -10598,21 +11166,10 @@ fn render_agent_thread_reasoning(
         .bg(theme.surface_subtle)
         .child(
             div()
+                .w_full()
                 .flex()
                 .items_center()
                 .gap(px(4.0))
-                .child(if message.reasoning_complete {
-                    Icon::new(IconName::Check)
-                        .size(px(12.0))
-                        .text_color(theme.success)
-                        .into_any_element()
-                } else {
-                    render_activity_indicator(
-                        format!("agent-thread-reasoning-{thread_id}-{message_index}"),
-                        theme,
-                        3.0,
-                    )
-                })
                 .child(
                     Button::new(format!(
                         "agent-thread-toggle-reasoning-{thread_id}-{message_index}"
@@ -10628,7 +11185,20 @@ fn render_agent_thread_reasoning(
                     .on_click(cx.listener(move |app, _, _, cx| {
                         app.toggle_agent_thread_reasoning(&toggle_thread_id, message_index, cx);
                     })),
-                ),
+                )
+                .child(div().flex_1())
+                .child(if message.reasoning_complete {
+                    Icon::new(IconName::Check)
+                        .size(px(12.0))
+                        .text_color(theme.success)
+                        .into_any_element()
+                } else {
+                    render_activity_indicator(
+                        format!("agent-thread-reasoning-{thread_id}-{message_index}"),
+                        theme,
+                        3.0,
+                    )
+                }),
         )
         .when(expanded, |this| {
             this.child(
@@ -10850,100 +11420,6 @@ fn render_activity_indicator(id: String, theme: UiTheme, dot_size: f32) -> AnyEl
                 )
                 .into_any_element()
         }))
-        .into_any_element()
-}
-
-fn render_source_tool_chip(
-    session_id: &SessionId,
-    source: &WorkSource,
-    theme: UiTheme,
-    cx: &mut Context<AverroesApp>,
-) -> AnyElement {
-    let opens_agent = matches!(source.kind.as_str(), "call_agents" | "call_agent");
-    let session_id = session_id.clone();
-    div()
-        .id(SharedString::from(format!(
-            "source-tool-{}-{}",
-            session_id.as_str(),
-            source.key
-        )))
-        .flex()
-        .items_center()
-        .gap(px(8.0))
-        .w_full()
-        .h(px(31.0))
-        .px(px(7.0))
-        .rounded(px(7.0))
-        .text_size(px(12.0))
-        .text_color(theme.muted)
-        .hover(|style| style.bg(theme.surface_hover))
-        .child(tool_icon(&source.kind, 14.0).text_color(theme.faint))
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .child(localized_tool_display_name(cx, &source.kind)),
-        )
-        .when(source.count > 1, |this| {
-            this.child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(theme.faint)
-                    .child(format!("×{}", source.count)),
-            )
-        })
-        .when(opens_agent, |this| {
-            this.cursor_pointer()
-                .on_click(cx.listener(move |app, _, _, cx| {
-                    app.open_latest_agent_thread(&session_id, cx);
-                }))
-        })
-        .into_any_element()
-}
-
-fn render_source_row(source: &WorkSource, theme: UiTheme) -> AnyElement {
-    let title = source_display_name(source);
-    div()
-        .flex()
-        .items_center()
-        .gap(px(8.0))
-        .w_full()
-        .h(px(32.0))
-        .px(px(7.0))
-        .rounded(px(7.0))
-        .hover(|style| style.bg(theme.surface_hover))
-        .child(
-            div()
-                .flex_none()
-                .size(px(18.0))
-                .rounded(px(4.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(render_source_icon(source, 15.0, theme)),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .text_ellipsis()
-                .text_size(px(12.0))
-                .text_color(theme.muted)
-                .child(title),
-        )
-        .when(source.count > 1, |this| {
-            this.child(
-                div()
-                    .flex_none()
-                    .text_size(px(11.0))
-                    .text_color(theme.faint)
-                    .child(format!("×{}", source.count)),
-            )
-        })
         .into_any_element()
 }
 
@@ -11298,21 +11774,10 @@ fn render_message(
                 .text_color(theme.muted)
                 .child(
                     div()
+                        .w_full()
                         .flex()
                         .items_center()
                         .gap(px(4.0))
-                        .child(if message.reasoning_complete {
-                            Icon::new(IconName::Check)
-                                .size(px(12.0))
-                                .text_color(theme.success)
-                                .into_any_element()
-                        } else {
-                            render_activity_indicator(
-                                format!("reasoning-{}-{index}", session_id.as_str()),
-                                theme,
-                                3.0,
-                            )
-                        })
                         .child(
                             Button::new(format!(
                                 "toggle-reasoning-{}-{index}",
@@ -11331,7 +11796,20 @@ fn render_message(
                                     app.toggle_reasoning(&toggle_reasoning_session_id, index, cx);
                                 },
                             )),
-                        ),
+                        )
+                        .child(div().flex_1())
+                        .child(if message.reasoning_complete {
+                            Icon::new(IconName::Check)
+                                .size(px(12.0))
+                                .text_color(theme.success)
+                                .into_any_element()
+                        } else {
+                            render_activity_indicator(
+                                format!("reasoning-{}-{index}", session_id.as_str()),
+                                theme,
+                                3.0,
+                            )
+                        }),
                 )
                 .when(reasoning_expanded, |this| {
                     this.child(

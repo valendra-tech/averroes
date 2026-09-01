@@ -17,8 +17,8 @@ mod version;
 use app::AverroesApp;
 use gpui::{
     div, img, point, px, size, App, AppContext, AssetSource, Bounds, Context, FontWeight,
-    IntoElement, ParentElement, Render, SharedString, Styled, TitlebarOptions, Window,
-    WindowBounds, WindowOptions,
+    IntoElement, Menu, MenuItem, ParentElement, Render, SharedString, Styled, TitlebarOptions,
+    Window, WindowBounds, WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::Root as ComponentRoot;
@@ -26,7 +26,10 @@ use i18n::{Locale, Localization};
 use keychain::MacKeychainKeyProvider;
 use reqwest_client::ReqwestClient;
 use runtime::AppRuntime;
-use shortcuts::{CloseSession, FocusInput, NewSession, Quit, SendMessage, ToggleSettings};
+use shortcuts::{
+    CloseSession, FocusInput, NewSession, NewWindow, OpenRecentProject, OpenWorkspace, Quit,
+    SendMessage, ToggleSettings,
+};
 use std::borrow::Cow;
 use std::sync::Arc;
 use ui::UiTheme;
@@ -58,6 +61,9 @@ impl AssetSource for UiAssets {
             "icons/pin.svg" => Some(&include_bytes!("../assets/pin.svg")[..]),
             "icons/pencil.svg" => Some(&include_bytes!("../assets/pencil.svg")[..]),
             "icons/trash.svg" => Some(&include_bytes!("../assets/trash.svg")[..]),
+            "icons/message-square-plus.svg" => {
+                Some(&include_bytes!("../assets/icons/message-square-plus.svg")[..])
+            }
             "tools/terminal.svg" => Some(&include_bytes!("../assets/tools/terminal.svg")[..]),
             "tools/file-read.svg" => Some(&include_bytes!("../assets/tools/file-read.svg")[..]),
             "tools/file-write.svg" => Some(&include_bytes!("../assets/tools/file-write.svg")[..]),
@@ -106,14 +112,50 @@ impl RootView {
     fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.app = None;
         self.error = None;
+        if let Err(error) = MacKeychainKeyProvider::default().request_access() {
+            self.error = Some(format!("Could not access macOS Keychain: {error}"));
+            cx.notify();
+            return;
+        }
         match AppRuntime::load(Arc::new(MacKeychainKeyProvider)) {
             Ok(runtime) => {
                 let runtime = Arc::new(runtime);
-                self.app = Some(cx.new(|cx| AverroesApp::new(window, cx, runtime)));
+                if let Err(error) = runtime.ensure_secure_storage_access() {
+                    self.error = Some(format!("Could not access macOS Keychain: {error}"));
+                } else {
+                    self.app = Some(cx.new(|cx| AverroesApp::new(window, cx, runtime)));
+                }
             }
             Err(error) => self.error = Some(error.to_string()),
         }
         cx.notify();
+    }
+
+    fn open_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(app) = self.app.clone() {
+            app.update(cx, |app, cx| app.open_workspace(window, cx));
+        }
+    }
+
+    fn open_recent_project(
+        &mut self,
+        project_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(app) = self.app.clone() {
+            let project_id = project_id.to_owned();
+            app.update(cx, |app, cx| {
+                app.open_recent_project(&project_id, window, cx)
+            });
+        }
+    }
+
+    fn recent_projects_for_menu(&self, cx: &App) -> Vec<(String, String)> {
+        self.app
+            .as_ref()
+            .map(|app| app.read(cx).recent_projects_for_menu())
+            .unwrap_or_default()
     }
 }
 
@@ -173,6 +215,35 @@ impl Render for RootView {
     }
 }
 
+fn active_component_root(cx: &App) -> Option<gpui::WindowHandle<ComponentRoot>> {
+    // Native menu callbacks can run while the menu itself has focus. In that
+    // moment `active_window()` may not point at the GPUI window anymore. Use
+    // the platform window stack first and fall back to GPUI's live handles.
+    cx.window_stack()
+        .into_iter()
+        .flatten()
+        .chain(cx.windows())
+        .find_map(|window| window.downcast::<ComponentRoot>())
+}
+
+pub(crate) fn refresh_application_menu(cx: &App, recent_projects: Vec<(String, String)>) {
+    let mut items = vec![
+        MenuItem::action(i18n::text(cx, "menu.new_window"), NewWindow),
+        MenuItem::action(i18n::text(cx, "menu.open_project"), OpenWorkspace),
+    ];
+    if !recent_projects.is_empty() {
+        let recent_items: Vec<MenuItem> = recent_projects
+            .into_iter()
+            .map(|(project_id, label)| MenuItem::action(label, OpenRecentProject { project_id }))
+            .collect();
+        items.push(MenuItem::separator());
+        items.push(MenuItem::submenu(
+            Menu::new(i18n::text(cx, "menu.recent_projects")).items(recent_items),
+        ));
+    }
+    cx.set_menus(vec![Menu::new(i18n::text(cx, "menu.file")).items(items)]);
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
@@ -200,35 +271,82 @@ fn main() {
             cx.bind_keys([
                 gpui::KeyBinding::new("cmd-q", Quit, None),
                 gpui::KeyBinding::new("cmd-n", NewSession, None),
+                gpui::KeyBinding::new("cmd-shift-n", NewWindow, None),
+                gpui::KeyBinding::new("cmd-o", OpenWorkspace, None),
                 gpui::KeyBinding::new("cmd-w", CloseSession, None),
                 gpui::KeyBinding::new("cmd-l", FocusInput, None),
                 gpui::KeyBinding::new("cmd-enter", SendMessage, None),
                 gpui::KeyBinding::new("cmd-,", ToggleSettings, None),
             ]);
+            refresh_application_menu(cx, Vec::new());
             cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.on_action(|_: &NewWindow, cx| {
+                if let Err(error) = open_averroes_window(cx) {
+                    tracing::error!(%error, "failed to open Averroes window");
+                }
+            });
+            cx.on_action(|_: &OpenWorkspace, cx| {
+                let Some(root) = active_component_root(cx) else {
+                    tracing::warn!("open workspace requested without an Averroes window");
+                    return;
+                };
+                if let Err(error) = root.update(cx, |root, window, cx| {
+                    if let Some(view) = root.view().clone().downcast::<RootView>().ok() {
+                        view.update(cx, |view, cx| view.open_workspace(window, cx));
+                    } else {
+                        tracing::warn!("open workspace requested without a RootView");
+                    }
+                }) {
+                    tracing::error!(%error, "failed to open workspace picker");
+                }
+            });
+            cx.on_action(|action: &OpenRecentProject, cx| {
+                let project_id = action.project_id.clone();
+                let Some(root) = active_component_root(cx) else {
+                    tracing::warn!("recent project requested without an Averroes window");
+                    return;
+                };
+                if let Err(error) = root.update(cx, |root, window, cx| {
+                    if let Some(view) = root.view().clone().downcast::<RootView>().ok() {
+                        view.update(cx, |view, cx| {
+                            view.open_recent_project(&project_id, window, cx)
+                        });
+                    } else {
+                        tracing::warn!("recent project requested without a RootView");
+                    }
+                }) {
+                    tracing::error!(%error, "failed to open recent project");
+                }
+            });
 
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                        None,
-                        size(px(1440.0), px(900.0)),
-                        cx,
-                    ))),
-                    window_min_size: Some(size(px(980.0), px(680.0))),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Averroes".into()),
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(px(14.0), px(15.0))),
-                    }),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let view = cx.new(|cx| RootView::new(window, cx));
-                    cx.new(|cx| ComponentRoot::new(view, window, cx).bordered(false))
-                },
-            )
-            .expect("failed to open Averroes window");
+            open_averroes_window(cx).expect("failed to open Averroes window");
         });
+}
+
+fn open_averroes_window(cx: &mut App) -> anyhow::Result<()> {
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(1440.0), px(900.0)),
+                cx,
+            ))),
+            window_min_size: Some(size(px(980.0), px(680.0))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Averroes".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(14.0), px(15.0))),
+            }),
+            ..Default::default()
+        },
+        |window, cx| {
+            let view = cx.new(|cx| RootView::new(window, cx));
+            let recent_projects = view.read(cx).recent_projects_for_menu(cx);
+            refresh_application_menu(cx, recent_projects);
+            cx.new(|cx| ComponentRoot::new(view, window, cx).bordered(false))
+        },
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

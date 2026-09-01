@@ -1,4 +1,4 @@
-use super::types::WorkProject;
+use super::types::{WorkConversationFolder, WorkProject};
 use rusqlite::Connection;
 use std::path::PathBuf;
 
@@ -25,6 +25,22 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             agent_threads_json TEXT NOT NULL DEFAULT '[]',
             agent_thread_transcripts_json TEXT NOT NULL DEFAULT '{}'
         );
+        CREATE TABLE IF NOT EXISTS conversation_folders (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            name TEXT COLLATE NOCASE NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(workspace_id, name)
+        );
+        CREATE INDEX IF NOT EXISTS conversation_folders_workspace
+            ON conversation_folders(workspace_id, updated_at DESC, name COLLATE NOCASE);
+        CREATE TABLE IF NOT EXISTS conversation_folder_members (
+            conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+            folder_id TEXT NOT NULL REFERENCES conversation_folders(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS conversation_folder_members_folder
+            ON conversation_folder_members(folder_id, conversation_id);
         -- Pinned is a presentation group, not a recency signal. Keep the
         -- storage index aligned with the query used by the sidebar/search.
         DROP INDEX IF EXISTS conversations_updated;
@@ -183,7 +199,7 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX conversation_embeddings_model
              ON conversation_embeddings(connection_id, model_id, conversation_id);",
     )?;
-    connection.pragma_update(None, "user_version", 11)?;
+    connection.pragma_update(None, "user_version", 12)?;
     Ok(())
 }
 
@@ -212,5 +228,17 @@ pub(super) fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work
         root: PathBuf::from(row.get::<_, String>(2)?),
         created_at: row.get(3)?,
         last_opened_at: row.get(4)?,
+    })
+}
+
+pub(super) fn conversation_folder_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkConversationFolder> {
+    Ok(WorkConversationFolder {
+        id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        name: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
     })
 }

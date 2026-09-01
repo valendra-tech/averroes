@@ -105,4 +105,14 @@ impl ConfigPaths {
             root,
         }
     }
+
+    /// The workspace used for conversations created before the user opens a
+    /// project explicitly. Keeping it beside `config/` makes it visible and
+    /// portable with the rest of Averroes' private data.
+    pub fn default_workspace_root(&self) -> PathBuf {
+        self.root
+            .parent()
+            .unwrap_or(self.root.as_path())
+            .join("default-workspace")
+    }
 }
