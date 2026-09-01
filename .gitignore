@@ -2,3 +2,4 @@
 /.superpowers/
 dist/
 docs/
+.DS_Store
