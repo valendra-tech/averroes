@@ -55,6 +55,41 @@ pub(crate) struct ToolNameCount {
     pub(crate) count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolGroupRenderMode {
+    /// The live group stays compact, but `hidden_count` tells the UI to keep
+    /// an explicit affordance for revealing the calls that preceded `index`.
+    Latest {
+        index: usize,
+        hidden_count: usize,
+    },
+    Expanded,
+    Collapsed,
+}
+
+impl ToolGroupRenderMode {
+    pub(crate) fn for_group(
+        expanded: bool,
+        active_group_id: Option<usize>,
+        group_id: usize,
+        activity_indices: &[usize],
+    ) -> Self {
+        let Some(index) = activity_indices.last().copied() else {
+            return Self::Collapsed;
+        };
+        if expanded {
+            Self::Expanded
+        } else if active_group_id == Some(group_id) {
+            Self::Latest {
+                index,
+                hidden_count: activity_indices.len().saturating_sub(1),
+            }
+        } else {
+            Self::Collapsed
+        }
+    }
+}
+
 /// Assigns group IDs to tool events. Non-tool events return `None`; reasoning
 /// tools also return `None` because they belong to the reasoning spoiler and
 /// must never create an independent visible group.
@@ -85,7 +120,7 @@ pub(crate) fn summarize_tool_names(names: &[&str]) -> Vec<ToolNameCount> {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_ids_for_events, summarize_tool_names, ToolGroupEvent};
+    use super::{group_ids_for_events, summarize_tool_names, ToolGroupEvent, ToolGroupRenderMode};
 
     #[test]
     fn assistant_text_closes_the_current_group() {
@@ -140,6 +175,29 @@ mod tests {
                     count: 1,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn active_group_keeps_an_expandable_path_to_older_calls() {
+        assert_eq!(
+            ToolGroupRenderMode::for_group(false, Some(4), 4, &[0, 1, 2]),
+            ToolGroupRenderMode::Latest {
+                index: 2,
+                hidden_count: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn closed_group_is_collapsed_until_the_user_expands_it() {
+        assert_eq!(
+            ToolGroupRenderMode::for_group(false, None, 4, &[0, 1, 2]),
+            ToolGroupRenderMode::Collapsed
+        );
+        assert_eq!(
+            ToolGroupRenderMode::for_group(true, Some(4), 4, &[0, 1, 2]),
+            ToolGroupRenderMode::Expanded
         );
     }
 }

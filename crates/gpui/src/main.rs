@@ -29,6 +29,10 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use ui::UiTheme;
 
+fn application_quit_mode() -> gpui::QuitMode {
+    gpui::QuitMode::LastWindowClosed
+}
+
 struct UiAssets;
 
 impl AssetSource for UiAssets {
@@ -182,6 +186,7 @@ fn main() {
     gpui_platform::application()
         .with_assets(UiAssets)
         .with_http_client(http_client)
+        .with_quit_mode(application_quit_mode())
         .run(|cx: &mut App| {
             gpui_component::init(cx);
             // Keep the UI copy in embedded catalogs. English is the default;
@@ -222,4 +227,15 @@ fn main() {
             )
             .expect("failed to open Averroes window");
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::application_quit_mode;
+    use gpui::QuitMode;
+
+    #[test]
+    fn closing_the_last_window_quits_the_desktop_process() {
+        assert_eq!(application_quit_mode(), QuitMode::LastWindowClosed);
+    }
 }

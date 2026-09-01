@@ -2,7 +2,9 @@ use crate::i18n;
 use crate::runtime::AppRuntime;
 use crate::session::SessionId;
 use crate::shortcuts::{CloseSession, FocusInput, NewSession, Quit, SendMessage, ToggleSettings};
-use crate::tool_groups::{summarize_tool_names, ToolGroupEvent, ToolGroupTracker};
+use crate::tool_groups::{
+    summarize_tool_names, ToolGroupEvent, ToolGroupRenderMode, ToolGroupTracker,
+};
 use crate::ui::{
     markdown::{normalize_reasoning_for_display, render_markdown, render_streaming_markdown},
     provider_logo, tool_icon, UiTheme,
@@ -3072,6 +3074,48 @@ impl AverroesApp {
                 self.conversation_list
                     .remeasure_items(message_index..message_index + 1);
             }
+            cx.notify();
+        }
+    }
+
+    fn toggle_agent_thread_tool_activity(
+        &mut self,
+        thread_id: &str,
+        message_index: usize,
+        activity_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let toggled = self
+            .active_mut()
+            .agent_thread_transcripts
+            .get_mut(thread_id)
+            .and_then(|transcript| transcript.messages.get_mut(message_index))
+            .and_then(|message| message.tool_activities.get_mut(activity_index))
+            .map(|activity| {
+                activity.expanded = !activity.expanded;
+            })
+            .is_some();
+        if toggled {
+            cx.notify();
+        }
+    }
+
+    fn toggle_agent_thread_reasoning(
+        &mut self,
+        thread_id: &str,
+        message_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let toggled = self
+            .active_mut()
+            .agent_thread_transcripts
+            .get_mut(thread_id)
+            .and_then(|transcript| transcript.messages.get_mut(message_index))
+            .map(|message| {
+                message.reasoning_expanded = !message.reasoning_expanded;
+            })
+            .is_some();
+        if toggled {
             cx.notify();
         }
     }
@@ -9904,24 +9948,54 @@ fn render_tool_group(
     theme: UiTheme,
     cx: &mut Context<AverroesApp>,
 ) -> AnyElement {
-    let should_show_all = expanded || active_group_id != Some(group_id);
-    if !should_show_all {
-        let activity_index = *activity_indices.last().expect("tool group is non-empty");
-        return render_tool_activity(
-            session_id,
-            message_index,
-            std::slice::from_ref(&activities[activity_index]),
-            activity_index,
-            theme,
-            cx,
-        );
-    }
-
-    if expanded {
-        return div()
+    match ToolGroupRenderMode::for_group(expanded, active_group_id, group_id, activity_indices) {
+        ToolGroupRenderMode::Latest {
+            index,
+            hidden_count,
+        } => {
+            let latest = render_tool_activity(
+                session_id,
+                message_index,
+                std::slice::from_ref(&activities[index]),
+                index,
+                theme,
+                cx,
+            );
+            if hidden_count == 0 {
+                latest
+            } else {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.0))
+                    .child(render_tool_group_summary(
+                        session_id,
+                        message_index,
+                        group_id,
+                        activity_indices,
+                        activities,
+                        false,
+                        theme,
+                        cx,
+                    ))
+                    .child(latest)
+                    .into_any_element()
+            }
+        }
+        ToolGroupRenderMode::Expanded => div()
             .flex()
             .flex_col()
             .gap(px(5.0))
+            .child(render_tool_group_summary(
+                session_id,
+                message_index,
+                group_id,
+                activity_indices,
+                activities,
+                true,
+                theme,
+                cx,
+            ))
             .children(activity_indices.iter().map(|activity_index| {
                 render_tool_activity(
                     session_id,
@@ -9932,26 +10006,27 @@ fn render_tool_group(
                     cx,
                 )
             }))
-            .into_any_element();
+            .into_any_element(),
+        ToolGroupRenderMode::Collapsed => render_tool_group_summary(
+            session_id,
+            message_index,
+            group_id,
+            activity_indices,
+            activities,
+            false,
+            theme,
+            cx,
+        ),
     }
-
-    render_collapsed_tool_group(
-        session_id,
-        message_index,
-        group_id,
-        activity_indices,
-        activities,
-        theme,
-        cx,
-    )
 }
 
-fn render_collapsed_tool_group(
+fn render_tool_group_summary(
     session_id: &SessionId,
     message_index: usize,
     group_id: usize,
     activity_indices: &[usize],
     activities: &[ToolActivity],
+    expanded: bool,
     theme: UiTheme,
     cx: &mut Context<AverroesApp>,
 ) -> AnyElement {
@@ -10040,9 +10115,13 @@ fn render_collapsed_tool_group(
                 .child(localized_tool_activity_state_label(cx, status)),
         )
         .child(
-            Icon::new(IconName::ChevronRight)
-                .size(px(13.0))
-                .text_color(theme.faint),
+            Icon::new(if expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            })
+            .size(px(13.0))
+            .text_color(theme.faint),
         )
         .into_any_element()
 }
@@ -10216,6 +10295,54 @@ fn render_tool_activity(
         .into_any_element()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentThreadBlock {
+    Reasoning,
+    Tool(usize),
+    Text { start: usize, end: usize },
+}
+
+fn agent_thread_blocks(message: &ShellMessage) -> Vec<AgentThreadBlock> {
+    let mut blocks = Vec::new();
+    if !message.reasoning.is_empty()
+        || message
+            .tool_activities
+            .iter()
+            .any(|activity| activity.inside_reasoning)
+    {
+        blocks.push(AgentThreadBlock::Reasoning);
+    }
+
+    let text_len = message.text.len();
+    let mut cursor = 0;
+    for (activity_index, activity) in message.tool_activities.iter().enumerate() {
+        if activity.inside_reasoning {
+            continue;
+        }
+        let offset = activity.text_offset.min(text_len);
+        let offset = if message.text.is_char_boundary(offset) {
+            offset.max(cursor)
+        } else {
+            cursor
+        };
+        if offset > cursor {
+            blocks.push(AgentThreadBlock::Text {
+                start: cursor,
+                end: offset,
+            });
+        }
+        blocks.push(AgentThreadBlock::Tool(activity_index));
+        cursor = offset;
+    }
+    if cursor < text_len {
+        blocks.push(AgentThreadBlock::Text {
+            start: cursor,
+            end: text_len,
+        });
+    }
+    blocks
+}
+
 fn render_agent_thread_transcript(
     thread_id: &str,
     messages: &[ShellMessage],
@@ -10227,206 +10354,360 @@ fn render_agent_thread_transcript(
         .iter()
         .enumerate()
         .map(|(index, message)| {
-            let message_id = format!("agent-thread-{thread_id}-{index}");
-            if message.role == MessageRole::User {
-                return div()
-                    .flex()
-                    .justify_end()
-                    .child(
-                        div()
-                            .max_w(px(245.0))
-                            .px(px(10.0))
-                            .py(px(8.0))
-                            .rounded(px(10.0))
-                            .bg(theme.surface_subtle)
-                            .child(
-                                TextView::markdown(message_id, message.text.clone())
-                                    .selectable(true),
-                            ),
-                    )
-                    .into_any_element();
-            }
-
-            if streaming
-                && message.role == MessageRole::Assistant
-                && message.text.is_empty()
-                && message.reasoning.is_empty()
-                && message.tool_activities.is_empty()
-            {
-                return div()
-                    .flex()
-                    .items_center()
-                    .child(render_activity_indicator(
-                        format!("agent-thread-waiting-{thread_id}-{index}"),
-                        theme,
-                        4.0,
-                    ))
-                    .into_any_element();
-            }
-
-            let reasoning = if message.reasoning.is_empty() {
-                None
-            } else {
-                let reasoning = normalize_reasoning_for_display(&message.reasoning);
-                let reasoning_content = if message.reasoning_complete {
-                    render_markdown(theme, &reasoning)
-                } else {
-                    render_streaming_markdown(theme, &reasoning)
-                };
-                let reasoning_tools = message
-                    .tool_activities
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, activity)| activity.inside_reasoning)
-                    .map(|(tool_index, activity)| {
-                        render_agent_thread_tool_activity(
-                            &message_id,
-                            tool_index,
-                            activity,
-                            theme,
-                            cx,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                Some(
-                    div()
-                        .p(px(8.0))
-                        .rounded(px(9.0))
-                        .bg(theme.surface_subtle)
-                        .text_size(px(11.0))
-                        .text_color(theme.muted)
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(7.0))
-                                .child(reasoning_content)
-                                .children(reasoning_tools),
-                        ),
-                )
-            };
-            let text = message.text.as_str();
-            let mut content = Vec::with_capacity(message.tool_activities.len() * 2 + 1);
-            let mut cursor = 0usize;
-            for (tool_index, activity) in message.tool_activities.iter().enumerate() {
-                if activity.inside_reasoning {
-                    continue;
-                }
-                let offset = activity.text_offset.min(text.len());
-                let offset = if text.is_char_boundary(offset) {
-                    offset.max(cursor)
-                } else {
-                    cursor
-                };
-                if let Some(segment) = text
-                    .get(cursor..offset)
-                    .filter(|segment| !segment.is_empty())
-                {
-                    content.push(
-                        TextView::markdown(
-                            format!("{message_id}-segment-{tool_index}"),
-                            segment.to_owned(),
-                        )
-                        .selectable(true)
-                        .into_any_element(),
-                    );
-                }
-                content.push(render_agent_thread_tool_activity(
-                    &message_id,
-                    tool_index,
-                    activity,
-                    theme,
-                    cx,
-                ));
-                cursor = offset;
-            }
-            if let Some(segment) = text.get(cursor..).filter(|segment| !segment.is_empty()) {
-                content.push(
-                    TextView::markdown(format!("{message_id}-tail"), segment.to_owned())
-                        .selectable(true)
-                        .into_any_element(),
-                );
-            }
-
             div()
-                .flex()
-                .flex_col()
-                .gap(px(7.0))
-                .when_some(reasoning, |this, reasoning| this.child(reasoning))
-                .children(content)
+                .id(SharedString::from(format!(
+                    "agent-thread-message-{thread_id}-{index}"
+                )))
+                .w_full()
+                .pt(if index == 0 { px(6.0) } else { px(0.0) })
+                .pb(px(22.0))
+                .child(render_agent_thread_message(
+                    thread_id, index, message, streaming, theme, cx,
+                ))
                 .into_any_element()
         })
         .collect::<Vec<_>>();
 
     div()
         .mt(px(6.0))
+        .w_full()
         .flex()
         .flex_col()
-        .gap(px(9.0))
         .children(rows)
         .into_any_element()
 }
 
+fn render_agent_thread_message(
+    thread_id: &str,
+    message_index: usize,
+    message: &ShellMessage,
+    streaming: bool,
+    theme: UiTheme,
+    cx: &mut Context<AverroesApp>,
+) -> AnyElement {
+    let message_id = format!("agent-thread-{thread_id}-{message_index}");
+    if message.role == MessageRole::User {
+        return div()
+            .w_full()
+            .flex()
+            .justify_end()
+            .child(
+                div()
+                    .max_w(px(620.0))
+                    .px(px(15.0))
+                    .py(px(11.0))
+                    .rounded(px(13.0))
+                    .bg(theme.surface_subtle)
+                    .child(TextView::markdown(message_id, message.text.clone()).selectable(true)),
+            )
+            .into_any_element();
+    }
+
+    if streaming
+        && message.role == MessageRole::Assistant
+        && message.text.is_empty()
+        && message.reasoning.is_empty()
+        && message.tool_activities.is_empty()
+    {
+        return div()
+            .w_full()
+            .flex()
+            .items_center()
+            .child(render_activity_indicator(
+                format!("agent-thread-waiting-{thread_id}-{message_index}"),
+                theme,
+                4.0,
+            ))
+            .into_any_element();
+    }
+
+    let blocks = agent_thread_blocks(message);
+    let content = blocks
+        .into_iter()
+        .filter_map(|block| match block {
+            AgentThreadBlock::Reasoning => Some(render_agent_thread_reasoning(
+                thread_id,
+                message_index,
+                message,
+                theme,
+                cx,
+            )),
+            AgentThreadBlock::Tool(activity_index) => Some(render_agent_thread_tool_activity(
+                thread_id,
+                message_index,
+                activity_index,
+                &message.tool_activities[activity_index],
+                theme,
+                cx,
+            )),
+            AgentThreadBlock::Text { start, end } => message.text.get(start..end).map(|text| {
+                if streaming {
+                    render_streaming_markdown(theme, text)
+                        .text_size(px(14.0))
+                        .into_any_element()
+                } else {
+                    TextView::markdown(format!("{message_id}-text-{start}"), text.to_owned())
+                        .selectable(true)
+                        .into_any_element()
+                }
+            }),
+        })
+        .collect::<Vec<_>>();
+
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .children(content)
+        .into_any_element()
+}
+
+fn render_agent_thread_reasoning(
+    thread_id: &str,
+    message_index: usize,
+    message: &ShellMessage,
+    theme: UiTheme,
+    cx: &mut Context<AverroesApp>,
+) -> AnyElement {
+    let expanded = message.reasoning_expanded;
+    let reasoning = normalize_reasoning_for_display(&message.reasoning);
+    let reasoning_content = if message.reasoning_complete {
+        render_markdown(theme, &reasoning)
+    } else {
+        render_streaming_markdown(theme, &reasoning)
+    };
+    let reasoning_tools = message
+        .tool_activities
+        .iter()
+        .enumerate()
+        .filter(|(_, activity)| activity.inside_reasoning)
+        .map(|(activity_index, activity)| {
+            render_agent_thread_tool_activity(
+                thread_id,
+                message_index,
+                activity_index,
+                activity,
+                theme,
+                cx,
+            )
+        })
+        .collect::<Vec<_>>();
+    let toggle_thread_id = thread_id.to_owned();
+    div()
+        .id(SharedString::from(format!(
+            "agent-thread-reasoning-{thread_id}-{message_index}"
+        )))
+        .w_full()
+        .px(px(12.0))
+        .py(px(9.0))
+        .rounded(px(10.0))
+        .bg(theme.surface_subtle)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .child(if message.reasoning_complete {
+                    Icon::new(IconName::Check)
+                        .size(px(12.0))
+                        .text_color(theme.success)
+                        .into_any_element()
+                } else {
+                    render_activity_indicator(
+                        format!("agent-thread-reasoning-{thread_id}-{message_index}"),
+                        theme,
+                        3.0,
+                    )
+                })
+                .child(
+                    Button::new(format!(
+                        "agent-thread-toggle-reasoning-{thread_id}-{message_index}"
+                    ))
+                    .ghost()
+                    .small()
+                    .icon(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .label(i18n::text(cx, "chat.reasoning"))
+                    .on_click(cx.listener(move |app, _, _, cx| {
+                        app.toggle_agent_thread_reasoning(&toggle_thread_id, message_index, cx);
+                    })),
+                ),
+        )
+        .when(expanded, |this| {
+            this.child(
+                div()
+                    .mt(px(7.0))
+                    .pt(px(7.0))
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .text_size(px(12.0))
+                    .text_color(theme.muted)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(7.0))
+                            .child(reasoning_content)
+                            .children(reasoning_tools),
+                    ),
+            )
+        })
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod agent_thread_render_tests {
+    use super::{
+        agent_thread_blocks, AgentThreadBlock, ShellMessage, ToolActivity, ToolActivityState,
+    };
+    use std::time::Instant;
+
+    #[test]
+    fn agent_response_keeps_reasoning_tools_and_text_in_separate_blocks() {
+        let mut message = ShellMessage::assistant();
+        message.reasoning = "Planning".into();
+        message.text = "Answer".into();
+        message.tool_activities.push(ToolActivity {
+            call_id: Some("call-1".into()),
+            name: "web_search".into(),
+            text_offset: 0,
+            group_id: None,
+            input: "{}".into(),
+            summary: "Search complete".into(),
+            output: "Result".into(),
+            state: ToolActivityState::Completed,
+            started_at: Instant::now(),
+            duration_ms: Some(10),
+            expanded: false,
+            inside_reasoning: false,
+        });
+
+        assert_eq!(
+            agent_thread_blocks(&message),
+            vec![
+                AgentThreadBlock::Reasoning,
+                AgentThreadBlock::Tool(0),
+                AgentThreadBlock::Text { start: 0, end: 6 },
+            ]
+        );
+    }
+}
+
 fn render_agent_thread_tool_activity(
-    message_id: &str,
+    thread_id: &str,
+    message_index: usize,
     tool_index: usize,
     activity: &ToolActivity,
     theme: UiTheme,
     cx: &mut Context<AverroesApp>,
 ) -> AnyElement {
-    let output = if activity.output.is_empty() {
-        activity.summary.clone()
-    } else {
-        activity.output.clone()
-    };
-    div()
-        .p(px(8.0))
-        .rounded(px(9.0))
-        .bg(theme.surface_subtle)
+    let activity_id = format!("agent-thread-tool-{thread_id}-{message_index}-{tool_index}");
+    let expanded = activity.expanded;
+    let output = activity.output.clone();
+    let toggle_thread_id = thread_id.to_owned();
+    let duration = activity
+        .duration_ms
+        .map(format_tool_duration)
+        .unwrap_or_else(|| i18n::text(cx, "tool.running").to_string());
+
+    let header = div()
         .flex()
-        .flex_col()
-        .gap(px(5.0))
+        .items_center()
+        .gap(px(7.0))
+        .child(tool_icon(&activity.name, 14.0).text_color(theme.muted))
         .child(
             div()
-                .flex()
-                .items_center()
-                .gap(px(7.0))
-                .child(tool_icon(&activity.name, 14.0).text_color(theme.muted))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .text_size(px(11.0))
-                        .child(localized_tool_display_name(cx, &activity.name)),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(tool_activity_state_color(activity.state, theme))
-                        .child(localized_tool_activity_state_label(cx, activity.state)),
-                ),
+                .flex_1()
+                .min_w(px(0.0))
+                .text_size(px(12.0))
+                .child(localized_tool_display_name(cx, &activity.name)),
         )
-        .when(!activity.input.is_empty(), |this| {
-            this.child(
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(tool_activity_state_color(activity.state, theme))
+                .child(localized_tool_activity_state_label(cx, activity.state)),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(theme.faint)
+                .child(duration),
+        )
+        .child(
+            Button::new(format!("{activity_id}-toggle"))
+                .ghost()
+                .small()
+                .icon(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .tooltip(if expanded {
+                    i18n::text(cx, "chat.hide_tool_details")
+                } else {
+                    i18n::text(cx, "chat.show_tool_details")
+                })
+                .on_click(cx.listener(move |app, _, _, cx| {
+                    app.toggle_agent_thread_tool_activity(
+                        &toggle_thread_id,
+                        message_index,
+                        tool_index,
+                        cx,
+                    );
+                })),
+        );
+
+    let summary = (!expanded && !activity.summary.is_empty()).then(|| {
+        div()
+            .min_w(px(0.0))
+            .whitespace_nowrap()
+            .overflow_hidden()
+            .text_ellipsis()
+            .text_size(px(11.0))
+            .text_color(theme.muted)
+            .child(activity.summary.clone())
+    });
+
+    let details = expanded.then(|| {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .pl(px(21.0))
+            .child(
                 div()
-                    .id(SharedString::from(format!(
-                        "{message_id}-tool-{tool_index}-input"
-                    )))
-                    .max_h(px(110.0))
-                    .overflow_y_scrollbar()
-                    .font(UiTheme::mono_font())
                     .text_size(px(10.0))
                     .text_color(theme.faint)
-                    .child(activity.input.clone()),
+                    .child(i18n::text(cx, "tool.arguments")),
             )
-        })
-        .when(!output.is_empty(), |this| {
-            this.child(
+            .when(!activity.input.is_empty(), |this| {
+                this.child(
+                    div()
+                        .id(SharedString::from(format!("{activity_id}-input")))
+                        .max_h(px(130.0))
+                        .overflow_y_scrollbar()
+                        .font(UiTheme::mono_font())
+                        .text_size(px(10.0))
+                        .text_color(theme.faint)
+                        .whitespace_normal()
+                        .child(activity.input.clone()),
+                )
+            })
+            .child(
                 div()
-                    .id(SharedString::from(format!(
-                        "{message_id}-tool-{tool_index}-output"
-                    )))
-                    .max_h(px(150.0))
+                    .text_size(px(10.0))
+                    .text_color(theme.faint)
+                    .child(i18n::text(cx, "tool.result")),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("{activity_id}-output")))
+                    .max_h(px(180.0))
                     .overflow_y_scrollbar()
                     .font(UiTheme::mono_font())
                     .text_size(px(10.0))
@@ -10435,9 +10716,28 @@ fn render_agent_thread_tool_activity(
                     } else {
                         theme.muted
                     })
-                    .child(output),
+                    .whitespace_normal()
+                    .child(if output.is_empty() {
+                        i18n::text(cx, "tool.no_output").to_string()
+                    } else {
+                        output
+                    }),
             )
-        })
+    });
+
+    div()
+        .id(SharedString::from(activity_id.clone()))
+        .w_full()
+        .p(px(9.0))
+        .rounded(px(10.0))
+        .bg(theme.surface_subtle)
+        .hover(|style| style.bg(theme.surface_hover))
+        .flex()
+        .flex_col()
+        .gap(px(7.0))
+        .child(header)
+        .when_some(summary, |this, summary| this.child(summary))
+        .when_some(details, |this, details| this.child(details))
         .into_any_element()
 }
 

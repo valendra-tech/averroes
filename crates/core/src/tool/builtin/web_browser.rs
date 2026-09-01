@@ -9,7 +9,7 @@ use url::Url;
 use crate::tool::{Result, ToolError};
 
 const MAX_BROWSER_SESSIONS: usize = 8;
-pub(crate) const PAGE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const PAGE_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 // The browser itself supports up to eight sessions, but page rendering and
 // JavaScript execution are comparatively heavy. A shared gate leaves room for
 // cleanup and prevents a burst of parallel tool calls from reaching its hard
@@ -194,7 +194,7 @@ mod tests {
     fn page_script_limits_stay_within_the_safe_boa_range() {
         let config = browser_config();
 
-        assert_eq!(PAGE_OPEN_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(PAGE_OPEN_TIMEOUT, Duration::from_secs(10));
         assert_eq!(config.nav_script_max_recursion, 128);
         assert_eq!(config.nav_script_max_stack_size, 1_024);
         assert_eq!(config.nav_script_max_loop_iterations, 5_000_000);
