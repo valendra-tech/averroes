@@ -139,7 +139,9 @@ impl WorkDatabase {
         let connection = self.connection.lock();
         let row = connection
             .query_row(
-                "SELECT id, title, project_id, pinned, unread, created_at, updated_at, binding_json, context_summary, context_usage_json
+                "SELECT id, title, project_id, pinned, unread, created_at, updated_at, binding_json,
+                        context_summary, context_usage_json, agent_threads_json,
+                        agent_thread_transcripts_json
                  FROM conversations WHERE id = ?1",
                 params![id],
                 |row| {
@@ -154,6 +156,8 @@ impl WorkDatabase {
                         row.get::<_, String>(7)?,
                         row.get::<_, Option<String>>(8)?,
                         row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
                     ))
                 },
             )
@@ -169,12 +173,16 @@ impl WorkDatabase {
             binding_json,
             context_summary,
             context_usage_json,
+            agent_threads_json,
+            agent_thread_transcripts_json,
         )) = row
         else {
             return Ok(None);
         };
         let binding = serde_json::from_str(&binding_json)?;
         let context_usage = serde_json::from_str(&context_usage_json)?;
+        let agent_threads = serde_json::from_str(&agent_threads_json)?;
+        let agent_thread_transcripts = serde_json::from_str(&agent_thread_transcripts_json)?;
         let messages = rows::load_messages(&connection, &id)?;
         let checkpoints = rows::load_checkpoints(&connection, &id)?;
         let tasks = rows::load_tasks(&connection, &id)?;
@@ -194,6 +202,8 @@ impl WorkDatabase {
             checkpoints,
             tasks,
             sources,
+            agent_threads,
+            agent_thread_transcripts,
         }))
     }
 
@@ -202,6 +212,9 @@ impl WorkDatabase {
         conversation: &WorkConversation,
     ) -> Result<(), WorkDatabaseError> {
         let binding = serde_json::to_string(&conversation.binding)?;
+        let agent_threads = serde_json::to_string(&conversation.agent_threads)?;
+        let agent_thread_transcripts =
+            serde_json::to_string(&conversation.agent_thread_transcripts)?;
         let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         let existing_updated_at = transaction
@@ -219,8 +232,10 @@ impl WorkDatabase {
             };
         transaction.execute(
             "INSERT INTO conversations
-                (id, title, project_id, pinned, unread, created_at, updated_at, binding_json, context_summary, context_usage_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                (id, title, project_id, pinned, unread, created_at, updated_at, binding_json,
+                 context_summary, context_usage_json, agent_threads_json,
+                 agent_thread_transcripts_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 project_id = excluded.project_id,
@@ -229,7 +244,9 @@ impl WorkDatabase {
                 updated_at = excluded.updated_at,
                 binding_json = excluded.binding_json,
                 context_summary = excluded.context_summary,
-                context_usage_json = excluded.context_usage_json",
+                context_usage_json = excluded.context_usage_json,
+                agent_threads_json = excluded.agent_threads_json,
+                agent_thread_transcripts_json = excluded.agent_thread_transcripts_json",
             params![
                 conversation.id,
                 conversation.title,
@@ -241,6 +258,8 @@ impl WorkDatabase {
                 binding,
                 conversation.context_summary,
                 serde_json::to_string(&conversation.context_usage)?,
+                agent_threads,
+                agent_thread_transcripts,
             ],
         )?;
         rows::replace_messages(&transaction, conversation)?;
@@ -806,6 +825,10 @@ mod tests {
                 role: WorkMessageRole::User,
                 text: "Make it excellent".into(),
                 reasoning: String::new(),
+                reasoning_complete: true,
+                reasoning_expanded: false,
+                tool_activities: Vec::new(),
+                expanded_tool_groups: Vec::new(),
             }],
             checkpoints: vec![WorkCheckpoint {
                 id: "ui".into(),
@@ -832,6 +855,8 @@ mod tests {
                 count: 1,
                 last_used_at: timestamp,
             }],
+            agent_threads: Vec::new(),
+            agent_thread_transcripts: std::collections::HashMap::new(),
         };
         database.save_conversation(&conversation).unwrap();
         drop(database);
@@ -861,6 +886,8 @@ mod tests {
             checkpoints: Vec::new(),
             tasks: Vec::new(),
             sources: Vec::new(),
+            agent_threads: Vec::new(),
+            agent_thread_transcripts: std::collections::HashMap::new(),
         };
         database.save_conversation(&conversation).unwrap();
         assert!(database.delete_conversation(&conversation.id).unwrap());
@@ -887,10 +914,16 @@ mod tests {
                 role: WorkMessageRole::User,
                 text: "Keep me".into(),
                 reasoning: String::new(),
+                reasoning_complete: true,
+                reasoning_expanded: false,
+                tool_activities: Vec::new(),
+                expanded_tool_groups: Vec::new(),
             }],
             checkpoints: Vec::new(),
             tasks: Vec::new(),
             sources: Vec::new(),
+            agent_threads: Vec::new(),
+            agent_thread_transcripts: std::collections::HashMap::new(),
         };
         database.save_conversation(&conversation).unwrap();
         assert!(database
@@ -1010,16 +1043,26 @@ mod tests {
                     role: WorkMessageRole::User,
                     text: "First decision".into(),
                     reasoning: "hidden chain of thought".into(),
+                    reasoning_complete: true,
+                    reasoning_expanded: false,
+                    tool_activities: Vec::new(),
+                    expanded_tool_groups: Vec::new(),
                 },
                 WorkMessage {
                     role: WorkMessageRole::Assistant,
                     text: "Second decision".into(),
                     reasoning: String::new(),
+                    reasoning_complete: true,
+                    reasoning_expanded: false,
+                    tool_activities: Vec::new(),
+                    expanded_tool_groups: Vec::new(),
                 },
             ],
             checkpoints: Vec::new(),
             tasks: Vec::new(),
             sources: Vec::new(),
+            agent_threads: Vec::new(),
+            agent_thread_transcripts: std::collections::HashMap::new(),
         };
         database.save_conversation(&conversation).unwrap();
 
@@ -1053,10 +1096,16 @@ mod tests {
                         role: WorkMessageRole::User,
                         text: id.into(),
                         reasoning: String::new(),
+                        reasoning_complete: true,
+                        reasoning_expanded: false,
+                        tool_activities: Vec::new(),
+                        expanded_tool_groups: Vec::new(),
                     }],
                     checkpoints: Vec::new(),
                     tasks: Vec::new(),
                     sources: Vec::new(),
+                    agent_threads: Vec::new(),
+                    agent_thread_transcripts: std::collections::HashMap::new(),
                 })
                 .unwrap();
         }
@@ -1086,10 +1135,16 @@ mod tests {
                         role: WorkMessageRole::User,
                         text: id.into(),
                         reasoning: String::new(),
+                        reasoning_complete: true,
+                        reasoning_expanded: false,
+                        tool_activities: Vec::new(),
+                        expanded_tool_groups: Vec::new(),
                     }],
                     checkpoints: Vec::new(),
                     tasks: Vec::new(),
                     sources: Vec::new(),
+                    agent_threads: Vec::new(),
+                    agent_thread_transcripts: std::collections::HashMap::new(),
                 })
                 .unwrap();
         }
@@ -1122,10 +1177,16 @@ mod tests {
                     role: WorkMessageRole::User,
                     text: "A literal 100% result".into(),
                     reasoning: String::new(),
+                    reasoning_complete: true,
+                    reasoning_expanded: false,
+                    tool_activities: Vec::new(),
+                    expanded_tool_groups: Vec::new(),
                 }],
                 checkpoints: Vec::new(),
                 tasks: Vec::new(),
                 sources: Vec::new(),
+                agent_threads: Vec::new(),
+                agent_thread_transcripts: std::collections::HashMap::new(),
             })
             .unwrap();
 
@@ -1157,10 +1218,16 @@ mod tests {
                 role: WorkMessageRole::User,
                 text: "Remember this decision".into(),
                 reasoning: String::new(),
+                reasoning_complete: true,
+                reasoning_expanded: false,
+                tool_activities: Vec::new(),
+                expanded_tool_groups: Vec::new(),
             }],
             checkpoints: Vec::new(),
             tasks: Vec::new(),
             sources: Vec::new(),
+            agent_threads: Vec::new(),
+            agent_thread_transcripts: std::collections::HashMap::new(),
         };
         database.save_conversation(&conversation).unwrap();
         let embedding_config = EmbeddingConfig {
@@ -1249,5 +1316,84 @@ mod tests {
             .forget_binding_for_connection(&connection_id)
             .unwrap();
         assert_eq!(database.last_binding().unwrap(), None);
+    }
+
+    #[test]
+    fn round_trips_tool_and_agent_history() {
+        use crate::agent::orchestration::{AgentThreadSnapshot, AgentThreadStatus};
+
+        let (_directory, database) = database();
+        let timestamp = now();
+        let activity = WorkToolActivity {
+            call_id: Some("call-1".into()),
+            name: "web_fetch".into(),
+            text_offset: 0,
+            group_id: Some(2),
+            input: "{\"url\":\"https://example.com\"}".into(),
+            summary: "Example page".into(),
+            output: "partial page output".into(),
+            state: WorkToolActivityState::Completed,
+            duration_ms: Some(125),
+            expanded: true,
+            inside_reasoning: false,
+        };
+        let conversation = WorkConversation {
+            id: "conversation-with-history".into(),
+            title: "History".into(),
+            project_id: None,
+            pinned: false,
+            unread: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+            binding: SessionBinding::default(),
+            context_summary: None,
+            context_usage: crate::agent::ContextUsage::default(),
+            messages: vec![WorkMessage {
+                role: WorkMessageRole::Assistant,
+                text: "Answer".into(),
+                reasoning: "Reasoning".into(),
+                reasoning_complete: true,
+                reasoning_expanded: true,
+                tool_activities: vec![activity.clone()],
+                expanded_tool_groups: vec![2],
+            }],
+            checkpoints: Vec::new(),
+            tasks: Vec::new(),
+            sources: Vec::new(),
+            agent_threads: vec![AgentThreadSnapshot {
+                id: "thread-1".into(),
+                thread_id: "thread-1".into(),
+                agent_id: "researcher".into(),
+                parent_session_id: "conversation-with-history".into(),
+                title: "Research".into(),
+                model_id: "model-1".into(),
+                status: AgentThreadStatus::Completed,
+                prompt: "Find the answer".into(),
+                output: "Agent answer".into(),
+                created_at: timestamp,
+                updated_at: timestamp,
+            }],
+            agent_thread_transcripts: std::collections::HashMap::from([(
+                "thread-1".into(),
+                vec![WorkMessage {
+                    role: WorkMessageRole::Assistant,
+                    text: "Agent answer".into(),
+                    reasoning: "Agent reasoning".into(),
+                    reasoning_complete: true,
+                    reasoning_expanded: false,
+                    tool_activities: vec![activity],
+                    expanded_tool_groups: Vec::new(),
+                }],
+            )]),
+        };
+
+        database.save_conversation(&conversation).unwrap();
+        let database_path = database.path().to_path_buf();
+        drop(database);
+        let database = WorkDatabase::open_at(database_path).unwrap();
+        assert_eq!(
+            database.conversation(&conversation.id).unwrap(),
+            Some(conversation)
+        );
     }
 }

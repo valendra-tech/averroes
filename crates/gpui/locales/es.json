@@ -42,7 +42,6 @@
   "placeholder.model_id": "ID del modelo, p. ej. qwen3:8b",
   "placeholder.display_name": "Nombre visible (opcional)",
   "placeholder.reasoning_levels": "Niveles de razonamiento, separados por comas (opcional)",
-  "placeholder.agent_id": "p. ej. investigador",
   "placeholder.agent_name": "p. ej. Investigador",
   "placeholder.agent_description": "¿Para qué debe usarse este agente?",
   "notice.first_connection": "Añade tu primera conexión. No se selecciona nada automáticamente.",
@@ -149,6 +148,7 @@
   "tool.running": "En curso",
   "tool.done": "Hecho",
   "tool.failed": "Fallida",
+  "tool.interrupted": "Interrumpida",
   "tool.shell": "Shell",
   "tool.read_file": "Leer archivo",
   "tool.write_file": "Escribir archivo",
@@ -202,13 +202,10 @@
   "settings.add_agent": "Añadir agente",
   "settings.edit_agent": "Editar",
   "settings.remove_agent": "Eliminar agente",
-  "settings.new_agent": "Nuevo",
   "settings.save_agent": "Guardar agente",
-  "settings.agent_id": "ID del agente",
   "settings.agent_name": "Nombre",
   "settings.agent_description": "Propósito",
   "settings.agent_description_help": "El propósito ayuda al agente padre a elegir el especialista adecuado.",
-  "settings.agent_connection": "Conexión",
   "settings.agent_model": "Modelo",
   "settings.choose_model": "Elige un modelo",
   "settings.diagnostics": "Diagnóstico",
@@ -293,6 +290,6 @@
   "update.open_failed": "No se ha podido abrir el instalador",
   "about.title": "Acerca de Averroes",
   "about.version": "Versión",
-  "about.philosopher": "Ibn Rushd (Averroes) fue un filósofo, médico y jurista cuyo trabajo conectó el pensamiento griego clásico con el saber medieval.",
-  "about.attribution": "Desarrollado por Valendra.tech con cariño <3"
+  "about.philosopher": "Ibn Rushd (Averroes), nacido en Córdoba, en Al-Ándalus, fue un filósofo, médico y jurista andalusí. Sus influyentes comentarios sobre Aristóteles ayudaron a transmitir el pensamiento clásico a la Europa medieval y marcaron profundamente la filosofía, la teología y la ciencia europeas.",
+  "about.attribution": "Desarrollado por Valendra.tech con cariño 💙"
 }

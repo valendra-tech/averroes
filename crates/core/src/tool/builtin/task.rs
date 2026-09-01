@@ -252,6 +252,8 @@ mod tests {
                 checkpoints: Vec::new(),
                 tasks: Vec::new(),
                 sources: Vec::new(),
+                agent_threads: Vec::new(),
+                agent_thread_transcripts: std::collections::HashMap::new(),
             })
             .unwrap();
 

@@ -1,6 +1,8 @@
+use crate::agent::orchestration::AgentThreadSnapshot;
 use crate::agent::ContextUsage;
 use crate::connection::{ConnectionId, SessionBinding};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +20,34 @@ pub enum WorkMessageRole {
     User,
     Assistant,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkToolActivityState {
+    Running,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkToolActivity {
+    pub call_id: Option<String>,
+    pub name: String,
+    pub text_offset: usize,
+    pub group_id: Option<usize>,
+    pub input: String,
+    pub summary: String,
+    pub output: String,
+    pub state: WorkToolActivityState,
+    pub duration_ms: Option<u64>,
+    pub expanded: bool,
+    pub inside_reasoning: bool,
+}
+
+fn default_reasoning_complete() -> bool {
+    true
 }
 
 impl WorkMessageRole {
@@ -44,6 +74,14 @@ pub struct WorkMessage {
     pub text: String,
     #[serde(default)]
     pub reasoning: String,
+    #[serde(default = "default_reasoning_complete")]
+    pub reasoning_complete: bool,
+    #[serde(default)]
+    pub reasoning_expanded: bool,
+    #[serde(default)]
+    pub tool_activities: Vec<WorkToolActivity>,
+    #[serde(default)]
+    pub expanded_tool_groups: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +203,10 @@ pub struct WorkConversation {
     pub tasks: Vec<WorkTask>,
     #[serde(default)]
     pub sources: Vec<WorkSource>,
+    #[serde(default)]
+    pub agent_threads: Vec<AgentThreadSnapshot>,
+    #[serde(default)]
+    pub agent_thread_transcripts: HashMap<String, Vec<WorkMessage>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

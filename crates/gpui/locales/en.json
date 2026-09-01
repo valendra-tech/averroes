@@ -42,7 +42,6 @@
   "placeholder.model_id": "Model ID, e.g. qwen3:8b",
   "placeholder.display_name": "Display name (optional)",
   "placeholder.reasoning_levels": "Reasoning levels, comma separated (optional)",
-  "placeholder.agent_id": "e.g. researcher",
   "placeholder.agent_name": "e.g. Researcher",
   "placeholder.agent_description": "What should this agent be used for?",
   "notice.first_connection": "Add your first connection. Nothing is selected automatically.",
@@ -149,6 +148,7 @@
   "tool.running": "Running",
   "tool.done": "Done",
   "tool.failed": "Failed",
+  "tool.interrupted": "Interrupted",
   "tool.shell": "Shell",
   "tool.read_file": "Read file",
   "tool.write_file": "Write file",
@@ -202,13 +202,10 @@
   "settings.add_agent": "Add agent",
   "settings.edit_agent": "Edit",
   "settings.remove_agent": "Remove agent",
-  "settings.new_agent": "New",
   "settings.save_agent": "Save agent",
-  "settings.agent_id": "Agent ID",
   "settings.agent_name": "Name",
   "settings.agent_description": "Purpose",
   "settings.agent_description_help": "The purpose helps the parent agent choose the right specialist.",
-  "settings.agent_connection": "Connection",
   "settings.agent_model": "Model",
   "settings.choose_model": "Choose a model",
   "settings.diagnostics": "Diagnostics",
@@ -293,6 +290,6 @@
   "update.open_failed": "Could not open the installer",
   "about.title": "About",
   "about.version": "Version",
-  "about.philosopher": "Ibn Rushd (Averroes) was a philosopher, physician, and jurist whose work connected classical Greek thought with medieval scholarship.",
-  "about.attribution": "Developed by Valendra.tech with love <3"
+  "about.philosopher": "Ibn Rushd (Averroes), born in Córdoba in al-Andalus, was an Andalusian philosopher, physician, and jurist. His influential commentaries on Aristotle helped carry classical Greek thought into medieval Europe and shaped European philosophy, theology, and science.",
+  "about.attribution": "Developed by Valendra.tech with love 💙"
 }

@@ -156,6 +156,10 @@ mod tests {
             role: WorkMessageRole::User,
             text: "a".repeat(2_000),
             reasoning: "private reasoning".into(),
+            reasoning_complete: true,
+            reasoning_expanded: false,
+            tool_activities: Vec::new(),
+            expanded_tool_groups: Vec::new(),
         }]);
         assert!(fragments.len() > 1);
         assert!(fragments[0].text.starts_with("User:"));

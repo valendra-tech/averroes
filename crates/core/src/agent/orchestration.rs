@@ -69,6 +69,7 @@ pub enum AgentThreadStatus {
     Running,
     Completed,
     Failed,
+    Interrupted,
 }
 
 #[async_trait]

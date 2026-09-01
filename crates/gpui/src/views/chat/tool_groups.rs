@@ -19,6 +19,18 @@ pub(crate) struct ToolGroupTracker {
 }
 
 impl ToolGroupTracker {
+    pub(crate) fn from_persisted_group_ids(group_ids: impl IntoIterator<Item = usize>) -> Self {
+        let next_group_id = group_ids
+            .into_iter()
+            .max()
+            .map(|group_id| group_id.saturating_add(1))
+            .unwrap_or(0);
+        Self {
+            next_group_id,
+            active_group_id: None,
+        }
+    }
+
     pub(crate) fn active_group_id(&self) -> Option<usize> {
         self.active_group_id
     }

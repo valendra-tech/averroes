@@ -87,6 +87,10 @@ fn load_documents_for_ids(
                     role: WorkMessageRole::parse(&row.get::<_, String>(0)?),
                     text: row.get(1)?,
                     reasoning: row.get(2)?,
+                    reasoning_complete: true,
+                    reasoning_expanded: false,
+                    tool_activities: Vec::new(),
+                    expanded_tool_groups: Vec::new(),
                 })
             })?;
             Ok(super::ConversationDocument {

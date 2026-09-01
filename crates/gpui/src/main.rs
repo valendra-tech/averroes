@@ -6,6 +6,8 @@ mod keychain;
 mod runtime;
 mod session;
 mod shortcuts;
+#[path = "views/chat/tool_details.rs"]
+mod tool_details;
 #[path = "views/chat/tool_groups.rs"]
 mod tool_groups;
 mod ui;
