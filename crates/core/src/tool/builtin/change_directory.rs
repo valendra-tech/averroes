@@ -188,7 +188,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.content.trim(), nested.canonicalize().unwrap().display().to_string());
+        assert_eq!(
+            result.content.trim(),
+            nested.canonicalize().unwrap().display().to_string()
+        );
         assert_eq!(
             result.metadata.unwrap()["working_dir"],
             nested.canonicalize().unwrap().display().to_string()
