@@ -173,6 +173,10 @@ impl ToolActivation {
 pub struct ToolResult {
     pub success: bool,
     pub content: String,
+    /// Provider-ready images returned by a tool. The textual projection stays
+    /// in `content` so existing tools and non-vision models keep working.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<crate::provider::types::ImageSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -184,6 +188,7 @@ impl ToolResult {
         Self {
             success: true,
             content: content.into(),
+            images: Vec::new(),
             error: None,
             metadata: None,
         }
@@ -193,6 +198,7 @@ impl ToolResult {
         Self {
             success: false,
             content: String::new(),
+            images: Vec::new(),
             error: Some(message.into()),
             metadata: None,
         }
@@ -200,6 +206,18 @@ impl ToolResult {
 
     pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
         self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_image(
+        mut self,
+        media_type: impl Into<String>,
+        base64_data: impl Into<String>,
+    ) -> Self {
+        self.images.push(crate::provider::types::ImageSource {
+            media_type: media_type.into(),
+            data: base64_data.into(),
+        });
         self
     }
 }
@@ -251,6 +269,7 @@ mod tests {
         let result = ToolResult::ok("success");
         assert!(result.success);
         assert_eq!(result.content, "success");
+        assert!(result.images.is_empty());
         assert!(result.error.is_none());
         assert!(result.metadata.is_none());
     }
@@ -261,6 +280,7 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.content, "");
         assert_eq!(result.error, Some("something went wrong".into()));
+        assert!(result.images.is_empty());
         assert!(result.metadata.is_none());
     }
 
@@ -278,5 +298,14 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.error, Some("fail".into()));
         assert_eq!(result.metadata, Some(json!({"code": 500})));
+    }
+
+    #[test]
+    fn test_tool_result_with_image() {
+        let result = ToolResult::ok("screenshot").with_image("image/png", "aW1hZ2U=");
+
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(result.images[0].media_type, "image/png");
+        assert_eq!(result.images[0].data, "aW1hZ2U=");
     }
 }

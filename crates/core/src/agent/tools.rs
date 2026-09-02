@@ -1,5 +1,5 @@
 use super::{Agent, AgentStreamEvent};
-use crate::provider::types::{MessageContent, Role, ToolCall};
+use crate::provider::types::{ContentPart, MessageContent, Role, ToolCall};
 use crate::provider::{ChatMessage, ChatResponse};
 use crate::tool::{EnabledTool, ToolContext, ToolResult};
 use anyhow::Result;
@@ -214,21 +214,40 @@ impl Agent {
             });
         }
 
-        let raw_content = if result.success {
-            result.content.as_str()
-        } else {
-            result.error.as_deref().unwrap_or("unknown error")
-        };
-        let content = crate::compaction::bound_live_tool_output(raw_content);
         ToolCallExecution {
             message: ChatMessage {
                 role: Role::Tool,
-                content: MessageContent::Text(content),
+                content: tool_result_message_content(&result),
                 tool_call_id: Some(tool_call.id.clone()),
                 tool_calls: None,
             },
         }
     }
+}
+
+fn tool_result_message_content(result: &ToolResult) -> MessageContent {
+    let raw_text = if result.success {
+        result.content.as_str()
+    } else {
+        result.error.as_deref().unwrap_or("unknown error")
+    };
+    let text = crate::compaction::bound_live_tool_output(raw_text);
+    if result.images.is_empty() {
+        return MessageContent::Text(text);
+    }
+
+    let mut parts = Vec::with_capacity(result.images.len() + 1);
+    if !text.is_empty() {
+        parts.push(ContentPart::Text { text });
+    }
+    parts.extend(
+        result
+            .images
+            .iter()
+            .cloned()
+            .map(|source| ContentPart::Image { source }),
+    );
+    MessageContent::Parts(parts)
 }
 
 fn is_parallel_web_tool(name: &str) -> bool {
@@ -237,12 +256,33 @@ fn is_parallel_web_tool(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_parallel_web_tool;
+    use super::{is_parallel_web_tool, tool_result_message_content};
+    use crate::provider::types::{ContentPart, MessageContent};
+    use crate::tool::ToolResult;
 
     #[test]
     fn only_stateless_web_reads_run_in_parallel() {
         assert!(is_parallel_web_tool("web_fetch"));
         assert!(is_parallel_web_tool("web_search_intrernal"));
         assert!(!is_parallel_web_tool("browser"));
+    }
+
+    #[test]
+    fn tool_images_are_preserved_in_provider_content() {
+        let result = ToolResult::ok("Screenshot captured").with_image("image/png", "aW1hZ2U=");
+
+        let MessageContent::Parts(parts) = tool_result_message_content(&result) else {
+            panic!("expected multimodal tool content");
+        };
+
+        assert!(matches!(
+            &parts[0],
+            ContentPart::Text { text } if text == "Screenshot captured"
+        ));
+        assert!(matches!(
+            &parts[1],
+            ContentPart::Image { source }
+                if source.media_type == "image/png" && source.data == "aW1hZ2U="
+        ));
     }
 }

@@ -95,6 +95,11 @@ impl OpenAiProvider {
             .unwrap_or_else(|| model_uses_responses_api(model))
     }
 
+    fn should_use_responses_api(&self, request: &ChatRequest) -> bool {
+        self.uses_responses_api(&request.model)
+            || (self.responses_api.is_none() && request_has_tool_images(request))
+    }
+
     pub fn build_body(&self, request: &ChatRequest, stream: bool) -> Value {
         request::build_chat_body(request, stream)
     }
@@ -267,7 +272,7 @@ impl OpenAiProvider {
 #[async_trait]
 impl Provider for OpenAiProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        if self.uses_responses_api(&request.model) {
+        if self.should_use_responses_api(&request) {
             return self.responses_chat(request).await;
         }
 
@@ -368,7 +373,7 @@ impl Provider for OpenAiProvider {
     }
 
     async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
-        if self.uses_responses_api(&request.model) {
+        if self.should_use_responses_api(&request) {
             return self.responses_chat_stream(request).await;
         }
 
@@ -454,6 +459,17 @@ impl Provider for OpenAiProvider {
     fn provider_name(&self) -> &'static str {
         "openai"
     }
+}
+
+fn request_has_tool_images(request: &ChatRequest) -> bool {
+    request.messages.iter().any(|message| {
+        message.role == Role::Tool
+            && matches!(
+                &message.content,
+                MessageContent::Parts(parts)
+                    if parts.iter().any(|part| matches!(part, ContentPart::Image { .. }))
+            )
+    })
 }
 
 pub(crate) fn parse_content_part(value: &Value) -> ContentPart {
@@ -644,6 +660,56 @@ mod tests {
         assert_eq!(input[0]["call_id"], "call-123");
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "call-123");
+    }
+
+    #[test]
+    fn multimodal_tool_outputs_reach_both_openai_apis() {
+        let message = ChatMessage {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Screenshot captured".into(),
+                },
+                ContentPart::Image {
+                    source: ImageSource {
+                        media_type: "image/png".into(),
+                        data: "aW1hZ2U=".into(),
+                    },
+                },
+            ]),
+            tool_call_id: Some("call-image".into()),
+            tool_calls: None,
+        };
+        let request = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![message],
+            tools: vec![],
+            temperature: None,
+            system: None,
+            reasoning_effort: None,
+        };
+
+        assert!(OpenAiProvider::new("test-key".into()).should_use_responses_api(&request));
+        assert!(!OpenAiProvider::new("test-key".into())
+            .with_responses_api(false)
+            .should_use_responses_api(&request));
+
+        let chat = OpenAiProvider::new("test-key".into()).build_body(&request, false);
+        let chat_content = chat["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(chat_content[0]["type"], "text");
+        assert_eq!(chat_content[1]["type"], "image_url");
+        assert_eq!(
+            chat_content[1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+
+        let responses = OpenAiProvider::build_responses_request(&request, false);
+        let output = responses["input"][0]["output"].as_array().unwrap();
+        assert_eq!(responses["input"][0]["type"], "function_call_output");
+        assert_eq!(responses["input"][0]["call_id"], "call-image");
+        assert_eq!(output[0]["type"], "input_text");
+        assert_eq!(output[1]["type"], "input_image");
+        assert_eq!(output[1]["image_url"], "data:image/png;base64,aW1hZ2U=");
     }
 
     #[test]

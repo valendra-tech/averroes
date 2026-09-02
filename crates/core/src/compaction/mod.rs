@@ -82,6 +82,13 @@ pub fn compact_tool_outputs(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
                     parts
                         .into_iter()
                         .map(|part| match part {
+                            ContentPart::Text { text } => ContentPart::Text {
+                                text: bound_tool_output(
+                                    &text,
+                                    MAX_COMPACTED_TOOL_OUTPUT_BYTES,
+                                    MAX_COMPACTED_TOOL_OUTPUT_LINES,
+                                ),
+                            },
                             ContentPart::ToolResult {
                                 tool_use_id,
                                 content,
@@ -342,5 +349,42 @@ mod tests {
         };
         assert!(output.len() <= MAX_COMPACTED_TOOL_OUTPUT_BYTES);
         assert!(output.contains("tool output truncated"));
+    }
+
+    #[test]
+    fn compacting_multimodal_tool_results_preserves_images_and_bounds_text() {
+        let image = crate::provider::types::ImageSource {
+            media_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        };
+        let messages = vec![ChatMessage {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "large output\n".repeat(2_000),
+                },
+                ContentPart::Image {
+                    source: image.clone(),
+                },
+            ]),
+            tool_call_id: Some("call-image".into()),
+            tool_calls: None,
+        }];
+
+        let compacted = compact_tool_outputs(messages);
+        let MessageContent::Parts(parts) = &compacted[0].content else {
+            panic!("expected multimodal tool result");
+        };
+
+        assert!(matches!(
+            &parts[0],
+            ContentPart::Text { text }
+                if text.len() <= MAX_COMPACTED_TOOL_OUTPUT_BYTES
+                    && text.contains("tool output truncated")
+        ));
+        assert!(matches!(
+            &parts[1],
+            ContentPart::Image { source } if source == &image
+        ));
     }
 }

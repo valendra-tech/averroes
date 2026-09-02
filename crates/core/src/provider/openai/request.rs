@@ -65,11 +65,22 @@ pub(super) fn build_responses_body(request: &ChatRequest, stream: bool) -> Value
     let mut input: Vec<Value> = Vec::new();
 
     for msg in &request.messages {
+        if msg.role == Role::Tool {
+            if let Some(tool_call_id) = &msg.tool_call_id {
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": tool_call_id,
+                    "output": responses_tool_output(&msg.content),
+                }));
+            }
+            continue;
+        }
+
         let role_str = match msg.role {
             Role::System => "developer",
             Role::User => "user",
             Role::Assistant => "assistant",
-            Role::Tool => "user",
+            Role::Tool => unreachable!(),
         };
 
         let content = match &msg.content {
@@ -101,20 +112,6 @@ pub(super) fn build_responses_body(request: &ChatRequest, stream: bool) -> Value
                 Value::Array(blocks)
             }
         };
-
-        if msg.role == Role::Tool {
-            if let Some(tool_call_id) = &msg.tool_call_id {
-                input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": tool_call_id,
-                    "output": match &msg.content {
-                        MessageContent::Text(text) => json!(text),
-                        _ => json!(""),
-                    },
-                }));
-            }
-            continue;
-        }
 
         if msg.role == Role::Assistant {
             if let Some(tool_calls) = &msg.tool_calls {
@@ -180,6 +177,30 @@ pub(super) fn build_responses_body(request: &ChatRequest, stream: bool) -> Value
     }
 
     body
+}
+
+fn responses_tool_output(content: &MessageContent) -> Value {
+    match content {
+        MessageContent::Text(text) => json!(text),
+        MessageContent::Parts(parts) => Value::Array(
+            parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => {
+                        Some(json!({ "type": "input_text", "text": text }))
+                    }
+                    ContentPart::Image { source } => Some(json!({
+                        "type": "input_image",
+                        "image_url": format!(
+                            "data:{};base64,{}",
+                            source.media_type, source.data
+                        ),
+                    })),
+                    _ => None,
+                })
+                .collect(),
+        ),
+    }
 }
 
 pub(crate) fn role_system_message(msg: &ProviderChatMessage) -> Value {
@@ -270,17 +291,27 @@ pub(crate) fn role_assistant_message(msg: &ProviderChatMessage) -> Value {
 pub(crate) fn role_tool_message(msg: &ProviderChatMessage) -> Value {
     let mut obj = json!({ "role": "tool" });
     let content = match &msg.content {
-        MessageContent::Text(text) => text.clone(),
-        MessageContent::Parts(parts) => parts
-            .iter()
-            .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(""),
+        MessageContent::Text(text) => json!(text),
+        MessageContent::Parts(parts) => Value::Array(
+            parts
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(json!({ "type": "text", "text": text })),
+                    ContentPart::Image { source } => Some(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!(
+                                "data:{};base64,{}",
+                                source.media_type, source.data
+                            ),
+                        }
+                    })),
+                    _ => None,
+                })
+                .collect(),
+        ),
     };
-    obj["content"] = json!(content);
+    obj["content"] = content;
     if let Some(tool_call_id) = &msg.tool_call_id {
         obj["tool_call_id"] = json!(tool_call_id);
     }

@@ -141,7 +141,6 @@ impl Tool for DynamicTool {
             DynamicToolHandler::MCP { client, tool_name } => client
                 .call_tool(tool_name, params.clone())
                 .await
-                .map(ToolResult::ok)
                 .map_err(|error| ToolError::Execution {
                     tool: self.name.clone(),
                     message: format!("MCP tool call failed: {error}"),
