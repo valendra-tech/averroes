@@ -769,6 +769,58 @@ impl WorkDatabase {
         Ok(())
     }
 
+    pub fn onboarding_steps(&self) -> Result<Vec<WorkOnboardingStep>, WorkDatabaseError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT step_id, completed, completed_at, updated_at
+             FROM onboarding_steps
+             ORDER BY updated_at ASC, step_id ASC",
+        )?;
+        let steps = statement.query_map([], |row| {
+            Ok(WorkOnboardingStep {
+                id: row.get(0)?,
+                completed: row.get::<_, i64>(1)? != 0,
+                completed_at: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })?;
+        steps
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(WorkDatabaseError::from)
+    }
+
+    pub fn set_onboarding_step(
+        &self,
+        step_id: &str,
+        completed: bool,
+    ) -> Result<(), WorkDatabaseError> {
+        let step_id = step_id.trim();
+        if step_id.is_empty() || step_id.len() > 80 {
+            return Err(WorkDatabaseError::InvalidOnboardingStep(
+                "step id must contain between 1 and 80 bytes".into(),
+            ));
+        }
+        let timestamp = now();
+        self.connection.lock().execute(
+            "INSERT INTO onboarding_steps (step_id, completed, completed_at, updated_at)
+             VALUES (?1, ?2, CASE WHEN ?2 = 1 THEN ?3 ELSE NULL END, ?3)
+             ON CONFLICT(step_id) DO UPDATE SET
+                completed = excluded.completed,
+                completed_at = CASE
+                    WHEN excluded.completed = 1
+                        THEN COALESCE(onboarding_steps.completed_at, excluded.completed_at)
+                    ELSE NULL
+                END,
+                updated_at = CASE
+                    WHEN onboarding_steps.completed <> excluded.completed
+                        THEN excluded.updated_at
+                    ELSE onboarding_steps.updated_at
+                END",
+            params![step_id, i64::from(completed), timestamp],
+        )?;
+        Ok(())
+    }
+
     pub fn forget_binding_for_connection(
         &self,
         connection_id: &ConnectionId,
@@ -925,6 +977,8 @@ pub enum WorkDatabaseError {
     InvalidGlobalMemory(String),
     #[error("invalid conversation folder: {0}")]
     InvalidFolder(String),
+    #[error("invalid onboarding step: {0}")]
+    InvalidOnboardingStep(String),
 }
 
 #[cfg(test)]
@@ -1243,6 +1297,49 @@ mod tests {
 
         let reopened = WorkDatabase::open_at(directory.path().join("averroes.db")).unwrap();
         assert_eq!(reopened.last_binding().unwrap(), Some(binding));
+    }
+
+    #[test]
+    fn onboarding_steps_persist_and_can_become_pending_again() {
+        let (directory, database) = database();
+        database
+            .set_onboarding_step("welcome_introduction", true)
+            .unwrap();
+        database
+            .set_onboarding_step("active_connection", false)
+            .unwrap();
+        drop(database);
+
+        let reopened = WorkDatabase::open_at(directory.path().join("averroes.db")).unwrap();
+        let steps = reopened.onboarding_steps().unwrap();
+        let introduction = steps
+            .iter()
+            .find(|step| step.id == "welcome_introduction")
+            .unwrap();
+        assert!(introduction.completed);
+        assert!(introduction.completed_at.is_some());
+        assert!(
+            !steps
+                .iter()
+                .find(|step| step.id == "active_connection")
+                .unwrap()
+                .completed
+        );
+
+        reopened
+            .set_onboarding_step("active_connection", true)
+            .unwrap();
+        reopened
+            .set_onboarding_step("active_connection", false)
+            .unwrap();
+        let connection = reopened
+            .onboarding_steps()
+            .unwrap()
+            .into_iter()
+            .find(|step| step.id == "active_connection")
+            .unwrap();
+        assert!(!connection.completed);
+        assert_eq!(connection.completed_at, None);
     }
 
     #[test]
@@ -1607,6 +1704,7 @@ mod tests {
                 title: "Research".into(),
                 model_id: "model-1".into(),
                 status: AgentThreadStatus::Completed,
+                enabled_tools: vec!["discover_tools".into(), "web_fetch".into()],
                 prompt: "Find the answer".into(),
                 output: "Agent answer".into(),
                 created_at: timestamp,

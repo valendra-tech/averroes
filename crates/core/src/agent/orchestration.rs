@@ -59,10 +59,41 @@ pub struct AgentThreadSnapshot {
     pub title: String,
     pub model_id: String,
     pub status: AgentThreadStatus,
+    /// Tool schemas activated by this delegated thread. Keeping them on the
+    /// thread snapshot lets a later call continue with the same capabilities
+    /// instead of restarting from the discovery bootstrap.
+    #[serde(default)]
+    pub enabled_tools: Vec<String>,
     pub prompt: String,
     pub output: String,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AgentThreadSnapshot;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_thread_snapshots_default_to_no_saved_tools() {
+        let snapshot: AgentThreadSnapshot = serde_json::from_value(json!({
+            "id": "thread-1",
+            "thread_id": "thread-1",
+            "agent_id": "researcher",
+            "parent_session_id": "conversation-1",
+            "title": "Research",
+            "model_id": "model-1",
+            "status": "completed",
+            "prompt": "Find the answer",
+            "output": "Done",
+            "created_at": 1,
+            "updated_at": 2
+        }))
+        .expect("legacy thread snapshot should deserialize");
+
+        assert!(snapshot.enabled_tools.is_empty());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
