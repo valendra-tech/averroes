@@ -368,6 +368,9 @@ jobs:
       - name: Publish validated release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          # The publish job intentionally has no checkout. Tell `gh` which
+          # repository to use instead of relying on a local `.git` directory.
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
           ARTIFACTS_DIR: ${{ runner.temp }}/averroes-release-artifacts
@@ -381,6 +384,11 @@ jobs:
           ARM64_DMG="${ARTIFACTS_DIR}/${ARM64_NAME}"
           # X86_64_DMG="${ARTIFACTS_DIR}/${X86_64_NAME}"
           CHECKSUM_PATH="${ARTIFACTS_DIR}/${CHECKSUM_NAME}"
+          if [[ "${RELEASE_VERSION}" == *-* ]]; then
+            RELEASE_PRERELEASE=true
+          else
+            RELEASE_PRERELEASE=false
+          fi
 
           shopt -s dotglob nullglob
           artifact_paths=("${ARTIFACTS_DIR}"/*)
@@ -437,11 +445,17 @@ jobs:
               exit "${release_view_status}"
             fi
 
-            gh release create "$RELEASE_TAG" --draft --generate-notes --verify-tag
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --generate-notes \
+              --prerelease="${RELEASE_PRERELEASE}" \
+              --verify-tag
           fi
 
           gh release upload "$RELEASE_TAG" \
             "${ARM64_DMG}" \
             "${CHECKSUM_PATH}" \
             --clobber
-          gh release edit "$RELEASE_TAG" --draft=false
+          gh release edit "$RELEASE_TAG" \
+            --draft=false \
+            --prerelease="${RELEASE_PRERELEASE}"

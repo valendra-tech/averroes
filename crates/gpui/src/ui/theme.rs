@@ -23,19 +23,19 @@ pub struct UiTheme {
 }
 
 impl UiTheme {
-    pub const RADIUS: f32 = 8.0;
+    pub const RADIUS: f32 = 10.0;
 
     pub fn dark() -> Self {
         Self {
-            background: rgb(0x181817),
-            rail: rgb(0x1e1e1d),
-            surface: rgb(0x222221),
-            surface_subtle: rgb(0x262625),
-            surface_hover: rgb(0x30302e),
-            foreground: rgb(0xf1f1ee),
-            muted: rgb(0xb4b4af),
-            faint: rgb(0x7f7f79),
-            border: rgb(0x333331),
+            background: rgb(0x171716),
+            rail: rgb(0x1c1c1b),
+            surface: rgb(0x222220),
+            surface_subtle: rgb(0x262624),
+            surface_hover: rgb(0x2e2e2c),
+            foreground: rgb(0xf3f3f0),
+            muted: rgb(0xb7b7b1),
+            faint: rgb(0x85857e),
+            border: rgb(0x343432),
             accent: rgb(0xe8e8e5),
             accent_hover: rgb(0xffffff),
             accent_soft: rgb(0x3b415e),
@@ -53,12 +53,12 @@ impl UiTheme {
             background: rgb(0xfdfdfc),
             rail: rgb(0xf7f7f5),
             surface: rgb(0xffffff),
-            surface_subtle: rgb(0xf4f4f2),
-            surface_hover: rgb(0xededeb),
-            foreground: rgb(0x20201f),
-            muted: rgb(0x6c6c67),
-            faint: rgb(0x95958f),
-            border: rgb(0xe3e3df),
+            surface_subtle: rgb(0xf5f5f2),
+            surface_hover: rgb(0xecece8),
+            foreground: rgb(0x20201e),
+            muted: rgb(0x6f6f69),
+            faint: rgb(0x989891),
+            border: rgb(0xe5e5e0),
             accent: rgb(0x171717),
             accent_hover: rgb(0x000000),
             accent_soft: rgb(0xe5eef3),
@@ -114,7 +114,7 @@ impl UiTheme {
         theme.font_size = px(14.0);
         theme.mono_font_size = px(13.0);
         theme.radius = px(Self::RADIUS);
-        theme.radius_lg = px(12.0);
+        theme.radius_lg = px(14.0);
         // This is deliberately a flat workspace. Elevation is provided by
         // color and borders, not a blanket layer of drop shadows.
         theme.shadow = false;
@@ -128,6 +128,10 @@ impl UiTheme {
         theme.muted_foreground = palette.muted.into();
         theme.accent = palette.surface_hover.into();
         theme.accent_foreground = palette.foreground.into();
+        theme.secondary = palette.surface_subtle.into();
+        theme.secondary_hover = palette.surface_hover.into();
+        theme.secondary_active = palette.surface_hover.into();
+        theme.secondary_foreground = palette.foreground.into();
         theme.primary = palette.accent.into();
         theme.primary_hover = palette.accent_hover.into();
         theme.primary_active = palette.accent.into();
@@ -176,8 +180,8 @@ impl UiTheme {
 
     // Native macOS families keep the app crisp at small UI sizes and avoid
     // depending on bundled web fonts being present on a user's machine.
-    pub const UI_FONT: &'static str = "Helvetica Neue";
-    pub const DISPLAY_FONT: &'static str = "Avenir Next";
+    pub const UI_FONT: &'static str = ".SystemUIFont";
+    pub const DISPLAY_FONT: &'static str = ".SystemUIFont";
     pub const MONO_FONT: &'static str = "Menlo";
 
     fn font_with_fallbacks(family: &'static str, fallbacks: &[&'static str]) -> Font {
@@ -198,14 +202,14 @@ impl UiTheme {
     pub fn ui_font() -> Font {
         Self::font_with_fallbacks(
             Self::UI_FONT,
-            &["Helvetica", "Arial", "Segoe UI", "sans-serif"],
+            &["Helvetica Neue", "Segoe UI", "Arial", "sans-serif"],
         )
     }
 
     pub fn display_font() -> Font {
         Self::font_with_fallbacks(
             Self::DISPLAY_FONT,
-            &[Self::UI_FONT, "Helvetica", "sans-serif"],
+            &["Helvetica Neue", "Segoe UI", "Arial", "sans-serif"],
         )
     }
 

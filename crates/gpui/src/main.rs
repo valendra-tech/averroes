@@ -60,6 +60,7 @@ impl AssetSource for UiAssets {
             "providers/generic.svg" => Some(&include_bytes!("../assets/providers/generic.svg")[..]),
             "icons/pin.svg" => Some(&include_bytes!("../assets/pin.svg")[..]),
             "icons/pencil.svg" => Some(&include_bytes!("../assets/pencil.svg")[..]),
+            "icons/square-pen.svg" => Some(&include_bytes!("../assets/icons/square-pen.svg")[..]),
             "icons/trash.svg" => Some(&include_bytes!("../assets/trash.svg")[..]),
             "icons/message-square-plus.svg" => {
                 Some(&include_bytes!("../assets/icons/message-square-plus.svg")[..])

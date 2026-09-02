@@ -211,6 +211,7 @@ fn parse_sse_event(
                     output_tokens: 0,
                     cache_read_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    reasoning_output_tokens: None,
                 });
                 if let Some(input_tokens) = delta.get("input_tokens").and_then(Value::as_u64) {
                     usage.input_tokens = input_tokens;
@@ -249,5 +250,6 @@ fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
         output_tokens: value["output_tokens"].as_u64().unwrap_or(0),
         cache_read_input_tokens: value["cache_read_input_tokens"].as_u64(),
         cache_creation_input_tokens: value["cache_creation_input_tokens"].as_u64(),
+        reasoning_output_tokens: None,
     })
 }

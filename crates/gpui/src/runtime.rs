@@ -8,11 +8,16 @@ use averroes_core::codex::{CodexAccount, CodexClient, CodexError, CodexLogin, Co
 use averroes_core::compaction::{CompactionConfig, CompactionStrategyType};
 use averroes_core::config::AgentProfile;
 use averroes_core::config::{AppConfig, ConfigError, ConfigPaths};
-use averroes_core::connection::{ConnectionId, ConnectionKind, ConnectionProfile, SessionBinding};
+use averroes_core::connection::{
+    ConnectionId, ConnectionKind, ConnectionProfile, CredentialRef, SessionBinding,
+};
 use averroes_core::credentials::{CredentialVault, VaultError, VaultKeyProvider};
 use averroes_core::diagnostics::{self, DiagnosticLevel};
 use averroes_core::github::{
     CopilotEndpoint, CopilotModel, GitHubCopilotClient, GitHubError, GitHubLogin,
+};
+use averroes_core::integrations::mcp::{
+    McpClient, ProjectMcpConfig, ProjectMcpServer, PROJECT_MCP_FILE,
 };
 use averroes_core::memory::{compile_fragments_with_context, cosine_similarity, decode_embedding};
 use averroes_core::models::{ManualModel, ModelRegistry};
@@ -21,13 +26,17 @@ use averroes_core::provider::codex::ChatGptCodexProvider;
 use averroes_core::provider::factory::{
     create_copilot_provider, create_direct_provider, ProviderFactoryError,
 };
+use averroes_core::provider::types::MessageContent;
 use averroes_core::provider::{
     EmbeddingRequest, ModelDiscovery, ModelInfo, Provider, ProviderRegistry,
 };
 use averroes_core::runtime::ResourceGovernor;
 use averroes_core::skill::{SkillIndex, SkillLoader};
 use averroes_core::tool::builtin::ask_user::{AskUserBroker, AskUserParams, UserQuestion};
-use averroes_core::tool::{builtin, MemorySearchBackend, ToolRegistry};
+use averroes_core::tool::dynamic::{DynamicTool, DynamicToolConfig, DynamicToolHandler};
+use averroes_core::tool::{
+    builtin, MemorySearchBackend, SkillMarketplaceBackend, SkillMarketplaceEntry, ToolRegistry,
+};
 use averroes_core::work::{
     ConversationSearchResult, EmbeddingConfig, VectorSearchHit, WorkDatabase, WorkDatabaseError,
 };
@@ -35,11 +44,20 @@ use futures::stream::{self, StreamExt};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::{Cursor, Read};
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const DEFAULT_COMPACTION_THRESHOLD: f64 = 0.8;
 const MAX_CONCURRENT_CALLS: usize = tokio::sync::Semaphore::MAX_PERMITS;
+const MAX_MARKETPLACE_SKILL_FILES: usize = 256;
+const MAX_MARKETPLACE_SKILL_BYTES: usize = 32 * 1024 * 1024;
+
+struct MarketplaceSkillFile {
+    path: PathBuf,
+    contents: Vec<u8>,
+}
 
 /// Provider-neutral application services.
 ///
@@ -63,6 +81,152 @@ pub struct AppRuntime {
     provider_hooks: ProviderRegistry,
     agent_threads: Arc<AgentThreadRegistry>,
     user_questions: Arc<AskUserBroker>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MarketplaceSkill {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub source: String,
+    pub slug: String,
+    pub installs: u64,
+    pub install_url: Option<String>,
+    pub url: Option<String>,
+}
+
+impl MarketplaceSkill {
+    fn from_value(value: serde_json::Value) -> Option<Self> {
+        let id = value.get("id")?.as_str()?.trim().to_owned();
+        let name = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("skillId").and_then(serde_json::Value::as_str))
+            .or_else(|| value.get("slug").and_then(serde_json::Value::as_str))?
+            .trim()
+            .to_owned();
+        if id.is_empty() || name.is_empty() {
+            return None;
+        }
+        let public_url = format!("https://skills.sh/{id}");
+        Some(Self {
+            id,
+            name,
+            description: value
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| value.get("summary").and_then(serde_json::Value::as_str))
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(str::to_owned),
+            source: value
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            slug: value
+                .get("slug")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| value.get("skillId").and_then(serde_json::Value::as_str))
+                .unwrap_or_default()
+                .to_owned(),
+            installs: value
+                .get("installs")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            install_url: value
+                .get("installUrl")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            url: value
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .or(Some(public_url)),
+        })
+    }
+}
+
+fn parse_public_trending_skills(body: &str) -> Vec<MarketplaceSkill> {
+    let marker = r#"\"initialSkills\":["#;
+    let Some(marker_start) = body.find(marker) else {
+        return Vec::new();
+    };
+    let start = marker_start + marker.len() - 1;
+    let mut depth = 0;
+    let mut end = None;
+    for (offset, character) in body[start..].char_indices() {
+        match character {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + offset + character.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end else {
+        return Vec::new();
+    };
+    let decoded = body[start..end].replace("\\\"", "\"");
+    let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(&decoded) else {
+        return Vec::new();
+    };
+    values
+        .into_iter()
+        .filter_map(|mut value| {
+            let source = value.get("source").and_then(serde_json::Value::as_str)?;
+            let skill_id = value.get("skillId").and_then(serde_json::Value::as_str)?;
+            value["id"] = serde_json::Value::String(format!("{source}/{skill_id}"));
+            MarketplaceSkill::from_value(value)
+        })
+        .take(20)
+        .collect()
+}
+
+#[cfg(test)]
+mod marketplace_skill_tests {
+    use super::{parse_public_trending_skills, MarketplaceSkill};
+    use serde_json::json;
+
+    #[test]
+    fn parses_public_skills_directory_results() {
+        let skill = MarketplaceSkill::from_value(json!({
+            "id": "vercel-labs/agent-skills/web-design-guidelines",
+            "skillId": "web-design-guidelines",
+            "name": "web-design-guidelines",
+            "description": "Guidelines for building polished web interfaces",
+            "installs": 598673,
+            "source": "vercel-labs/agent-skills"
+        }))
+        .expect("public skills result should parse");
+
+        assert_eq!(skill.name, "web-design-guidelines");
+        assert_eq!(skill.slug, "web-design-guidelines");
+        assert_eq!(skill.installs, 598673);
+        assert_eq!(
+            skill.description.as_deref(),
+            Some("Guidelines for building polished web interfaces")
+        );
+        assert_eq!(
+            skill.url.as_deref(),
+            Some("https://skills.sh/vercel-labs/agent-skills/web-design-guidelines")
+        );
+    }
+
+    #[test]
+    fn parses_public_trending_page_data() {
+        let skills = parse_public_trending_skills(
+            r#"50:["$","$L57",null,{\"initialSkills\":[{\"source\":\"owner/repo\",\"skillId\":\"release\",\"name\":\"release\",\"installs\":42}]}]"#,
+        );
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].id, "owner/repo/release");
+        assert_eq!(skills[0].installs, 42);
+    }
 }
 
 pub struct AgentThreadRegistry {
@@ -346,12 +510,12 @@ impl RuntimeAgentRunner {
                 request.parent_objective.trim()
             )
         };
-        let tools = request
-            .tools
-            .iter()
-            .filter(|tool| !matches!(tool.as_str(), "list_agents" | "call_agent" | "call_agents"))
-            .cloned()
-            .collect::<Vec<_>>();
+        // Keep the child request small. It still receives the exact same
+        // scoped registry (including workspace MCP tools), so it has the same
+        // capabilities, but discovery decides which full schemas are needed
+        // for this objective. Sending every active parent schema here was
+        // enough to hit provider tool-count limits before the child started.
+        let tools = self.tool_registry.bootstrap_names();
         let agent = Arc::new(Agent::new(
             AgentConfig {
                 name: format!("delegated-{}", &thread_id[..thread_id.len().min(8)]),
@@ -360,9 +524,9 @@ impl RuntimeAgentRunner {
                     "{}{parent_context}\n\n## Delegation boundary\nYou are a delegated leaf agent. Do not call `list_agents`, `call_agent`, or `call_agents`, and do not start another subagent. Complete the assigned objective yourself and return your result to the parent agent.",
                     self.system_prompt
                 )),
-                // A delegated agent receives precisely the parent's current
-                // tool set, including discovery and delegation tools.
-                tools: tools.clone(),
+                // A delegated agent receives the same registry and starts
+                // with only the compact discovery bootstrap tools.
+                tools,
                 max_iterations: 12,
                 compaction: self.compaction.clone(),
                 reasoning_effort: self.reasoning_effort.clone(),
@@ -650,6 +814,56 @@ pub enum RuntimeError {
     Runtime(String),
     #[error("work database error: {0}")]
     Database(#[from] WorkDatabaseError),
+    #[error("project MCP error: {0}")]
+    ProjectMcp(String),
+}
+
+#[async_trait]
+impl SkillMarketplaceBackend for AppRuntime {
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> std::result::Result<Vec<SkillMarketplaceEntry>, String> {
+        self.search_skill_marketplace(query)
+            .await
+            .map(|skills| {
+                skills
+                    .into_iter()
+                    .take(limit)
+                    .map(|skill| SkillMarketplaceEntry {
+                        id: skill.id,
+                        name: skill.name,
+                        description: skill.description,
+                        source: skill.source,
+                        slug: skill.slug,
+                        installs: skill.installs,
+                        url: skill.url,
+                    })
+                    .collect()
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    async fn install(
+        &self,
+        workspace_root: &Path,
+        skill: &SkillMarketplaceEntry,
+    ) -> std::result::Result<String, String> {
+        let skill = MarketplaceSkill {
+            id: skill.id.clone(),
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            source: skill.source.clone(),
+            slug: skill.slug.clone(),
+            installs: skill.installs,
+            install_url: None,
+            url: skill.url.clone(),
+        };
+        self.install_skill_from_marketplace(workspace_root, &skill)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 impl AppRuntime {
@@ -958,6 +1172,243 @@ impl AppRuntime {
         self.connection(id)
             .ok_or_else(|| RuntimeError::ConnectionNotFound(id.to_string()))?;
         Ok(self.model_registry.models(id).unwrap_or_default())
+    }
+
+    pub fn project_mcp_config(
+        &self,
+        workspace_root: &Path,
+    ) -> Result<ProjectMcpConfig, RuntimeError> {
+        ProjectMcpConfig::load(workspace_root)
+            .map_err(|error| RuntimeError::ProjectMcp(error.to_string()))
+    }
+
+    pub fn save_project_mcp_server(
+        &self,
+        workspace_root: &Path,
+        name: &str,
+        mut server: ProjectMcpServer,
+        secret: Option<&str>,
+    ) -> Result<(), RuntimeError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(RuntimeError::ProjectMcp(
+                "MCP server name cannot be empty".into(),
+            ));
+        }
+        let mut config = self.project_mcp_config(workspace_root)?;
+        let previous = config.servers.get(name).cloned();
+        let mut credential_ref_to_store = None;
+        if server.auth.kind != averroes_core::integrations::mcp::McpAuthType::None {
+            let credential_ref = server
+                .auth
+                .credential_ref
+                .clone()
+                .or_else(|| {
+                    previous
+                        .as_ref()
+                        .and_then(|item| item.auth.credential_ref.clone())
+                })
+                .unwrap_or_else(|| project_mcp_credential_ref(workspace_root, name).0);
+            server.auth.credential_ref = Some(credential_ref.clone());
+            credential_ref_to_store = Some(credential_ref);
+        }
+        let clear_previous_credential =
+            server.auth.kind == averroes_core::integrations::mcp::McpAuthType::None;
+        let previous_credential = previous
+            .as_ref()
+            .and_then(|item| item.auth.credential_ref.clone());
+        server
+            .validate()
+            .map_err(|error| RuntimeError::ProjectMcp(error.to_string()))?;
+        if let (Some(credential_ref), Some(secret)) = (
+            credential_ref_to_store,
+            secret.filter(|secret| !secret.trim().is_empty()),
+        ) {
+            self.vault.put(&CredentialRef(credential_ref), secret)?;
+        }
+        config.servers.insert(name.to_owned(), server);
+        config
+            .save(workspace_root)
+            .map_err(|error| RuntimeError::ProjectMcp(error.to_string()))?;
+        if clear_previous_credential {
+            if let Some(credential_ref) = previous_credential {
+                let _ = self.vault.delete(&CredentialRef(credential_ref));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn delete_project_mcp_server(
+        &self,
+        workspace_root: &Path,
+        name: &str,
+    ) -> Result<bool, RuntimeError> {
+        let mut config = self.project_mcp_config(workspace_root)?;
+        let Some(server) = config.servers.remove(name) else {
+            return Ok(false);
+        };
+        config
+            .save(workspace_root)
+            .map_err(|error| RuntimeError::ProjectMcp(error.to_string()))?;
+        if let Some(credential_ref) = server.auth.credential_ref {
+            let _ = self.vault.delete(&CredentialRef(credential_ref));
+        }
+        Ok(true)
+    }
+
+    pub fn project_mcp_file(&self, workspace_root: &Path) -> PathBuf {
+        workspace_root.join(PROJECT_MCP_FILE)
+    }
+
+    /// Returns only skills installed inside the project. Global skills remain
+    /// available to agents but are not presented as project-owned files.
+    pub fn project_skills(&self, workspace_root: &Path) -> Vec<averroes_core::skill::SkillMeta> {
+        let Some(index) = self.workspace_skill_index(workspace_root) else {
+            return Vec::new();
+        };
+        let roots = project_skill_roots(workspace_root);
+        index
+            .list()
+            .into_iter()
+            .filter(|skill| roots.iter().any(|root| skill.path.starts_with(root)))
+            .cloned()
+            .collect()
+    }
+
+    pub fn delete_project_skill(
+        &self,
+        workspace_root: &Path,
+        name: &str,
+    ) -> Result<bool, RuntimeError> {
+        let Some(index) = self.refresh_workspace_skills(workspace_root) else {
+            return Ok(false);
+        };
+        let Some(skill) = index.get(name) else {
+            return Ok(false);
+        };
+        let roots = project_skill_roots(workspace_root);
+        if !roots.iter().any(|root| skill.path.starts_with(root)) {
+            return Err(RuntimeError::Runtime(
+                "refusing to delete a global skill from project settings".into(),
+            ));
+        }
+        let directory = skill.path.parent().unwrap_or(skill.path.as_path());
+        std::fs::remove_dir_all(directory).map_err(|error| {
+            RuntimeError::Runtime(format!("could not delete skill '{}': {error}", name))
+        })?;
+        self.refresh_workspace_skills(workspace_root);
+        Ok(true)
+    }
+
+    pub async fn search_skill_marketplace(
+        &self,
+        query: &str,
+    ) -> Result<Vec<MarketplaceSkill>, RuntimeError> {
+        let query = query.trim();
+        let client = reqwest::Client::new();
+        if query.is_empty() {
+            let response = client
+                .get("https://skills.sh/trending")
+                .send()
+                .await
+                .map_err(|error| {
+                    RuntimeError::Runtime(format!("skills marketplace request failed: {error}"))
+                })?;
+            let status = response.status();
+            let body = response.text().await.map_err(|error| {
+                RuntimeError::Runtime(format!("invalid skills marketplace response: {error}"))
+            })?;
+            if !status.is_success() {
+                return Err(RuntimeError::Runtime(format!(
+                    "skills marketplace returned HTTP {status}"
+                )));
+            }
+            let skills = parse_public_trending_skills(&body);
+            if skills.is_empty() {
+                return Err(RuntimeError::Runtime(
+                    "skills marketplace returned no featured skills".into(),
+                ));
+            }
+            return Ok(skills);
+        }
+        if query.chars().count() < 2 {
+            return Ok(Vec::new());
+        }
+
+        // The documented /api/v1 endpoints are Vercel OIDC-protected and
+        // therefore cannot be called by a standalone desktop application.
+        // The public directory uses this endpoint for its own search UI.
+        let request = client
+            .get("https://skills.sh/api/search")
+            .query(&[("q", query), ("limit", "20")]);
+        let response = request.send().await.map_err(|error| {
+            RuntimeError::Runtime(format!("skills marketplace request failed: {error}"))
+        })?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.map_err(|error| {
+            RuntimeError::Runtime(format!("invalid skills marketplace response: {error}"))
+        })?;
+        if !status.is_success() {
+            return Err(RuntimeError::Runtime(format!(
+                "skills marketplace returned HTTP {status}: {body}"
+            )));
+        }
+        let items = body
+            .get("skills")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let skills = items
+            .into_iter()
+            .filter_map(MarketplaceSkill::from_value)
+            .collect::<Vec<_>>();
+        if skills.is_empty() && body.get("count").and_then(serde_json::Value::as_u64) > Some(0) {
+            return Err(RuntimeError::Runtime(
+                "skills marketplace returned results in an unsupported format".into(),
+            ));
+        }
+        Ok(skills)
+    }
+
+    pub async fn install_skill_from_marketplace(
+        &self,
+        workspace_root: &Path,
+        skill: &MarketplaceSkill,
+    ) -> Result<String, RuntimeError> {
+        let source = skill.source.trim();
+        let slug = skill.slug.trim();
+        let valid_segment = |value: &str| {
+            !value.is_empty() && value != "." && value != ".." && !value.contains(['/', '\\'])
+        };
+        if !valid_segment(slug) {
+            return Err(RuntimeError::Runtime(
+                "marketplace skill has an invalid skill name".into(),
+            ));
+        }
+        let source = source.to_owned();
+        let slug = slug.to_owned();
+        let client = reqwest::Client::new();
+        let files = if source.split('/').count() == 2 && source.split('/').all(valid_segment) {
+            fetch_github_skill_files(&client, &source, &slug).await?
+        } else if is_well_known_skill_domain(&source) {
+            fetch_domain_skill_files(&client, &source, &slug).await?
+        } else {
+            return Err(RuntimeError::Runtime(
+                "marketplace skill has an unsupported source".into(),
+            ));
+        };
+        let destination = workspace_root.join(".averroes").join("skills").join(&slug);
+        for file in files {
+            let destination = destination.join(file.path);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| RuntimeError::Runtime(error.to_string()))?;
+            }
+            std::fs::write(destination, file.contents)
+                .map_err(|error| RuntimeError::Runtime(error.to_string()))?;
+        }
+        self.refresh_workspace_skills(workspace_root);
+        Ok(slug)
     }
 
     pub async fn live_models_for_connection(
@@ -1545,7 +1996,7 @@ impl AppRuntime {
     }
 
     pub async fn new_agent(
-        &self,
+        self: &Arc<Self>,
         session_id: &SessionId,
         binding: &SessionBinding,
         working_dir: Option<&Path>,
@@ -1582,6 +2033,11 @@ impl AppRuntime {
                 );
             }
         }
+        if workspace_root.is_some() {
+            builtin::register_skill_marketplace_tools(&scoped_tools, self.clone());
+        }
+        self.register_project_mcp_tools(&scoped_tools, workspace_root.as_deref())
+            .await;
 
         let provider: Arc<dyn Provider> = match profile.kind {
             ConnectionKind::Codex => {
@@ -1813,13 +2269,7 @@ impl AppRuntime {
     }
 
     fn build_workspace_skill_index(&self, workspace_root: &Path) -> Option<Arc<SkillIndex>> {
-        let project_paths = [
-            workspace_root.join(".averroes").join("skills"),
-            workspace_root.join(".agents").join("skills"),
-            workspace_root.join(".codex").join("skills"),
-            workspace_root.join(".claude").join("skills"),
-            workspace_root.join("skills"),
-        ];
+        let project_paths = project_skill_roots(workspace_root);
         let global_paths = self
             .config()
             .skills
@@ -1892,7 +2342,81 @@ impl AppRuntime {
         }
     }
 
+    async fn register_project_mcp_tools(
+        &self,
+        registry: &ToolRegistry,
+        workspace_root: Option<&Path>,
+    ) {
+        let Some(workspace_root) = workspace_root else {
+            return;
+        };
+        let config = match self.project_mcp_config(workspace_root) {
+            Ok(config) => config,
+            Err(error) => {
+                diagnostics::record(DiagnosticLevel::Warning, "mcp.project", error.to_string());
+                return;
+            }
+        };
+        for (server_name, server) in config.servers {
+            let access_token = server
+                .auth
+                .credential_ref
+                .as_ref()
+                .and_then(|reference| self.vault.get(&CredentialRef(reference.clone())).ok())
+                .map(|secret| secret.to_string());
+            let client =
+                match McpClient::from_project_server(server_name.clone(), &server, access_token) {
+                    Ok(client) => Arc::new(client),
+                    Err(error) => {
+                        diagnostics::record(
+                            DiagnosticLevel::Warning,
+                            "mcp.project",
+                            format!("Skipping '{server_name}': {error}"),
+                        );
+                        continue;
+                    }
+                };
+            match client.list_tools().await {
+                Ok(tools) => {
+                    for tool in tools {
+                        let name = format!(
+                            "mcp__{}__{}",
+                            mcp_name_part(&server_name),
+                            mcp_name_part(&tool.name)
+                        );
+                        registry.register(DynamicTool::new(DynamicToolConfig {
+                            name,
+                            description: format!(
+                                "{} (MCP server: {server_name})",
+                                tool.description
+                            ),
+                            parameters: tool.input_schema,
+                            handler: DynamicToolHandler::MCP {
+                                client: client.clone(),
+                                tool_name: tool.name,
+                            },
+                        }));
+                    }
+                }
+                Err(error) => diagnostics::record(
+                    DiagnosticLevel::Warning,
+                    "mcp.project",
+                    format!("Could not discover tools from '{server_name}': {error}"),
+                ),
+            }
+        }
+    }
+
     pub fn spawn_agent_stream(&self, agent: Arc<Agent>, prompt: String) -> AgentStreamHandle {
+        self.spawn_agent_stream_with_content(agent, prompt, None)
+    }
+
+    pub fn spawn_agent_stream_with_content(
+        &self,
+        agent: Arc<Agent>,
+        prompt: String,
+        content: Option<MessageContent>,
+    ) -> AgentStreamHandle {
         match self.database.global_memory_prompt() {
             Ok(global_memory_prompt) => agent.set_global_memory_prompt(global_memory_prompt),
             Err(error) => diagnostics::record(
@@ -1902,9 +2426,16 @@ impl AppRuntime {
             ),
         }
         let (sender, events) = tokio::sync::mpsc::unbounded_channel();
-        let handle = self
-            .runtime
-            .spawn(async move { agent.run_streaming(&prompt, sender).await });
+        let handle = self.runtime.spawn(async move {
+            match content {
+                Some(content) => {
+                    agent
+                        .run_streaming_with_content(&prompt, content, sender)
+                        .await
+                }
+                None => agent.run_streaming(&prompt, sender).await,
+            }
+        });
         AgentStreamHandle {
             handle: Some(handle),
             events,
@@ -1949,6 +2480,414 @@ fn resolve_skill_path(raw_path: &str) -> PathBuf {
         }
     }
     PathBuf::from(raw_path)
+}
+
+async fn fetch_github_skill_files(
+    client: &reqwest::Client,
+    source: &str,
+    slug: &str,
+) -> Result<Vec<MarketplaceSkillFile>, RuntimeError> {
+    let roots = [format!("skills/{slug}"), slug.to_owned()];
+    for root in roots {
+        let endpoint = format!("https://api.github.com/repos/{source}/contents/{root}");
+        let response = client
+            .get(&endpoint)
+            .header(reqwest::header::USER_AGENT, "Averroes")
+            .send()
+            .await
+            .map_err(|error| {
+                RuntimeError::Runtime(format!("skill catalogue request failed: {error}"))
+            })?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            continue;
+        }
+        let status = response.status();
+        if !status.is_success() {
+            return Err(RuntimeError::Runtime(format!(
+                "GitHub skill catalogue returned HTTP {status}"
+            )));
+        }
+        let value: serde_json::Value = response.json().await.map_err(|error| {
+            RuntimeError::Runtime(format!("invalid GitHub skill catalogue response: {error}"))
+        })?;
+        let files = collect_github_skill_files(client, &root, value).await?;
+        if files.iter().any(|file| is_skill_manifest(&file.path)) {
+            return download_github_skill_files(client, files).await;
+        }
+    }
+    Err(RuntimeError::Runtime(format!(
+        "SKILL.md was not found in the public repository for '{slug}'"
+    )))
+}
+
+async fn collect_github_skill_files(
+    client: &reqwest::Client,
+    root: &str,
+    value: serde_json::Value,
+) -> Result<Vec<GithubSkillFileRef>, RuntimeError> {
+    let mut directories = vec![(root.to_owned(), value)];
+    let mut files = Vec::new();
+    let mut expected_bytes = 0_u64;
+    while let Some((directory, value)) = directories.pop() {
+        let entries = value.as_array().ok_or_else(|| {
+            RuntimeError::Runtime(format!(
+                "GitHub skill path '{directory}' is not a directory"
+            ))
+        })?;
+        for entry in entries {
+            let path = entry
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| RuntimeError::Runtime("GitHub skill entry has no path".into()))?;
+            let relative = safe_skill_relative_path(path, root)?;
+            match entry.get("type").and_then(serde_json::Value::as_str) {
+                Some("dir") => {
+                    let endpoint = entry
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|url| url.starts_with("https://api.github.com/repos/"))
+                        .ok_or_else(|| {
+                            RuntimeError::Runtime(
+                                "GitHub skill directory has an invalid API URL".into(),
+                            )
+                        })?;
+                    let response = client
+                        .get(endpoint)
+                        .header(reqwest::header::USER_AGENT, "Averroes")
+                        .send()
+                        .await
+                        .map_err(|error| {
+                            RuntimeError::Runtime(format!(
+                                "GitHub skill directory request failed: {error}"
+                            ))
+                        })?;
+                    let status = response.status();
+                    if !status.is_success() {
+                        return Err(RuntimeError::Runtime(format!(
+                            "GitHub skill directory returned HTTP {status}"
+                        )));
+                    }
+                    let children = response.json().await.map_err(|error| {
+                        RuntimeError::Runtime(format!(
+                            "invalid GitHub skill directory response: {error}"
+                        ))
+                    })?;
+                    directories.push((path.to_owned(), children));
+                }
+                Some("file") => {
+                    let download_url = entry
+                        .get("download_url")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|url| url.starts_with("https://raw.githubusercontent.com/"))
+                        .ok_or_else(|| {
+                            RuntimeError::Runtime(
+                                "GitHub skill file has no trusted download URL".into(),
+                            )
+                        })?;
+                    let size = entry
+                        .get("size")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default();
+                    expected_bytes = expected_bytes.saturating_add(size);
+                    if files.len() >= MAX_MARKETPLACE_SKILL_FILES
+                        || expected_bytes > MAX_MARKETPLACE_SKILL_BYTES as u64
+                    {
+                        return Err(RuntimeError::Runtime(
+                            "marketplace skill is too large to install safely".into(),
+                        ));
+                    }
+                    files.push(GithubSkillFileRef {
+                        path: relative,
+                        download_url: download_url.to_owned(),
+                    });
+                }
+                Some("symlink") | Some("submodule") | None => {}
+                Some(kind) => {
+                    return Err(RuntimeError::Runtime(format!(
+                        "unsupported GitHub skill entry type '{kind}'"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(files)
+}
+
+async fn download_github_skill_files(
+    client: &reqwest::Client,
+    files: Vec<GithubSkillFileRef>,
+) -> Result<Vec<MarketplaceSkillFile>, RuntimeError> {
+    let downloaded = stream::iter(files.into_iter().map(|file| {
+        let client = client.clone();
+        async move {
+            let response = client
+                .get(&file.download_url)
+                .header(reqwest::header::USER_AGENT, "Averroes")
+                .send()
+                .await
+                .map_err(|error| {
+                    RuntimeError::Runtime(format!("skill file download failed: {error}"))
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(RuntimeError::Runtime(format!(
+                    "skill file download returned HTTP {status}"
+                )));
+            }
+            let contents = response.bytes().await.map_err(|error| {
+                RuntimeError::Runtime(format!("could not read skill file: {error}"))
+            })?;
+            if contents.len() > MAX_MARKETPLACE_SKILL_BYTES {
+                return Err(RuntimeError::Runtime(
+                    "marketplace skill file is too large to install safely".into(),
+                ));
+            }
+            Ok(MarketplaceSkillFile {
+                path: file.path,
+                contents: contents.to_vec(),
+            })
+        }
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<_>>()
+    .await;
+    let mut result = Vec::with_capacity(downloaded.len());
+    let mut total_bytes = 0_usize;
+    for file in downloaded {
+        let file = file?;
+        total_bytes = total_bytes.saturating_add(file.contents.len());
+        if total_bytes > MAX_MARKETPLACE_SKILL_BYTES {
+            return Err(RuntimeError::Runtime(
+                "marketplace skill is too large to install safely".into(),
+            ));
+        }
+        result.push(file);
+    }
+    Ok(result)
+}
+
+async fn fetch_domain_skill_files(
+    client: &reqwest::Client,
+    source: &str,
+    slug: &str,
+) -> Result<Vec<MarketplaceSkillFile>, RuntimeError> {
+    let index_url = format!("https://{source}/.well-known/agent-skills/index.json");
+    let index_bytes = fetch_marketplace_bytes(client, &index_url, "skill domain index").await?;
+    let index: serde_json::Value = serde_json::from_slice(&index_bytes)
+        .map_err(|error| RuntimeError::Runtime(format!("invalid skill domain index: {error}")))?;
+    let entry = index
+        .get("skills")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|skills| {
+            skills.iter().find(|entry| {
+                entry
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| name == slug)
+            })
+        })
+        .ok_or_else(|| {
+            RuntimeError::Runtime(format!(
+                "skill '{slug}' was not found in {source}'s public skill index"
+            ))
+        })?;
+    let raw_url = entry
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| RuntimeError::Runtime("skill domain entry has no download URL".into()))?;
+    let url = if raw_url.starts_with('/') {
+        format!("https://{source}{raw_url}")
+    } else {
+        raw_url.to_owned()
+    };
+    if !url.starts_with(&format!("https://{source}/")) {
+        return Err(RuntimeError::Runtime(
+            "skill domain entry points outside its source domain".into(),
+        ));
+    }
+    let is_archive = entry.get("type").and_then(serde_json::Value::as_str) == Some("archive")
+        || url.to_ascii_lowercase().ends_with(".zip");
+    let bytes = fetch_marketplace_bytes(client, &url, "skill files").await?;
+    if is_archive {
+        decode_skill_archive(bytes)
+    } else {
+        Ok(vec![MarketplaceSkillFile {
+            path: PathBuf::from("SKILL.md"),
+            contents: bytes,
+        }])
+    }
+}
+
+async fn fetch_marketplace_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    resource: &str,
+) -> Result<Vec<u8>, RuntimeError> {
+    let response =
+        client.get(url).send().await.map_err(|error| {
+            RuntimeError::Runtime(format!("{resource} download failed: {error}"))
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(RuntimeError::Runtime(format!(
+            "{resource} download returned HTTP {status}"
+        )));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| RuntimeError::Runtime(format!("could not read {resource}: {error}")))?;
+    if bytes.len() > MAX_MARKETPLACE_SKILL_BYTES {
+        return Err(RuntimeError::Runtime(
+            "marketplace skill is too large to install safely".into(),
+        ));
+    }
+    Ok(bytes.to_vec())
+}
+
+fn decode_skill_archive(bytes: Vec<u8>) -> Result<Vec<MarketplaceSkillFile>, RuntimeError> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|error| RuntimeError::Runtime(format!("invalid skill archive: {error}")))?;
+    if archive.len() > MAX_MARKETPLACE_SKILL_FILES {
+        return Err(RuntimeError::Runtime(
+            "marketplace skill archive contains too many files".into(),
+        ));
+    }
+    let mut files = Vec::new();
+    let mut total_bytes = 0_usize;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| {
+            RuntimeError::Runtime(format!("invalid skill archive entry: {error}"))
+        })?;
+        if entry.is_dir() {
+            continue;
+        }
+        let path = entry.enclosed_name().ok_or_else(|| {
+            RuntimeError::Runtime("skill archive contains an unsafe file path".into())
+        })?;
+        let path = safe_archive_relative_path(&path)?;
+        let mut contents = Vec::new();
+        entry.read_to_end(&mut contents).map_err(|error| {
+            RuntimeError::Runtime(format!("could not read skill archive entry: {error}"))
+        })?;
+        total_bytes = total_bytes.saturating_add(contents.len());
+        if total_bytes > MAX_MARKETPLACE_SKILL_BYTES {
+            return Err(RuntimeError::Runtime(
+                "marketplace skill archive is too large to install safely".into(),
+            ));
+        }
+        files.push(MarketplaceSkillFile { path, contents });
+    }
+    let manifest_path = files
+        .iter()
+        .find(|file| is_skill_manifest(&file.path))
+        .map(|file| file.path.clone())
+        .ok_or_else(|| RuntimeError::Runtime("skill archive does not contain SKILL.md".into()))?;
+    if let Some(parent) = manifest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        files.retain(|file| file.path.starts_with(parent));
+        for file in &mut files {
+            file.path = file
+                .path
+                .strip_prefix(parent)
+                .map(Path::to_path_buf)
+                .map_err(|_| RuntimeError::Runtime("invalid skill archive layout".into()))?;
+        }
+    }
+    Ok(files)
+}
+
+fn safe_skill_relative_path(path: &str, root: &str) -> Result<PathBuf, RuntimeError> {
+    let path = Path::new(path);
+    let root = Path::new(root);
+    let relative = path.strip_prefix(root).map_err(|_| {
+        RuntimeError::Runtime("skill source returned a path outside its skill directory".into())
+    })?;
+    safe_relative_path(relative)
+}
+
+fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, RuntimeError> {
+    safe_relative_path(path)
+}
+
+fn safe_relative_path(path: &Path) -> Result<PathBuf, RuntimeError> {
+    if path.as_os_str().is_empty()
+        || path.to_string_lossy().contains('\\')
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(RuntimeError::Runtime(
+            "skill source returned an unsafe file path".into(),
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn is_skill_manifest(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| name.to_string_lossy().eq_ignore_ascii_case("SKILL.md"))
+        .unwrap_or(false)
+}
+
+struct GithubSkillFileRef {
+    path: PathBuf,
+    download_url: String,
+}
+
+fn project_skill_roots(workspace_root: &Path) -> Vec<PathBuf> {
+    vec![
+        workspace_root.join(".averroes").join("skills"),
+        workspace_root.join(".agents").join("skills"),
+        workspace_root.join(".codex").join("skills"),
+        workspace_root.join(".claude").join("skills"),
+        workspace_root.join("skills"),
+    ]
+}
+
+fn is_well_known_skill_domain(source: &str) -> bool {
+    if source.is_empty() || source.len() > 253 || source.split('.').count() < 2 {
+        return false;
+    }
+    source.split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    })
+}
+
+fn project_mcp_credential_ref(workspace_root: &Path, server_name: &str) -> CredentialRef {
+    CredentialRef(format!(
+        "mcp:{}:{}",
+        workspace_root.to_string_lossy(),
+        server_name.trim()
+    ))
+}
+
+fn mcp_name_part(value: &str) -> String {
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if normalized.is_empty() {
+        "tool".into()
+    } else {
+        normalized
+    }
 }
 
 fn copilot_model_infos(models: &[CopilotModel]) -> Vec<ModelInfo> {

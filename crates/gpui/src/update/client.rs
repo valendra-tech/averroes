@@ -10,11 +10,11 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use super::{
-    release_update, validate_asset_url, Architecture, GithubRelease, UpdateError, UpdateInfo,
+    releases_update, validate_asset_url, Architecture, GithubRelease, UpdateError, UpdateInfo,
 };
 
-const LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/valendra-tech/averroes/releases/latest";
+const RELEASES_URL: &str =
+    "https://api.github.com/repos/valendra-tech/averroes/releases?per_page=20";
 const GITHUB_JSON_ACCEPT: &str = "application/vnd.github+json";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DOWNLOAD_SIZE: u64 = 512 * 1024 * 1024;
@@ -45,18 +45,18 @@ impl UpdateClient {
     pub(crate) async fn check(&self, current: &Version) -> Result<Option<UpdateInfo>, UpdateError> {
         let response = self
             .client
-            .get(LATEST_RELEASE_URL)
+            .get(RELEASES_URL)
             .header(ACCEPT, GITHUB_JSON_ACCEPT)
             .send()
             .await
             .map_err(UpdateError::Client)?;
         let response = ensure_success(response)?;
-        let release = response
-            .json::<GithubRelease>()
+        let releases = response
+            .json::<Vec<GithubRelease>>()
             .await
             .map_err(UpdateError::Client)?;
 
-        release_update(current, release, Architecture::current())
+        releases_update(current, releases, Architecture::current())
     }
 
     pub(crate) async fn download(&self, info: &UpdateInfo) -> Result<PathBuf, UpdateError> {

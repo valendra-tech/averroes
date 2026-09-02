@@ -9,7 +9,7 @@ use crate::work::ConversationSearchResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 #[async_trait]
@@ -19,6 +19,37 @@ pub trait MemorySearchBackend: Send + Sync {
         query: &str,
         limit: usize,
     ) -> std::result::Result<Vec<ConversationSearchResult>, String>;
+}
+
+/// A marketplace entry that can be presented to an agent and passed back to
+/// the installer without exposing UI-specific runtime types in core.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillMarketplaceEntry {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub source: String,
+    pub slug: String,
+    pub installs: u64,
+    pub url: Option<String>,
+}
+
+/// Application-provided access to the public skills marketplace. The core
+/// tools own the agent-facing contract while the desktop runtime supplies the
+/// network and workspace implementation.
+#[async_trait]
+pub trait SkillMarketplaceBackend: Send + Sync {
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> std::result::Result<Vec<SkillMarketplaceEntry>, String>;
+
+    async fn install(
+        &self,
+        workspace_root: &Path,
+        skill: &SkillMarketplaceEntry,
+    ) -> std::result::Result<String, String>;
 }
 
 #[derive(Clone)]

@@ -59,7 +59,7 @@ pub(crate) fn release_update(
     release: GithubRelease,
     architecture: Architecture,
 ) -> Result<Option<UpdateInfo>, UpdateError> {
-    if release.draft || release.prerelease {
+    if release.draft {
         return Ok(None);
     }
 
@@ -69,7 +69,7 @@ pub(crate) fn release_update(
             source,
         })?;
 
-    if !version.pre.is_empty() || version <= *current {
+    if version <= *current || !release_channel_accepts(current, &version, release.prerelease) {
         return Ok(None);
     }
 
@@ -98,6 +98,65 @@ pub(crate) fn release_update(
         dmg_size: asset.size,
         dmg_sha256,
     }))
+}
+
+/// Select the newest installable release in the current build's channel.
+///
+/// Stable builds only receive stable releases. Development builds may move to
+/// newer development builds or to the eventual stable release. GitHub marks
+/// prereleases independently from SemVer, so both signals are considered.
+pub(crate) fn releases_update(
+    current: &Version,
+    releases: Vec<GithubRelease>,
+    architecture: Architecture,
+) -> Result<Option<UpdateInfo>, UpdateError> {
+    let mut candidates = Vec::new();
+    let mut first_error = None;
+
+    for release in releases {
+        if release.draft {
+            continue;
+        }
+        let version = match normalize_release_version(&release.tag_name) {
+            Ok(version) => version,
+            Err(source) => {
+                first_error.get_or_insert(UpdateError::InvalidTag {
+                    tag: release.tag_name.clone(),
+                    source,
+                });
+                continue;
+            }
+        };
+        if version > *current && release_channel_accepts(current, &version, release.prerelease) {
+            candidates.push((version, release));
+        }
+    }
+
+    candidates.sort_by(|(left, _), (right, _)| right.cmp(left));
+    for (_, release) in candidates {
+        match release_update(current, release, architecture) {
+            Ok(Some(info)) => return Ok(Some(info)),
+            Ok(None) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
+}
+
+fn release_channel_accepts(
+    current: &Version,
+    candidate: &Version,
+    github_prerelease: bool,
+) -> bool {
+    let current_is_development = !current.pre.is_empty();
+    let candidate_is_development = github_prerelease || !candidate.pre.is_empty();
+    current_is_development || !candidate_is_development
 }
 
 pub(crate) fn select_dmg(
@@ -166,7 +225,8 @@ fn normalize_asset_digest(asset: &ReleaseAsset) -> Result<String, UpdateError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        release_update, select_dmg, validate_asset_url, Architecture, GithubRelease, ReleaseAsset,
+        release_update, releases_update, select_dmg, validate_asset_url, Architecture,
+        GithubRelease, ReleaseAsset,
     };
     use crate::update::UpdateError;
     use semver::Version;
@@ -246,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn prerelease_is_ignored() {
+    fn stable_build_ignores_prerelease() {
         let release = fixture_release(
             "v1.4.0-beta.1",
             false,
@@ -261,6 +321,65 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn development_build_receives_newer_development_release() {
+        let release = fixture_release(
+            "v0.0.1-dev2",
+            false,
+            true,
+            vec![fixture_dmg("Averroes-0.0.1-dev2-macos-arm64.dmg")],
+        );
+
+        let update = release_update(
+            &Version::parse("0.0.1-dev1").unwrap(),
+            release,
+            Architecture::Arm64,
+        )
+        .unwrap()
+        .expect("development channel should advance to a newer development release");
+
+        assert_eq!(update.version, Version::parse("0.0.1-dev2").unwrap());
+    }
+
+    #[test]
+    fn development_build_can_advance_to_stable_release() {
+        let release = fixture_release(
+            "v0.0.1",
+            false,
+            false,
+            vec![fixture_dmg("Averroes-0.0.1-macos-arm64.dmg")],
+        );
+
+        assert!(release_update(
+            &Version::parse("0.0.1-dev5").unwrap(),
+            release,
+            Architecture::Arm64,
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
+    fn release_list_uses_newest_installable_candidate() {
+        let newest_without_dmg = fixture_release("v0.0.1-dev3", false, true, Vec::new());
+        let installable = fixture_release(
+            "v0.0.1-dev2",
+            false,
+            true,
+            vec![fixture_dmg("Averroes-0.0.1-dev2-macos-arm64.dmg")],
+        );
+
+        let update = releases_update(
+            &Version::parse("0.0.1-dev1").unwrap(),
+            vec![installable, newest_without_dmg],
+            Architecture::Arm64,
+        )
+        .unwrap()
+        .expect("an older installable candidate should not be hidden by a publishing release");
+
+        assert_eq!(update.version, Version::parse("0.0.1-dev2").unwrap());
     }
 
     #[test]

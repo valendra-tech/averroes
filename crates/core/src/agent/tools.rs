@@ -197,22 +197,13 @@ impl Agent {
         }
 
         if let Some(events) = events {
-            let summary = if result.success {
-                result.content.chars().take(180).collect()
+            let event_output = if result.success {
+                result.content.as_str()
             } else {
-                result
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| String::from("unknown error"))
+                result.error.as_deref().unwrap_or("unknown error")
             };
-            let output = if result.success {
-                result.content.chars().take(12_000).collect()
-            } else {
-                result
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| String::from("unknown error"))
-            };
+            let summary = event_output.chars().take(180).collect();
+            let output = event_output.chars().take(12_000).collect();
             let _ = events.send(AgentStreamEvent::ToolFinished {
                 call_id: Some(tool_call.id.clone()),
                 name: tool_call.function.name.clone(),
@@ -223,13 +214,12 @@ impl Agent {
             });
         }
 
-        let content = if result.success {
-            result.content
+        let raw_content = if result.success {
+            result.content.as_str()
         } else {
-            result
-                .error
-                .unwrap_or_else(|| String::from("unknown error"))
+            result.error.as_deref().unwrap_or("unknown error")
         };
+        let content = crate::compaction::bound_live_tool_output(raw_content);
         ToolCallExecution {
             message: ChatMessage {
                 role: Role::Tool,

@@ -116,10 +116,20 @@ where
                                                 .as_u64()
                                                 .unwrap_or(0),
                                             cache_read_input_tokens: usage
-                                                .get("cache_read_input_tokens")
-                                                .and_then(Value::as_u64),
+                                                .get("prompt_tokens_details")
+                                                .and_then(|details| details.get("cached_tokens"))
+                                                .and_then(Value::as_u64)
+                                                .or_else(|| {
+                                                    usage
+                                                        .get("cache_read_input_tokens")
+                                                        .and_then(Value::as_u64)
+                                                }),
                                             cache_creation_input_tokens: usage
                                                 .get("cache_creation_input_tokens")
+                                                .and_then(Value::as_u64),
+                                            reasoning_output_tokens: usage
+                                                .get("completion_tokens_details")
+                                                .and_then(|details| details.get("reasoning_tokens"))
                                                 .and_then(Value::as_u64),
                                         });
                                         if tx.send(Ok(StreamEvent::MessageEnd { usage })).is_err() {
@@ -395,6 +405,10 @@ where
                                             .and_then(|d| d.get("cached_tokens"))
                                             .and_then(Value::as_u64),
                                         cache_creation_input_tokens: None,
+                                        reasoning_output_tokens: u
+                                            .get("output_tokens_details")
+                                            .and_then(|d| d.get("reasoning_tokens"))
+                                            .and_then(Value::as_u64),
                                     });
                                     if tx.send(Ok(StreamEvent::MessageEnd { usage })).is_err() {
                                         return;

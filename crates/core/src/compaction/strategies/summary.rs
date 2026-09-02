@@ -43,7 +43,7 @@ async fn generate_summary(
         messages: vec![ChatMessage {
             role: Role::User,
             content: MessageContent::Text(format!(
-                "Rewrite the following conversation into a compact understood context.\n\nReturn only these sections, with concise factual bullets:\nObjective:\nDecisions:\nConstraints:\nOpen questions:\nCurrent state:\nNext action:\n\nDo not reproduce the transcript, hidden reasoning, or tool payloads. Do not invent missing facts. Keep it under 1,200 words.\n\n{}",
+                "Rewrite the following conversation into a compact understood context.\n\nReturn only these sections, with concise factual bullets:\nObjective:\nDecisions:\nConstraints:\nActive skills and instructions:\nTool findings:\nOpen questions:\nCurrent state:\nNext action:\n\nPreserve the names and essential rules of skills already loaded, plus durable facts learned from tools, without copying raw tool payloads. Do not reproduce the transcript or hidden reasoning. Do not invent missing facts. Keep it under 1,200 words.\n\n{}",
                 text
             )),
             tool_call_id: None,
