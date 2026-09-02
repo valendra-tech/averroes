@@ -113,6 +113,7 @@ jobs:
           CERTIFICATE_PATH="${RUNNER_TEMP}/developer-id-application.p12"
           API_KEY_PATH="${RUNNER_TEMP}/notary-api-key.p8"
           KEYCHAIN_PATH="${RUNNER_TEMP}/averroes-signing.keychain-db"
+          ORIGINAL_KEYCHAINS_PATH="${RUNNER_TEMP}/averroes-original-keychains.txt"
           NOTARY_RESPONSE_PATH="${RUNNER_TEMP}/notarytool-response.json"
           NOTARY_ERROR_PATH="${RUNNER_TEMP}/notarytool-submit.stderr"
           NOTARY_LOG_PATH="${RUNNER_TEMP}/notarytool-log.json"
@@ -123,6 +124,7 @@ jobs:
             printf 'API_KEY_PATH=%s\n' "${API_KEY_PATH}"
             printf 'KEYCHAIN_PATH=%s\n' "${KEYCHAIN_PATH}"
             printf 'CODESIGN_KEYCHAIN=%s\n' "${KEYCHAIN_PATH}"
+            printf 'ORIGINAL_KEYCHAINS_PATH=%s\n' "${ORIGINAL_KEYCHAINS_PATH}"
             printf 'NOTARY_RESPONSE_PATH=%s\n' "${NOTARY_RESPONSE_PATH}"
             printf 'NOTARY_ERROR_PATH=%s\n' "${NOTARY_ERROR_PATH}"
             printf 'NOTARY_LOG_PATH=%s\n' "${NOTARY_LOG_PATH}"
@@ -132,9 +134,20 @@ jobs:
           printf '%s' "${APPLE_API_KEY_BASE64}" | base64 -D > "${API_KEY_PATH}"
           chmod 600 "${API_KEY_PATH}"
 
+          security list-keychains -d user > "${ORIGINAL_KEYCHAINS_PATH}"
+          original_keychains=()
+          while IFS= read -r keychain; do
+            keychain="${keychain#"${keychain%%[![:space:]]*}"}"
+            keychain="${keychain#\"}"
+            keychain="${keychain%\"}"
+            [[ -z "${keychain}" ]] && continue
+            original_keychains+=("${keychain}")
+          done < "${ORIGINAL_KEYCHAINS_PATH}"
+
           security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
           security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
           security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security list-keychains -d user -s "${KEYCHAIN_PATH}" "${original_keychains[@]}"
           security import "${CERTIFICATE_PATH}" \
             -P "${APPLE_CERTIFICATE_PASSWORD}" \
             -x \
@@ -304,10 +317,23 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ -f "${ORIGINAL_KEYCHAINS_PATH:-}" ]]; then
+            original_keychains=()
+            while IFS= read -r keychain; do
+              keychain="${keychain#"${keychain%%[![:space:]]*}"}"
+              keychain="${keychain#\"}"
+              keychain="${keychain%\"}"
+              [[ -z "${keychain}" ]] && continue
+              original_keychains+=("${keychain}")
+            done < "${ORIGINAL_KEYCHAINS_PATH}"
+            if [[ "${#original_keychains[@]}" -gt 0 ]]; then
+              security list-keychains -d user -s "${original_keychains[@]}" || true
+            fi
+          fi
           if [[ -n "${KEYCHAIN_PATH:-}" && -e "${KEYCHAIN_PATH}" ]]; then
             security delete-keychain "${KEYCHAIN_PATH}" || true
           fi
-          rm -f "${CERTIFICATE_PATH:-}" "${API_KEY_PATH:-}"
+          rm -f "${CERTIFICATE_PATH:-}" "${API_KEY_PATH:-}" "${ORIGINAL_KEYCHAINS_PATH:-}"
 
   publish:
     name: Publish GitHub release
