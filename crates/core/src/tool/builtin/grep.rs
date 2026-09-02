@@ -5,6 +5,7 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde_json::{json, Value};
 
+use super::resolve_file_path;
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 
 pub struct GrepTool;
@@ -21,7 +22,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Recursively search text files using a regular expression"
+        "Recursively search text files using a regular expression inside or outside the workspace"
     }
 
     fn parameters(&self) -> Value {
@@ -31,6 +32,10 @@ impl Tool for GrepTool {
                 "pattern": {
                     "type": "string",
                     "description": "Regular expression to search for"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File or directory to search. Accepts an absolute path or a path relative to the workspace, including ../. Defaults to the workspace."
                 },
                 "include": {
                     "type": "string",
@@ -65,6 +70,9 @@ impl Tool for GrepTool {
 
     async fn execute(&self, ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
         let pattern = required_string(self.name(), params, "pattern")?;
+        let root = optional_string(self.name(), params, "path")?
+            .map(|path| resolve_file_path(&ctx.working_dir, path))
+            .unwrap_or_else(|| ctx.working_dir.clone());
         let include = optional_string(self.name(), params, "include")?.map(str::to_owned);
         let exclude = optional_string(self.name(), params, "exclude")?.map(str::to_owned);
         let context = integer_param(self.name(), params, "context", 0, 0, MAX_CONTEXT_LINES)?;
@@ -80,8 +88,6 @@ impl Tool for GrepTool {
             tool: self.name().into(),
             message: format!("Invalid regex pattern: {error}"),
         })?;
-        let root = ctx.working_dir.clone();
-
         tokio::task::spawn_blocking(move || {
             search_workspace(
                 &root,
@@ -125,15 +131,27 @@ fn search_workspace(
     context: usize,
     limit: usize,
 ) -> Result<ToolResult> {
-    if !root.is_dir() {
+    if !root.is_dir() && !root.is_file() {
         return Err(ToolError::Execution {
             tool: "grep".into(),
-            message: format!("Working directory '{}' is not accessible", root.display()),
+            message: format!("Search path '{}' is not accessible", root.display()),
         });
     }
 
-    let mut paths = collect_paths(root, include, exclude);
-    paths.sort_by_key(|path| relative_path(root, path));
+    let display_root = if root.is_file() {
+        root.parent().unwrap_or_else(|| Path::new(""))
+    } else {
+        root
+    };
+    let mut paths = if root.is_file() {
+        path_allowed(display_root, root, include, exclude)
+            .then(|| root.to_path_buf())
+            .into_iter()
+            .collect()
+    } else {
+        collect_paths(root, include, exclude)
+    };
+    paths.sort_by_key(|path| relative_path(display_root, path));
 
     let mut stats = SearchStats::default();
     let mut output = String::new();
@@ -176,7 +194,7 @@ fn search_workspace(
         if !matching_lines.is_empty() {
             stats.files_with_matches += 1;
             let file = FileMatches {
-                path: relative_path(root, &path),
+                path: relative_path(display_root, &path),
                 lines,
                 matching_lines,
             };
@@ -449,5 +467,45 @@ mod tests {
         assert!(result.content.contains("many.txt:1: hit"));
         assert!(result.content.contains("many.txt:2: hit"));
         assert!(!result.content.contains("many.txt:3: hit"));
+    }
+
+    #[tokio::test]
+    async fn searches_a_directory_outside_the_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let external = directory.path().join("shared");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("outside.txt"), "external needle\n").unwrap();
+
+        let result = GrepTool
+            .execute(
+                &context(&workspace),
+                &json!({ "pattern": "needle", "path": "../shared" }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.content.contains("outside.txt:1: external needle"));
+        assert_eq!(result.metadata.unwrap()["matches"], 1);
+    }
+
+    #[tokio::test]
+    async fn searches_an_absolute_file_outside_the_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let external = directory.path().join("outside.txt");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(&external, "one needle\n").unwrap();
+
+        let result = GrepTool
+            .execute(
+                &context(&workspace),
+                &json!({ "pattern": "needle", "path": external.to_string_lossy() }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.content.contains("outside.txt:1: one needle"));
     }
 }

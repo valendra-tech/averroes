@@ -3,6 +3,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::path::Path;
 
+use super::resolve_file_path;
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 
 pub struct FileReadTool;
@@ -18,7 +19,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a text file by line range or return a supported image to a multimodal model"
+        "Read a text file by line range or return a supported image to a multimodal model. Absolute paths and paths outside the workspace are supported."
     }
 
     fn parameters(&self) -> Value {
@@ -27,7 +28,7 @@ impl Tool for FileReadTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The path to the file to read"
+                    "description": "Absolute path, or a path relative to the workspace. Parent paths such as ../other-project/file.txt are supported."
                 },
                 "offset": {
                     "type": "integer",
@@ -59,7 +60,7 @@ impl Tool for FileReadTool {
                 message: "Missing required parameter: file_path".into(),
             })?;
 
-        let full_path = ctx.working_dir.join(file_path);
+        let full_path = resolve_file_path(&ctx.working_dir, file_path);
 
         if let Some(media_type) = image_media_type(&full_path) {
             return read_image(self.name(), &full_path, media_type).await;
@@ -346,6 +347,29 @@ mod tests {
 
         assert!(matches!(offset_error, ToolError::InvalidParams { .. }));
         assert!(matches!(limit_error, ToolError::InvalidParams { .. }));
+    }
+
+    #[tokio::test]
+    async fn reads_an_absolute_path_outside_the_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let external = directory.path().join("shared.txt");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(&external, "outside\n").unwrap();
+
+        let result = FileReadTool
+            .execute(
+                &context(&workspace),
+                &json!({ "file_path": external.to_string_lossy() }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.content.contains("1: outside"));
+        assert_eq!(
+            result.metadata.unwrap()["file_path"],
+            external.display().to_string()
+        );
     }
 
     #[tokio::test]

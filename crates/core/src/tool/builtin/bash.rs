@@ -17,7 +17,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Run commands in a persistent non-interactive bash session backed by pipes. State such as cd and exports is retained between calls. Terminal-dependent programs, pagers, SSH shells, and interactive REPLs are not supported. Use detach:true only for commands that can run without a terminal."
+        "Run commands in a persistent non-interactive bash session backed by pipes. State such as cd and exports is retained between calls, and commands may access paths outside the active workspace. Terminal-dependent programs, pagers, SSH shells, and interactive REPLs are not supported. Use detach:true only for commands that can run without a terminal."
     }
 
     fn parameters(&self) -> Value {

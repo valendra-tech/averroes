@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use super::resolve_file_path;
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 
 pub struct FileWriteTool;
@@ -12,7 +13,7 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does."
+        "Write content to a file, including outside the workspace. Creates the file if it doesn't exist, overwrites if it does."
     }
 
     fn parameters(&self) -> Value {
@@ -21,7 +22,7 @@ impl Tool for FileWriteTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The path to the file to write"
+                    "description": "Absolute path, or a path relative to the workspace. Parent paths such as ../other-project/file.txt are supported."
                 },
                 "content": {
                     "type": "string",
@@ -51,7 +52,7 @@ impl Tool for FileWriteTool {
                 message: "Missing required parameter: content".into(),
             })?;
 
-        let full_path = ctx.working_dir.join(file_path);
+        let full_path = resolve_file_path(&ctx.working_dir, file_path);
 
         if let Some(parent) = full_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -82,5 +83,48 @@ impl Tool for FileWriteTool {
             "byte_count": byte_count,
             "file_path": full_path.display().to_string()
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::Path, sync::Arc};
+
+    use super::*;
+    use crate::tool::ToolActivation;
+
+    fn context(root: &Path) -> ToolContext {
+        ToolContext {
+            working_dir: root.to_path_buf(),
+            session_id: "session".into(),
+            agent_id: "agent".into(),
+            enabled_tools: Vec::new(),
+            available_tools: Vec::new(),
+            tool_activation: Arc::new(ToolActivation::default()),
+            conversation_context: Vec::new(),
+            agent_runner: None,
+            memory_search_backend: None,
+            agent_event_sink: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn writes_through_a_parent_path_outside_the_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+
+        FileWriteTool
+            .execute(
+                &context(&workspace),
+                &json!({ "file_path": "../shared/output.txt", "content": "outside" }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("shared/output.txt")).unwrap(),
+            "outside"
+        );
     }
 }
