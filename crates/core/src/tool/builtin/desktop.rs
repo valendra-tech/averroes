@@ -382,9 +382,9 @@ mod macos {
         array::CFArray,
         base::{CFType, TCFType},
         boolean::CFBoolean,
-        dictionary::CFDictionary,
+        dictionary::{CFDictionary, CFDictionaryRef},
         number::CFNumber,
-        string::CFString,
+        string::{CFString, CFStringRef},
     };
     use core_graphics::{
         access::ScreenCaptureAccess,
@@ -407,6 +407,8 @@ mod macos {
 
     const MAX_SCREENSHOT_BYTES: usize = 20 * 1024 * 1024;
     const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(60);
+    const ACCESSIBILITY_SETTINGS_URL: &str =
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
 
     #[derive(Debug, Clone, Serialize)]
     struct DisplayInfo {
@@ -926,13 +928,39 @@ mod macos {
     }
 
     fn ensure_input_access() -> Result<()> {
-        let allowed = unsafe { CGPreflightPostEventAccess() };
-        if allowed || unsafe { CGRequestPostEventAccess() } {
+        if unsafe { CGPreflightPostEventAccess() } {
             Ok(())
         } else {
+            request_accessibility_prompt();
+            if unsafe { CGRequestPostEventAccess() } || unsafe { CGPreflightPostEventAccess() } {
+                return Ok(());
+            }
+            open_accessibility_settings();
             Err(execution(
-                "Accessibility permission is required for desktop input. Enable Averroes in System Settings > Privacy & Security > Accessibility, then retry",
+                "Accessibility permission is required for desktop input. macOS requires you to enable Averroes manually in the Accessibility settings that were opened, then retry",
             ))
+        }
+    }
+
+    fn request_accessibility_prompt() {
+        let prompt_key = unsafe { CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt) };
+        let prompt_value = CFBoolean::true_value();
+        let options = CFDictionary::from_CFType_pairs(&[(prompt_key, prompt_value)]);
+        // The prompt is asynchronous, so a false return here is expected. The
+        // post-event preflight above remains the authority for tool execution.
+        let _ = unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) };
+    }
+
+    fn open_accessibility_settings() {
+        if let Err(error) = std::process::Command::new("/usr/bin/open")
+            .arg(ACCESSIBILITY_SETTINGS_URL)
+            .spawn()
+        {
+            crate::observability::diagnostics::record(
+                crate::observability::diagnostics::DiagnosticLevel::Warning,
+                "desktop.accessibility",
+                format!("Could not open the macOS Accessibility settings: {error}"),
+            );
         }
     }
 
@@ -1365,6 +1393,12 @@ mod macos {
     extern "C" {
         fn CGPreflightPostEventAccess() -> bool;
         fn CGRequestPostEventAccess() -> bool;
+    }
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        static kAXTrustedCheckOptionPrompt: CFStringRef;
+        fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
     }
 
     #[cfg(test)]
