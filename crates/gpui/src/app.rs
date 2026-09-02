@@ -7,7 +7,7 @@ use crate::tool_groups::{
     summarize_tool_names, ToolGroupEvent, ToolGroupRenderMode, ToolGroupTracker,
 };
 use crate::ui::{
-    markdown::{normalize_reasoning_for_display, render_markdown, render_streaming_markdown},
+    markdown::{normalize_reasoning_for_display, render_streaming_markdown},
     provider_logo, tool_icon, UiTheme,
 };
 use crate::update::{open_installer, UpdateClient, UpdateInfo, UpdateState};
@@ -8304,51 +8304,31 @@ impl AverroesApp {
         list(
             list_state,
             cx.processor(|this, index: usize, _window, cx| {
-                let (
-                    session_id,
-                    message,
-                    processing,
-                    streaming,
-                    is_last_assistant,
-                    conversation_sources,
-                    show_tool_activity,
-                    show_sources,
-                    pending_user_question,
-                    ask_user_input,
-                ) = {
-                    let session = this.active();
-                    let Some(message) = session.messages.get(index).cloned() else {
-                        return div().into_any_element();
-                    };
-                    let is_last_assistant = session
-                        .messages
-                        .iter()
-                        .rposition(|message| message.role == MessageRole::Assistant)
-                        == Some(index);
-                    let streaming = session.processing
-                        && index + 1 == session.messages.len()
-                        && message.role == MessageRole::Assistant;
-                    (
-                        session.id.clone(),
-                        message,
-                        session.processing,
-                        streaming,
-                        is_last_assistant,
-                        if is_last_assistant {
-                            session.sources.clone()
-                        } else {
-                            Vec::new()
-                        },
-                        this.show_tool_activity,
-                        this.show_sources,
-                        if is_last_assistant {
-                            session.pending_user_question.clone()
-                        } else {
-                            None
-                        },
-                        this.ask_user_input.clone(),
-                    )
+                let show_tool_activity = this.show_tool_activity;
+                let show_sources = this.show_sources;
+                let ask_user_input = this.ask_user_input.clone();
+                let session = this.active();
+                let Some(message) = session.messages.get(index) else {
+                    return div().into_any_element();
                 };
+                let session_id = &session.id;
+                let processing = session.processing;
+                let is_last_assistant = session
+                    .messages
+                    .iter()
+                    .rposition(|message| message.role == MessageRole::Assistant)
+                    == Some(index);
+                let streaming = processing
+                    && index + 1 == session.messages.len()
+                    && message.role == MessageRole::Assistant;
+                let conversation_sources = if is_last_assistant {
+                    session.sources.as_slice()
+                } else {
+                    &[]
+                };
+                let pending_user_question = is_last_assistant
+                    .then_some(session.pending_user_question.as_ref())
+                    .flatten();
                 let theme = UiTheme::current(cx);
                 div()
                     .id(SharedString::from(format!(
@@ -8361,19 +8341,15 @@ impl AverroesApp {
                     .flex()
                     .justify_center()
                     .child(div().w_full().max_w(px(820.0)).child(render_message(
-                        &session_id,
+                        session_id,
                         index,
-                        &message,
+                        message,
                         processing,
                         streaming,
                         show_tool_activity,
                         show_sources,
-                        if is_last_assistant {
-                            conversation_sources.as_slice()
-                        } else {
-                            &[]
-                        },
-                        pending_user_question.as_ref(),
+                        conversation_sources,
+                        pending_user_question,
                         &ask_user_input,
                         theme,
                         cx,
@@ -13638,23 +13614,22 @@ fn render_agent_thread_reasoning(
     let active_reasoning_group_id = streaming
         .then(|| message.active_reasoning_tool_group())
         .flatten();
-    let reasoning_blocks = tool_group_stream_blocks(
-        &message.reasoning,
-        reasoning_groups,
-        &message.tool_activities,
-    );
-    let reasoning_content = reasoning_blocks
+    let reasoning_content = if expanded {
+        tool_group_stream_blocks(
+            &message.reasoning,
+            reasoning_groups,
+            &message.tool_activities,
+        )
         .into_iter()
         .filter_map(|block| match block {
             ToolStreamBlock::Text { start, end } => {
                 message.reasoning.get(start..end).map(|segment| {
-                    let segment = normalize_reasoning_for_display(segment);
-                    let element = if !reasoning_complete && end == message.reasoning.len() {
-                        render_streaming_markdown(theme, &segment)
-                    } else {
-                        render_markdown(theme, &segment)
-                    };
-                    element.into_any_element()
+                    render_reasoning_text_segment(
+                        format!("agent-thread-reasoning-text-{thread_id}-{message_index}-{start}"),
+                        segment,
+                        !reasoning_complete && end == message.reasoning.len(),
+                        theme,
+                    )
                 })
             }
             ToolStreamBlock::Group {
@@ -13672,7 +13647,10 @@ fn render_agent_thread_reasoning(
                 cx,
             )),
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let toggle_thread_id = thread_id.to_owned();
     div()
         .id(SharedString::from(format!(
@@ -14544,6 +14522,28 @@ fn render_assistant_text_segment(
     }
 }
 
+fn render_reasoning_text_segment(
+    id: String,
+    text: &str,
+    streaming: bool,
+    theme: UiTheme,
+) -> AnyElement {
+    let text = normalize_reasoning_for_display(text);
+    if streaming {
+        render_streaming_markdown(theme, text.as_ref())
+            .text_size(px(12.0))
+            .into_any_element()
+    } else {
+        // Keep the parsed document behind a stable key. The variable-height
+        // conversation list requests a visible message again while scrolling;
+        // unchanged reasoning must not be reparsed on each wheel event.
+        TextView::markdown(id, text.into_owned())
+            .selectable(true)
+            .text_size(px(12.0))
+            .into_any_element()
+    }
+}
+
 fn render_image_attachments(
     message_id: &str,
     attachments: &[PathBuf],
@@ -14654,23 +14654,25 @@ fn render_message(
         let active_reasoning_group_id = streaming
             .then(|| message.active_reasoning_tool_group())
             .flatten();
-        let reasoning_blocks = tool_group_stream_blocks(
-            &message.reasoning,
-            reasoning_groups,
-            &message.tool_activities,
-        );
-        let reasoning_content = reasoning_blocks
+        let reasoning_content = if reasoning_expanded {
+            tool_group_stream_blocks(
+                &message.reasoning,
+                reasoning_groups,
+                &message.tool_activities,
+            )
             .into_iter()
             .filter_map(|block| match block {
                 ToolStreamBlock::Text { start, end } => {
                     message.reasoning.get(start..end).map(|segment| {
-                        let segment = normalize_reasoning_for_display(segment);
-                        let element = if !reasoning_complete && end == message.reasoning.len() {
-                            render_streaming_markdown(theme, &segment)
-                        } else {
-                            render_markdown(theme, &segment)
-                        };
-                        element.into_any_element()
+                        render_reasoning_text_segment(
+                            format!(
+                                "reasoning-text-{}-{index}-{start}",
+                                reasoning_session_id.as_str()
+                            ),
+                            segment,
+                            !reasoning_complete && end == message.reasoning.len(),
+                            theme,
+                        )
                     })
                 }
                 ToolStreamBlock::Group {
@@ -14688,7 +14690,10 @@ fn render_message(
                     cx,
                 )),
             })
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let toggle_reasoning_session_id = reasoning_session_id.clone();
         Some(
             div()
