@@ -26,7 +26,7 @@ use averroes_core::work::{
     now, CheckpointStatus, ConversationSearchResult, ConversationSummary, EmbeddingConfig,
     EmbeddingIndexStatus, TaskStatus, WorkCheckpoint, WorkConversation, WorkConversationFolder,
     WorkMessage, WorkMessageRole, WorkProject, WorkSource, WorkTask, WorkToolActivity,
-    WorkToolActivityState,
+    WorkToolActivityState, WorkWindowMode, WorkWindowState,
 };
 use base64::Engine as _;
 use gpui::prelude::FluentBuilder as _;
@@ -34,8 +34,8 @@ use gpui::{
     div, img, list, px, Anchor, Animation, AnimationExt as _, AnyElement, App, AppContext,
     ClipboardItem, Context, Entity, ExternalPaths, FollowMode, FontWeight, FutureExt as _,
     InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task,
-    Transformation, Window,
+    SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription,
+    SystemNotification, Task, Transformation, Window, WindowBounds,
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::dialog::DialogButtonProps;
@@ -64,6 +64,7 @@ use std::time::{Duration, Instant};
 // events still bypass this window and are painted as soon as they arrive.
 const STREAM_UI_BATCH_WINDOW: Duration = Duration::from_millis(32);
 const STREAM_UI_MAX_EVENTS: usize = 64;
+const STREAM_RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 const STREAM_MESSAGE_FADE_DURATION: Duration = Duration::from_millis(260);
 const CONVERSATION_SEARCH_DEBOUNCE: Duration = Duration::from_millis(280);
 const SIDEBAR_WIDTH: f32 = 352.0;
@@ -631,6 +632,7 @@ struct WelcomeStepSpec {
 
 pub struct AverroesApp {
     runtime: Arc<AppRuntime>,
+    window_state: WorkWindowState,
     route: Route,
     settings_tab: SettingsTab,
     sessions: Vec<ShellSession>,
@@ -719,11 +721,17 @@ pub struct AverroesApp {
     conversation_list_session: Option<SessionId>,
     selected_agent_thread: Option<String>,
     agent_thread_view: Option<String>,
+    stream_recovery_checkpoints: HashMap<SessionId, Instant>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl AverroesApp {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, runtime: Arc<AppRuntime>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        runtime: Arc<AppRuntime>,
+        mut window_state: WorkWindowState,
+    ) -> Self {
         diagnostics::record(
             DiagnosticLevel::Info,
             "app",
@@ -938,7 +946,12 @@ impl AverroesApp {
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.on_app_quit(|app, _cx| {
             app.persist_all_sessions_on_quit();
+            app.persist_window_state();
             async {}
+        }));
+        subscriptions.push(cx.observe_window_bounds(window, |app, window, _cx| {
+            app.capture_window_bounds(window);
+            app.persist_window_state();
         }));
         subscriptions.push(cx.subscribe_in(
             &composer,
@@ -1104,15 +1117,58 @@ impl AverroesApp {
         let conversation_list = ListState::new(0, ListAlignment::Top, px(768.0));
         conversation_list.set_follow_mode(FollowMode::Tail);
         let default_project = projects.first().cloned();
-        let mut app = Self {
-            runtime,
-            route: Route::Home,
-            settings_tab: SettingsTab::Models,
-            sessions: vec![ShellSession::new(
+        let mut restored_sessions = Vec::new();
+        let mut restored_ids = HashSet::new();
+        for conversation_id in &window_state.session_ids {
+            if !restored_ids.insert(conversation_id.clone()) {
+                continue;
+            }
+            match runtime.database.conversation(conversation_id) {
+                Ok(Some(conversation)) => {
+                    let mut session = ShellSession::from_work(conversation, &projects);
+                    let _ =
+                        ensure_binding_tools(&mut session.binding, &runtime.default_agent_tools());
+                    restored_sessions.push(session);
+                }
+                Ok(None) => {}
+                Err(error) => diagnostics::record(
+                    DiagnosticLevel::Warning,
+                    "window.restore",
+                    format!("Could not restore conversation {conversation_id}: {error}"),
+                ),
+            }
+        }
+        let restored_any = !restored_sessions.is_empty();
+        if !restored_any {
+            restored_sessions.push(ShellSession::new(
                 default_project.as_ref(),
                 remembered_binding.clone(),
-            )],
-            active_session: 0,
+            ));
+        }
+        let active_session = window_state
+            .active_session_id
+            .as_deref()
+            .and_then(|active_id| {
+                restored_sessions
+                    .iter()
+                    .position(|session| session.id.as_str() == active_id)
+            })
+            .unwrap_or(0);
+        let active_workspace_id = restored_any
+            .then(|| restored_sessions[active_session].project_id.clone())
+            .flatten();
+        capture_window_bounds_into(&mut window_state, window.window_bounds());
+        let mut app = Self {
+            runtime,
+            window_state,
+            route: if restored_any {
+                Route::Chat
+            } else {
+                Route::Home
+            },
+            settings_tab: SettingsTab::Models,
+            sessions: restored_sessions,
+            active_session,
             remembered_binding,
             composer,
             connection_select,
@@ -1171,7 +1227,7 @@ impl AverroesApp {
             conversation_folder_ids: HashMap::new(),
             expanded_conversation_folders: HashSet::new(),
             folder_name_input,
-            active_workspace_id: None,
+            active_workspace_id,
             projects_expanded: true,
             project_settings_open: false,
             project_settings_tab: ProjectSettingsTab::Mcp,
@@ -1198,6 +1254,7 @@ impl AverroesApp {
             conversation_list_session: None,
             selected_agent_thread: None,
             agent_thread_view: None,
+            stream_recovery_checkpoints: HashMap::new(),
             _subscriptions: subscriptions,
         };
         app.sync_embedding_selectors(window, cx);
@@ -1205,6 +1262,9 @@ impl AverroesApp {
             app.refresh_codex_account(cx);
         }
         app.sync_selectors_to_active(window, cx);
+        if restored_any {
+            app.mark_active_read(cx);
+        }
         app.reconcile_onboarding_steps();
         // Refresh configured remote catalogs concurrently. Each Copilot
         // request re-discovers GitHub's current per-account API endpoint, so
@@ -1213,6 +1273,7 @@ impl AverroesApp {
 
         app.schedule_background_indexing(cx);
         app.start_update_check(window, cx);
+        app.persist_window_state();
         app
     }
 
@@ -2470,6 +2531,7 @@ impl AverroesApp {
                 self.persist_pending_conversation_folder(active_index, cx);
                 self.refresh_navigation();
                 self.schedule_background_indexing(cx);
+                self.persist_window_state();
                 true
             }
             Err(error) => {
@@ -2494,6 +2556,7 @@ impl AverroesApp {
                 self.persist_pending_conversation_folder(index, cx);
                 self.refresh_navigation();
                 self.schedule_background_indexing(cx);
+                self.persist_window_state();
             }
             Err(error) => {
                 self.notice = Some(Notice {
@@ -2546,6 +2609,63 @@ impl AverroesApp {
         }
     }
 
+    fn set_persisted_processing(&self, id: &SessionId, processing: bool) {
+        if let Err(error) = self
+            .runtime
+            .database
+            .set_conversation_processing(id.as_str(), processing)
+        {
+            diagnostics::record(
+                DiagnosticLevel::Warning,
+                "conversation.recovery",
+                format!("Could not persist processing state for {id}: {error}"),
+            );
+        }
+    }
+
+    /// Keep an in-flight transcript recoverable without writing every small
+    /// text delta to SQLite. Lifecycle events are durable immediately; plain
+    /// text and reasoning are checkpointed at most once per second.
+    fn persist_stream_recovery_checkpoint(&mut self, id: &SessionId, force: bool) {
+        let checkpoint_at = Instant::now();
+        if !force
+            && self
+                .stream_recovery_checkpoints
+                .get(id)
+                .is_some_and(|last| {
+                    checkpoint_at.duration_since(*last) < STREAM_RECOVERY_CHECKPOINT_INTERVAL
+                })
+        {
+            return;
+        }
+        self.stream_recovery_checkpoints
+            .insert(id.clone(), checkpoint_at);
+
+        let Some(index) = self.sessions.iter().position(|session| &session.id == id) else {
+            return;
+        };
+        let snapshot = self.sessions[index].snapshot();
+        match self.runtime.database.save_conversation(&snapshot) {
+            Ok(()) => self.sessions[index].persisted = true,
+            Err(error) => diagnostics::record(
+                DiagnosticLevel::Warning,
+                "conversation.recovery",
+                format!("Could not checkpoint active conversation {id}: {error}"),
+            ),
+        }
+    }
+
+    fn notify_conversation_ready(&self, id: &SessionId, title: &str, cx: &Context<Self>) {
+        cx.show_system_notification(SystemNotification {
+            tag: format!("conversation:{}", id.as_str()).into(),
+            title: title.to_owned().into(),
+            body: i18n::text(cx, "notification.conversation_ready")
+                .to_string()
+                .into(),
+            actions: Vec::new(),
+        });
+    }
+
     fn persist_all_sessions_on_quit(&mut self) {
         for session in &self.sessions {
             // Keep the initial blank composer ephemeral. Otherwise every
@@ -2564,6 +2684,39 @@ impl AverroesApp {
                     "Could not persist conversation while quitting"
                 );
             }
+        }
+    }
+
+    fn capture_window_bounds(&mut self, window: &Window) {
+        capture_window_bounds_into(&mut self.window_state, window.window_bounds());
+    }
+
+    fn persist_window_state(&self) {
+        let session_ids = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.persisted
+                    || !session.messages.is_empty()
+                    || !session.agent_threads.is_empty()
+                    || !session.agent_thread_transcripts.is_empty()
+            })
+            .map(|session| session.id.to_string())
+            .collect::<Vec<_>>();
+        let active_session_id = self
+            .sessions
+            .get(self.active_session)
+            .map(|session| session.id.to_string())
+            .filter(|id| session_ids.contains(id));
+        let mut state = self.window_state.clone();
+        state.session_ids = session_ids;
+        state.active_session_id = active_session_id;
+        if let Err(error) = self.runtime.database.save_window_state(&state) {
+            diagnostics::record(
+                DiagnosticLevel::Warning,
+                "window.persist",
+                format!("Could not persist window state: {error}"),
+            );
         }
     }
 
@@ -2823,7 +2976,9 @@ impl AverroesApp {
             format!("Streaming stopped by user for conversation {session_id}."),
         );
         self.remeasure_active_conversation_tail(&session_id);
+        self.stream_recovery_checkpoints.remove(&session_id);
         self.persist_session(&session_id, cx);
+        self.set_persisted_processing(&session_id, false);
         cx.notify();
     }
 
@@ -2932,6 +3087,7 @@ impl AverroesApp {
         self.sync_selectors_to_active(window, cx);
         self.composer
             .update(cx, |state, cx| state.focus(window, cx));
+        self.persist_window_state();
         cx.notify();
     }
 
@@ -3803,6 +3959,7 @@ impl AverroesApp {
                 }
                 self.remember_active_setup(cx);
                 self.sync_selectors_to_active(window, cx);
+                self.persist_window_state();
                 cx.notify();
             }
             Ok(None) => {
@@ -6381,6 +6538,7 @@ impl AverroesApp {
             self.attachments = attachments;
             return;
         }
+        self.set_persisted_processing(&session_id, true);
         cx.notify();
 
         let runtime = self.runtime.clone();
@@ -6406,6 +6564,12 @@ impl AverroesApp {
                         format!("Could not load attached files: {error}"),
                     );
                     _ = this.update(cx, |app, cx| {
+                        let unread = conversation_has_unread_update(
+                            app.route,
+                            &app.active().id,
+                            &stream_session_id,
+                        );
+                        let mut notification_title = None;
                         if let Some(session) = app
                             .sessions
                             .iter_mut()
@@ -6413,6 +6577,10 @@ impl AverroesApp {
                         {
                             session.processing = false;
                             session.task = None;
+                            session.unread = unread;
+                            if unread {
+                                notification_title = Some(session.title.clone());
+                            }
                             if let Some(message) = session.messages.last_mut() {
                                 message.role = MessageRole::Error;
                                 message.text = format!("Could not attach files: {error}");
@@ -6423,6 +6591,10 @@ impl AverroesApp {
                         }
                         app.remeasure_active_conversation_tail(&stream_session_id);
                         app.persist_session(&stream_session_id, cx);
+                        app.set_persisted_processing(&stream_session_id, false);
+                        if let Some(title) = notification_title {
+                            app.notify_conversation_ready(&stream_session_id, &title, cx);
+                        }
                     });
                     return;
                 }
@@ -6475,6 +6647,7 @@ impl AverroesApp {
                                     &app.active().id,
                                     &stream_session_id,
                                 );
+                                let mut notification_title = None;
                                 if let Some(session) = app
                                     .sessions
                                     .iter_mut()
@@ -6483,6 +6656,9 @@ impl AverroesApp {
                                     session.processing = false;
                                     session.task = None;
                                     session.unread = unread;
+                                    if unread {
+                                        notification_title = Some(session.title.clone());
+                                    }
                                     if let Some(message) = session.messages.last_mut() {
                                         message.role = MessageRole::Error;
                                         message.text = format!("Could not start request: {error}");
@@ -6490,6 +6666,10 @@ impl AverroesApp {
                                 }
                                 app.remeasure_active_conversation_tail(&stream_session_id);
                                 app.persist_session(&stream_session_id, cx);
+                                app.set_persisted_processing(&stream_session_id, false);
+                                if let Some(title) = notification_title {
+                                    app.notify_conversation_ready(&stream_session_id, &title, cx);
+                                }
                             });
                             return;
                         }
@@ -6568,9 +6748,15 @@ impl AverroesApp {
                 }
 
                 _ = this.update(cx, |app, cx| {
+                    let force_recovery_checkpoint =
+                        events.iter().any(stream_event_requires_immediate_flush);
                     for event in events {
                         app.apply_agent_stream_event(&stream_session_id, event, cx);
                     }
+                    app.persist_stream_recovery_checkpoint(
+                        &stream_session_id,
+                        force_recovery_checkpoint,
+                    );
                     cx.notify();
                 });
 
@@ -6671,9 +6857,10 @@ impl AverroesApp {
                 );
             }
             let next_queued_message = this.update(cx, |app, cx| {
+                app.stream_recovery_checkpoints.remove(&stream_session_id);
                 let unread =
                     conversation_has_unread_update(app.route, &app.active().id, &stream_session_id);
-                {
+                let notification_title = {
                     let Some(session) = app
                         .sessions
                         .iter_mut()
@@ -6721,9 +6908,14 @@ impl AverroesApp {
                                 .push(ShellMessage::error(format!("Task failed: {error}")));
                         }
                     }
-                }
+                    unread.then(|| session.title.clone())
+                };
                 app.remeasure_active_conversation_tail(&stream_session_id);
                 app.persist_session(&stream_session_id, cx);
+                app.set_persisted_processing(&stream_session_id, false);
+                if let Some(title) = notification_title {
+                    app.notify_conversation_ready(&stream_session_id, &title, cx);
+                }
                 if app.active().id != stream_session_id {
                     return None;
                 }
@@ -6791,9 +6983,13 @@ impl AverroesApp {
 
     fn close_active_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let closing_session_id = self.active().id.clone();
+        if self.active().processing {
+            self.stop_active_stream(cx);
+        }
         if !self.active().messages.is_empty() {
             self.persist_session(&closing_session_id, cx);
         }
+        self.stream_recovery_checkpoints.remove(&closing_session_id);
         self.sessions.remove(self.active_session);
         if self.sessions.is_empty() {
             self.sessions.push(ShellSession::new(
@@ -6812,6 +7008,7 @@ impl AverroesApp {
         self.reset_conversation_scroll();
         self.mark_active_read(cx);
         self.sync_selectors_to_active(window, cx);
+        self.persist_window_state();
         cx.notify();
     }
 
@@ -6833,6 +7030,7 @@ impl AverroesApp {
         self.remember_active_setup(cx);
         self.sync_selectors_to_active(window, cx);
         self.start_next_queued_message(window, cx);
+        self.persist_window_state();
         cx.notify();
     }
 
@@ -12282,6 +12480,19 @@ fn conversation_has_unread_update(
     updated_session: &SessionId,
 ) -> bool {
     route != Route::Chat || active_session != updated_session
+}
+
+fn capture_window_bounds_into(state: &mut WorkWindowState, bounds: WindowBounds) {
+    let (bounds, mode) = match bounds {
+        WindowBounds::Windowed(bounds) => (bounds, WorkWindowMode::Windowed),
+        WindowBounds::Maximized(bounds) => (bounds, WorkWindowMode::Maximized),
+        WindowBounds::Fullscreen(bounds) => (bounds, WorkWindowMode::Fullscreen),
+    };
+    state.x = f32::from(bounds.origin.x).round() as i32;
+    state.y = f32::from(bounds.origin.y).round() as i32;
+    state.width = f32::from(bounds.size.width).round() as i32;
+    state.height = f32::from(bounds.size.height).round() as i32;
+    state.mode = mode;
 }
 
 fn inherited_session_binding(

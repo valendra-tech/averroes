@@ -133,6 +133,122 @@ impl WorkDatabase {
         Ok(())
     }
 
+    pub fn window_states(&self) -> Result<Vec<WorkWindowState>, WorkDatabaseError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT window_id, session_ids_json, active_session_id,
+                    x, y, width, height, mode
+             FROM app_windows
+             ORDER BY updated_at ASC, window_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let mode = match row.get::<_, String>(7)?.as_str() {
+                "maximized" => WorkWindowMode::Maximized,
+                "fullscreen" => WorkWindowMode::Fullscreen,
+                _ => WorkWindowMode::Windowed,
+            };
+            let session_ids_json = row.get::<_, String>(1)?;
+            let session_ids = serde_json::from_str(&session_ids_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(WorkWindowState {
+                id: row.get(0)?,
+                session_ids,
+                active_session_id: row.get(2)?,
+                x: row.get(3)?,
+                y: row.get(4)?,
+                width: row.get(5)?,
+                height: row.get(6)?,
+                mode,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn save_window_state(&self, state: &WorkWindowState) -> Result<(), WorkDatabaseError> {
+        let session_ids = serde_json::to_string(&state.session_ids)?;
+        let mode = match state.mode {
+            WorkWindowMode::Windowed => "windowed",
+            WorkWindowMode::Maximized => "maximized",
+            WorkWindowMode::Fullscreen => "fullscreen",
+        };
+        self.connection.lock().execute(
+            "INSERT INTO app_windows
+                (window_id, session_ids_json, active_session_id,
+                 x, y, width, height, mode, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(window_id) DO UPDATE SET
+                session_ids_json = excluded.session_ids_json,
+                active_session_id = excluded.active_session_id,
+                x = excluded.x,
+                y = excluded.y,
+                width = excluded.width,
+                height = excluded.height,
+                mode = excluded.mode,
+                updated_at = excluded.updated_at",
+            params![
+                state.id,
+                session_ids,
+                state.active_session_id,
+                state.x,
+                state.y,
+                state.width,
+                state.height,
+                mode,
+                now(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_window_state(&self, window_id: &str) -> Result<(), WorkDatabaseError> {
+        self.connection.lock().execute(
+            "DELETE FROM app_windows WHERE window_id = ?1",
+            params![window_id],
+        )?;
+        Ok(())
+    }
+
+    /// Converts requests left active by a process crash into unread,
+    /// recoverable conversations. The remote request itself cannot survive a
+    /// process exit, but its transcript and window remain available.
+    pub fn recover_interrupted_conversations(&self) -> Result<usize, WorkDatabaseError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE messages
+             SET reasoning_complete = 1
+             WHERE conversation_id IN (
+                 SELECT id FROM conversations WHERE processing = 1
+             )",
+            [],
+        )?;
+        let recovered = transaction.execute(
+            "UPDATE conversations
+             SET processing = 0, unread = 1
+             WHERE processing = 1",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(recovered)
+    }
+
+    pub fn set_conversation_processing(
+        &self,
+        conversation_id: &str,
+        processing: bool,
+    ) -> Result<bool, WorkDatabaseError> {
+        let updated = self.connection.lock().execute(
+            "UPDATE conversations SET processing = ?2 WHERE id = ?1",
+            params![conversation_id, processing as i64],
+        )?;
+        Ok(updated > 0)
+    }
+
     pub fn conversation_folders(
         &self,
         workspace_id: &str,
@@ -1340,6 +1456,75 @@ mod tests {
             .unwrap();
         assert!(!connection.completed);
         assert_eq!(connection.completed_at, None);
+    }
+
+    #[test]
+    fn window_state_round_trips_and_can_be_removed() {
+        let (directory, database) = database();
+        let state = WorkWindowState {
+            id: "window-1".into(),
+            session_ids: vec!["conversation-1".into(), "conversation-2".into()],
+            active_session_id: Some("conversation-2".into()),
+            x: 120,
+            y: 80,
+            width: 1440,
+            height: 900,
+            mode: WorkWindowMode::Maximized,
+        };
+
+        database.save_window_state(&state).unwrap();
+        drop(database);
+        let reopened = WorkDatabase::open_at(directory.path().join("averroes.db")).unwrap();
+        assert_eq!(reopened.window_states().unwrap(), vec![state.clone()]);
+
+        reopened.delete_window_state(&state.id).unwrap();
+        assert!(reopened.window_states().unwrap().is_empty());
+    }
+
+    #[test]
+    fn interrupted_requests_become_unread_and_finish_reasoning() {
+        let (_directory, database) = database();
+        {
+            let connection = database.connection.lock();
+            connection
+                .execute(
+                    "INSERT INTO conversations
+                        (id, title, unread, processing, created_at, updated_at)
+                     VALUES ('interrupted', 'Interrupted', 0, 1, 1, 1)",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO messages
+                        (conversation_id, position, role, text, reasoning_complete)
+                     VALUES ('interrupted', 0, 'assistant', '', 0)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(database.recover_interrupted_conversations().unwrap(), 1);
+        assert_eq!(database.recover_interrupted_conversations().unwrap(), 0);
+
+        let connection = database.connection.lock();
+        let state = connection
+            .query_row(
+                "SELECT unread, processing FROM conversations WHERE id = 'interrupted'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (1, 0));
+        let reasoning_complete = connection
+            .query_row(
+                "SELECT reasoning_complete FROM messages
+                 WHERE conversation_id = 'interrupted'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(reasoning_complete, 1);
     }
 
     #[test]

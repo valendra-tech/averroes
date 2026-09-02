@@ -20,12 +20,15 @@ use crate::tool::{ToolActivation, ToolRegistry};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub use context::ContextUsage;
 
 const MAX_AUTO_SKILLS: usize = 3;
 const MAX_AUTO_SKILL_CONTEXT_BYTES: usize = 32 * 1024;
 const MAX_SKILL_CATALOG_BYTES: usize = 8 * 1024;
+const PROVIDER_INITIAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_SILENT_PROVIDER_RETRIES: usize = 1;
 
 pub(super) fn is_delegation_tool(name: &str) -> bool {
     matches!(name, "list_agents" | "call_agent" | "call_agents")

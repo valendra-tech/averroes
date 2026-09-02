@@ -1,6 +1,7 @@
 {
   "app.initialize_error": "Averroes no ha podido iniciarse.",
   "app.needs_attention": "Averroes necesita atención",
+  "notification.conversation_ready": "Averroes ha terminado y necesita tu atención.",
   "app.try_again": "Intentar de nuevo",
   "composer.placeholder": "Dile a tu agente qué hacer, / para comandos, @ para contexto…",
   "composer.workspace": "Espacio de trabajo",
