@@ -27,6 +27,31 @@ pub struct WorkOnboardingStep {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkWindowMode {
+    Windowed,
+    Maximized,
+    Fullscreen,
+}
+
+/// Restorable state for one native Averroes window.
+///
+/// Conversation contents remain normalized in their existing tables; this
+/// record only remembers which conversations were open in each window and
+/// the native window geometry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkWindowState {
+    pub id: String,
+    pub session_ids: Vec<String>,
+    pub active_session_id: Option<String>,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub mode: WorkWindowMode,
+}
+
 /// A virtual project/folder that groups conversations inside one workspace.
 /// It is intentionally not a filesystem path: the workspace remains the
 /// execution context, while this entity is only a navigation organization.

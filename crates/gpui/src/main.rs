@@ -15,6 +15,8 @@ mod update;
 mod version;
 
 use app::AverroesApp;
+use averroes_core::config::ConfigPaths;
+use averroes_core::work::{WorkDatabase, WorkWindowMode, WorkWindowState};
 use gpui::{
     div, img, point, px, size, App, AppContext, AssetSource, Bounds, Context, FontWeight,
     IntoElement, Menu, MenuItem, ParentElement, Render, SharedString, Styled, TitlebarOptions,
@@ -31,8 +33,11 @@ use shortcuts::{
     SendMessage, ToggleSettings,
 };
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use ui::UiTheme;
+
+pub(crate) static APP_QUITTING: AtomicBool = AtomicBool::new(false);
 
 fn application_quit_mode() -> gpui::QuitMode {
     gpui::QuitMode::LastWindowClosed
@@ -98,13 +103,15 @@ impl AssetSource for UiAssets {
 struct RootView {
     app: Option<gpui::Entity<AverroesApp>>,
     error: Option<String>,
+    window_state: WorkWindowState,
 }
 
 impl RootView {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>, window_state: WorkWindowState) -> Self {
         let mut root = Self {
             app: None,
             error: None,
+            window_state,
         };
         root.load(window, cx);
         root
@@ -124,7 +131,19 @@ impl RootView {
                 if let Err(error) = runtime.ensure_secure_storage_access() {
                     self.error = Some(format!("Could not access macOS Keychain: {error}"));
                 } else {
-                    self.app = Some(cx.new(|cx| AverroesApp::new(window, cx, runtime)));
+                    let database = runtime.database.clone();
+                    let window_id = self.window_state.id.clone();
+                    window.on_window_should_close(cx, move |_, cx| {
+                        if !APP_QUITTING.load(Ordering::SeqCst) && cx.windows().len() > 1 {
+                            if let Err(error) = database.delete_window_state(&window_id) {
+                                tracing::warn!(%error, %window_id, "failed to forget closed window");
+                            }
+                        }
+                        true
+                    });
+                    let window_state = self.window_state.clone();
+                    self.app =
+                        Some(cx.new(|cx| AverroesApp::new(window, cx, runtime, window_state)));
                 }
             }
             Err(error) => self.error = Some(error.to_string()),
@@ -284,7 +303,14 @@ fn main() {
             // work during rendering.
             cx.set_global(Localization::new(Locale::English));
             UiTheme::install_component_theme(cx);
+            cx.set_app_identity("com.valendra.averroes", "Averroes");
             cx.activate(true);
+            APP_QUITTING.store(false, Ordering::SeqCst);
+            cx.on_app_quit(|_| {
+                APP_QUITTING.store(true, Ordering::SeqCst);
+                async {}
+            })
+            .detach();
             cx.bind_keys([
                 gpui::KeyBinding::new("cmd-q", Quit, None),
                 gpui::KeyBinding::new("cmd-n", NewSession, None),
@@ -298,56 +324,115 @@ fn main() {
             refresh_application_menu(cx, Vec::new());
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.on_action(|_: &NewWindow, cx| {
-                if let Err(error) = open_averroes_window(cx) {
+                if let Err(error) = open_averroes_window(cx, None) {
                     tracing::error!(%error, "failed to open Averroes window");
                 }
             });
             cx.on_action(|_: &OpenWorkspace, cx| {
-                let Some(root) = active_component_root(cx) else {
-                    tracing::warn!("open workspace requested without an Averroes window");
-                    return;
-                };
-                if let Err(error) = root.update(cx, |root, window, cx| {
-                    if let Some(view) = root.view().clone().downcast::<RootView>().ok() {
-                        view.update(cx, |view, cx| view.open_workspace(window, cx));
-                    } else {
-                        tracing::warn!("open workspace requested without a RootView");
+                cx.defer(|cx| {
+                    let Some(root) = active_component_root(cx) else {
+                        tracing::warn!("open workspace requested without an Averroes window");
+                        return;
+                    };
+                    if let Err(error) = root.update(cx, |root, window, cx| {
+                        if let Ok(view) = root.view().clone().downcast::<RootView>() {
+                            view.update(cx, |view, cx| view.open_workspace(window, cx));
+                        } else {
+                            tracing::warn!("open workspace requested without a RootView");
+                        }
+                    }) {
+                        tracing::error!(%error, "failed to open workspace picker");
                     }
-                }) {
-                    tracing::error!(%error, "failed to open workspace picker");
-                }
+                });
             });
             cx.on_action(|action: &OpenRecentProject, cx| {
                 let project_id = action.project_id.clone();
-                let Some(root) = active_component_root(cx) else {
-                    tracing::warn!("recent project requested without an Averroes window");
-                    return;
-                };
-                if let Err(error) = root.update(cx, |root, window, cx| {
-                    if let Some(view) = root.view().clone().downcast::<RootView>().ok() {
-                        view.update(cx, |view, cx| {
-                            view.open_recent_project(&project_id, window, cx)
-                        });
-                    } else {
-                        tracing::warn!("recent project requested without a RootView");
+                cx.defer(move |cx| {
+                    let Some(root) = active_component_root(cx) else {
+                        tracing::warn!("recent project requested without an Averroes window");
+                        return;
+                    };
+                    if let Err(error) = root.update(cx, |root, window, cx| {
+                        if let Ok(view) = root.view().clone().downcast::<RootView>() {
+                            view.update(cx, |view, cx| {
+                                view.open_recent_project(&project_id, window, cx)
+                            });
+                        } else {
+                            tracing::warn!("recent project requested without a RootView");
+                        }
+                    }) {
+                        tracing::error!(%error, "failed to open recent project");
                     }
-                }) {
-                    tracing::error!(%error, "failed to open recent project");
-                }
+                });
             });
 
-            open_averroes_window(cx).expect("failed to open Averroes window");
+            let restored_windows = load_restorable_windows();
+            if restored_windows.is_empty() {
+                open_averroes_window(cx, None).expect("failed to open Averroes window");
+            } else {
+                for state in restored_windows {
+                    if let Err(error) = open_averroes_window(cx, Some(state)) {
+                        tracing::error!(%error, "failed to restore Averroes window");
+                    }
+                }
+                if cx.windows().is_empty() {
+                    open_averroes_window(cx, None).expect("failed to open Averroes window");
+                }
+            }
         });
 }
 
-fn open_averroes_window(cx: &mut App) -> anyhow::Result<()> {
+fn load_restorable_windows() -> Vec<WorkWindowState> {
+    let result = ConfigPaths::discover()
+        .map_err(anyhow::Error::from)
+        .and_then(|paths| WorkDatabase::open(&paths).map_err(anyhow::Error::from));
+    let database = match result {
+        Ok(database) => database,
+        Err(error) => {
+            tracing::warn!(%error, "could not load persisted window state");
+            return Vec::new();
+        }
+    };
+    match database.recover_interrupted_conversations() {
+        Ok(recovered) if recovered > 0 => {
+            tracing::info!(recovered, "recovered interrupted conversations")
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "could not recover interrupted conversations"),
+    }
+    database.window_states().unwrap_or_else(|error| {
+        tracing::warn!(%error, "could not read persisted window state");
+        Vec::new()
+    })
+}
+
+fn open_averroes_window(cx: &mut App, restored: Option<WorkWindowState>) -> anyhow::Result<()> {
+    let default_bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
+    let window_state = restored.unwrap_or_else(|| WorkWindowState {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_ids: Vec::new(),
+        active_session_id: None,
+        x: f32::from(default_bounds.origin.x).round() as i32,
+        y: f32::from(default_bounds.origin.y).round() as i32,
+        width: f32::from(default_bounds.size.width).round() as i32,
+        height: f32::from(default_bounds.size.height).round() as i32,
+        mode: WorkWindowMode::Windowed,
+    });
+    let bounds = Bounds {
+        origin: point(px(window_state.x as f32), px(window_state.y as f32)),
+        size: size(
+            px(window_state.width.max(980) as f32),
+            px(window_state.height.max(680) as f32),
+        ),
+    };
+    let window_bounds = match window_state.mode {
+        WorkWindowMode::Windowed => WindowBounds::Windowed(bounds),
+        WorkWindowMode::Maximized => WindowBounds::Maximized(bounds),
+        WorkWindowMode::Fullscreen => WindowBounds::Fullscreen(bounds),
+    };
     cx.open_window(
         WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(1440.0), px(900.0)),
-                cx,
-            ))),
+            window_bounds: Some(window_bounds),
             window_min_size: Some(size(px(980.0), px(680.0))),
             titlebar: Some(TitlebarOptions {
                 title: Some("Averroes".into()),
@@ -356,8 +441,8 @@ fn open_averroes_window(cx: &mut App) -> anyhow::Result<()> {
             }),
             ..Default::default()
         },
-        |window, cx| {
-            let view = cx.new(|cx| RootView::new(window, cx));
+        move |window, cx| {
+            let view = cx.new(|cx| RootView::new(window, cx, window_state));
             let recent_projects = view.read(cx).recent_projects_for_menu(cx);
             refresh_application_menu(cx, recent_projects);
             cx.new(|cx| ComponentRoot::new(view, window, cx).bordered(false))

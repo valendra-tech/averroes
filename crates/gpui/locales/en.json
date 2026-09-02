@@ -1,6 +1,7 @@
 {
   "app.initialize_error": "Averroes could not initialize.",
   "app.needs_attention": "Averroes needs attention",
+  "notification.conversation_ready": "Averroes has finished and needs your attention.",
   "app.try_again": "Try again",
   "composer.placeholder": "Tell your agent what to do, / for commands, @ for context…",
   "composer.workspace": "Workspace",
