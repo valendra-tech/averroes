@@ -1,4 +1,8 @@
 use crate::i18n;
+use crate::remote_agent::{
+    capture_desktop_screenshot, TelegramCallbackQuery, TelegramClient, TelegramMessage,
+    TelegramUpdate, TelegramUser,
+};
 use crate::runtime::{AppRuntime, MarketplaceSkill};
 use crate::session::SessionId;
 use crate::shortcuts::{CloseSession, FocusInput, NewSession, Quit, SendMessage, ToggleSettings};
@@ -51,9 +55,11 @@ use gpui_component::{
     Disableable, Icon, IconName, Root as ComponentRoot, Selectable, Sizable, WindowExt as _,
 };
 use semver::Version;
+use serde_json::json;
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -66,6 +72,8 @@ const STREAM_UI_BATCH_WINDOW: Duration = Duration::from_millis(32);
 const STREAM_UI_MAX_EVENTS: usize = 64;
 const STREAM_RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 const STREAM_MESSAGE_FADE_DURATION: Duration = Duration::from_millis(260);
+const REMOTE_LIVE_EDIT_INTERVAL: Duration = Duration::from_millis(750);
+const REMOTE_QUESTION_CALLBACK_PREFIX: &str = "ask-answer";
 const CONVERSATION_SEARCH_DEBOUNCE: Duration = Duration::from_millis(280);
 const SIDEBAR_WIDTH: f32 = 352.0;
 const SIDEBAR_GUTTER: f32 = 12.0;
@@ -79,6 +87,87 @@ const ONBOARDING_ACTIVE_CONNECTION: &str = "active_connection";
 const ONBOARDING_WORKSPACE: &str = "workspace_available";
 const ONBOARDING_FIRST_CONVERSATION: &str = "first_conversation";
 const ONBOARDING_STEP_COUNT: usize = 4;
+
+fn subscribed_keyboard(cx: &App) -> serde_json::Value {
+    json!({
+        "inline_keyboard": [
+            [
+                { "text": format!("📡 {}", i18n::text(cx, "remote_agent.button_status")), "callback_data": "status" },
+                { "text": format!("📸 {}", i18n::text(cx, "remote_agent.button_screenshot")), "callback_data": "screenshot" }
+            ],
+            [
+                { "text": format!("⏸ {}", i18n::text(cx, "remote_agent.button_unsubscribe")), "callback_data": "unsubscribe" }
+            ]
+        ]
+    })
+}
+
+fn welcome_keyboard(cx: &App) -> serde_json::Value {
+    json!({
+        "inline_keyboard": [
+            [
+                { "text": format!("📡 {}", i18n::text(cx, "remote_agent.button_subscribe")), "callback_data": "subscribe" },
+                { "text": format!("📸 {}", i18n::text(cx, "remote_agent.button_screenshot")), "callback_data": "screenshot" }
+            ],
+            [
+                { "text": format!("ℹ️ {}", i18n::text(cx, "remote_agent.button_status")), "callback_data": "status" }
+            ]
+        ]
+    })
+}
+
+fn remote_question_keyboard(
+    question: &averroes_core::tool::builtin::ask_user::UserQuestion,
+) -> Option<serde_json::Value> {
+    (!question.options.is_empty()).then(|| {
+        let rows = question
+            .options
+            .iter()
+            .take(6)
+            .enumerate()
+            .map(|(index, option)| {
+                vec![json!({
+                    "text": telegram_button_label(option),
+                    "callback_data": format!(
+                        "{REMOTE_QUESTION_CALLBACK_PREFIX}:{}:{index}",
+                        question.id
+                    ),
+                })]
+            })
+            .collect::<Vec<_>>();
+        json!({ "inline_keyboard": rows })
+    })
+}
+
+fn telegram_button_label(label: &str) -> String {
+    const MAX_BUTTON_CHARS: usize = 60;
+    let mut visible = label.chars().take(MAX_BUTTON_CHARS + 1).collect::<String>();
+    if visible.chars().count() > MAX_BUTTON_CHARS {
+        visible.truncate(
+            visible
+                .char_indices()
+                .nth(MAX_BUTTON_CHARS)
+                .map_or(visible.len(), |(index, _)| index),
+        );
+        visible.push('…');
+    }
+    visible
+}
+
+fn parse_remote_question_callback(data: &str) -> Option<(&str, usize)> {
+    let (prefix, question_id, option_index) = data.split_once(':').and_then(|(prefix, rest)| {
+        rest.split_once(':')
+            .map(|(question_id, option_index)| (prefix, question_id, option_index))
+    })?;
+    (prefix == REMOTE_QUESTION_CALLBACK_PREFIX)
+        .then(|| {
+            option_index
+                .parse::<usize>()
+                .ok()
+                .map(|index| (question_id, index))
+        })
+        .flatten()
+}
 
 fn stream_event_requires_immediate_flush(event: &AgentStreamEvent) -> bool {
     matches!(
@@ -110,6 +199,7 @@ enum SettingsTab {
     Connections,
     Models,
     Agents,
+    RemoteAgent,
     Diagnostics,
     Storage,
     About,
@@ -210,6 +300,21 @@ struct ComposerAttachment {
 struct QueuedMessage {
     text: String,
     attachments: Vec<ComposerAttachment>,
+    remote_origin_chat_id: Option<i64>,
+}
+
+struct RemoteLiveReply {
+    chat_id: i64,
+    message_id: i64,
+    text: String,
+    last_edit: Instant,
+    edit_in_flight: bool,
+}
+
+#[derive(Clone)]
+struct PendingRemoteAccessRequest {
+    chat_id: i64,
+    label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -667,6 +772,15 @@ pub struct AverroesApp {
     agent_name_input: Entity<InputState>,
     agent_description_input: Entity<InputState>,
     editing_agent_id: Option<String>,
+    remote_agent_token_input: Entity<InputState>,
+    remote_agent_session_ids: HashSet<String>,
+    remote_agent_chats: HashMap<i64, SessionId>,
+    remote_agent_chat_users: HashMap<i64, i64>,
+    remote_agent_pending_access: HashMap<i64, PendingRemoteAccessRequest>,
+    remote_agent_client: Option<TelegramClient>,
+    remote_agent_task: Option<Task<()>>,
+    remote_agent_stop: Option<Arc<AtomicBool>>,
+    remote_agent_live_replies: HashMap<SessionId, RemoteLiveReply>,
     embedding_index_busy: bool,
     background_indexing: bool,
     background_index_scheduled: bool,
@@ -893,6 +1007,11 @@ impl AverroesApp {
         });
         let agent_description_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.agent_description"))
+        });
+        let remote_agent_token_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(i18n::text(cx, "placeholder.remote_agent_token"))
+                .masked(true)
         });
         let folder_name_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.folder_name"))
@@ -1199,6 +1318,15 @@ impl AverroesApp {
             agent_name_input,
             agent_description_input,
             editing_agent_id: None,
+            remote_agent_token_input,
+            remote_agent_session_ids: HashSet::new(),
+            remote_agent_chats: HashMap::new(),
+            remote_agent_chat_users: HashMap::new(),
+            remote_agent_pending_access: HashMap::new(),
+            remote_agent_client: None,
+            remote_agent_task: None,
+            remote_agent_stop: None,
+            remote_agent_live_replies: HashMap::new(),
             embedding_index_busy: false,
             background_indexing: false,
             background_index_scheduled: false,
@@ -1273,6 +1401,9 @@ impl AverroesApp {
 
         app.schedule_background_indexing(cx);
         app.start_update_check(window, cx);
+        if app.runtime.remote_agent().enabled && app.runtime.has_remote_agent_token() {
+            app.start_remote_agent(window, cx);
+        }
         app.persist_window_state();
         app
     }
@@ -2380,6 +2511,911 @@ impl AverroesApp {
         cx.notify();
     }
 
+    fn save_remote_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let token = self
+            .remote_agent_token_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_owned();
+        let mut settings = self.runtime.remote_agent();
+        settings.enabled = true;
+
+        match self
+            .runtime
+            .save_remote_agent(settings, (!token.is_empty()).then_some(token.as_str()))
+        {
+            Ok(()) => {
+                self.remote_agent_token_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.start_remote_agent(window, cx);
+                self.notice = Some(Notice {
+                    success: true,
+                    text: i18n::text(cx, "remote_agent.notice_ready").to_string(),
+                });
+            }
+            Err(error) => self.show_error(error.to_string(), cx),
+        }
+        cx.notify();
+    }
+
+    fn toggle_remote_agent_for_active(&mut self, cx: &mut Context<Self>) {
+        let configured =
+            self.runtime.remote_agent().enabled && self.runtime.has_remote_agent_token();
+        if !configured {
+            self.settings_tab = SettingsTab::RemoteAgent;
+            self.route = Route::Connections;
+            self.project_settings_open = false;
+            self.notice = Some(Notice {
+                success: false,
+                text: i18n::text(cx, "remote_agent.notice_connect_first").to_string(),
+            });
+        } else {
+            let session_id = self.active().id.to_string();
+            if !self.remote_agent_session_ids.insert(session_id.clone()) {
+                self.remote_agent_session_ids.remove(&session_id);
+                self.remote_agent_chats
+                    .retain(|_, mapped_session| mapped_session.as_str() != session_id);
+            }
+        }
+        cx.notify();
+    }
+
+    fn pause_remote_agent(&mut self, cx: &mut Context<Self>) {
+        let mut settings = self.runtime.remote_agent();
+        settings.enabled = false;
+        match self.runtime.save_remote_agent(settings, None) {
+            Ok(()) => {
+                self.stop_remote_agent();
+                self.remote_agent_session_ids.clear();
+                self.remote_agent_chats.clear();
+                self.remote_agent_chat_users.clear();
+                self.notice = Some(Notice {
+                    success: true,
+                    text: i18n::text(cx, "remote_agent.notice_paused").to_string(),
+                });
+            }
+            Err(error) => self.show_error(error.to_string(), cx),
+        }
+        cx.notify();
+    }
+
+    fn remote_agent_is_active(&self) -> bool {
+        self.remote_agent_session_ids
+            .contains(self.active().id.as_str())
+    }
+
+    fn start_remote_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_remote_agent();
+        let settings = self.runtime.remote_agent();
+        if !settings.enabled {
+            return;
+        }
+        let token = match self.runtime.remote_agent_token() {
+            Ok(token) => token.to_string(),
+            Err(error) => {
+                self.show_error(
+                    i18n::format(
+                        cx,
+                        "remote_agent.notice_start_failed",
+                        &[("error", error.to_string())],
+                    ),
+                    cx,
+                );
+                return;
+            }
+        };
+        let client = TelegramClient::new(token);
+        self.remote_agent_client = Some(client.clone());
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        self.remote_agent_stop = Some(stop_signal.clone());
+        let runtime = self.runtime.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let auth_client = client.clone();
+            match runtime
+                .spawn_background(async move {
+                    auth_client.delete_webhook().await?;
+                    auth_client.bot_username().await
+                })
+                .await
+            {
+                Ok(Ok(username)) => {
+                    diagnostics::record(
+                        DiagnosticLevel::Success,
+                        "remote_agent.telegram",
+                        format!(
+                            "Telegram relay connected{}.",
+                            username
+                                .as_deref()
+                                .map(|name| format!(" as @{name}"))
+                                .unwrap_or_default()
+                        ),
+                    );
+                }
+                Ok(Err(error)) => {
+                    diagnostics::record(
+                        DiagnosticLevel::Error,
+                        "remote_agent.telegram",
+                        format!("Telegram relay authentication failed: {error}"),
+                    );
+                    _ = this.update(cx, |app, cx| {
+                        app.notice = Some(Notice {
+                            success: false,
+                            text: i18n::format(
+                                cx,
+                                "remote_agent.notice_connection_failed",
+                                &[("error", error)],
+                            ),
+                        });
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(error) => {
+                    diagnostics::record(
+                        DiagnosticLevel::Error,
+                        "remote_agent.telegram",
+                        format!("Telegram relay task failed: {error}"),
+                    );
+                    return;
+                }
+            }
+
+            let mut offset = None;
+            loop {
+                if stop_signal.load(Ordering::Relaxed) {
+                    break;
+                }
+                let poll_client = client.clone();
+                let updates = match runtime
+                    .spawn_background(async move { poll_client.get_updates(offset).await })
+                    .await
+                {
+                    Ok(Ok(updates)) => updates,
+                    Ok(Err(error)) => {
+                        diagnostics::record(
+                            DiagnosticLevel::Warning,
+                            "remote_agent.telegram",
+                            format!("Telegram polling failed: {error}"),
+                        );
+                        cx.background_executor().timer(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        diagnostics::record(
+                            DiagnosticLevel::Warning,
+                            "remote_agent.telegram",
+                            format!("Telegram polling task failed: {error}"),
+                        );
+                        cx.background_executor().timer(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                if stop_signal.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                for update in updates {
+                    offset = Some(update.update_id + 1);
+                    _ = this.update_in(cx, |app, window, cx| {
+                        app.handle_remote_update(update, window, cx);
+                    });
+                }
+            }
+        });
+        self.remote_agent_task = Some(task);
+    }
+
+    fn stop_remote_agent(&mut self) {
+        if let Some(stop_signal) = self.remote_agent_stop.take() {
+            stop_signal.store(true, Ordering::Relaxed);
+        }
+        self.remote_agent_task.take();
+        self.remote_agent_client = None;
+        self.remote_agent_live_replies.clear();
+    }
+
+    fn handle_remote_update(
+        &mut self,
+        update: TelegramUpdate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(callback) = update.callback_query {
+            self.handle_remote_callback(callback, window, cx);
+        }
+        if let Some(message) = update.message {
+            self.handle_remote_message(message, window, cx);
+        }
+    }
+
+    fn handle_remote_message(
+        &mut self,
+        message: TelegramMessage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(user_id) = message.from.as_ref().map(|user| user.id) else {
+            return;
+        };
+        if !self.remote_user_is_allowed(user_id) {
+            if let Some(user) = message.from.as_ref() {
+                self.register_remote_access_request(user, message.chat.id, cx);
+            }
+            return;
+        }
+        self.remote_agent_chat_users
+            .insert(message.chat.id, user_id);
+
+        let text = message.text.unwrap_or_default();
+        let command = text
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .split('@')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match command.as_str() {
+            "/start" | "/help" => {
+                self.send_remote_text(
+                    message.chat.id,
+                    &i18n::text(cx, "remote_agent.bot_welcome"),
+                    Some(welcome_keyboard(cx)),
+                    cx,
+                );
+            }
+            "/subscribe" => self.subscribe_remote_chat(message.chat.id, cx),
+            "/unsubscribe" => self.unsubscribe_remote_chat(message.chat.id, cx),
+            "/status" => self.send_remote_status(message.chat.id, cx),
+            "/screenshot" => self.send_remote_screenshot(message.chat.id, cx),
+            _ if text.trim().is_empty() => {}
+            _ if self.answer_remote_user_question(message.chat.id, None, text.clone(), cx) => {}
+            _ => self.forward_remote_text(message.chat.id, text, window, cx),
+        }
+    }
+
+    fn handle_remote_callback(
+        &mut self,
+        callback: TelegramCallbackQuery,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.remote_agent_client.clone() else {
+            return;
+        };
+        let callback_id = callback.id.clone();
+        let runtime = self.runtime.clone();
+        let request = runtime
+            .spawn_background(async move { client.answer_callback_query(&callback_id).await });
+        cx.spawn(async move |_, _| {
+            let _ = request.await;
+        })
+        .detach();
+
+        let Some(message) = callback.message else {
+            return;
+        };
+        if !self.remote_user_is_allowed(callback.from.id) {
+            self.register_remote_access_request(&callback.from, message.chat.id, cx);
+            return;
+        }
+        self.remote_agent_chat_users
+            .insert(message.chat.id, callback.from.id);
+        match callback.data.as_deref() {
+            Some(data) if parse_remote_question_callback(data).is_some() => {
+                let (question_id, option_index) =
+                    parse_remote_question_callback(data).expect("the callback was checked above");
+                self.answer_remote_user_question_option(
+                    message.chat.id,
+                    question_id,
+                    option_index,
+                    cx,
+                );
+            }
+            Some("subscribe") => self.subscribe_remote_chat(message.chat.id, cx),
+            Some("unsubscribe") => self.unsubscribe_remote_chat(message.chat.id, cx),
+            Some("status") => self.send_remote_status(message.chat.id, cx),
+            Some("screenshot") => self.send_remote_screenshot(message.chat.id, cx),
+            _ => {}
+        }
+    }
+
+    fn remote_user_is_allowed(&self, user_id: i64) -> bool {
+        self.runtime
+            .remote_agent()
+            .allowed_user_ids
+            .iter()
+            .any(|allowed| allowed.parse::<i64>().ok() == Some(user_id))
+    }
+
+    fn register_remote_access_request(
+        &mut self,
+        user: &TelegramUser,
+        chat_id: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let label = user
+            .username
+            .as_ref()
+            .map(|username| format!("@{username}"))
+            .or_else(|| {
+                (!user.first_name.trim().is_empty()).then(|| user.first_name.trim().to_owned())
+            })
+            .unwrap_or_else(|| {
+                i18n::format(
+                    cx,
+                    "remote_agent.unknown_user",
+                    &[("id", user.id.to_string())],
+                )
+            });
+        let is_new = self
+            .remote_agent_pending_access
+            .insert(
+                user.id,
+                PendingRemoteAccessRequest {
+                    chat_id,
+                    label: label.clone(),
+                },
+            )
+            .is_none();
+        if !is_new {
+            return;
+        }
+        self.notice = Some(Notice {
+            success: true,
+            text: i18n::format(
+                cx,
+                "remote_agent.notice_access_requested",
+                &[("user", label.clone())],
+            ),
+        });
+        self.send_remote_text(
+            chat_id,
+            &i18n::text(cx, "remote_agent.bot_access_pending"),
+            None,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn approve_remote_access_request(&mut self, user_id: i64, cx: &mut Context<Self>) {
+        let Some(request) = self.remote_agent_pending_access.remove(&user_id) else {
+            return;
+        };
+        let mut settings = self.runtime.remote_agent();
+        if !settings
+            .allowed_user_ids
+            .iter()
+            .any(|allowed| allowed == &user_id.to_string())
+        {
+            settings.allowed_user_ids.push(user_id.to_string());
+        }
+        match self.runtime.save_remote_agent(settings, None) {
+            Ok(()) => {
+                self.remote_agent_chat_users
+                    .insert(request.chat_id, user_id);
+                self.send_remote_text(
+                    request.chat_id,
+                    &i18n::text(cx, "remote_agent.bot_access_approved"),
+                    Some(welcome_keyboard(cx)),
+                    cx,
+                );
+                self.notice = Some(Notice {
+                    success: true,
+                    text: i18n::format(
+                        cx,
+                        "remote_agent.notice_access_approved",
+                        &[("user", request.label)],
+                    ),
+                });
+            }
+            Err(error) => {
+                self.remote_agent_pending_access.insert(user_id, request);
+                self.show_error(error.to_string(), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn reject_remote_access_request(&mut self, user_id: i64, cx: &mut Context<Self>) {
+        let Some(request) = self.remote_agent_pending_access.remove(&user_id) else {
+            return;
+        };
+        self.send_remote_text(
+            request.chat_id,
+            &i18n::text(cx, "remote_agent.bot_access_rejected"),
+            None,
+            cx,
+        );
+        self.notice = Some(Notice {
+            success: true,
+            text: i18n::format(
+                cx,
+                "remote_agent.notice_access_rejected",
+                &[("user", request.label)],
+            ),
+        });
+        cx.notify();
+    }
+
+    fn revoke_remote_access(&mut self, user_id: String, cx: &mut Context<Self>) {
+        let mut settings = self.runtime.remote_agent();
+        settings
+            .allowed_user_ids
+            .retain(|allowed| allowed != &user_id);
+        if let Err(error) = self.runtime.save_remote_agent(settings, None) {
+            self.show_error(error.to_string(), cx);
+            return;
+        }
+        let Ok(user_id_number) = user_id.parse::<i64>() else {
+            return;
+        };
+        let chats = self
+            .remote_agent_chat_users
+            .iter()
+            .filter_map(|(chat_id, mapped_user_id)| {
+                (*mapped_user_id == user_id_number).then_some(*chat_id)
+            })
+            .collect::<HashSet<_>>();
+        self.remote_agent_chats
+            .retain(|chat_id, _| !chats.contains(chat_id));
+        self.remote_agent_chat_users
+            .retain(|chat_id, _| !chats.contains(chat_id));
+        self.remote_agent_live_replies
+            .retain(|_, reply| !chats.contains(&reply.chat_id));
+        self.notice = Some(Notice {
+            success: true,
+            text: i18n::format(cx, "remote_agent.notice_access_revoked", &[("id", user_id)]),
+        });
+        cx.notify();
+    }
+
+    fn subscribe_remote_chat(&mut self, chat_id: i64, cx: &mut Context<Self>) {
+        let active_session = self.active().id.clone();
+        let mut candidate_ids = Vec::new();
+        if self
+            .remote_agent_session_ids
+            .contains(active_session.as_str())
+        {
+            candidate_ids.push(active_session.as_str().to_owned());
+        }
+        candidate_ids.extend(
+            self.remote_agent_session_ids
+                .iter()
+                .filter(|id| id.as_str() != self.active().id.as_str())
+                .cloned(),
+        );
+        let Some(session_id) = candidate_ids
+            .iter()
+            .find_map(|id| {
+                self.sessions
+                    .iter()
+                    .find(|session| session.id.as_str() == id)
+            })
+            .map(|session| session.id.clone())
+        else {
+            self.send_remote_text(
+                chat_id,
+                &i18n::text(cx, "remote_agent.bot_subscribe_needs_conversation"),
+                Some(welcome_keyboard(cx)),
+                cx,
+            );
+            return;
+        };
+        self.remote_agent_chats.insert(chat_id, session_id.clone());
+        let title = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.title.clone())
+            .unwrap_or_else(|| i18n::text(cx, "remote_agent.conversation_fallback").to_string());
+        self.send_remote_text(
+            chat_id,
+            &i18n::format(cx, "remote_agent.bot_subscribed", &[("title", title)]),
+            Some(subscribed_keyboard(cx)),
+            cx,
+        );
+    }
+
+    fn unsubscribe_remote_chat(&mut self, chat_id: i64, cx: &mut Context<Self>) {
+        self.remote_agent_chats.remove(&chat_id);
+        self.send_remote_text(
+            chat_id,
+            &i18n::text(cx, "remote_agent.bot_unsubscribed"),
+            Some(welcome_keyboard(cx)),
+            cx,
+        );
+    }
+
+    fn send_remote_status(&self, chat_id: i64, cx: &mut Context<Self>) {
+        let Some(session_id) = self.remote_agent_chats.get(&chat_id) else {
+            self.send_remote_text(
+                chat_id,
+                &i18n::text(cx, "remote_agent.bot_status_not_subscribed"),
+                Some(welcome_keyboard(cx)),
+                cx,
+            );
+            return;
+        };
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+        else {
+            self.send_remote_text(
+                chat_id,
+                &i18n::text(cx, "remote_agent.bot_conversation_unavailable"),
+                None,
+                cx,
+            );
+            return;
+        };
+        let state = if session.processing {
+            i18n::text(cx, "remote_agent.status_working")
+        } else {
+            i18n::text(cx, "remote_agent.status_ready")
+        };
+        self.send_remote_text(
+            chat_id,
+            &i18n::format(
+                cx,
+                "remote_agent.bot_status",
+                &[
+                    ("state", state.to_string()),
+                    ("count", session.messages.len().to_string()),
+                ],
+            ),
+            Some(subscribed_keyboard(cx)),
+            cx,
+        );
+    }
+
+    fn send_remote_user_question(
+        &self,
+        session_id: &SessionId,
+        question: &averroes_core::tool::builtin::ask_user::UserQuestion,
+        cx: &mut Context<Self>,
+    ) {
+        let chats = self
+            .remote_agent_chats
+            .iter()
+            .filter_map(|(chat_id, mapped_session)| {
+                (mapped_session == session_id).then_some(*chat_id)
+            })
+            .collect::<Vec<_>>();
+        if chats.is_empty() {
+            return;
+        }
+        let text = i18n::format(
+            cx,
+            "remote_agent.bot_user_question",
+            &[("question", question.question.clone())],
+        );
+        let keyboard = remote_question_keyboard(question);
+        for chat_id in chats {
+            self.send_remote_text(chat_id, &text, keyboard.clone(), cx);
+        }
+    }
+
+    fn answer_remote_user_question_option(
+        &mut self,
+        chat_id: i64,
+        question_id: &str,
+        option_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self.remote_agent_chats.get(&chat_id).cloned() else {
+            return;
+        };
+        let Some(question) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.pending_user_question.clone())
+        else {
+            self.send_remote_text(
+                chat_id,
+                &i18n::text(cx, "remote_agent.bot_question_expired"),
+                Some(subscribed_keyboard(cx)),
+                cx,
+            );
+            return;
+        };
+        let Some(answer) = (question.id == question_id)
+            .then(|| question.options.get(option_index).cloned())
+            .flatten()
+        else {
+            self.send_remote_text(
+                chat_id,
+                &i18n::text(cx, "remote_agent.bot_question_expired"),
+                Some(subscribed_keyboard(cx)),
+                cx,
+            );
+            return;
+        };
+        self.answer_remote_user_question(chat_id, Some(question_id), answer, cx);
+    }
+
+    fn answer_remote_user_question(
+        &mut self,
+        chat_id: i64,
+        expected_question_id: Option<&str>,
+        answer: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(session_id) = self.remote_agent_chats.get(&chat_id).cloned() else {
+            return false;
+        };
+        let Some(question) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.pending_user_question.clone())
+        else {
+            return false;
+        };
+        let answer_for_relay = answer.clone();
+        if expected_question_id.is_some_and(|question_id| question_id != question.id)
+            || answer.trim().is_empty()
+            || !self
+                .runtime
+                .answer_user_question(&session_id, &question.id, answer)
+        {
+            self.send_remote_text(
+                chat_id,
+                &i18n::text(cx, "remote_agent.bot_question_expired"),
+                Some(subscribed_keyboard(cx)),
+                cx,
+            );
+            return true;
+        }
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        {
+            session.pending_user_question = None;
+        }
+        self.relay_remote_user_answer(
+            &session_id,
+            &answer_for_relay,
+            expected_question_id.is_none().then_some(chat_id),
+            cx,
+        );
+        self.remeasure_active_conversation_tail(&session_id);
+        self.send_remote_text(
+            chat_id,
+            &i18n::text(cx, "remote_agent.bot_answer_received"),
+            Some(subscribed_keyboard(cx)),
+            cx,
+        );
+        cx.notify();
+        true
+    }
+
+    fn forward_remote_text(
+        &mut self,
+        chat_id: i64,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self.remote_agent_chats.get(&chat_id).cloned() else {
+            self.send_remote_text(
+                chat_id,
+                &i18n::text(cx, "remote_agent.bot_not_subscribed"),
+                Some(welcome_keyboard(cx)),
+                cx,
+            );
+            return;
+        };
+        let Some(session_index) = self
+            .sessions
+            .iter()
+            .position(|session| session.id == session_id)
+        else {
+            self.remote_agent_chats.remove(&chat_id);
+            self.send_remote_text(
+                chat_id,
+                &i18n::text(cx, "remote_agent.bot_conversation_unavailable"),
+                None,
+                cx,
+            );
+            return;
+        };
+        let binding = self.sessions[session_index].binding.clone();
+        if let Err(error) = self.runtime.validate_binding(&binding) {
+            self.send_remote_text(
+                chat_id,
+                &i18n::format(
+                    cx,
+                    "remote_agent.bot_binding_error",
+                    &[("error", error.to_string())],
+                ),
+                Some(subscribed_keyboard(cx)),
+                cx,
+            );
+            return;
+        }
+        if self.sessions[session_index].processing {
+            let session = &mut self.sessions[session_index];
+            session.queued_messages.push(QueuedMessage {
+                text,
+                attachments: Vec::new(),
+                remote_origin_chat_id: Some(chat_id),
+            });
+            session.queue_autostart = true;
+            self.send_remote_text(
+                chat_id,
+                &i18n::text(cx, "remote_agent.bot_queued"),
+                None,
+                cx,
+            );
+            return;
+        }
+        self.begin_remote_request(
+            chat_id,
+            session_id,
+            text,
+            Vec::new(),
+            false,
+            Some(chat_id),
+            window,
+            cx,
+        );
+    }
+
+    fn begin_remote_request(
+        &mut self,
+        chat_id: i64,
+        session_id: SessionId,
+        text: String,
+        attachments: Vec<ComposerAttachment>,
+        clear_composer: bool,
+        remote_origin_chat_id: Option<i64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if remote_origin_chat_id.is_some() {
+            self.send_remote_typing(chat_id, cx);
+        }
+        let Some(client) = self.remote_agent_client.clone() else {
+            self.start_message_request_for_session(
+                session_id,
+                text,
+                attachments,
+                clear_composer,
+                remote_origin_chat_id,
+                window,
+                cx,
+            );
+            return;
+        };
+        let working_text = i18n::text(cx, "remote_agent.bot_working").to_string();
+        let keyboard = subscribed_keyboard(cx);
+        let runtime = self.runtime.clone();
+        let request = runtime.spawn_background(async move {
+            client
+                .send_message(chat_id, &working_text, Some(keyboard))
+                .await
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let message_id = match request.await {
+                Ok(Ok(message_id)) => Some(message_id),
+                Ok(Err(error)) => {
+                    diagnostics::record(
+                        DiagnosticLevel::Warning,
+                        "remote_agent.telegram",
+                        format!("Could not create Telegram live reply: {error}"),
+                    );
+                    None
+                }
+                Err(error) => {
+                    diagnostics::record(
+                        DiagnosticLevel::Warning,
+                        "remote_agent.telegram",
+                        format!("Telegram live reply task failed: {error}"),
+                    );
+                    None
+                }
+            };
+            _ = this.update_in(cx, |app, window, cx| {
+                if let Some(message_id) = message_id {
+                    app.remote_agent_live_replies.insert(
+                        session_id.clone(),
+                        RemoteLiveReply {
+                            chat_id,
+                            message_id,
+                            text: String::new(),
+                            last_edit: Instant::now(),
+                            edit_in_flight: false,
+                        },
+                    );
+                }
+                app.start_message_request_for_session(
+                    session_id,
+                    text,
+                    attachments,
+                    clear_composer,
+                    remote_origin_chat_id,
+                    window,
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn send_remote_typing(&self, chat_id: i64, cx: &mut Context<Self>) {
+        let Some(client) = self.remote_agent_client.clone() else {
+            return;
+        };
+        let runtime = self.runtime.clone();
+        let request = runtime
+            .spawn_background(async move { client.send_chat_action(chat_id, "typing").await });
+        cx.spawn(async move |_, _| {
+            let _ = request.await;
+        })
+        .detach();
+    }
+
+    fn send_remote_text(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_markup: Option<serde_json::Value>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.remote_agent_client.clone() else {
+            return;
+        };
+        let runtime = self.runtime.clone();
+        let text = text.to_owned();
+        let request = runtime.spawn_background(async move {
+            client.send_text_chunks(chat_id, &text, reply_markup).await
+        });
+        cx.spawn(async move |_, _| {
+            if let Ok(Err(error)) = request.await {
+                diagnostics::record(
+                    DiagnosticLevel::Warning,
+                    "remote_agent.telegram",
+                    format!("Could not send Telegram message: {error}"),
+                );
+            }
+        })
+        .detach();
+    }
+
+    fn send_remote_screenshot(&self, chat_id: i64, cx: &mut Context<Self>) {
+        let Some(client) = self.remote_agent_client.clone() else {
+            return;
+        };
+        let caption = i18n::text(cx, "remote_agent.bot_screenshot_caption").to_string();
+        let error_prefix = i18n::text(cx, "remote_agent.bot_screenshot_error").to_string();
+        let runtime = self.runtime.clone();
+        let request = runtime.spawn_background(async move {
+            match capture_desktop_screenshot().await {
+                Ok(bytes) => client.send_photo(chat_id, bytes, &caption).await,
+                Err(error) => {
+                    let _ = client.send_message(chat_id, &error_prefix, None).await;
+                    Err(error)
+                }
+            }
+        });
+        cx.spawn(async move |_, _| {
+            if let Ok(Err(error)) = request.await {
+                diagnostics::record(
+                    DiagnosticLevel::Warning,
+                    "remote_agent.telegram",
+                    format!("Could not send Telegram screenshot: {error}"),
+                );
+            }
+        })
+        .detach();
+    }
+
     fn refresh_conversation_search(&mut self, cx: &mut Context<Self>) {
         let query = self.conversation_search.read(cx).value().trim().to_owned();
         self.conversation_search_generation = self.conversation_search_generation.wrapping_add(1);
@@ -2551,27 +3587,30 @@ impl AverroesApp {
         }
     }
 
-    fn persist_session(&mut self, id: &SessionId, cx: &mut Context<Self>) {
+    fn persist_session(&mut self, id: &SessionId, cx: &mut Context<Self>) -> bool {
         let Some(index) = self.sessions.iter().position(|session| &session.id == id) else {
-            return;
+            return false;
         };
         let snapshot = self.sessions[index].snapshot();
-        match self.runtime.database.save_conversation(&snapshot) {
+        let saved = match self.runtime.database.save_conversation(&snapshot) {
             Ok(()) => {
                 self.sessions[index].persisted = true;
                 self.persist_pending_conversation_folder(index, cx);
                 self.refresh_navigation();
                 self.schedule_background_indexing(cx);
                 self.persist_window_state();
+                true
             }
             Err(error) => {
                 self.notice = Some(Notice {
                     success: false,
                     text: error.to_string(),
                 });
+                false
             }
-        }
+        };
         cx.notify();
+        saved
     }
 
     fn persist_pending_conversation_folder(
@@ -2933,9 +3972,11 @@ impl AverroesApp {
 
         let attachments = std::mem::take(&mut self.attachments);
         let session = self.active_mut();
-        session
-            .queued_messages
-            .push(QueuedMessage { text, attachments });
+        session.queued_messages.push(QueuedMessage {
+            text,
+            attachments,
+            remote_origin_chat_id: None,
+        });
         session.queue_autostart = true;
         self.composer
             .update(cx, |state, cx| state.set_value("", window, cx));
@@ -2985,6 +4026,11 @@ impl AverroesApp {
         self.stream_recovery_checkpoints.remove(&session_id);
         self.persist_session(&session_id, cx);
         self.set_persisted_processing(&session_id, false);
+        self.cancel_remote_live_reply(
+            &session_id,
+            i18n::text(cx, "remote_agent.bot_stopped").to_string(),
+            cx,
+        );
         cx.notify();
     }
 
@@ -3011,7 +4057,16 @@ impl AverroesApp {
         if self.active().queued_messages.is_empty() {
             self.active_mut().queue_autostart = false;
         }
-        self.start_message_request(message.text, message.attachments, false, window, cx);
+        let session_id = self.active().id.clone();
+        self.start_relayable_message_request_for_session(
+            session_id,
+            message.text,
+            message.attachments,
+            false,
+            message.remote_origin_chat_id,
+            window,
+            cx,
+        );
     }
 
     fn force_send_queued_message(
@@ -3028,7 +4083,16 @@ impl AverroesApp {
             self.stop_active_stream(cx);
         }
         self.active_mut().queue_autostart = !self.active().queued_messages.is_empty();
-        self.start_message_request(message.text, message.attachments, false, window, cx);
+        let session_id = self.active().id.clone();
+        self.start_relayable_message_request_for_session(
+            session_id,
+            message.text,
+            message.attachments,
+            false,
+            message.remote_origin_chat_id,
+            window,
+            cx,
+        );
     }
 
     fn new_session_for_project(
@@ -5085,6 +6149,7 @@ impl AverroesApp {
                         message.assistant_text_arrived();
                     }
                 }
+                self.relay_remote_stream_delta(session_id, &text, cx);
             }
             AgentStreamEvent::ReasoningDelta { text } => {
                 let Some(session) = self
@@ -5180,6 +6245,7 @@ impl AverroesApp {
                 } else {
                     None
                 };
+                let remote_user_question = user_question.clone();
                 self.record_tool_source(session_id, &name);
                 if let Some(session) = self
                     .sessions
@@ -5224,6 +6290,9 @@ impl AverroesApp {
                             });
                         }
                     }
+                }
+                if let Some(question) = remote_user_question.as_ref() {
+                    self.send_remote_user_question(session_id, question, cx);
                 }
             }
             AgentStreamEvent::ToolFinished {
@@ -5454,6 +6523,7 @@ impl AverroesApp {
             self.show_error(i18n::text(cx, "notice.enter_answer"), cx);
             return;
         }
+        let answer_for_relay = answer.clone();
         if !self
             .runtime
             .answer_user_question(session_id, &question.id, answer)
@@ -5468,6 +6538,7 @@ impl AverroesApp {
         {
             session.pending_user_question = None;
         }
+        self.relay_remote_user_answer(session_id, &answer_for_relay, None, cx);
         self.ask_user_input
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.remeasure_active_conversation_tail(session_id);
@@ -6476,9 +7547,81 @@ impl AverroesApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let binding = self.active().binding.clone();
+        let session_id = self.active().id.clone();
+        self.start_relayable_message_request_for_session(
+            session_id,
+            text,
+            attachments,
+            clear_composer,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    fn start_relayable_message_request_for_session(
+        &mut self,
+        session_id: SessionId,
+        text: String,
+        attachments: Vec<ComposerAttachment>,
+        clear_composer: bool,
+        remote_origin_chat_id: Option<i64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let relay_chat_id = remote_origin_chat_id.or_else(|| {
+            self.remote_agent_chats
+                .iter()
+                .find_map(|(chat_id, mapped_session)| {
+                    (mapped_session == &session_id).then_some(*chat_id)
+                })
+        });
+        if let Some(chat_id) = relay_chat_id {
+            self.begin_remote_request(
+                chat_id,
+                session_id,
+                text,
+                attachments,
+                clear_composer,
+                remote_origin_chat_id,
+                window,
+                cx,
+            );
+        } else {
+            self.start_message_request_for_session(
+                session_id,
+                text,
+                attachments,
+                clear_composer,
+                remote_origin_chat_id,
+                window,
+                cx,
+            );
+        }
+    }
+
+    fn start_message_request_for_session(
+        &mut self,
+        session_id: SessionId,
+        text: String,
+        attachments: Vec<ComposerAttachment>,
+        clear_composer: bool,
+        remote_origin_chat_id: Option<i64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_index) = self
+            .sessions
+            .iter()
+            .position(|session| session.id == session_id)
+        else {
+            return;
+        };
+        let binding = self.sessions[session_index].binding.clone();
         if let Err(error) = self.runtime.validate_binding(&binding) {
-            self.attachments.extend(attachments);
+            if self.active().id == session_id {
+                self.attachments.extend(attachments);
+            }
             self.show_error(error.to_string(), cx);
             return;
         }
@@ -6497,19 +7640,20 @@ impl AverroesApp {
             ),
         );
 
-        let session_id = self.active().id.clone();
-        let existing_agent = self.active().agent.clone();
+        let existing_agent = self.sessions[session_index].agent.clone();
         let reuse_existing_agent = existing_agent.is_some();
-        let working_dir = self.active().workspace_root.clone();
-        let restored_history = shell_messages_to_agent_history(&self.active().messages);
-        let restored_context = self.active().context_summary.clone();
-        let restored_usage = self.active().context_usage;
+        let working_dir = self.sessions[session_index].workspace_root.clone();
+        let restored_history =
+            shell_messages_to_agent_history(&self.sessions[session_index].messages);
+        let restored_context = self.sessions[session_index].context_summary.clone();
+        let restored_usage = self.sessions[session_index].context_usage;
         let attachment_paths = attachments
             .iter()
             .map(|attachment| attachment.path.clone())
             .collect::<Vec<_>>();
         let attachments_for_error = attachments.clone();
         let display_text = composer_message_label(&text, &attachments);
+        let relay_text = display_text.clone();
         let title_source = if text.is_empty() {
             attachments
                 .first()
@@ -6518,33 +7662,45 @@ impl AverroesApp {
         } else {
             text.clone()
         };
-        let should_generate_title = self.active().messages.is_empty();
+        let should_generate_title = self.sessions[session_index].messages.is_empty();
         let fallback_title = short_title(&title_source);
 
         if should_generate_title {
-            self.active_mut().title = fallback_title.clone();
+            self.sessions[session_index].title = fallback_title.clone();
         }
-        self.active_mut()
+        self.sessions[session_index]
             .messages
             .push(ShellMessage::user_with_attachments(
                 display_text,
                 attachment_paths.clone(),
             ));
-        self.active_mut().messages.push(ShellMessage::assistant());
-        self.active_mut().processing = true;
-        self.active_mut().unread = false;
-        self.reset_conversation_scroll();
+        self.sessions[session_index]
+            .messages
+            .push(ShellMessage::assistant());
+        self.sessions[session_index].processing = true;
+        self.sessions[session_index].unread = false;
+        if self.active().id == session_id {
+            self.reset_conversation_scroll();
+        }
         self.notice = None;
-        if clear_composer {
+        if clear_composer && self.active().id == session_id {
             self.composer
                 .update(cx, |state, cx| state.set_value("", window, cx));
         }
-        if !self.persist_active(cx) {
-            self.active_mut().processing = false;
-            self.attachments = attachments;
+        if !self.persist_session(&session_id, cx) {
+            self.sessions[session_index].processing = false;
+            if self.active().id == session_id {
+                self.attachments = attachments;
+            }
+            self.cancel_remote_live_reply(
+                &session_id,
+                i18n::text(cx, "remote_agent.bot_request_not_started").to_string(),
+                cx,
+            );
             return;
         }
         self.set_persisted_processing(&session_id, true);
+        self.relay_remote_user_message(&session_id, &relay_text, remote_origin_chat_id, cx);
         cx.notify();
 
         let runtime = self.runtime.clone();
@@ -6598,6 +7754,7 @@ impl AverroesApp {
                         app.remeasure_active_conversation_tail(&stream_session_id);
                         app.persist_session(&stream_session_id, cx);
                         app.set_persisted_processing(&stream_session_id, false);
+                        app.relay_remote_session_completion(&stream_session_id, cx);
                         if let Some(title) = notification_title {
                             app.notify_conversation_ready(&stream_session_id, &title, cx);
                         }
@@ -6673,6 +7830,7 @@ impl AverroesApp {
                                 app.remeasure_active_conversation_tail(&stream_session_id);
                                 app.persist_session(&stream_session_id, cx);
                                 app.set_persisted_processing(&stream_session_id, false);
+                                app.relay_remote_session_completion(&stream_session_id, cx);
                                 if let Some(title) = notification_title {
                                     app.notify_conversation_ready(&stream_session_id, &title, cx);
                                 }
@@ -6919,11 +8077,9 @@ impl AverroesApp {
                 app.remeasure_active_conversation_tail(&stream_session_id);
                 app.persist_session(&stream_session_id, cx);
                 app.set_persisted_processing(&stream_session_id, false);
+                app.relay_remote_session_completion(&stream_session_id, cx);
                 if let Some(title) = notification_title {
                     app.notify_conversation_ready(&stream_session_id, &title, cx);
-                }
-                if app.active().id != stream_session_id {
-                    return None;
                 }
                 app.sessions
                     .iter_mut()
@@ -6939,11 +8095,239 @@ impl AverroesApp {
             });
             if let Ok(Some(message)) = next_queued_message {
                 let _ = this.update_in(cx, |app, window, cx| {
-                    app.start_message_request(message.text, message.attachments, false, window, cx)
+                    app.start_relayable_message_request_for_session(
+                        stream_session_id,
+                        message.text,
+                        message.attachments,
+                        false,
+                        message.remote_origin_chat_id,
+                        window,
+                        cx,
+                    )
                 });
             }
         });
-        self.active_mut().task = Some(task);
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        {
+            session.task = Some(task);
+        }
+    }
+
+    fn relay_remote_stream_delta(
+        &mut self,
+        session_id: &SessionId,
+        delta: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if delta.is_empty() {
+            return;
+        }
+        let Some(reply) = self.remote_agent_live_replies.get_mut(session_id) else {
+            return;
+        };
+        reply.text.push_str(delta);
+        if reply.edit_in_flight || reply.last_edit.elapsed() < REMOTE_LIVE_EDIT_INTERVAL {
+            return;
+        }
+        self.schedule_remote_live_edit(session_id, cx);
+    }
+
+    fn relay_remote_user_message(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+        remote_origin_chat_id: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let chats = self
+            .remote_agent_chats
+            .iter()
+            .filter_map(|(chat_id, mapped_session)| {
+                (mapped_session == session_id && Some(*chat_id) != remote_origin_chat_id)
+                    .then_some(*chat_id)
+            })
+            .collect::<Vec<_>>();
+        if chats.is_empty() {
+            return;
+        }
+        let message = i18n::format(
+            cx,
+            "remote_agent.bot_desktop_message",
+            &[("message", text.to_owned())],
+        );
+        for chat_id in chats {
+            self.send_remote_text(chat_id, &message, Some(subscribed_keyboard(cx)), cx);
+        }
+    }
+
+    fn relay_remote_user_answer(
+        &self,
+        session_id: &SessionId,
+        answer: &str,
+        excluded_chat_id: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        let chats = self
+            .remote_agent_chats
+            .iter()
+            .filter_map(|(chat_id, mapped_session)| {
+                (mapped_session == session_id && Some(*chat_id) != excluded_chat_id)
+                    .then_some(*chat_id)
+            })
+            .collect::<Vec<_>>();
+        if chats.is_empty() {
+            return;
+        }
+        let message = i18n::format(
+            cx,
+            "remote_agent.bot_user_answer",
+            &[("answer", answer.to_owned())],
+        );
+        for chat_id in chats {
+            self.send_remote_text(chat_id, &message, Some(subscribed_keyboard(cx)), cx);
+        }
+    }
+
+    fn schedule_remote_live_edit(&mut self, session_id: &SessionId, cx: &mut Context<Self>) {
+        let Some(reply) = self.remote_agent_live_replies.get_mut(session_id) else {
+            return;
+        };
+        if reply.edit_in_flight || reply.text.is_empty() {
+            return;
+        }
+        let Some(client) = self.remote_agent_client.clone() else {
+            return;
+        };
+        reply.edit_in_flight = true;
+        let chat_id = reply.chat_id;
+        let message_id = reply.message_id;
+        let text = format!("🤖 {}", reply.text);
+        let runtime = self.runtime.clone();
+        let session_id = session_id.clone();
+        let request = runtime.spawn_background(async move {
+            client.edit_message_text(chat_id, message_id, &text).await
+        });
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            _ = this.update(cx, |app, _| {
+                if let Some(reply) = app.remote_agent_live_replies.get_mut(&session_id) {
+                    reply.edit_in_flight = false;
+                    reply.last_edit = Instant::now();
+                }
+            });
+            if let Ok(Err(error)) = result {
+                diagnostics::record(
+                    DiagnosticLevel::Warning,
+                    "remote_agent.telegram",
+                    format!("Could not update Telegram live reply: {error}"),
+                );
+            }
+        })
+        .detach();
+    }
+
+    fn relay_remote_session_completion(&mut self, session_id: &SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+        else {
+            return;
+        };
+        let Some(message) = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| !message.text.is_empty())
+        else {
+            return;
+        };
+        let text = if message.role == MessageRole::Error {
+            i18n::text(cx, "remote_agent.bot_request_failed").to_string()
+        } else {
+            message.text.clone()
+        };
+        let live_chat_id = self
+            .remote_agent_live_replies
+            .remove(session_id)
+            .map(|reply| {
+                let final_text = format!("🤖 {text}");
+                if final_text.chars().count() <= 4096 {
+                    self.schedule_remote_edit_message(
+                        reply.chat_id,
+                        reply.message_id,
+                        final_text,
+                        cx,
+                    );
+                } else {
+                    self.send_remote_text(
+                        reply.chat_id,
+                        &final_text,
+                        Some(subscribed_keyboard(cx)),
+                        cx,
+                    );
+                }
+                reply.chat_id
+            });
+        let chats = self
+            .remote_agent_chats
+            .iter()
+            .filter_map(|(chat_id, mapped_session)| {
+                (mapped_session == session_id && Some(*chat_id) != live_chat_id).then_some(*chat_id)
+            })
+            .collect::<Vec<_>>();
+        for chat_id in chats {
+            self.send_remote_text(
+                chat_id,
+                &format!("🤖 {text}"),
+                Some(subscribed_keyboard(cx)),
+                cx,
+            );
+        }
+    }
+
+    fn cancel_remote_live_reply(
+        &mut self,
+        session_id: &SessionId,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(reply) = self.remote_agent_live_replies.remove(session_id) else {
+            return;
+        };
+        self.schedule_remote_edit_message(reply.chat_id, reply.message_id, text, cx);
+    }
+
+    fn schedule_remote_edit_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.remote_agent_client.clone() else {
+            return;
+        };
+        let runtime = self.runtime.clone();
+        let request = runtime.spawn_background(async move {
+            client.edit_message_text(chat_id, message_id, &text).await
+        });
+        cx.spawn(async move |_, _| {
+            if let Ok(Err(error)) = request.await {
+                diagnostics::record(
+                    DiagnosticLevel::Warning,
+                    "remote_agent.telegram",
+                    format!("Could not finalize Telegram live reply: {error}"),
+                );
+            }
+        })
+        .detach();
     }
 
     fn regenerate_assistant_message(
@@ -6995,6 +8379,9 @@ impl AverroesApp {
         if !self.active().messages.is_empty() {
             self.persist_session(&closing_session_id, cx);
         }
+        self.remote_agent_chats
+            .retain(|_, mapped_session| mapped_session != &closing_session_id);
+        self.remote_agent_live_replies.remove(&closing_session_id);
         self.stream_recovery_checkpoints.remove(&closing_session_id);
         self.sessions.remove(self.active_session);
         if self.sessions.is_empty() {
@@ -7209,7 +8596,69 @@ impl AverroesApp {
             .flex_col()
             .gap(px(8.0))
             .child(self.render_queued_messages(cx))
+            .child(self.render_remote_agent_banner(cx))
             .child(self.render_composer(compact, cx))
+            .into_any_element()
+    }
+
+    fn render_remote_agent_banner(&self, cx: &mut Context<Self>) -> AnyElement {
+        if !self.remote_agent_is_active() {
+            return div().into_any_element();
+        }
+
+        let theme = UiTheme::current(cx);
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(9.0))
+            .px(px(12.0))
+            .py(px(9.0))
+            .rounded(px(10.0))
+            .bg(theme.success_soft)
+            .border_1()
+            .border_color(theme.success.opacity(0.28))
+            .child(
+                div()
+                    .size(px(25.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.0))
+                    .bg(theme.success)
+                    .text_color(theme.background)
+                    .child(Icon::new(IconName::Bot).size(px(15.0))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.success)
+                            .child(i18n::text(cx, "remote_agent.active_title")),
+                    )
+                    .child(
+                        div()
+                            .mt(px(2.0))
+                            .text_size(px(10.5))
+                            .text_color(theme.muted)
+                            .child(i18n::text(cx, "remote_agent.active_description")),
+                    ),
+            )
+            .child(
+                Button::new("remote-agent-disable")
+                    .ghost()
+                    .small()
+                    .label(i18n::text(cx, "remote_agent.disable"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let session_id = this.active().id.to_string();
+                        this.remote_agent_session_ids.remove(&session_id);
+                        cx.notify();
+                    })),
+            )
             .into_any_element()
     }
 
@@ -8268,6 +9717,22 @@ impl AverroesApp {
                             .items_center()
                             .gap(px(4.0))
                             .flex_none()
+                            .child(
+                                Button::new("remote-agent-compose")
+                                    .ghost()
+                                    .small()
+                                    .selected(self.remote_agent_is_active())
+                                    .icon(IconName::Bot)
+                                    .label(if self.remote_agent_is_active() {
+                                        i18n::text(cx, "remote_agent.on_short")
+                                    } else {
+                                        i18n::text(cx, "remote_agent.share_short")
+                                    })
+                                    .tooltip(i18n::text(cx, "remote_agent.compose_tooltip"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_remote_agent_for_active(cx);
+                                    })),
+                            )
                             .child(
                                 Select::new(&self.model_select)
                                     .w(px(148.0))
@@ -10716,6 +12181,9 @@ impl AverroesApp {
             .when(self.settings_tab == SettingsTab::Agents, |this| {
                 this.child(self.render_settings_agents(cx))
             })
+            .when(self.settings_tab == SettingsTab::RemoteAgent, |this| {
+                this.child(self.render_settings_remote_agent(cx))
+            })
             .when(self.settings_tab == SettingsTab::Diagnostics, |this| {
                 this.child(self.render_settings_diagnostics(cx))
             })
@@ -10776,6 +12244,9 @@ impl AverroesApp {
             .when(self.settings_tab == SettingsTab::Agents, |this| {
                 this.child(self.render_settings_agents(cx))
             })
+            .when(self.settings_tab == SettingsTab::RemoteAgent, |this| {
+                this.child(self.render_settings_remote_agent(cx))
+            })
             .when(self.settings_tab == SettingsTab::Diagnostics, |this| {
                 this.child(self.render_settings_diagnostics(cx))
             })
@@ -10793,6 +12264,11 @@ impl AverroesApp {
         let tabs = [
             (SettingsTab::Models, "settings.models", "models"),
             (SettingsTab::Agents, "settings.agents", "agents"),
+            (
+                SettingsTab::RemoteAgent,
+                "settings.remote_agent",
+                "remote-agent",
+            ),
             (
                 SettingsTab::Diagnostics,
                 "settings.diagnostics",
@@ -10835,6 +12311,541 @@ impl AverroesApp {
                     }))
                     .into_any_element()
             }))
+            .into_any_element()
+    }
+
+    fn render_settings_remote_agent(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let settings = self.runtime.remote_agent();
+        let token_configured = self.runtime.has_remote_agent_token();
+        let relay_ready = settings.enabled && token_configured;
+        let active_conversations = self.remote_agent_session_ids.len();
+        let allowed_users = settings.allowed_user_ids.len();
+        let mut pending_requests = self
+            .remote_agent_pending_access
+            .iter()
+            .map(|(user_id, request)| (*user_id, request.clone()))
+            .collect::<Vec<_>>();
+        pending_requests.sort_by(|(_, left), (_, right)| left.label.cmp(&right.label));
+        let mut approved_users = settings.allowed_user_ids.clone();
+        approved_users.sort();
+        let (status_label, status_color, status_background) = if relay_ready {
+            (
+                i18n::text(cx, "settings.remote_agent_status_ready"),
+                theme.success,
+                theme.success_soft,
+            )
+        } else if token_configured {
+            (
+                i18n::text(cx, "settings.remote_agent_status_paused"),
+                theme.warning,
+                theme.surface,
+            )
+        } else {
+            (
+                i18n::text(cx, "settings.remote_agent_status_not_configured"),
+                theme.faint,
+                theme.surface,
+            )
+        };
+        let notice = self.notice.clone().map(|notice| {
+            div()
+                .mt(px(14.0))
+                .p(px(10.0))
+                .rounded(px(8.0))
+                .bg(if notice.success {
+                    theme.success_soft
+                } else {
+                    theme.destructive_soft
+                })
+                .text_color(if notice.success {
+                    theme.success
+                } else {
+                    theme.destructive
+                })
+                .text_size(px(11.0))
+                .child(notice.text)
+                .into_any_element()
+        });
+
+        let detail_row = |icon: IconName, title: SharedString, description: SharedString| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .px(px(14.0))
+                .py(px(12.0))
+                .rounded(px(10.0))
+                .bg(theme.surface)
+                .child(
+                    div()
+                        .size(px(32.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(9.0))
+                        .bg(theme.accent_soft)
+                        .child(Icon::new(icon).size(px(16.0)).text_color(theme.foreground)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .mt(px(3.0))
+                                .text_size(px(11.0))
+                                .text_color(theme.muted)
+                                .child(description),
+                        ),
+                )
+                .into_any_element()
+        };
+
+        div()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .mx_auto()
+                    .w_full()
+                    .max_w(px(1100.0))
+                    .h_full()
+                    .px(px(32.0))
+                    .py(px(30.0))
+                    .flex()
+                    .gap(px(24.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .min_h(px(0.0))
+                            .child(settings_page_title(
+                                i18n::text(cx, "settings.remote_agent_title"),
+                                i18n::text(cx, "settings.remote_agent_description"),
+                                theme,
+                            ))
+                            .child(
+                                div()
+                                    .mt(px(22.0))
+                                    .p(px(18.0))
+                                    .rounded(px(12.0))
+                                    .bg(theme.surface_subtle)
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(11.0))
+                                            .child(
+                                                div()
+                                                    .size(px(34.0))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(9.0))
+                                                    .bg(theme.accent_soft)
+                                                    .text_color(theme.foreground)
+                                                    .child(Icon::new(IconName::Bot).size(px(17.0))),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .child(
+                                                        div()
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .child(i18n::text(
+                                                                cx,
+                                                                "settings.remote_agent_relay_title",
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .mt(px(3.0))
+                                                            .text_size(px(11.0))
+                                                            .text_color(theme.muted)
+                                                            .child(i18n::text(
+                                                                cx,
+                                                                "settings.remote_agent_connect_description",
+                                                            )),
+                                                    )
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .px(px(9.0))
+                                                    .py(px(4.0))
+                                                    .rounded_full()
+                                                    .bg(status_background)
+                                                    .text_size(px(10.0))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(status_color)
+                                                    .child(status_label),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt(px(14.0))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(14.0))
+                                            .text_size(px(11.0))
+                                            .text_color(theme.muted)
+                                            .child(
+                                                div()
+                                                    .child(format!(
+                                                        "{} {}",
+                                                        if token_configured {
+                                                            "✓"
+                                                        } else {
+                                                            "–"
+                                                        },
+                                                        i18n::text(
+                                                            cx,
+                                                            if token_configured {
+                                                                "settings.remote_agent_token_saved"
+                                                            } else {
+                                                                "settings.remote_agent_token_missing"
+                                                            },
+                                                        )
+                                                    )),
+                                            )
+                                            .child(i18n::format(
+                                                cx,
+                                                "settings.remote_agent_allowed_count",
+                                                &[("count", allowed_users.to_string())],
+                                            ))
+                                            .child(i18n::format(
+                                                cx,
+                                                "settings.remote_agent_active_count",
+                                                &[("count", active_conversations.to_string())],
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(22.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(i18n::text(cx, "settings.remote_agent_flow_title")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("remote-agent-details-scroll")
+                                    .mt(px(10.0))
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .overflow_y_scrollbar()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(9.0))
+                                    .child(detail_row(
+                                        IconName::Bot,
+                                        i18n::text(cx, "settings.remote_agent_live_title"),
+                                        i18n::text(cx, "settings.remote_agent_live_description"),
+                                    ))
+                                    .child(detail_row(
+                                        IconName::Eye,
+                                        i18n::text(cx, "settings.remote_agent_screenshots_title"),
+                                        i18n::text(cx, "settings.remote_agent_screenshots_description"),
+                                    ))
+                                    .child(detail_row(
+                                        IconName::Network,
+                                        i18n::text(cx, "settings.remote_agent_security_title"),
+                                        i18n::text(cx, "settings.remote_agent_security_description"),
+                                    ))
+                                    .child(
+                                        div()
+                                            .mt(px(5.0))
+                                            .p(px(14.0))
+                                            .rounded(px(10.0))
+                                            .bg(theme.surface)
+                                            .text_size(px(11.0))
+                                            .line_height(px(17.0))
+                                            .text_color(theme.muted)
+                                            .child(i18n::text(
+                                                cx,
+                                                "settings.remote_agent_flow_description",
+                                            )),
+                                    ),
+                            )
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(330.0))
+                            .h_full()
+                            .min_h(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .overflow_y_scrollbar()
+                            .p(px(18.0))
+                            .rounded(px(12.0))
+                            .bg(theme.surface_subtle)
+                            .child(
+                                div()
+                                    .font(UiTheme::display_font())
+                                    .text_size(px(17.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(i18n::text(cx, "settings.remote_agent_connect_title")),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(5.0))
+                                    .mb(px(16.0))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted)
+                                    .child(i18n::text(cx, "settings.remote_agent_connect_description")),
+                            )
+                            .child(form_label(i18n::text(cx, "settings.remote_agent_token"), theme))
+                            .child(Input::new(&self.remote_agent_token_input).w_full().mask_toggle())
+                            .child(
+                                div()
+                                    .mt(px(7.0))
+                                    .text_size(px(10.5))
+                                    .text_color(theme.faint)
+                                    .child(i18n::text(cx, "settings.remote_agent_token_help")),
+                            )
+                            .child(
+                                form_label(
+                                    i18n::text(cx, "settings.remote_agent_pairing_title"),
+                                    theme,
+                                )
+                                .mt(px(18.0)),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(7.0))
+                                    .text_size(px(10.5))
+                                    .text_color(theme.faint)
+                                    .child(i18n::text(
+                                        cx,
+                                        "settings.remote_agent_pairing_description",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(9.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(6.0))
+                                    .when(pending_requests.is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .p(px(10.0))
+                                                .rounded(px(8.0))
+                                                .bg(theme.surface)
+                                                .text_size(px(10.5))
+                                                .text_color(theme.muted)
+                                                .child(i18n::text(
+                                                    cx,
+                                                    "settings.remote_agent_pairing_empty",
+                                                )),
+                                        )
+                                    })
+                                    .children(pending_requests.into_iter().map(
+                                        |(user_id, request)| {
+                                            let approve_user_id = user_id;
+                                            let reject_user_id = user_id;
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "remote-agent-pending-{user_id}"
+                                                )))
+                                                .p(px(10.0))
+                                                .rounded(px(8.0))
+                                                .bg(theme.surface)
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.0))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .child(request.label),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .mt(px(8.0))
+                                                        .flex()
+                                                        .gap(px(6.0))
+                                                        .child(
+                                                            Button::new(format!(
+                                                                "approve-remote-access-{approve_user_id}"
+                                                            ))
+                                                            .primary()
+                                                            .label(i18n::text(
+                                                                cx,
+                                                                "settings.remote_agent_approve",
+                                                            ))
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.approve_remote_access_request(
+                                                                        approve_user_id,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                        )
+                                                        .child(
+                                                            Button::new(format!(
+                                                                "reject-remote-access-{reject_user_id}"
+                                                            ))
+                                                            .secondary()
+                                                            .label(i18n::text(
+                                                                cx,
+                                                                "settings.remote_agent_reject",
+                                                            ))
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.reject_remote_access_request(
+                                                                        reject_user_id,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                        ),
+                                                )
+                                                .into_any_element()
+                                        },
+                                    )),
+                            )
+                            .child(
+                                form_label(
+                                    i18n::text(cx, "settings.remote_agent_allowed_users"),
+                                    theme,
+                                )
+                                .mt(px(16.0)),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(7.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(6.0))
+                                    .when(approved_users.is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .p(px(10.0))
+                                                .rounded(px(8.0))
+                                                .bg(theme.surface)
+                                                .text_size(px(10.5))
+                                                .text_color(theme.muted)
+                                                .child(i18n::text(
+                                                    cx,
+                                                    "settings.remote_agent_allowed_users_help",
+                                                )),
+                                        )
+                                    })
+                                    .children(approved_users.into_iter().map(|user_id| {
+                                        let revoke_user_id = user_id.clone();
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "remote-agent-approved-{user_id}"
+                                            )))
+                                            .px(px(10.0))
+                                            .py(px(8.0))
+                                            .rounded(px(8.0))
+                                            .bg(theme.surface)
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap(px(8.0))
+                                            .child(
+                                                div()
+                                                    .min_w(px(0.0))
+                                                    .text_size(px(11.0))
+                                                    .text_color(theme.foreground)
+                                                    .child(user_id),
+                                            )
+                                            .child(
+                                                Button::new(format!(
+                                                    "revoke-remote-access-{revoke_user_id}"
+                                                ))
+                                                .secondary()
+                                                .label(i18n::text(
+                                                    cx,
+                                                    "settings.remote_agent_revoke",
+                                                ))
+                                                .on_click(cx.listener(
+                                                    move |this, _, _, cx| {
+                                                        this.revoke_remote_access(
+                                                            revoke_user_id.clone(),
+                                                            cx,
+                                                        );
+                                                    },
+                                                )),
+                                            )
+                                            .into_any_element()
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(18.0))
+                                    .p(px(11.0))
+                                    .rounded(px(9.0))
+                                    .bg(theme.surface)
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted)
+                                    .child(i18n::format(
+                                        cx,
+                                        "settings.remote_agent_relay_summary",
+                                        &[
+                                            (
+                                                "token",
+                                                i18n::text(
+                                                    cx,
+                                                    if token_configured {
+                                                        "settings.remote_agent_token_saved"
+                                                    } else {
+                                                        "settings.remote_agent_token_missing"
+                                                    },
+                                                )
+                                                .to_string(),
+                                            ),
+                                            ("allowed", allowed_users.to_string()),
+                                            ("active", active_conversations.to_string()),
+                                        ],
+                                    )),
+                            )
+                            .when_some(notice, |this, notice| this.child(notice))
+                            .child(
+                                div()
+                                    .mt(px(18.0))
+                                    .flex()
+                                    .gap(px(8.0))
+                                    .child(
+                                        Button::new("save-remote-agent")
+                                            .primary()
+                                            .icon(IconName::CircleCheck)
+                                            .label(i18n::text(cx, "settings.remote_agent_save"))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.save_remote_agent(window, cx);
+                                            })),
+                                    )
+                                    .when(relay_ready, |this| {
+                                        this.child(
+                                            Button::new("pause-remote-agent")
+                                                .secondary()
+                                                .label(i18n::text(cx, "settings.remote_agent_pause"))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.pause_remote_agent(cx);
+                                                })),
+                                        )
+                                    }),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -14970,6 +16981,7 @@ fn settings_tab_description(tab: SettingsTab) -> &'static str {
         SettingsTab::Connections => "settings.global_connections",
         SettingsTab::Models => "settings.provider_catalogs",
         SettingsTab::Agents => "settings.delegated_agents_description",
+        SettingsTab::RemoteAgent => "settings.remote_agent_description",
         SettingsTab::Diagnostics => "settings.session_trace_short",
         SettingsTab::Storage => "settings.local_storage",
         SettingsTab::About => "settings.about_description",
@@ -15357,5 +17369,30 @@ mod workspace_grouping_tests {
         assert_eq!(agent_id_from_name("Research & News"), "research-news");
         assert_eq!(agent_id_from_name("  Mi agente  "), "mi-agente");
         assert_eq!(agent_id_from_name("!!!"), "agent");
+    }
+}
+
+#[cfg(test)]
+mod remote_agent_question_tests {
+    use super::{parse_remote_question_callback, remote_question_keyboard};
+    use averroes_core::tool::builtin::ask_user::UserQuestion;
+
+    #[test]
+    fn question_options_round_trip_through_telegram_callbacks() {
+        let question = UserQuestion {
+            id: "question-1234abcd".into(),
+            question: "Continue?".into(),
+            options: vec!["Yes".into(), "No".into()],
+        };
+
+        let keyboard = remote_question_keyboard(&question).expect("options create a keyboard");
+        let callback = keyboard["inline_keyboard"][1][0]["callback_data"]
+            .as_str()
+            .expect("callback data");
+
+        assert_eq!(
+            parse_remote_question_callback(callback),
+            Some(("question-1234abcd", 1))
+        );
     }
 }

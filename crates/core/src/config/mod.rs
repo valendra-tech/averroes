@@ -144,10 +144,22 @@ mod tests {
     fn default_settings_have_no_connection_or_model_default() {
         let settings = AppConfig::default();
         assert!(settings.connections.is_empty());
+        assert!(!settings.remote_agent.enabled);
+        assert!(settings.remote_agent.allowed_user_ids.is_empty());
         let source = toml::to_string(&settings).unwrap();
         assert!(!source.contains("api_key"));
         assert!(!source.contains("default_provider"));
         assert!(!source.contains("default_model"));
+    }
+
+    #[test]
+    fn old_settings_without_remote_agent_use_safe_defaults() {
+        let source = r#"
+version = 1
+"#;
+
+        let settings: AppConfig = toml::from_str(source).unwrap();
+        assert_eq!(settings.remote_agent, RemoteAgentSection::default());
     }
 
     #[test]

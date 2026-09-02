@@ -3,6 +3,7 @@
 mod app;
 mod i18n;
 mod keychain;
+mod remote_agent;
 mod runtime;
 mod session;
 mod shortcuts;

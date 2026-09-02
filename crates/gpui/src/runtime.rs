@@ -7,7 +7,7 @@ use averroes_core::agent::{Agent, AgentConfig, AgentStreamEvent};
 use averroes_core::codex::{CodexAccount, CodexClient, CodexError, CodexLogin, CodexModel};
 use averroes_core::compaction::{CompactionConfig, CompactionStrategyType};
 use averroes_core::config::AgentProfile;
-use averroes_core::config::{AppConfig, ConfigError, ConfigPaths};
+use averroes_core::config::{AppConfig, ConfigError, ConfigPaths, RemoteAgentSection};
 use averroes_core::connection::{
     ConnectionId, ConnectionKind, ConnectionProfile, CredentialRef, SessionBinding,
 };
@@ -48,11 +48,13 @@ use std::io::{Cursor, Read};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 const DEFAULT_COMPACTION_THRESHOLD: f64 = 0.8;
 const MAX_CONCURRENT_CALLS: usize = tokio::sync::Semaphore::MAX_PERMITS;
 const MAX_MARKETPLACE_SKILL_FILES: usize = 256;
 const MAX_MARKETPLACE_SKILL_BYTES: usize = 32 * 1024 * 1024;
+const REMOTE_AGENT_CREDENTIAL_REF: &str = "credential:remote-agent:telegram-bot";
 
 struct MarketplaceSkillFile {
     path: PathBuf,
@@ -1045,6 +1047,60 @@ impl AppRuntime {
 
     pub fn agents(&self) -> Vec<AgentProfile> {
         self.config.read().agents.clone()
+    }
+
+    pub fn remote_agent(&self) -> RemoteAgentSection {
+        self.config.read().remote_agent.clone()
+    }
+
+    pub fn has_remote_agent_token(&self) -> bool {
+        self.vault
+            .contains(&remote_agent_credential_ref())
+            .unwrap_or(false)
+    }
+
+    pub fn remote_agent_token(&self) -> Result<Zeroizing<String>, RuntimeError> {
+        Ok(self.vault.get(&remote_agent_credential_ref())?)
+    }
+
+    /// Persist Telegram relay settings while keeping the bot token in the
+    /// same encrypted vault used for provider credentials.
+    pub fn save_remote_agent(
+        &self,
+        settings: RemoteAgentSection,
+        token: Option<&str>,
+    ) -> Result<(), RuntimeError> {
+        let credential = remote_agent_credential_ref();
+        let previous_token = self.vault.get(&credential).ok();
+        let supplied_token = token.filter(|value| !value.trim().is_empty());
+
+        if settings.enabled && supplied_token.is_none() && previous_token.is_none() {
+            return Err(RuntimeError::Runtime(
+                "a Telegram bot token is required to enable Remote Agent".into(),
+            ));
+        }
+
+        if let Some(token) = supplied_token {
+            self.vault.put(&credential, token)?;
+        }
+
+        let mut next = self.config();
+        next.remote_agent = settings;
+        if let Err(error) = next.save_to(&self.paths) {
+            match previous_token {
+                Some(previous) => {
+                    let _ = self.vault.put(&credential, &previous);
+                }
+                None if supplied_token.is_some() => {
+                    let _ = self.vault.delete(&credential);
+                }
+                None => {}
+            }
+            return Err(error.into());
+        }
+
+        *self.config.write() = next;
+        Ok(())
     }
 
     pub fn save_agent(&self, agent: AgentProfile) -> Result<(), RuntimeError> {
@@ -2569,6 +2625,10 @@ impl AppRuntime {
     {
         self.runtime.spawn(future)
     }
+}
+
+fn remote_agent_credential_ref() -> CredentialRef {
+    CredentialRef(REMOTE_AGENT_CREDENTIAL_REF.into())
 }
 
 fn resolve_skill_path(raw_path: &str) -> PathBuf {

@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub skills: SkillsSection,
     #[serde(default)]
     pub agents: Vec<AgentProfile>,
+    #[serde(default)]
+    pub remote_agent: RemoteAgentSection,
 }
 
 const fn config_version() -> u32 {
@@ -33,6 +35,27 @@ impl Default for AppConfig {
             compaction: CompactionSection::default(),
             skills: SkillsSection::default(),
             agents: Vec::new(),
+            remote_agent: RemoteAgentSection::default(),
+        }
+    }
+}
+
+/// Configuration for the Telegram transport that exposes an existing
+/// Averroes conversation on a phone. The bot token itself is intentionally
+/// not part of this structure; it lives in the encrypted credential vault.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteAgentSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
+}
+
+impl Default for RemoteAgentSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_user_ids: Vec::new(),
         }
     }
 }
