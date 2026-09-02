@@ -163,6 +163,31 @@ impl AnthropicProvider {
                         }
                     }
                     MessageContent::Parts(parts) => {
+                        if m.role == Role::Tool {
+                            let content = parts
+                                .iter()
+                                .filter_map(|part| match part {
+                                    ContentPart::Text { text } => {
+                                        Some(json!({ "type": "text", "text": text }))
+                                    }
+                                    ContentPart::Image { source } => Some(json!({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": source.media_type,
+                                            "data": source.data,
+                                        }
+                                    })),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>();
+                            msg["content"] = json!([{
+                                "type": "tool_result",
+                                "tool_use_id": m.tool_call_id.as_deref().unwrap_or(""),
+                                "content": content,
+                            }]);
+                            return msg;
+                        }
                         let blocks: Vec<Value> = parts
                             .iter()
                             .filter(|part| match part {
@@ -451,6 +476,39 @@ mod tests {
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0]["role"].as_str(), Some("user"));
         assert_eq!(converted[0]["content"].as_str(), Some("hello"));
+    }
+
+    #[test]
+    fn tool_images_are_nested_inside_the_anthropic_tool_result() {
+        let provider = AnthropicProvider::new("test-key".into());
+        let messages = vec![ChatMessage {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Screenshot captured".into(),
+                },
+                ContentPart::Image {
+                    source: crate::provider::types::ImageSource {
+                        media_type: "image/png".into(),
+                        data: "aW1hZ2U=".into(),
+                    },
+                },
+            ]),
+            tool_call_id: Some("tool-image".into()),
+            tool_calls: None,
+        }];
+
+        let converted = provider.convert_messages(&messages);
+        let tool_result = &converted[0]["content"][0];
+        let content = tool_result["content"].as_array().unwrap();
+
+        assert_eq!(converted[0]["role"], "user");
+        assert_eq!(tool_result["type"], "tool_result");
+        assert_eq!(tool_result["tool_use_id"], "tool-image");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "aW1hZ2U=");
     }
 
     #[test]

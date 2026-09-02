@@ -1,5 +1,7 @@
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::{json, Value};
+use std::path::Path;
 
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 
@@ -7,6 +9,7 @@ pub struct FileReadTool;
 
 const DEFAULT_LINE_LIMIT: usize = 400;
 const MAX_LINE_LIMIT: usize = 2_000;
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 #[async_trait]
 impl Tool for FileReadTool {
@@ -15,7 +18,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file"
+        "Read a text file by line range or return a supported image to a multimodal model"
     }
 
     fn parameters(&self) -> Value {
@@ -57,6 +60,10 @@ impl Tool for FileReadTool {
             })?;
 
         let full_path = ctx.working_dir.join(file_path);
+
+        if let Some(media_type) = image_media_type(&full_path) {
+            return read_image(self.name(), &full_path, media_type).await;
+        }
 
         let content =
             tokio::fs::read_to_string(&full_path)
@@ -143,6 +150,71 @@ impl Tool for FileReadTool {
                 "file_path": full_path.display().to_string()
             })),
         )
+    }
+}
+
+async fn read_image(tool: &str, path: &Path, media_type: &str) -> Result<ToolResult> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|error| ToolError::Execution {
+            tool: tool.into(),
+            message: format!("Failed to read image '{}': {error}", path.display()),
+        })?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(ToolError::Execution {
+            tool: tool.into(),
+            message: format!(
+                "Image '{}' exceeds the {} MiB tool-result limit",
+                path.display(),
+                MAX_IMAGE_BYTES / 1024 / 1024
+            ),
+        });
+    }
+    if !has_image_signature(media_type, &bytes) {
+        return Err(ToolError::Execution {
+            tool: tool.into(),
+            message: format!(
+                "File '{}' does not contain a valid {media_type} signature",
+                path.display()
+            ),
+        });
+    }
+
+    Ok(ToolResult::ok(format!(
+        "Image '{}' ({media_type}, {} bytes)",
+        path.display(),
+        bytes.len()
+    ))
+    .with_image(
+        media_type,
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+    )
+    .with_metadata(json!({
+        "file_path": path.display().to_string(),
+        "media_type": media_type,
+        "kind": "image"
+    })))
+}
+
+fn image_media_type(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn has_image_signature(media_type: &str, bytes: &[u8]) -> bool {
+    match media_type {
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => {
+            bytes.starts_with(b"RIFF") && bytes.get(8..12).is_some_and(|tag| tag == b"WEBP")
+        }
+        _ => false,
     }
 }
 
@@ -274,5 +346,30 @@ mod tests {
 
         assert!(matches!(offset_error, ToolError::InvalidParams { .. }));
         assert!(matches!(limit_error, ToolError::InvalidParams { .. }));
+    }
+
+    #[tokio::test]
+    async fn returns_supported_images_as_multimodal_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let png = b"\x89PNG\r\n\x1a\nimage payload";
+        std::fs::write(directory.path().join("chart.png"), png).unwrap();
+
+        let result = FileReadTool
+            .execute(
+                &context(directory.path()),
+                &json!({ "file_path": "chart.png" }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(result.images[0].media_type, "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&result.images[0].data)
+                .unwrap(),
+            png
+        );
+        assert_eq!(result.metadata.unwrap()["kind"], "image");
     }
 }

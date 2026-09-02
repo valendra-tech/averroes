@@ -5,6 +5,7 @@
 //! HTTP MCP server; neither is represented as an opaque URL plus token.
 
 use anyhow::{anyhow, Context};
+use base64::Engine as _;
 use oxibrowser_core::{Browser, BrowserConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -15,9 +16,13 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, OnceCell};
 use url::Url;
 
+use crate::tool::ToolResult;
+
 pub const PROJECT_MCP_FILE: &str = "mcp.yaml";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MCP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const MAX_TOOL_RESULT_IMAGES: usize = 20;
+const MAX_TOOL_RESULT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectMcpConfig {
@@ -221,7 +226,7 @@ impl McpClient {
         }
     }
 
-    pub async fn call_tool(&self, name: &str, params: Value) -> anyhow::Result<String> {
+    pub async fn call_tool(&self, name: &str, params: Value) -> anyhow::Result<ToolResult> {
         let value = match self.transport {
             McpTransport::Stdio => {
                 self.stdio_request("tools/call", json!({ "name": name, "arguments": params }))
@@ -234,7 +239,7 @@ impl McpClient {
             }
             McpTransport::WebMcp => return self.webmcp_call_tool(name, params).await,
         };
-        stringify_tool_result(value)
+        parse_tool_result(value)
     }
 
     async fn stdio_request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
@@ -406,7 +411,7 @@ impl McpClient {
         parse_tools(result.value.unwrap_or(Value::Null))
     }
 
-    async fn webmcp_call_tool(&self, name: &str, params: Value) -> anyhow::Result<String> {
+    async fn webmcp_call_tool(&self, name: &str, params: Value) -> anyhow::Result<ToolResult> {
         let browser = self.webmcp_browser().await?;
         let endpoint = self.endpoint.as_deref().unwrap_or_default();
         let session_handle = browser.new_session().await?;
@@ -428,15 +433,7 @@ impl McpClient {
         if let Some(error) = result.exception {
             return Err(anyhow!("WebMCP tool execution failed: {error}"));
         }
-        Ok(result
-            .value
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| value.to_string())
-            })
-            .unwrap_or_default())
+        parse_tool_result(result.value.unwrap_or(Value::Null))
     }
 }
 
@@ -557,21 +554,172 @@ fn parse_tools(value: Value) -> anyhow::Result<Vec<McpToolDef>> {
         .collect()
 }
 
-fn stringify_tool_result(value: Value) -> anyhow::Result<String> {
-    let content = value.get("content").cloned().unwrap_or(value);
+fn parse_tool_result(value: Value) -> anyhow::Result<ToolResult> {
+    let is_error = value
+        .get("isError")
+        .or_else(|| value.get("is_error"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let structured_content = value
+        .get("structuredContent")
+        .or_else(|| value.get("structured_content"))
+        .cloned();
+    let content = value.get("content").unwrap_or(&value);
+    let mut text = Vec::new();
+    let mut images = Vec::new();
+
     if let Some(items) = content.as_array() {
-        let text = items
-            .iter()
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        if !text.is_empty() {
-            return Ok(text.join("\n"));
+        for item in items {
+            parse_tool_content_item(item, &mut text, &mut images);
+        }
+    } else if let Some(value) = content.as_str() {
+        text.push(value.to_owned());
+    } else if !content.is_null() {
+        text.push(content.to_string());
+    }
+
+    if text.is_empty() {
+        if let Some(structured_content) = &structured_content {
+            text.push(structured_content.to_string());
+        } else if !images.is_empty() {
+            text.push(format!(
+                "Tool returned {} image{}.",
+                images.len(),
+                if images.len() == 1 { "" } else { "s" }
+            ));
+        } else if !content.is_null() {
+            text.push(content.to_string());
         }
     }
-    Ok(content
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| content.to_string()))
+
+    let message = text.join("\n");
+    let mut result = if is_error {
+        ToolResult::error(message)
+    } else {
+        ToolResult::ok(message)
+    };
+    result.images = images;
+    if let Some(structured_content) = structured_content {
+        result = result.with_metadata(json!({ "structured_content": structured_content }));
+    }
+    Ok(result)
+}
+
+fn parse_tool_content_item(
+    item: &Value,
+    text: &mut Vec<String>,
+    images: &mut Vec<crate::provider::types::ImageSource>,
+) {
+    match item.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            if let Some(value) = item.get("text").and_then(Value::as_str) {
+                text.push(value.to_owned());
+            }
+        }
+        Some("image") => push_image(item, text, images),
+        Some("resource") => parse_embedded_resource(item, text, images),
+        Some("resource_link") => {
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("resource");
+            let uri = item.get("uri").and_then(Value::as_str).unwrap_or_default();
+            text.push(format!("Resource: {name} ({uri})"));
+        }
+        Some("audio") => {
+            let media_type = item
+                .get("mimeType")
+                .or_else(|| item.get("mime_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("audio");
+            text.push(format!("Audio output returned ({media_type})."));
+        }
+        _ => {
+            if let Some(value) = item.get("text").and_then(Value::as_str) {
+                text.push(value.to_owned());
+            }
+        }
+    }
+}
+
+fn parse_embedded_resource(
+    item: &Value,
+    text: &mut Vec<String>,
+    images: &mut Vec<crate::provider::types::ImageSource>,
+) {
+    let resource = item.get("resource").unwrap_or(item);
+    if let Some(value) = resource.get("text").and_then(Value::as_str) {
+        text.push(value.to_owned());
+        return;
+    }
+    if resource.get("blob").is_some() {
+        let image_count = images.len();
+        push_image(resource, text, images);
+        if images.len() == image_count {
+            let uri = resource
+                .get("uri")
+                .and_then(Value::as_str)
+                .unwrap_or("embedded resource");
+            text.push(format!("Binary resource returned: {uri}"));
+        }
+    }
+}
+
+fn push_image(
+    item: &Value,
+    text: &mut Vec<String>,
+    images: &mut Vec<crate::provider::types::ImageSource>,
+) {
+    let media_type = item
+        .get("mimeType")
+        .or_else(|| item.get("mime_type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let data = item
+        .get("data")
+        .or_else(|| item.get("blob"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let decoded_image = (!data.is_empty())
+        .then(|| base64::engine::general_purpose::STANDARD.decode(data))
+        .transpose()
+        .ok()
+        .flatten();
+    if is_supported_image_type(media_type)
+        && images.len() < MAX_TOOL_RESULT_IMAGES
+        && decoded_image
+            .as_ref()
+            .is_some_and(|bytes| bytes.len() <= MAX_TOOL_RESULT_IMAGE_BYTES)
+    {
+        images.push(crate::provider::types::ImageSource {
+            media_type: normalize_image_type(media_type),
+            data: data.to_owned(),
+        });
+    } else {
+        text.push(format!(
+            "Image output omitted because it was invalid, too large, or unsupported ({}).",
+            if media_type.is_empty() {
+                "missing media type"
+            } else {
+                media_type
+            }
+        ));
+    }
+}
+
+fn is_supported_image_type(media_type: &str) -> bool {
+    matches!(
+        media_type.to_ascii_lowercase().as_str(),
+        "image/jpeg" | "image/jpg" | "image/png" | "image/gif" | "image/webp"
+    )
+}
+
+fn normalize_image_type(media_type: &str) -> String {
+    if media_type.eq_ignore_ascii_case("image/jpg") {
+        "image/jpeg".into()
+    } else {
+        media_type.to_ascii_lowercase()
+    }
 }
 
 #[cfg(test)]
@@ -615,5 +763,43 @@ mcpServers:
             ..Default::default()
         };
         assert!(server.validate().is_err());
+    }
+
+    #[test]
+    fn mcp_tool_results_preserve_text_images_and_structured_content() {
+        let result = parse_tool_result(json!({
+            "content": [
+                { "type": "text", "text": "Rendered chart" },
+                { "type": "image", "mimeType": "image/png", "data": "aW1hZ2U=" }
+            ],
+            "structuredContent": { "width": 640, "height": 480 }
+        }))
+        .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.content, "Rendered chart");
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(result.images[0].media_type, "image/png");
+        assert_eq!(result.images[0].data, "aW1hZ2U=");
+        assert_eq!(result.metadata.unwrap()["structured_content"]["width"], 640);
+    }
+
+    #[test]
+    fn mcp_embedded_image_resources_are_multimodal() {
+        let result = parse_tool_result(json!({
+            "content": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///chart.webp",
+                    "mimeType": "image/webp",
+                    "blob": "aW1hZ2U="
+                }
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(result.images[0].media_type, "image/webp");
+        assert_eq!(result.content, "Tool returned 1 image.");
     }
 }

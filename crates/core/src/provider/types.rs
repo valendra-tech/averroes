@@ -111,6 +111,31 @@ mod tests {
     }
 
     #[test]
+    fn multimodal_tool_messages_round_trip() {
+        let message = ChatMessage {
+            role: Role::Tool,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Screenshot".into(),
+                },
+                ContentPart::Image {
+                    source: ImageSource {
+                        media_type: "image/png".into(),
+                        data: "aW1hZ2U=".into(),
+                    },
+                },
+            ]),
+            tool_call_id: Some("call-image".into()),
+            tool_calls: None,
+        };
+
+        let serialized = serde_json::to_string(&message).unwrap();
+        let restored = serde_json::from_str::<ChatMessage>(&serialized).unwrap();
+
+        assert_eq!(restored, message);
+    }
+
+    #[test]
     fn test_tool_call_deserialization() {
         let json = r#"{
             "id": "toolu_01",

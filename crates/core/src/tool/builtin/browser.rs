@@ -1,6 +1,7 @@
 //! Stateful browser interaction exposed through one compact action schema.
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use oxibrowser_core::{BrowseResult, Tab};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -46,6 +47,8 @@ struct BrowserParams {
     delta_y: Option<f64>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    width: Option<u32>,
 }
 
 impl Default for BrowserTool {
@@ -78,7 +81,7 @@ impl Tool for BrowserTool {
                     "enum": [
                         "open", "inspect", "click", "fill", "type", "press",
                         "select", "check", "uncheck", "scroll", "wait", "back",
-                        "forward", "reload", "close"
+                        "forward", "reload", "screenshot", "close"
                     ],
                     "description": "Browser operation to perform"
                 },
@@ -111,6 +114,12 @@ impl Tool for BrowserTool {
                     "minimum": 1,
                     "maximum": 60000,
                     "description": "Wait timeout; defaults to 10000"
+                },
+                "width": {
+                    "type": "integer",
+                    "minimum": 320,
+                    "maximum": 2000,
+                    "description": "Screenshot viewport width; defaults to 1280"
                 }
             },
             "required": ["action"],
@@ -283,8 +292,23 @@ impl BrowserTool {
                     .map_err(|error| browser_error(action, error))?;
                 self.action_result(&tab, action, None).await
             }
+            "screenshot" => {
+                let width = params.width.unwrap_or(1_280).clamp(320, 2_000);
+                let png = tab
+                    .screenshot(width)
+                    .await
+                    .map_err(|error| browser_error(action, error))?;
+                Ok(ToolResult::ok(format!(
+                    "Captured the current page as a {width}px-wide PNG screenshot."
+                ))
+                .with_image(
+                    "image/png",
+                    base64::engine::general_purpose::STANDARD.encode(png),
+                )
+                .with_metadata(json!({ "width": width, "media_type": "image/png" })))
+            }
             _ => Err(invalid(format!(
-                "Unknown browser action '{action}'. Use open, inspect, click, fill, type, press, select, check, uncheck, scroll, wait, back, forward, reload, or close"
+                "Unknown browser action '{action}'. Use open, inspect, click, fill, type, press, select, check, uncheck, scroll, wait, back, forward, reload, screenshot, or close"
             ))),
         }
     }
@@ -597,6 +621,10 @@ mod tests {
             .as_array()
             .is_some_and(|actions| actions.len() >= 15));
         assert!(schema.get("oneOf").is_none());
+        assert!(schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("screenshot")));
     }
 
     #[test]
@@ -668,6 +696,16 @@ mod tests {
             .unwrap();
 
         assert!(inspected.content.contains("Averroes"));
+
+        let screenshot = tool
+            .execute(&context, &json!({ "action": "screenshot", "width": 640 }))
+            .await
+            .unwrap();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(&screenshot.images[0].data)
+            .unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(screenshot.images[0].media_type, "image/png");
         assert_eq!(tool.sessions.lock().await.len(), 1);
     }
 
