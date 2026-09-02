@@ -17,7 +17,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Run commands in a persistent non-interactive bash session backed by pipes. State such as cd and exports is retained between calls, and commands may access paths outside the active workspace. Terminal-dependent programs, pagers, SSH shells, and interactive REPLs are not supported. Use detach:true only for commands that can run without a terminal."
+        "Run commands in a persistent non-interactive bash session backed by pipes. New sessions start in the conversation's current directory; shell-local state such as cd and exports is retained between calls. Commands may access paths outside the active workspace. Terminal-dependent programs, pagers, SSH shells, and interactive REPLs are not supported. Use detach:true only for commands that can run without a terminal."
     }
 
     fn parameters(&self) -> Value {
@@ -62,6 +62,7 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
+        let current_dir = ctx.current_dir();
         let session_name = params
             .get("session")
             .and_then(Value::as_str)
@@ -76,7 +77,7 @@ impl Tool for BashTool {
         {
             let closed = self
                 .sessions
-                .close(&ctx.session_id, session_name, &ctx.working_dir)
+                .close(&ctx.session_id, session_name, &current_dir)
                 .map_err(|error| ToolError::Execution {
                     tool: self.name().into(),
                     message: error.to_string(),
@@ -105,7 +106,7 @@ impl Tool for BashTool {
 
         let session = self
             .sessions
-            .get_or_create(&ctx.session_id, session_name, &ctx.working_dir)
+            .get_or_create(&ctx.session_id, session_name, &current_dir)
             .await
             .map_err(|error| ToolError::Execution {
                 tool: self.name().into(),
@@ -159,7 +160,7 @@ impl Tool for BashTool {
             "exit_code": output.exit_code,
             "timed_out": output.timed_out,
             "running": output.running,
-            "working_dir": ctx.working_dir,
+            "working_dir": current_dir,
         });
         let content = if output.content.is_empty() {
             if output.running {

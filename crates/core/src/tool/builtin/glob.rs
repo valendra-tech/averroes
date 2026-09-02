@@ -13,7 +13,7 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> &str {
-        "Find files matching a glob pattern inside or outside the workspace"
+        "Find files matching a glob pattern relative to the conversation's current directory or at an absolute path"
     }
 
     fn parameters(&self) -> Value {
@@ -22,7 +22,7 @@ impl Tool for GlobTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Absolute glob pattern, or one relative to the workspace. Parent paths such as ../other-project/**/*.rs are supported."
+                    "description": "Absolute glob pattern, or one relative to the current directory. Parent paths such as ../other-project/**/*.rs are supported."
                 }
             },
             "required": ["pattern"]
@@ -41,7 +41,8 @@ impl Tool for GlobTool {
                 message: "Missing required parameter: pattern".into(),
             })?;
 
-        let search_path = resolve_file_path(&ctx.working_dir, pattern);
+        let current_dir = ctx.current_dir();
+        let search_path = resolve_file_path(&current_dir, pattern);
 
         let paths: Vec<String> = glob::glob(&search_path.to_string_lossy())
             .map_err(|e| ToolError::Execution {
@@ -51,7 +52,7 @@ impl Tool for GlobTool {
             .filter_map(|entry| {
                 let path = entry.ok()?;
                 Some(
-                    path.strip_prefix(&ctx.working_dir)
+                    path.strip_prefix(&current_dir)
                         .unwrap_or(&path)
                         .display()
                         .to_string(),

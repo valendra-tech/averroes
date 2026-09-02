@@ -54,7 +54,7 @@ impl Tool for PatchTool {
     }
 
     fn description(&self) -> &str {
-        "Apply a compact unified diff to files inside or outside the workspace. Accepts absolute paths, ../ paths, the *** Begin Patch format, or standard unified diff format. Use this instead of rewriting complete files."
+        "Apply a compact unified diff relative to the conversation's current directory or to absolute paths, including outside the workspace. Accepts ../ paths, the *** Begin Patch format, or standard unified diff format. Use this instead of rewriting complete files."
     }
 
     fn parameters(&self) -> Value {
@@ -88,7 +88,8 @@ impl Tool for PatchTool {
         }
 
         let file_patches = parse_patch(patch).map_err(invalid_params)?;
-        let changes = prepare_changes(&ctx.working_dir, file_patches)
+        let current_dir = ctx.current_dir();
+        let changes = prepare_changes(&current_dir, file_patches)
             .await
             .map_err(|message| ToolError::Execution {
                 tool: self.name().into(),
@@ -129,7 +130,7 @@ impl Tool for PatchTool {
             .map(|change| {
                 change
                     .destination
-                    .strip_prefix(&ctx.working_dir)
+                    .strip_prefix(&current_dir)
                     .unwrap_or(&change.destination)
                     .display()
                     .to_string()

@@ -13,7 +13,7 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write content to a file, including outside the workspace. Creates the file if it doesn't exist, overwrites if it does."
+        "Write content to a file relative to the conversation's current directory or at an absolute path, including outside the workspace. Creates the file if it doesn't exist and overwrites it if it does."
     }
 
     fn parameters(&self) -> Value {
@@ -22,7 +22,7 @@ impl Tool for FileWriteTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute path, or a path relative to the workspace. Parent paths such as ../other-project/file.txt are supported."
+                    "description": "Absolute path, or a path relative to the current directory. Parent paths such as ../other-project/file.txt are supported."
                 },
                 "content": {
                     "type": "string",
@@ -52,7 +52,7 @@ impl Tool for FileWriteTool {
                 message: "Missing required parameter: content".into(),
             })?;
 
-        let full_path = resolve_file_path(&ctx.working_dir, file_path);
+        let full_path = resolve_file_path(&ctx.current_dir(), file_path);
 
         if let Some(parent) = full_path.parent() {
             tokio::fs::create_dir_all(parent)

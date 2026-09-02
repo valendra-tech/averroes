@@ -19,7 +19,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a text file by line range or return a supported image to a multimodal model. Absolute paths and paths outside the workspace are supported."
+        "Read a text file by line range or return a supported image to a multimodal model. Relative paths use the conversation's current directory; absolute paths and paths outside the workspace are supported."
     }
 
     fn parameters(&self) -> Value {
@@ -28,7 +28,7 @@ impl Tool for FileReadTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute path, or a path relative to the workspace. Parent paths such as ../other-project/file.txt are supported."
+                    "description": "Absolute path, or a path relative to the current directory. Parent paths such as ../other-project/file.txt are supported."
                 },
                 "offset": {
                     "type": "integer",
@@ -60,7 +60,7 @@ impl Tool for FileReadTool {
                 message: "Missing required parameter: file_path".into(),
             })?;
 
-        let full_path = resolve_file_path(&ctx.working_dir, file_path);
+        let full_path = resolve_file_path(&ctx.current_dir(), file_path);
 
         if let Some(media_type) = image_media_type(&full_path) {
             return read_image(self.name(), &full_path, media_type).await;
