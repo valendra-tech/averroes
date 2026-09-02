@@ -65,8 +65,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15-intel
-            arch: x86_64
+          # Intel builds are temporarily disabled until the runner/signing
+          # path is stable again.
+          # - runner: macos-15-intel
+          #   arch: x86_64
           - runner: macos-15
             arch: arm64
 
@@ -357,11 +359,11 @@ jobs:
           name: validated-dmg-arm64
           path: ${{ runner.temp }}/averroes-release-artifacts
 
-      - name: Download x86_64 DMG
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: validated-dmg-x86_64
-          path: ${{ runner.temp }}/averroes-release-artifacts
+      # - name: Download x86_64 DMG
+      #   uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      #   with:
+      #     name: validated-dmg-x86_64
+      #     path: ${{ runner.temp }}/averroes-release-artifacts
 
       - name: Publish validated release assets
         env:
@@ -374,28 +376,29 @@ jobs:
           set -euo pipefail
 
           ARM64_NAME="Averroes-${RELEASE_VERSION}-macos-arm64.dmg"
-          X86_64_NAME="Averroes-${RELEASE_VERSION}-macos-x86_64.dmg"
+          # X86_64_NAME="Averroes-${RELEASE_VERSION}-macos-x86_64.dmg"
           CHECKSUM_NAME="SHA256SUMS.txt"
           ARM64_DMG="${ARTIFACTS_DIR}/${ARM64_NAME}"
-          X86_64_DMG="${ARTIFACTS_DIR}/${X86_64_NAME}"
+          # X86_64_DMG="${ARTIFACTS_DIR}/${X86_64_NAME}"
           CHECKSUM_PATH="${ARTIFACTS_DIR}/${CHECKSUM_NAME}"
 
           shopt -s dotglob nullglob
           artifact_paths=("${ARTIFACTS_DIR}"/*)
-          if [[ "${#artifact_paths[@]}" -ne 2 ]]; then
-            printf 'Expected exactly two validated DMG artifacts.\n' >&2
+          if [[ "${#artifact_paths[@]}" -ne 1 ]]; then
+            printf 'Expected exactly one validated DMG artifact.\n' >&2
             exit 1
           fi
           for artifact_path in "${artifact_paths[@]}"; do
             case "$(basename "${artifact_path}")" in
-              "${ARM64_NAME}"|"${X86_64_NAME}") ;;
+              "${ARM64_NAME}") ;;
+              # "${X86_64_NAME}") ;;
               *)
                 printf 'Unexpected artifact file: %s\n' "${artifact_path}" >&2
                 exit 1
                 ;;
             esac
           done
-          for dmg_path in "${ARM64_DMG}" "${X86_64_DMG}"; do
+          for dmg_path in "${ARM64_DMG}"; do
             if [[ ! -f "${dmg_path}" || -L "${dmg_path}" || ! -s "${dmg_path}" ]]; then
               printf 'Expected a nonempty regular DMG file: %s\n' "${dmg_path}" >&2
               exit 1
@@ -404,7 +407,7 @@ jobs:
 
           (
             cd "${ARTIFACTS_DIR}"
-            shasum -a 256 "${ARM64_NAME}" "${X86_64_NAME}" > "${CHECKSUM_NAME}"
+            shasum -a 256 "${ARM64_NAME}" > "${CHECKSUM_NAME}"
           )
 
           RELEASE_VIEW_ERROR_PATH="${RUNNER_TEMP}/averroes-release-view.stderr"
@@ -418,7 +421,8 @@ jobs:
             while IFS= read -r asset_name; do
               [[ -z "${asset_name}" ]] && continue
               case "${asset_name}" in
-                "${ARM64_NAME}"|"${X86_64_NAME}"|"${CHECKSUM_NAME}") ;;
+                "${ARM64_NAME}"|"${CHECKSUM_NAME}") ;;
+                # "${X86_64_NAME}") ;;
                 *)
                   printf 'Refusing to modify draft release with unknown asset: %s\n' "${asset_name}" >&2
                   exit 1
@@ -438,7 +442,6 @@ jobs:
 
           gh release upload "$RELEASE_TAG" \
             "${ARM64_DMG}" \
-            "${X86_64_DMG}" \
             "${CHECKSUM_PATH}" \
             --clobber
           gh release edit "$RELEASE_TAG" --draft=false
