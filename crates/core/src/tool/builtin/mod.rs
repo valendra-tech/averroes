@@ -4,6 +4,7 @@ pub mod browser;
 pub mod call_agents;
 pub mod checkpoint;
 pub mod deep_memory;
+pub mod desktop;
 pub mod discover_tools;
 pub mod enable_tools;
 pub mod file_read;
@@ -54,6 +55,7 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(grep::GrepTool);
     registry.register(web_fetch::WebFetchTool::default());
     registry.register(browser::BrowserTool::default());
+    desktop::register(registry);
     registry.register(web_search_intrernal::WebSearchTool);
     registry.register(discover_tools::DiscoverToolsTool);
     registry.register(enable_tools::EnableToolsTool);
@@ -95,5 +97,7 @@ mod tests {
             .any(|name| name == "compact_conversation"));
         assert!(registry.get("patch").is_some());
         assert!(registry.get("browser").is_some());
+        assert!(registry.get("desktop_screenshot").is_some());
+        assert!(registry.get("desktop_input").is_some());
     }
 }
