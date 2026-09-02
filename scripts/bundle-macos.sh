@@ -209,6 +209,13 @@ if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
         codesign_keychain_args=(--keychain "${CODESIGN_KEYCHAIN}")
     fi
 
+    # Loadable libraries are independent Mach-O code objects. Signing only the
+    # outer app leaves Cargo's ad-hoc dylib signature in place, which passes a
+    # deep local verification but is rejected by Apple's notarization service.
+    echo "Signing embedded libraries with ${CODESIGN_IDENTITY}..."
+    codesign --force --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" "${codesign_keychain_args[@]+"${codesign_keychain_args[@]}"}" "${BUNDLE}/Contents/MacOS/libsqlite_vector_rs.dylib"
+    codesign --verify --strict --verbose=2 "${BUNDLE}/Contents/MacOS/libsqlite_vector_rs.dylib"
+
     echo "Signing app bundle with ${CODESIGN_IDENTITY}..."
     codesign --force --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" "${codesign_keychain_args[@]+"${codesign_keychain_args[@]}"}" "${BUNDLE}"
     codesign --verify --deep --strict "${codesign_keychain_args[@]+"${codesign_keychain_args[@]}"}" "${BUNDLE}"
