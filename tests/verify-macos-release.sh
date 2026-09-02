@@ -353,12 +353,13 @@ assert!(matrix_entries.is_a?(Array), "build job must define an architecture matr
 architectures = matrix_entries.map do |entry|
   entry["arch"] if entry.is_a?(Hash) && entry["arch"].is_a?(String)
 end.compact
-assert!(architectures.sort == %w[arm64 x86_64],
-         "build matrix must define exactly arm64 and x86_64 architectures")
+assert!(architectures == %w[arm64],
+         "build matrix must define exactly arm64 while Intel is disabled")
 assert!(matrix_entries.map { |entry| entry.slice("runner", "arch") }.sort_by { |entry| entry.fetch("arch") } == [
-          { "runner" => "macos-15", "arch" => "arm64" },
-          { "runner" => "macos-15-intel", "arch" => "x86_64" }
-        ], "build matrix must use the required macOS runners")
+           { "runner" => "macos-15", "arch" => "arm64" }
+         ], "build matrix must use the required macOS runners")
+assert!(workflow_source.match?(/^\s*#\s*-\s*runner:\s*macos-15-intel\s*$/),
+        "Intel runner must remain commented out")
 
 expected_actions = {
   "actions/checkout" => "11bd71901bbe5b1630ceea73d27597364c9af683",
@@ -404,8 +405,10 @@ assert!(diagnostic_uploads.fetch(0).dig("with", "retention-days").to_s == "7" &&
         "notarization diagnostics must use seven-day retention and tolerate absent files")
 
 download_names = download_steps.map { |step| step.dig("with", "name") }.sort
-assert!(download_names == %w[validated-dmg-arm64 validated-dmg-x86_64],
-        "publish job must download only the private validated DMG artifacts")
+assert!(download_names == %w[validated-dmg-arm64],
+         "publish job must download only the private arm64 validated DMG artifact")
+assert!(workflow_source.match?(/^\s*#\s*-\s*name:\s*Download x86_64 DMG\s*$/),
+        "Intel artifact download must remain commented out")
 assert!(!run_text(build).match?(/\bgh\s+release\b/),
         "build job must not publish release assets directly")
 
@@ -486,9 +489,12 @@ assert!(draft_creation && upload && publication &&
            draft_creation.begin(0) < upload.begin(0) && upload.begin(0) < publication.begin(0),
          "publish job must create, upload to, then publish the release")
 assert!(publish_runs.match?(/\bgh\s+release\s+view\s+"\$RELEASE_TAG"\s+--json\s+isDraft/) &&
-        publish_runs.match?(/\bgh\s+release\s+view\s+"\$RELEASE_TAG"\s+--json\s+assets/) &&
-        publish_runs.match?(/\bshasum\s+-a\s+256\b/) &&
-        publish_runs.match?(/SHA256SUMS\.txt/) &&
-        publish_runs.match?(/\bgh\s+release\s+upload\s+"\$RELEASE_TAG".*--clobber/m),
-        "publish job must validate draft assets and upload ordered DMGs with checksums")
+         publish_runs.match?(/\bgh\s+release\s+view\s+"\$RELEASE_TAG"\s+--json\s+assets/) &&
+         publish_runs.match?(/\bshasum\s+-a\s+256\b/) &&
+         publish_runs.match?(/SHA256SUMS\.txt/) &&
+         publish_runs.match?(/\bgh\s+release\s+upload\s+"\$RELEASE_TAG".*--clobber/m),
+         "publish job must validate draft assets and upload ordered DMGs with checksums")
+publish_shell_lines = executable_shell_lines(publish_runs)
+assert!(publish_shell_lines.none? { |line| line.match?(/\bX86_64_(?:NAME|DMG)\b/) },
+        "Intel artifact variables must remain inactive in the publish command")
 RUBY
