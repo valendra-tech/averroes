@@ -793,6 +793,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_reasoning_aliases_are_deduplicated_per_stream_frame() {
+        let frame = concat!(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"ha","reasoning":"ha"},"finish_reason":null}]}"#,
+            "\n"
+        );
+        let byte_stream = futures::stream::iter(vec![
+            Ok(Bytes::from(frame)),
+            Ok(Bytes::from(frame)),
+            Ok(Bytes::from("data: [DONE]\n")),
+        ]);
+        let (receiver, producer) = spawn_openai_stream_producer(byte_stream);
+        let events = OpenAiStream::new(receiver, producer)
+            .collect::<Vec<_>>()
+            .await;
+        let reasoning = events
+            .into_iter()
+            .filter_map(|event| match event.ok()? {
+                StreamEvent::ReasoningDelta { text } => Some(text),
+                _ => None,
+            })
+            .collect::<String>();
+
+        // Alias duplication inside each QDivZero frame disappears, while the
+        // model's legitimate repetition across independent frames remains.
+        assert_eq!(reasoning, "haha");
+    }
+
+    #[tokio::test]
     async fn streamed_tool_call_continuations_keep_identity_and_close() {
         let byte_stream = futures::stream::iter(vec![
             Ok(Bytes::from(concat!(
