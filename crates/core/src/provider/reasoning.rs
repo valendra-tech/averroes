@@ -1,33 +1,41 @@
 use serde_json::Value;
 
-/// Collect text from a provider's reasoning-shaped JSON value without ever
-/// imposing a character limit. Provider APIs disagree on the exact nesting:
-/// some use a string, others use arrays of summary parts.
-pub(crate) fn append_reasoning_value(value: &Value, output: &mut String) {
+/// Collect text from one provider reasoning value. Object keys are aliases in
+/// the compatible APIs, but some gateways populate more than one alias with
+/// the same fragment. Keep distinct values while suppressing exact aliases.
+fn reasoning_value_text(value: &Value) -> String {
     match value {
-        Value::String(text) => output.push_str(text),
-        Value::Array(values) => {
-            for value in values {
-                append_reasoning_value(value, output);
-            }
-        }
+        Value::String(text) => text.clone(),
+        Value::Array(values) => values.iter().map(reasoning_value_text).collect(),
         Value::Object(object) => {
+            let mut output = String::new();
+            let mut seen = Vec::new();
             for key in ["text", "content", "delta", "summary", "thinking"] {
                 if let Some(value) = object.get(key) {
-                    append_reasoning_value(value, output);
+                    append_unique_candidate(&mut output, &mut seen, reasoning_value_text(value));
                 }
             }
+            output
         }
-        _ => {}
+        _ => String::new(),
     }
+}
+
+fn append_unique_candidate(output: &mut String, seen: &mut Vec<String>, candidate: String) {
+    if candidate.is_empty() || seen.iter().any(|existing| existing == &candidate) {
+        return;
+    }
+    output.push_str(&candidate);
+    seen.push(candidate);
 }
 
 pub(crate) fn chat_reasoning(value: &Value) -> Option<String> {
     let mut output = String::new();
+    let mut seen = Vec::new();
 
     for key in ["reasoning_content", "reasoning", "thinking"] {
         if let Some(value) = value.get(key) {
-            append_reasoning_value(value, &mut output);
+            append_unique_candidate(&mut output, &mut seen, reasoning_value_text(value));
         }
     }
 
@@ -35,7 +43,7 @@ pub(crate) fn chat_reasoning(value: &Value) -> Option<String> {
         for part in parts {
             let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
             if matches!(kind, "reasoning" | "thinking" | "reasoning_content") {
-                append_reasoning_value(part, &mut output);
+                append_unique_candidate(&mut output, &mut seen, reasoning_value_text(part));
             }
         }
     }
@@ -49,9 +57,14 @@ pub(crate) fn responses_reasoning(value: &Value) -> Option<String> {
     if let Some(items) = value.get("output").and_then(Value::as_array) {
         for item in items {
             if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                let mut seen = Vec::new();
                 for key in ["summary", "content", "text"] {
                     if let Some(value) = item.get(key) {
-                        append_reasoning_value(value, &mut output);
+                        append_unique_candidate(
+                            &mut output,
+                            &mut seen,
+                            reasoning_value_text(value),
+                        );
                     }
                 }
             }
@@ -71,6 +84,26 @@ mod tests {
         assert_eq!(
             chat_reasoning(&json!({"reasoning_content": "one", "thinking": " two"})),
             Some("one two".into())
+        );
+    }
+
+    #[test]
+    fn duplicate_compatible_aliases_are_emitted_only_once() {
+        assert_eq!(
+            chat_reasoning(&json!({
+                "reasoning_content": "The user is asking",
+                "reasoning": "The user is asking"
+            })),
+            Some("The user is asking".into())
+        );
+        assert_eq!(
+            chat_reasoning(&json!({
+                "reasoning": {
+                    "text": "Nested fragment",
+                    "content": "Nested fragment"
+                }
+            })),
+            Some("Nested fragment".into())
         );
     }
 
