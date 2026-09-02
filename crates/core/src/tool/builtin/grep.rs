@@ -22,7 +22,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Recursively search text files using a regular expression inside or outside the workspace"
+        "Recursively search text files using a regular expression from the conversation's current directory or an absolute path"
     }
 
     fn parameters(&self) -> Value {
@@ -35,7 +35,7 @@ impl Tool for GrepTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "File or directory to search. Accepts an absolute path or a path relative to the workspace, including ../. Defaults to the workspace."
+                    "description": "File or directory to search. Accepts an absolute path or a path relative to the current directory, including ../. Defaults to the current directory."
                 },
                 "include": {
                     "type": "string",
@@ -70,9 +70,10 @@ impl Tool for GrepTool {
 
     async fn execute(&self, ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
         let pattern = required_string(self.name(), params, "pattern")?;
+        let current_dir = ctx.current_dir();
         let root = optional_string(self.name(), params, "path")?
-            .map(|path| resolve_file_path(&ctx.working_dir, path))
-            .unwrap_or_else(|| ctx.working_dir.clone());
+            .map(|path| resolve_file_path(&current_dir, path))
+            .unwrap_or(current_dir);
         let include = optional_string(self.name(), params, "include")?.map(str::to_owned);
         let exclude = optional_string(self.name(), params, "exclude")?.map(str::to_owned);
         let context = integer_param(self.name(), params, "context", 0, 0, MAX_CONTEXT_LINES)?;

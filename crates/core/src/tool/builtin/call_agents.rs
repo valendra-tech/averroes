@@ -118,7 +118,7 @@ impl Tool for CallAgentsTool {
                 .collect(),
             prompt: prompt.to_string(),
             model_id: params.model_id.filter(|model| !model.trim().is_empty()),
-            working_dir: ctx.working_dir.clone(),
+            working_dir: ctx.current_dir(),
             context: reduced_context(&ctx.conversation_context),
         };
         let mut snapshot = if let Some(events) = ctx.agent_event_sink.clone() {

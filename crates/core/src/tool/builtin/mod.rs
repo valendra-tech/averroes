@@ -2,6 +2,7 @@ pub mod ask_user;
 pub mod bash;
 pub mod browser;
 pub mod call_agents;
+pub mod change_directory;
 pub mod checkpoint;
 pub mod deep_memory;
 pub mod desktop;
@@ -35,19 +36,20 @@ use std::{
 };
 
 /// Resolve a tool path without confining it to the active workspace.
-/// Relative paths still start at the workspace; absolute paths and `..`
-/// components intentionally remain valid so tools can work across projects.
-pub(crate) fn resolve_file_path(working_dir: &Path, requested: &str) -> PathBuf {
+/// Relative paths start at the conversation's current directory; absolute
+/// paths and `..` components intentionally remain valid across projects.
+pub(crate) fn resolve_file_path(current_dir: &Path, requested: &str) -> PathBuf {
     let requested = Path::new(requested);
     if requested.is_absolute() {
         requested.to_path_buf()
     } else {
-        working_dir.join(requested)
+        current_dir.join(requested)
     }
 }
 
 pub fn register_all(registry: &ToolRegistry) {
     registry.register(bash::BashTool::default());
+    registry.register(change_directory::ChangeDirectoryTool);
     registry.register(file_read::FileReadTool);
     registry.register(file_write::FileWriteTool);
     registry.register(patch::PatchTool);
@@ -97,6 +99,7 @@ mod tests {
             .any(|name| name == "compact_conversation"));
         assert!(registry.get("patch").is_some());
         assert!(registry.get("browser").is_some());
+        assert!(registry.get("change_directory").is_some());
         assert!(registry.get("desktop_screenshot").is_some());
         assert!(registry.get("desktop_input").is_some());
     }

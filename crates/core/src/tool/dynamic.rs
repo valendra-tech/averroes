@@ -60,13 +60,14 @@ impl Tool for DynamicTool {
         self.parameters.clone()
     }
 
-    async fn execute(&self, _ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
         match &self.handler {
             DynamicToolHandler::ShellCommand { command_template } => {
                 let command = interpolate(command_template, params);
                 let output = tokio::process::Command::new("bash")
                     .arg("-c")
                     .arg(&command)
+                    .current_dir(ctx.current_dir())
                     .output()
                     .await
                     .map_err(|e| ToolError::Execution {
@@ -176,7 +177,24 @@ pub fn register_dynamic_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::ToolActivation;
     use serde_json::json;
+    use std::{path::Path, sync::Arc};
+
+    fn context(root: &Path) -> ToolContext {
+        ToolContext {
+            working_dir: root.to_path_buf(),
+            session_id: "session".into(),
+            agent_id: "agent".into(),
+            enabled_tools: Vec::new(),
+            available_tools: Vec::new(),
+            tool_activation: Arc::new(ToolActivation::default()),
+            conversation_context: Vec::new(),
+            agent_runner: None,
+            memory_search_backend: None,
+            agent_event_sink: None,
+        }
+    }
 
     #[test]
     fn test_interpolate_simple() {
@@ -208,5 +226,26 @@ mod tests {
         let params = json!({});
         let result = interpolate(template, &params);
         assert_eq!(result, "${name}");
+    }
+
+    #[tokio::test]
+    async fn shell_commands_use_the_conversation_current_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let context = context(directory.path());
+        context.set_current_dir(nested.canonicalize().unwrap());
+        let tool = DynamicTool::new(DynamicToolConfig {
+            name: "pwd".into(),
+            description: "Print the current directory".into(),
+            parameters: json!({ "type": "object" }),
+            handler: DynamicToolHandler::ShellCommand {
+                command_template: "pwd".into(),
+            },
+        });
+
+        let result = tool.execute(&context, &json!({})).await.unwrap();
+
+        assert_eq!(result.content.trim(), nested.display().to_string());
     }
 }

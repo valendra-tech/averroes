@@ -76,6 +76,18 @@ pub struct ToolContext {
         Option<tokio::sync::mpsc::UnboundedSender<crate::agent::AgentStreamEvent>>,
 }
 
+impl ToolContext {
+    /// Current base directory for relative tool paths. It starts at the
+    /// workspace root and can change without changing the workspace itself.
+    pub fn current_dir(&self) -> PathBuf {
+        self.tool_activation.current_directory(&self.working_dir)
+    }
+
+    pub fn set_current_dir(&self, path: PathBuf) {
+        self.tool_activation.set_current_directory(path);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnabledTool {
     pub name: String,
@@ -87,6 +99,7 @@ impl std::fmt::Debug for ToolContext {
         formatter
             .debug_struct("ToolContext")
             .field("working_dir", &self.working_dir)
+            .field("current_dir", &self.current_dir())
             .field("session_id", &self.session_id)
             .field("agent_id", &self.agent_id)
             .field("enabled_tools", &self.enabled_tools.len())
@@ -108,6 +121,7 @@ impl std::fmt::Debug for ToolContext {
 #[derive(Default)]
 pub struct ToolActivation {
     names: RwLock<BTreeSet<String>>,
+    current_directory: RwLock<Option<PathBuf>>,
 }
 
 impl ToolActivation {
@@ -124,6 +138,18 @@ impl ToolActivation {
 
     pub fn names(&self) -> Vec<String> {
         self.names.read().unwrap().iter().cloned().collect()
+    }
+
+    fn current_directory(&self, fallback: &Path) -> PathBuf {
+        self.current_directory
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| fallback.to_path_buf())
+    }
+
+    fn set_current_directory(&self, path: PathBuf) {
+        *self.current_directory.write().unwrap() = Some(path);
     }
 
     pub fn enabled(&self, catalog: &[EnabledTool]) -> Vec<EnabledTool> {
