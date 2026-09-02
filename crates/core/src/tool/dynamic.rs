@@ -1,3 +1,4 @@
+use crate::integrations::mcp::McpClient;
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -22,7 +23,7 @@ pub enum DynamicToolHandler {
     },
     Inline(Arc<dyn Fn(&Value) -> String + Send + Sync>),
     MCP {
-        server_name: String,
+        client: Arc<McpClient>,
         tool_name: String,
     },
 }
@@ -137,10 +138,14 @@ impl Tool for DynamicTool {
                 let result = handler(params);
                 Ok(ToolResult::ok(result))
             }
-            DynamicToolHandler::MCP {
-                server_name: _,
-                tool_name: _,
-            } => Ok(ToolResult::ok("MCP handler: not yet implemented")),
+            DynamicToolHandler::MCP { client, tool_name } => client
+                .call_tool(tool_name, params.clone())
+                .await
+                .map(ToolResult::ok)
+                .map_err(|error| ToolError::Execution {
+                    tool: self.name.clone(),
+                    message: format!("MCP tool call failed: {error}"),
+                }),
         }
     }
 }

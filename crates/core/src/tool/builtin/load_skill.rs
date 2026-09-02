@@ -20,7 +20,7 @@ impl Tool for LoadSkillTool {
         "load_skill"
     }
     fn description(&self) -> &str {
-        "Load the full content of a skill by name. Use list_skills first to see available skills."
+        "Load the full content of a workspace skill by exact name. Skill names are already present in the system context; use list_skills with a focused query only when the name is unclear."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({

@@ -140,6 +140,16 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    // Early builds used the generic 128k fallback for GPT-5.6. Correct those
+    // persisted snapshots so reopening an existing conversation does not keep
+    // showing 100% before its next provider response arrives.
+    connection.execute(
+        "UPDATE conversations
+         SET context_usage_json = json_set(context_usage_json, '$.context_limit', 1050000)
+         WHERE json_extract(binding_json, '$.model_id') LIKE 'gpt-5.6%'
+           AND json_extract(context_usage_json, '$.context_limit') = 128000",
+        [],
+    )?;
     if !conversation_has_column(connection, "agent_threads_json")? {
         connection.execute(
             "ALTER TABLE conversations ADD COLUMN agent_threads_json TEXT NOT NULL DEFAULT '[]'",

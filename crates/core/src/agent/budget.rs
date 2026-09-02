@@ -1,5 +1,5 @@
 use super::{AgentState, ChatMessage};
-use crate::provider::types::{ContentPart, MessageContent, TokenUsage};
+use crate::provider::types::{ContentPart, MessageContent};
 use crate::provider::{ChatRequest, ChatResponse, ChatStream, Provider, StreamEvent};
 use crate::runtime::{CallPermit, ResourceGovernor};
 use async_trait::async_trait;
@@ -7,13 +7,6 @@ use futures::Stream;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-
-pub(super) fn usage_input_tokens(usage: &TokenUsage) -> u64 {
-    // Providers report cache reads and writes as a breakdown of input usage.
-    // Adding them again inflates the real context size and can trigger an
-    // unnecessary compaction.
-    usage.input_tokens
-}
 
 pub(super) fn message_text(message: &ChatMessage) -> String {
     match &message.content {

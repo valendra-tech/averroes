@@ -72,6 +72,9 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     pub cache_read_input_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
+    /// Reasoning tokens are a breakdown of `output_tokens` for providers such
+    /// as OpenAI. They must not be added to the total a second time.
+    pub reasoning_output_tokens: Option<u64>,
 }
 
 #[cfg(test)]

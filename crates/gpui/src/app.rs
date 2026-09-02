@@ -1,5 +1,5 @@
 use crate::i18n;
-use crate::runtime::AppRuntime;
+use crate::runtime::{AppRuntime, MarketplaceSkill};
 use crate::session::SessionId;
 use crate::shortcuts::{CloseSession, FocusInput, NewSession, Quit, SendMessage, ToggleSettings};
 use crate::tool_details::{render_tool_detail, ToolDetailSection};
@@ -18,8 +18,9 @@ use averroes_core::codex::CodexAccount;
 use averroes_core::config::AgentProfile;
 use averroes_core::connection::{ConnectionId, ConnectionKind, ConnectionProfile, SessionBinding};
 use averroes_core::diagnostics::{self, DiagnosticLevel};
+use averroes_core::integrations::mcp::{McpAuth, McpAuthType, McpTransport, ProjectMcpServer};
 use averroes_core::models::ManualModel;
-use averroes_core::provider::types::{ChatMessage, MessageContent, Role};
+use averroes_core::provider::types::{ChatMessage, ContentPart, ImageSource, MessageContent, Role};
 use averroes_core::provider::{ModelInfo, ModelSource};
 use averroes_core::work::{
     now, CheckpointStatus, ConversationSearchResult, ConversationSummary, EmbeddingConfig,
@@ -27,14 +28,16 @@ use averroes_core::work::{
     WorkMessage, WorkMessageRole, WorkProject, WorkSource, WorkTask, WorkToolActivity,
     WorkToolActivityState,
 };
+use base64::Engine as _;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, img, list, px, rgb, Anchor, Animation, AnimationExt as _, AnyElement, App, AppContext,
-    ClipboardItem, Context, Entity, FollowMode, FontWeight, FutureExt as _, InteractiveElement,
-    IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, Transformation, Window,
+    div, img, list, px, Anchor, Animation, AnimationExt as _, AnyElement, App, AppContext,
+    ClipboardItem, Context, Entity, ExternalPaths, FollowMode, FontWeight, FutureExt as _,
+    InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task,
+    Transformation, Window,
 };
-use gpui_component::button::{Button, ButtonRounded, ButtonVariant, ButtonVariants};
+use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::link::Link;
@@ -44,12 +47,14 @@ use gpui_component::select::{
     SearchableVec, Select, SelectEvent, SelectGroup, SelectItem, SelectState,
 };
 use gpui_component::text::TextView;
-use gpui_component::{Disableable, Icon, IconName, Root as ComponentRoot, Sizable, WindowExt as _};
+use gpui_component::{
+    Disableable, Icon, IconName, Root as ComponentRoot, Selectable, Sizable, WindowExt as _,
+};
 use semver::Version;
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // Keep the main window responsive while the provider emits many small deltas.
@@ -61,6 +66,13 @@ const STREAM_UI_BATCH_WINDOW: Duration = Duration::from_millis(32);
 const STREAM_UI_MAX_EVENTS: usize = 64;
 const STREAM_MESSAGE_FADE_DURATION: Duration = Duration::from_millis(260);
 const CONVERSATION_SEARCH_DEBOUNCE: Duration = Duration::from_millis(280);
+const SIDEBAR_WIDTH: f32 = 352.0;
+const SIDEBAR_GUTTER: f32 = 12.0;
+const SIDEBAR_ROW_HEIGHT: f32 = 34.0;
+const SIDEBAR_NAV_HEIGHT: f32 = 38.0;
+const SIDEBAR_RADIUS: f32 = 10.0;
+const WORK_RAIL_WIDTH: f32 = 336.0;
+const WORK_RAIL_TRIGGER_WIDTH: f32 = 36.0;
 
 fn stream_event_requires_immediate_flush(event: &AgentStreamEvent) -> bool {
     matches!(
@@ -98,6 +110,34 @@ enum SettingsTab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectSettingsTab {
+    Mcp,
+    Skills,
+}
+
+#[derive(Clone)]
+struct ProjectMcpDialogState {
+    transport: McpTransport,
+    auth_type: McpAuthType,
+}
+
+#[derive(Clone, Default)]
+struct SkillMarketplaceDialogState {
+    busy: bool,
+    results: Vec<MarketplaceSkill>,
+    installed_skill_names: HashSet<String>,
+    active_skill_action: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct UpdateDialogState {
+    state: UpdateState,
+    open_error: Option<String>,
+    open_in_flight: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageRole {
     User,
     Assistant,
@@ -119,12 +159,12 @@ struct ToolActivity {
     /// duplicate entry for the same call.
     call_id: Option<String>,
     name: String,
-    /// Byte position in the assistant text at which the tool was invoked.
-    /// Stream deltas only append, so this preserves the provider's temporal
-    /// ordering without retaining every individual delta as a UI node.
+    /// Byte position in the stream that owns the tool: `reasoning` for an
+    /// inside-reasoning call, otherwise the assistant response text. Stream
+    /// deltas only append, so this preserves temporal ordering cheaply.
     text_offset: usize,
-    /// Visible non-reasoning activities share a group until assistant text
-    /// arrives. Reasoning activities intentionally have no group.
+    /// Calls share a compact group until more text arrives in their owning
+    /// stream. Reasoning and assistant-text groups use separate trackers.
     group_id: Option<usize>,
     input: String,
     summary: String,
@@ -140,6 +180,7 @@ struct ToolActivity {
 struct ShellMessage {
     role: MessageRole,
     text: String,
+    attachments: Vec<PathBuf>,
     reasoning: String,
     reasoning_complete: bool,
     reasoning_expanded: bool,
@@ -217,9 +258,14 @@ impl SelectItem for ConnectionKindChoice {
 
 impl ShellMessage {
     fn user(text: String) -> Self {
+        Self::user_with_attachments(text, Vec::new())
+    }
+
+    fn user_with_attachments(text: String, attachments: Vec<PathBuf>) -> Self {
         Self {
             role: MessageRole::User,
             text,
+            attachments,
             reasoning: String::new(),
             reasoning_complete: true,
             reasoning_expanded: false,
@@ -234,6 +280,7 @@ impl ShellMessage {
         Self {
             role: MessageRole::Assistant,
             text: String::new(),
+            attachments: Vec::new(),
             reasoning: String::new(),
             reasoning_complete: false,
             reasoning_expanded: false,
@@ -248,6 +295,7 @@ impl ShellMessage {
         Self {
             role: MessageRole::Error,
             text: text.into(),
+            attachments: Vec::new(),
             reasoning: String::new(),
             reasoning_complete: true,
             reasoning_expanded: false,
@@ -283,6 +331,10 @@ impl ShellMessage {
 
     fn active_tool_group(&self) -> Option<usize> {
         self.tool_groups.active_group_id()
+    }
+
+    fn active_reasoning_tool_group(&self) -> Option<usize> {
+        self.tool_groups.active_reasoning_group_id()
     }
 }
 
@@ -353,6 +405,7 @@ fn shell_message_from_work(message: WorkMessage) -> ShellMessage {
             WorkMessageRole::Error => MessageRole::Error,
         },
         text: message.text,
+        attachments: Vec::new(),
         reasoning: message.reasoning,
         reasoning_complete: message.reasoning_complete,
         reasoning_expanded: message.reasoning_expanded,
@@ -612,12 +665,28 @@ pub struct AverroesApp {
     conversation_folders: Vec<WorkConversationFolder>,
     conversation_folder_ids: HashMap<String, String>,
     expanded_conversation_folders: HashSet<String>,
-    unfiled_conversations_expanded: bool,
     folder_name_input: Entity<InputState>,
     /// The workspace whose conversations are currently shown. `None` is the
     /// welcome screen; a chat session always has a concrete workspace.
     active_workspace_id: Option<String>,
     projects_expanded: bool,
+    project_settings_open: bool,
+    project_settings_tab: ProjectSettingsTab,
+    project_mcp_transport: McpTransport,
+    project_mcp_auth_type: McpAuthType,
+    project_mcp_name_input: Entity<InputState>,
+    project_mcp_command_input: Entity<InputState>,
+    project_mcp_args_input: Entity<InputState>,
+    project_mcp_url_input: Entity<InputState>,
+    project_mcp_auth_server_input: Entity<InputState>,
+    project_mcp_client_id_input: Entity<InputState>,
+    project_mcp_scopes_input: Entity<InputState>,
+    project_mcp_token_input: Entity<InputState>,
+    project_mcp_search: Entity<InputState>,
+    project_skill_search: Entity<InputState>,
+    skill_marketplace_query: Entity<InputState>,
+    skill_marketplace_results: Vec<MarketplaceSkill>,
+    skill_marketplace_busy: bool,
     show_sources: bool,
     show_tool_activity: bool,
     show_context: bool,
@@ -795,6 +864,42 @@ impl AverroesApp {
         let folder_name_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.folder_name"))
         });
+        let project_mcp_name_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.mcp_name"))
+        });
+        let project_mcp_command_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.mcp_command"))
+        });
+        let project_mcp_args_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.mcp_args"))
+        });
+        let project_mcp_url_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.mcp_url"))
+        });
+        let project_mcp_auth_server_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(i18n::text(cx, "placeholder.mcp_authorization_server"))
+        });
+        let project_mcp_client_id_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.mcp_client_id"))
+        });
+        let project_mcp_scopes_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.mcp_scopes"))
+        });
+        let project_mcp_token_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(i18n::text(cx, "placeholder.mcp_access_token"))
+                .masked(true)
+        });
+        let project_mcp_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.mcp_search"))
+        });
+        let project_skill_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.skill_list_search"))
+        });
+        let skill_marketplace_query = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.skill_search"))
+        });
         let manual_model_id_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.model_id"))
         });
@@ -876,6 +981,24 @@ impl AverroesApp {
         ));
         subscriptions.push(cx.subscribe_in(
             &diagnostics_search,
+            window,
+            |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &project_mcp_search,
+            window,
+            |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &project_skill_search,
             window,
             |_, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -1007,10 +1130,26 @@ impl AverroesApp {
             conversation_folders: Vec::new(),
             conversation_folder_ids: HashMap::new(),
             expanded_conversation_folders: HashSet::new(),
-            unfiled_conversations_expanded: true,
             folder_name_input,
             active_workspace_id: None,
             projects_expanded: true,
+            project_settings_open: false,
+            project_settings_tab: ProjectSettingsTab::Mcp,
+            project_mcp_transport: McpTransport::StreamableHttp,
+            project_mcp_auth_type: McpAuthType::None,
+            project_mcp_name_input,
+            project_mcp_command_input,
+            project_mcp_args_input,
+            project_mcp_url_input,
+            project_mcp_auth_server_input,
+            project_mcp_client_id_input,
+            project_mcp_scopes_input,
+            project_mcp_token_input,
+            project_mcp_search,
+            project_skill_search,
+            skill_marketplace_query,
+            skill_marketplace_results: Vec::new(),
+            skill_marketplace_busy: false,
             show_sources: true,
             show_tool_activity: true,
             show_context: false,
@@ -1082,7 +1221,7 @@ impl AverroesApp {
                         diagnostics::record(
                             DiagnosticLevel::Info,
                             "update.check",
-                            format!("Stable update available: {}.", info.version),
+                            format!("Compatible update available: {}.", info.version),
                         );
                         app.update_state = UpdateState::Available(info.clone());
                         app.show_update_dialog(info, window, cx);
@@ -1093,7 +1232,7 @@ impl AverroesApp {
                     diagnostics::record(
                         DiagnosticLevel::Info,
                         "update.check",
-                        "No stable update is available.",
+                        "No compatible update is available.",
                     );
                     this.update_in(cx, |app, _, cx| {
                         app.update_state = UpdateState::Idle;
@@ -1146,18 +1285,25 @@ impl AverroesApp {
 
         self.update_prompt_shown = true;
         let fallback_info = info;
+        let dialog_state = Arc::new(Mutex::new(UpdateDialogState {
+            state: self.update_state.clone(),
+            open_error: self.update_open_error.clone(),
+            open_in_flight: self.update_open_in_flight,
+        }));
         let view = cx.entity();
         let localization = cx.global::<i18n::Localization>().clone();
 
         window.open_dialog(cx, move |dialog, _window, cx| {
-            let (state, open_error, open_in_flight) = {
-                let app = view.read(cx);
-                (
-                    app.update_state.clone(),
-                    app.update_open_error.clone(),
-                    app.update_open_in_flight,
-                )
-            };
+            // The parent app is already leased while the dialog layer is
+            // rendered. Reading it here would trigger GPUI's double-lease
+            // panic, so the dialog uses its own shared snapshot.
+            let snapshot = dialog_state
+                .lock()
+                .expect("update dialog state poisoned")
+                .clone();
+            let state = snapshot.state;
+            let open_error = snapshot.open_error;
+            let open_in_flight = snapshot.open_in_flight;
 
             let info = match &state {
                 UpdateState::Available(info)
@@ -1250,6 +1396,7 @@ impl AverroesApp {
                 // immediate state feedback and can retry if opening fails.
             } else if retryable_open {
                 let retry_view = view.clone();
+                let retry_state = dialog_state.clone();
                 let retry_info = info.clone();
                 let retry_path = match &state {
                     UpdateState::ReadyToOpen { path, .. } => Some(path.clone()),
@@ -1264,13 +1411,20 @@ impl AverroesApp {
                                 let path = path.clone();
                                 let info = retry_info.clone();
                                 let _ = retry_view.update(cx, |app, cx| {
-                                    app.start_installer_open(info, path, window, cx);
+                                    app.start_installer_open(
+                                        info,
+                                        path,
+                                        window,
+                                        cx,
+                                        retry_state.clone(),
+                                    );
                                 });
                             }),
                     );
                 }
             } else {
                 let update_view = view.clone();
+                let update_state = dialog_state.clone();
                 let update_info = info.clone();
                 footer = footer.child(
                     Button::new("update-dismiss")
@@ -1286,7 +1440,12 @@ impl AverroesApp {
                             .on_click(move |_, window, cx| {
                                 let info = update_info.clone();
                                 let _ = update_view.update(cx, |app, cx| {
-                                    app.start_update_download(info, window, cx);
+                                    app.start_update_download(
+                                        info,
+                                        window,
+                                        cx,
+                                        update_state.clone(),
+                                    );
                                 });
                             }),
                     );
@@ -1298,7 +1457,12 @@ impl AverroesApp {
                             .on_click(move |_, window, cx| {
                                 let info = update_info.clone();
                                 let _ = update_view.update(cx, |app, cx| {
-                                    app.start_update_download(info, window, cx);
+                                    app.start_update_download(
+                                        info,
+                                        window,
+                                        cx,
+                                        update_state.clone(),
+                                    );
                                 });
                             }),
                     );
@@ -1316,11 +1480,19 @@ impl AverroesApp {
         });
     }
 
+    fn sync_update_dialog_state(&self, dialog_state: &Arc<Mutex<UpdateDialogState>>) {
+        let mut snapshot = dialog_state.lock().expect("update dialog state poisoned");
+        snapshot.state = self.update_state.clone();
+        snapshot.open_error = self.update_open_error.clone();
+        snapshot.open_in_flight = self.update_open_in_flight;
+    }
+
     fn start_update_download(
         &mut self,
         info: UpdateInfo,
         window: &mut Window,
         cx: &mut Context<Self>,
+        dialog_state: Arc<Mutex<UpdateDialogState>>,
     ) {
         let requested_version = info.version.clone();
         let Some((state, info)) =
@@ -1336,6 +1508,7 @@ impl AverroesApp {
 
         self.update_state = state;
         self.update_open_error = None;
+        self.sync_update_dialog_state(&dialog_state);
         diagnostics::record(
             DiagnosticLevel::Info,
             "update.download",
@@ -1349,6 +1522,7 @@ impl AverroesApp {
             client.download(&info).await
         });
 
+        let dialog_state_for_task = dialog_state.clone();
         cx.spawn_in(window, async move |this, cx| {
             match request.await {
                 Ok(Ok(path)) => {
@@ -1362,6 +1536,7 @@ impl AverroesApp {
                                 "Download completed but update state was no longer downloading.",
                             );
                             app.update_state = state;
+                            app.sync_update_dialog_state(&dialog_state_for_task);
                             cx.notify();
                             return;
                         };
@@ -1375,7 +1550,13 @@ impl AverroesApp {
                             info: info.clone(),
                             path: path.clone(),
                         };
-                        app.start_installer_open(info, path, window, cx);
+                        app.start_installer_open(
+                            info,
+                            path,
+                            window,
+                            cx,
+                            dialog_state_for_task.clone(),
+                        );
                         cx.notify();
                     })?;
                 }
@@ -1389,6 +1570,7 @@ impl AverroesApp {
                         app.update_state =
                             std::mem::replace(&mut app.update_state, UpdateState::Idle)
                                 .download_failed(error.to_string());
+                        app.sync_update_dialog_state(&dialog_state_for_task);
                         cx.notify();
                     })?;
                 }
@@ -1402,6 +1584,7 @@ impl AverroesApp {
                         app.update_state =
                             std::mem::replace(&mut app.update_state, UpdateState::Idle)
                                 .download_failed(error.to_string());
+                        app.sync_update_dialog_state(&dialog_state_for_task);
                         cx.notify();
                     })?;
                 }
@@ -1418,6 +1601,7 @@ impl AverroesApp {
         path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
+        dialog_state: Arc<Mutex<UpdateDialogState>>,
     ) {
         if !matches!(self.update_state, UpdateState::ReadyToOpen { .. }) {
             return;
@@ -1433,6 +1617,7 @@ impl AverroesApp {
 
         self.update_open_in_flight = true;
         self.update_open_error = None;
+        self.sync_update_dialog_state(&dialog_state);
         cx.notify();
 
         diagnostics::record(
@@ -1445,6 +1630,7 @@ impl AverroesApp {
             .runtime
             .spawn_blocking(move || open_installer(&path));
 
+        let dialog_state_for_task = dialog_state.clone();
         cx.spawn_in(window, async move |this, cx| {
             match request.await {
                 Ok(Ok(())) => {
@@ -1455,6 +1641,7 @@ impl AverroesApp {
                     );
                     this.update_in(cx, |app, window, cx| {
                         app.update_open_in_flight = false;
+                        app.sync_update_dialog_state(&dialog_state_for_task);
                         window.close_dialog(cx);
                         cx.quit();
                     })?;
@@ -1468,6 +1655,7 @@ impl AverroesApp {
                     this.update_in(cx, |app, _, cx| {
                         app.update_open_in_flight = false;
                         app.update_open_error = Some(error.to_string());
+                        app.sync_update_dialog_state(&dialog_state_for_task);
                         cx.notify();
                     })?;
                 }
@@ -1480,6 +1668,7 @@ impl AverroesApp {
                     this.update_in(cx, |app, _, cx| {
                         app.update_open_in_flight = false;
                         app.update_open_error = Some(error.to_string());
+                        app.sync_update_dialog_state(&dialog_state_for_task);
                         cx.notify();
                     })?;
                 }
@@ -2390,24 +2579,61 @@ impl AverroesApp {
             prompt: Some(i18n::text(cx, "notice.attach_files")),
         });
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = receiver.await else {
-                return Ok::<(), anyhow::Error>(());
-            };
-            this.update_in(cx, |app, _, cx| {
-                for path in paths {
-                    if !app
-                        .attachments
-                        .iter()
-                        .any(|attachment| attachment.path == path)
-                    {
-                        app.attachments.push(ComposerAttachment { path });
-                    }
+            match receiver.await {
+                Ok(Ok(Some(paths))) => {
+                    this.update_in(cx, |app, _, cx| {
+                        app.add_attachment_paths(paths, cx);
+                    })?;
                 }
-                cx.notify();
-            })?;
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    this.update_in(cx, |app, _, cx| {
+                        app.show_error(
+                            format!("Could not open the attachment picker: {error}"),
+                            cx,
+                        );
+                    })?;
+                }
+                Err(error) => {
+                    this.update_in(cx, |app, _, cx| {
+                        app.show_error(
+                            format!("Could not open the attachment picker: {error}"),
+                            cx,
+                        );
+                    })?;
+                }
+            }
             Ok::<(), anyhow::Error>(())
         })
         .detach();
+    }
+
+    fn add_attachment_paths(
+        &mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut added = false;
+        for path in paths {
+            if !self
+                .attachments
+                .iter()
+                .any(|attachment| attachment.path == path)
+            {
+                self.attachments.push(ComposerAttachment { path });
+                added = true;
+            }
+        }
+        if added {
+            // A previous attachment error should not remain visible after the
+            // user successfully selects or drops another file.
+            self.notice = None;
+            cx.notify();
+        }
+    }
+
+    fn add_dropped_attachments(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
+        self.add_attachment_paths(paths.paths().iter().cloned(), cx);
     }
 
     fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -2527,9 +2753,28 @@ impl AverroesApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The active session is the source of truth while the sidebar is
+        // being rebuilt. The selected workspace can briefly lag behind it
+        // after opening a workspace or restoring a saved conversation; using
+        // the first project in that window would silently put the new chat in
+        // the default workspace.
+        let active_project_id = (self.route == Route::Chat)
+            .then(|| self.active().project_id.clone())
+            .flatten();
+        let active_workspace_id = (self.route == Route::Chat)
+            .then(|| self.active_workspace_id.clone())
+            .flatten();
         let project = project
             .or_else(|| {
-                self.active_workspace_id.as_ref().and_then(|id| {
+                active_project_id.as_ref().and_then(|id| {
+                    self.projects
+                        .iter()
+                        .find(|project| &project.id == id)
+                        .cloned()
+                })
+            })
+            .or_else(|| {
+                active_workspace_id.as_ref().and_then(|id| {
                     self.projects
                         .iter()
                         .find(|project| &project.id == id)
@@ -2554,6 +2799,7 @@ impl AverroesApp {
             .push(ShellSession::new(Some(&project), binding));
         self.active_session = self.sessions.len() - 1;
         self.route = Route::Chat;
+        self.project_settings_open = false;
         self.show_sources = true;
         self.show_context = false;
         self.selected_agent_thread = None;
@@ -2572,7 +2818,16 @@ impl AverroesApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.new_session_for_project(None, window, cx);
+        let project = self
+            .projects
+            .iter()
+            .find(|project| project.id == folder.workspace_id)
+            .cloned();
+        if project.is_none() {
+            self.show_error(i18n::text(cx, "notice.workspace_missing"), cx);
+            return;
+        }
+        self.new_session_for_project(project, window, cx);
         self.active_mut().pending_conversation_folder_id = Some(folder.id);
         cx.notify();
     }
@@ -2595,6 +2850,774 @@ impl AverroesApp {
         cx: &mut Context<Self>,
     ) {
         self.select_project(project_id, window, cx);
+    }
+
+    fn active_project(&self) -> Option<WorkProject> {
+        self.active_workspace_id.as_ref().and_then(|id| {
+            self.projects
+                .iter()
+                .find(|project| &project.id == id)
+                .cloned()
+        })
+    }
+
+    fn open_project_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_project().is_none() {
+            return;
+        }
+        for input in [&self.project_mcp_search, &self.project_skill_search] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.project_settings_open = true;
+        self.project_settings_tab = ProjectSettingsTab::Mcp;
+        self.route = Route::Chat;
+        self.refresh_navigation();
+        cx.notify();
+        let _ = window;
+    }
+
+    fn close_project_settings(&mut self, cx: &mut Context<Self>) {
+        self.project_settings_open = false;
+        cx.notify();
+    }
+
+    fn open_project_mcp_dialog(
+        &mut self,
+        transport: McpTransport,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_mcp_transport = transport;
+        self.project_mcp_auth_type = McpAuthType::None;
+        for input in [
+            &self.project_mcp_name_input,
+            &self.project_mcp_command_input,
+            &self.project_mcp_args_input,
+            &self.project_mcp_url_input,
+            &self.project_mcp_auth_server_input,
+            &self.project_mcp_client_id_input,
+            &self.project_mcp_scopes_input,
+            &self.project_mcp_token_input,
+        ] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        let dialog_state = Arc::new(Mutex::new(ProjectMcpDialogState {
+            transport: self.project_mcp_transport.clone(),
+            auth_type: self.project_mcp_auth_type.clone(),
+        }));
+        let view = cx.entity();
+        let project_mcp_name_input = self.project_mcp_name_input.clone();
+        let project_mcp_command_input = self.project_mcp_command_input.clone();
+        let project_mcp_args_input = self.project_mcp_args_input.clone();
+        let project_mcp_url_input = self.project_mcp_url_input.clone();
+        let project_mcp_auth_server_input = self.project_mcp_auth_server_input.clone();
+        let project_mcp_client_id_input = self.project_mcp_client_id_input.clone();
+        let project_mcp_scopes_input = self.project_mcp_scopes_input.clone();
+        let project_mcp_token_input = self.project_mcp_token_input.clone();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            // The parent AverroesApp is already leased while this dialog is
+            // rendered. Keep dialog-only state outside that entity; reading
+            // `view` here would trigger GPUI's double-lease panic.
+            let state = dialog_state
+                .lock()
+                .expect("MCP dialog state poisoned")
+                .clone();
+            let transport = state.transport;
+            let auth_type = state.auth_type;
+            let transport_choices = [
+                (McpTransport::Stdio, "project.mcp_transport_stdio", "stdio"),
+                (
+                    McpTransport::StreamableHttp,
+                    "project.mcp_transport_http",
+                    "http",
+                ),
+                (
+                    McpTransport::WebMcp,
+                    "project.mcp_transport_webmcp",
+                    "webmcp",
+                ),
+            ];
+            let auth_choices = [
+                (McpAuthType::None, "project.auth_none", "none"),
+                (McpAuthType::Bearer, "project.auth_bearer", "bearer"),
+                (McpAuthType::OAuth, "project.auth_oauth", "oauth"),
+            ];
+            let transport_buttons = transport_choices
+                .into_iter()
+                .map(|(choice, label, id)| {
+                    let selected = transport == choice;
+                    let target = view.clone();
+                    let dialog_state = dialog_state.clone();
+                    let button = Button::new(SharedString::from(format!("mcp-transport-{id}")))
+                        .label(i18n::text(cx, label))
+                        .on_click(move |_, _, cx| {
+                            target.update(cx, |app, cx| {
+                                app.project_mcp_transport = choice.clone();
+                                if choice == McpTransport::WebMcp {
+                                    app.project_mcp_auth_type = McpAuthType::None;
+                                }
+                                cx.notify();
+                            });
+                            let mut state = dialog_state.lock().expect("MCP dialog state poisoned");
+                            state.transport = choice.clone();
+                            if choice == McpTransport::WebMcp {
+                                state.auth_type = McpAuthType::None;
+                            }
+                        });
+                    if selected {
+                        button.primary()
+                    } else {
+                        button.secondary()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let auth_buttons = if transport == McpTransport::WebMcp {
+                Vec::new()
+            } else {
+                auth_choices
+                    .into_iter()
+                    .map(|(choice, label, id)| {
+                        let selected = auth_type == choice;
+                        let target = view.clone();
+                        let dialog_state = dialog_state.clone();
+                        let button = Button::new(SharedString::from(format!("mcp-auth-{id}")))
+                            .label(i18n::text(cx, label))
+                            .on_click(move |_, _, cx| {
+                                target.update(cx, |app, cx| {
+                                    app.project_mcp_auth_type = choice.clone();
+                                    cx.notify();
+                                });
+                                dialog_state
+                                    .lock()
+                                    .expect("MCP dialog state poisoned")
+                                    .auth_type = choice.clone();
+                            });
+                        if selected {
+                            button.primary()
+                        } else {
+                            button.secondary()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let confirm_view = view.clone();
+            let confirm = Button::new("project-mcp-save")
+                .primary()
+                .label(i18n::text(cx, "project.save_mcp"))
+                .on_click(move |_, window, cx| {
+                    if confirm_view.update(cx, |app, cx| app.save_project_mcp_from_form(cx)) {
+                        window.close_dialog(cx);
+                    }
+                });
+            project_mcp_name_input.update(cx, |input, cx| input.focus(window, cx));
+
+            let mut body = div()
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(form_label(
+                    i18n::text(cx, "project.server_name"),
+                    UiTheme::current(cx),
+                ))
+                .child(Input::new(&project_mcp_name_input).w_full())
+                .child(form_label(
+                    i18n::text(cx, "project.transport"),
+                    UiTheme::current(cx),
+                ))
+                .child(div().flex().gap(px(6.0)).children(transport_buttons));
+            if transport == McpTransport::Stdio {
+                body = body
+                    .child(form_label(
+                        i18n::text(cx, "project.command"),
+                        UiTheme::current(cx),
+                    ))
+                    .child(Input::new(&project_mcp_command_input).w_full())
+                    .child(form_label(
+                        i18n::text(cx, "project.arguments"),
+                        UiTheme::current(cx),
+                    ))
+                    .child(Input::new(&project_mcp_args_input).w_full());
+            } else {
+                body = body
+                    .child(form_label(
+                        i18n::text(cx, "project.url"),
+                        UiTheme::current(cx),
+                    ))
+                    .child(Input::new(&project_mcp_url_input).w_full());
+            }
+            if transport != McpTransport::WebMcp {
+                body = body
+                    .child(form_label(
+                        i18n::text(cx, "project.authentication"),
+                        UiTheme::current(cx),
+                    ))
+                    .child(div().flex().gap(px(6.0)).children(auth_buttons));
+            }
+            if auth_type != McpAuthType::None && transport != McpTransport::WebMcp {
+                if auth_type == McpAuthType::OAuth {
+                    body = body
+                        .child(form_label(
+                            i18n::text(cx, "project.authorization_server"),
+                            UiTheme::current(cx),
+                        ))
+                        .child(Input::new(&project_mcp_auth_server_input).w_full())
+                        .child(form_label(
+                            i18n::text(cx, "project.client_id"),
+                            UiTheme::current(cx),
+                        ))
+                        .child(Input::new(&project_mcp_client_id_input).w_full())
+                        .child(form_label(
+                            i18n::text(cx, "project.scopes"),
+                            UiTheme::current(cx),
+                        ))
+                        .child(Input::new(&project_mcp_scopes_input).w_full());
+                }
+                body = body
+                    .child(form_label(
+                        i18n::text(cx, "project.access_token"),
+                        UiTheme::current(cx),
+                    ))
+                    .child(Input::new(&project_mcp_token_input).w_full().mask_toggle())
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(UiTheme::current(cx).muted)
+                            .child(i18n::text(cx, "project.oauth_keychain_note")),
+                    );
+            }
+            dialog
+                .title(i18n::text(cx, "project.add_mcp"))
+                .w(px(560.0))
+                .child(body)
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            Button::new("project-mcp-cancel")
+                                .secondary()
+                                .label(i18n::text(cx, "dialog.cancel"))
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(confirm),
+                )
+        });
+    }
+
+    fn save_project_mcp_from_form(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(project) = self.active_project() else {
+            return false;
+        };
+        let name = self
+            .project_mcp_name_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_owned();
+        let transport = self.project_mcp_transport.clone();
+        let auth_type = if transport == McpTransport::WebMcp {
+            McpAuthType::None
+        } else {
+            self.project_mcp_auth_type.clone()
+        };
+        let scopes = self
+            .project_mcp_scopes_input
+            .read(cx)
+            .value()
+            .split(|character: char| character == ',' || character.is_whitespace())
+            .filter(|scope| !scope.trim().is_empty())
+            .map(str::to_owned)
+            .collect();
+        let server = ProjectMcpServer {
+            transport: transport.clone(),
+            command: (transport == McpTransport::Stdio).then(|| {
+                self.project_mcp_command_input
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_owned()
+            }),
+            args: self
+                .project_mcp_args_input
+                .read(cx)
+                .value()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+            url: (transport != McpTransport::Stdio).then(|| {
+                self.project_mcp_url_input
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_owned()
+            }),
+            auth: McpAuth {
+                kind: auth_type,
+                authorization_server: non_empty_input(&self.project_mcp_auth_server_input, cx),
+                client_id: non_empty_input(&self.project_mcp_client_id_input, cx),
+                scopes,
+                credential_ref: None,
+            },
+            ..Default::default()
+        };
+        let secret = non_empty_input(&self.project_mcp_token_input, cx);
+        match self
+            .runtime
+            .save_project_mcp_server(&project.root, &name, server, secret.as_deref())
+        {
+            Ok(()) => {
+                if !self.active().processing {
+                    // The scoped registry is created with the agent. Rebuild
+                    // it on the next request so newly added MCP tools become
+                    // visible without losing the persisted conversation.
+                    self.active_mut().agent = None;
+                }
+                self.notice = Some(Notice {
+                    success: true,
+                    text: i18n::text(cx, "project.mcp_saved").to_string(),
+                });
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.show_error(error.to_string(), cx);
+                false
+            }
+        }
+    }
+
+    fn delete_project_mcp_server(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(project) = self.active_project() else {
+            return;
+        };
+        match self.runtime.delete_project_mcp_server(&project.root, name) {
+            Ok(true) => {
+                if !self.active().processing {
+                    self.active_mut().agent = None;
+                }
+                self.notice = Some(Notice {
+                    success: true,
+                    text: i18n::text(cx, "project.mcp_removed").to_string(),
+                });
+                cx.notify();
+            }
+            Ok(false) => {}
+            Err(error) => self.show_error(error.to_string(), cx),
+        }
+    }
+
+    fn search_skill_marketplace(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        dialog_state: Arc<Mutex<SkillMarketplaceDialogState>>,
+    ) {
+        self.skill_marketplace_busy = true;
+        let mut state = dialog_state
+            .lock()
+            .expect("skill marketplace dialog state poisoned");
+        state.busy = true;
+        state.active_skill_action = None;
+        state.error = None;
+        let query = self.skill_marketplace_query.read(cx).value().to_owned();
+        let runtime = self.runtime.clone();
+        let request_runtime = runtime.clone();
+        let task = runtime.spawn_background(async move {
+            request_runtime.search_skill_marketplace(&query).await
+        });
+        let dialog_state_for_task = dialog_state.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |app, cx| {
+                app.skill_marketplace_busy = false;
+                match result {
+                    Ok(Ok(skills)) => {
+                        app.skill_marketplace_results = skills.clone();
+                        let mut state = dialog_state_for_task
+                            .lock()
+                            .expect("skill marketplace dialog state poisoned");
+                        state.results = skills;
+                        state.busy = false;
+                        state.active_skill_action = None;
+                        state.error = None;
+                    }
+                    Ok(Err(error)) => {
+                        let mut state = dialog_state_for_task
+                            .lock()
+                            .expect("skill marketplace dialog state poisoned");
+                        state.busy = false;
+                        state.active_skill_action = None;
+                        state.error = Some(error.to_string());
+                        app.show_error(error.to_string(), cx);
+                    }
+                    Err(error) => {
+                        let mut state = dialog_state_for_task
+                            .lock()
+                            .expect("skill marketplace dialog state poisoned");
+                        state.busy = false;
+                        state.active_skill_action = None;
+                        state.error = Some(error.to_string());
+                        app.show_error(error.to_string(), cx);
+                    }
+                }
+                cx.notify();
+            })
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn open_skill_marketplace_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.active_project() else {
+            return;
+        };
+        let workspace_root = project.root.clone();
+        let installed_skill_names = self
+            .runtime
+            .project_skills(&workspace_root)
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        self.skill_marketplace_results.clear();
+        self.skill_marketplace_query
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        let dialog_state = Arc::new(Mutex::new(SkillMarketplaceDialogState {
+            installed_skill_names,
+            ..Default::default()
+        }));
+        self.search_skill_marketplace(window, cx, dialog_state.clone());
+        let view = cx.entity();
+        let query = self.skill_marketplace_query.clone();
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            // The parent app is already leased while this dialog is
+            // rendered. Read only the independent dialog snapshot.
+            let state = dialog_state
+                .lock()
+                .expect("skill marketplace dialog state poisoned")
+                .clone();
+            let busy = state.busy;
+            let results = state.results;
+            let installed_skill_names = state.installed_skill_names;
+            let active_skill_action = state.active_skill_action;
+            let error = state.error;
+            let search_view = view.clone();
+            let search_state = dialog_state.clone();
+            let search = Button::new("skill-marketplace-search")
+                .primary()
+                .loading(busy && active_skill_action.is_none())
+                .label(i18n::text(cx, "project.search"))
+                .on_click(move |_, window, cx| {
+                    search_view.update(cx, |app, cx| {
+                        app.search_skill_marketplace(window, cx, search_state.clone())
+                    });
+                });
+            let result_rows = results
+                .into_iter()
+                .map(|skill| {
+                    let is_installed = installed_skill_names.contains(&skill.name);
+                    let action_busy = active_skill_action.as_deref() == Some(skill.name.as_str());
+                    let description = skill.description.clone();
+                    let action_skill = skill.clone();
+                    let action_view = view.clone();
+                    let action_state = dialog_state.clone();
+                    let action_workspace_root = workspace_root.clone();
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .p(px(10.0))
+                        .rounded(px(8.0))
+                        .bg(UiTheme::current(cx).surface_subtle)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .child(div().font_weight(FontWeight::SEMIBOLD).child(skill.name))
+                                .when_some(description, |this, description| {
+                                    this.child(
+                                        div()
+                                            .mt(px(3.0))
+                                            .text_size(px(11.0))
+                                            .text_color(UiTheme::current(cx).foreground)
+                                            .child(description),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .mt(px(4.0))
+                                        .text_size(px(11.0))
+                                        .text_color(UiTheme::current(cx).muted)
+                                        .child(format!(
+                                            "{} · {} installs",
+                                            skill.source, skill.installs
+                                        )),
+                                ),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "install-skill-{}",
+                                action_skill.id
+                            )))
+                            .secondary()
+                            .loading(action_busy)
+                            .label(i18n::text(
+                                cx,
+                                if action_busy {
+                                    if is_installed {
+                                        "project.removing"
+                                    } else {
+                                        "project.installing"
+                                    }
+                                } else if is_installed {
+                                    "project.remove"
+                                } else {
+                                    "project.install"
+                                },
+                            ))
+                            .disabled(busy)
+                            .on_click(move |_, window, cx| {
+                                action_view.update(cx, |app, cx| {
+                                    if is_installed {
+                                        app.remove_marketplace_skill(
+                                            action_skill.clone(),
+                                            action_workspace_root.clone(),
+                                            action_state.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    } else {
+                                        app.install_marketplace_skill(
+                                            action_skill.clone(),
+                                            action_workspace_root.clone(),
+                                            action_state.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    }
+                                });
+                            }),
+                        )
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>();
+            dialog
+                .title(i18n::text(cx, "project.skill_marketplace"))
+                .w(px(640.0))
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .child(Input::new(&query).flex_1())
+                        .child(search),
+                )
+                .when_some(error, |this, error| {
+                    this.child(
+                        div()
+                            .mt(px(10.0))
+                            .text_size(px(11.0))
+                            .text_color(UiTheme::current(cx).destructive)
+                            .child(error),
+                    )
+                })
+                .child(
+                    div()
+                        .mt(px(12.0))
+                        .id("skill-marketplace-results")
+                        .flex_none()
+                        .h(px(380.0))
+                        .overflow_y_scrollbar()
+                        .flex()
+                        .flex_col()
+                        .gap(px(7.0))
+                        .when(result_rows.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .py(px(24.0))
+                                    .text_center()
+                                    .text_color(UiTheme::current(cx).muted)
+                                    .child(if busy {
+                                        i18n::text(cx, "project.searching")
+                                    } else {
+                                        i18n::text(cx, "project.no_skills_found")
+                                    }),
+                            )
+                        })
+                        .children(result_rows),
+                )
+                .footer(
+                    div().flex().justify_end().child(
+                        Button::new("skill-marketplace-close")
+                            .secondary()
+                            .label(i18n::text(cx, "dialog.cancel"))
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                )
+        });
+    }
+
+    fn install_marketplace_skill(
+        &mut self,
+        skill: MarketplaceSkill,
+        workspace_root: PathBuf,
+        dialog_state: Arc<Mutex<SkillMarketplaceDialogState>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.skill_marketplace_busy = true;
+        let mut state = dialog_state
+            .lock()
+            .expect("skill marketplace dialog state poisoned");
+        state.busy = true;
+        state.active_skill_action = Some(skill.name.clone());
+        state.error = None;
+        let runtime = self.runtime.clone();
+        let request_runtime = runtime.clone();
+        let workspace_root_for_task = workspace_root.clone();
+        let task = runtime.spawn_background(async move {
+            request_runtime
+                .install_skill_from_marketplace(&workspace_root_for_task, &skill)
+                .await
+        });
+        let dialog_state_for_task = dialog_state.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |app, cx| {
+                app.skill_marketplace_busy = false;
+                let mut state = dialog_state_for_task
+                    .lock()
+                    .expect("skill marketplace dialog state poisoned");
+                state.busy = false;
+                state.active_skill_action = None;
+                match result {
+                    Ok(Ok(name)) => {
+                        app.refresh_project_skills_after_change(&workspace_root);
+                        state.installed_skill_names = app
+                            .runtime
+                            .project_skills(&workspace_root)
+                            .into_iter()
+                            .map(|skill| skill.name)
+                            .collect();
+                        app.notice = Some(Notice {
+                            success: true,
+                            text: format!("{}: {name}", i18n::text(cx, "project.skill_installed")),
+                        });
+                        cx.notify();
+                    }
+                    Ok(Err(error)) => {
+                        state.error = Some(error.to_string());
+                        app.show_error(error.to_string(), cx);
+                    }
+                    Err(error) => {
+                        state.error = Some(error.to_string());
+                        app.show_error(error.to_string(), cx);
+                    }
+                }
+            })
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn remove_marketplace_skill(
+        &mut self,
+        skill: MarketplaceSkill,
+        workspace_root: PathBuf,
+        dialog_state: Arc<Mutex<SkillMarketplaceDialogState>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.skill_marketplace_busy = true;
+        let skill_name = skill.name.clone();
+        let mut state = dialog_state
+            .lock()
+            .expect("skill marketplace dialog state poisoned");
+        state.busy = true;
+        state.active_skill_action = Some(skill_name.clone());
+        state.error = None;
+        let runtime = self.runtime.clone();
+        let request_runtime = runtime.clone();
+        let name_for_task = skill_name.clone();
+        let workspace_root_for_task = workspace_root.clone();
+        let task = runtime.spawn_background(async move {
+            request_runtime.delete_project_skill(&workspace_root_for_task, &name_for_task)
+        });
+        let dialog_state_for_task = dialog_state.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |app, cx| {
+                app.skill_marketplace_busy = false;
+                let mut state = dialog_state_for_task
+                    .lock()
+                    .expect("skill marketplace dialog state poisoned");
+                state.busy = false;
+                state.active_skill_action = None;
+                match result {
+                    Ok(Ok(true)) => {
+                        app.refresh_project_skills_after_change(&workspace_root);
+                        state.installed_skill_names = app
+                            .runtime
+                            .project_skills(&workspace_root)
+                            .into_iter()
+                            .map(|skill| skill.name)
+                            .collect();
+                        app.notice = Some(Notice {
+                            success: true,
+                            text: i18n::text(cx, "project.skill_removed").to_string(),
+                        });
+                        cx.notify();
+                    }
+                    Ok(Ok(false)) => {
+                        let error = i18n::text(cx, "project.skill_not_found").to_string();
+                        state.error = Some(error.clone());
+                        app.show_error(error, cx)
+                    }
+                    Ok(Err(error)) => {
+                        state.error = Some(error.to_string());
+                        app.show_error(error.to_string(), cx);
+                    }
+                    Err(error) => {
+                        state.error = Some(error.to_string());
+                        app.show_error(error.to_string(), cx);
+                    }
+                }
+            })
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn delete_project_skill(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(project) = self.active_project() else {
+            return;
+        };
+        match self.runtime.delete_project_skill(&project.root, name) {
+            Ok(true) => {
+                self.refresh_project_skills_after_change(&project.root);
+                self.notice = Some(Notice {
+                    success: true,
+                    text: i18n::text(cx, "project.skill_removed").to_string(),
+                });
+                cx.notify();
+            }
+            Ok(false) => {}
+            Err(error) => self.show_error(error.to_string(), cx),
+        }
+    }
+
+    /// Keep the cached project index, the project settings list, and every
+    /// already-created agent in the workspace in sync after a skill changes.
+    fn refresh_project_skills_after_change(&self, workspace_root: &std::path::Path) {
+        let Some(index) = self.runtime.refresh_workspace_skills(workspace_root) else {
+            return;
+        };
+        for session in &self.sessions {
+            if session.workspace_root.as_deref() == Some(workspace_root) {
+                if let Some(agent) = session.agent.as_ref() {
+                    agent.set_skill_index(Some(index.clone()));
+                }
+            }
+        }
     }
 
     pub(crate) fn recent_projects_for_menu(&self) -> Vec<(String, String)> {
@@ -2644,6 +3667,7 @@ impl AverroesApp {
                 self.active_workspace_id = self.active().project_id.clone();
                 self.refresh_conversation_folders();
                 self.route = Route::Chat;
+                self.project_settings_open = false;
                 self.show_sources = true;
                 self.show_context = false;
                 self.selected_agent_thread = None;
@@ -3082,8 +4106,13 @@ impl AverroesApp {
                     activity.started_at = Instant::now();
                     activity.duration_ms = None;
                 } else {
-                    let text_offset = message.text.len();
-                    let group_id = message.assign_tool_group(false);
+                    let inside_reasoning = message.text.is_empty();
+                    let text_offset = if inside_reasoning {
+                        message.reasoning.len()
+                    } else {
+                        message.text.len()
+                    };
+                    let group_id = message.assign_tool_group(inside_reasoning);
                     message.tool_activities.push(ToolActivity {
                         call_id: None,
                         name: "compact_conversation".into(),
@@ -3096,7 +4125,7 @@ impl AverroesApp {
                         started_at: Instant::now(),
                         duration_ms: None,
                         expanded: false,
-                        inside_reasoning: false,
+                        inside_reasoning,
                     });
                     record_source = true;
                 }
@@ -3148,8 +4177,13 @@ impl AverroesApp {
                 }
                 // Keep the event visible even if the UI missed the start
                 // event while switching sessions.
-                let text_offset = message.text.len();
-                let group_id = message.assign_tool_group(false);
+                let inside_reasoning = message.text.is_empty();
+                let text_offset = if inside_reasoning {
+                    message.reasoning.len()
+                } else {
+                    message.text.len()
+                };
+                let group_id = message.assign_tool_group(inside_reasoning);
                 message.tool_activities.push(ToolActivity {
                     call_id: None,
                     name: "compact_conversation".into(),
@@ -3162,7 +4196,7 @@ impl AverroesApp {
                     started_at: Instant::now(),
                     duration_ms: Some(0),
                     expanded: false,
-                    inside_reasoning: false,
+                    inside_reasoning,
                 });
             }
         }
@@ -3404,6 +4438,27 @@ impl AverroesApp {
         }
     }
 
+    fn toggle_agent_thread_tool_group(
+        &mut self,
+        thread_id: &str,
+        message_index: usize,
+        group_id: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let toggled = self
+            .active_mut()
+            .agent_thread_transcripts
+            .get_mut(thread_id)
+            .and_then(|transcript| transcript.messages.get_mut(message_index))
+            .map(|message| message.toggle_tool_group(group_id))
+            .is_some();
+        if toggled {
+            let session_id = self.active().id.clone();
+            self.persist_session(&session_id, cx);
+            cx.notify();
+        }
+    }
+
     fn toggle_agent_thread_reasoning(
         &mut self,
         thread_id: &str,
@@ -3536,17 +4591,21 @@ impl AverroesApp {
                         input,
                         inside_reasoning,
                     } => {
+                        let inside_reasoning = inside_reasoning || message.text.is_empty();
                         if let Some(activity) =
                             message.tool_activities.iter_mut().rev().find(|activity| {
                                 activity.call_id.as_deref() == Some(call_id.as_str())
-                                    && activity.state == ToolActivityState::Running
                             })
                         {
                             activity.name = name;
                             activity.input = format_tool_input(&input);
                             activity.inside_reasoning = inside_reasoning;
                         } else {
-                            let text_offset = message.text.len();
+                            let text_offset = if inside_reasoning {
+                                message.reasoning.len()
+                            } else {
+                                message.text.len()
+                            };
                             let group_id = message.assign_tool_group(inside_reasoning);
                             message.tool_activities.push(ToolActivity {
                                 call_id: Some(call_id),
@@ -3585,8 +4644,13 @@ impl AverroesApp {
                             activity.started_at = Instant::now();
                             activity.duration_ms = None;
                         } else {
-                            let text_offset = message.text.len();
-                            let group_id = message.assign_tool_group(false);
+                            let inside_reasoning = message.text.is_empty();
+                            let text_offset = if inside_reasoning {
+                                message.reasoning.len()
+                            } else {
+                                message.text.len()
+                            };
+                            let group_id = message.assign_tool_group(inside_reasoning);
                             message.tool_activities.push(ToolActivity {
                                 call_id,
                                 name,
@@ -3599,7 +4663,7 @@ impl AverroesApp {
                                 started_at: Instant::now(),
                                 duration_ms: None,
                                 expanded: false,
-                                inside_reasoning: false,
+                                inside_reasoning,
                             });
                         }
                     }
@@ -3612,10 +4676,11 @@ impl AverroesApp {
                         ..
                     } => {
                         let existing = call_id.as_deref().and_then(|call_id| {
-                            message.tool_activities.iter_mut().rev().find(|activity| {
-                                activity.call_id.as_deref() == Some(call_id)
-                                    && activity.name == name
-                            })
+                            message
+                                .tool_activities
+                                .iter_mut()
+                                .rev()
+                                .find(|activity| activity.call_id.as_deref() == Some(call_id))
                         });
                         if let Some(activity) = existing {
                             activity.state = if success {
@@ -3628,8 +4693,13 @@ impl AverroesApp {
                             activity.duration_ms =
                                 Some(activity.started_at.elapsed().as_millis() as u64);
                         } else {
-                            let text_offset = message.text.len();
-                            let group_id = message.assign_tool_group(false);
+                            let inside_reasoning = message.text.is_empty();
+                            let text_offset = if inside_reasoning {
+                                message.reasoning.len()
+                            } else {
+                                message.text.len()
+                            };
+                            let group_id = message.assign_tool_group(inside_reasoning);
                             message.tool_activities.push(ToolActivity {
                                 call_id,
                                 name,
@@ -3646,13 +4716,18 @@ impl AverroesApp {
                                 started_at: Instant::now(),
                                 duration_ms: Some(0),
                                 expanded: false,
-                                inside_reasoning: false,
+                                inside_reasoning,
                             });
                         }
                     }
                     AgentStreamEvent::CompactionStarted { reason } => {
-                        let text_offset = message.text.len();
-                        let group_id = message.assign_tool_group(false);
+                        let inside_reasoning = message.text.is_empty();
+                        let text_offset = if inside_reasoning {
+                            message.reasoning.len()
+                        } else {
+                            message.text.len()
+                        };
+                        let group_id = message.assign_tool_group(inside_reasoning);
                         message.tool_activities.push(ToolActivity {
                             call_id: None,
                             name: "compact_conversation".into(),
@@ -3665,7 +4740,7 @@ impl AverroesApp {
                             started_at: Instant::now(),
                             duration_ms: None,
                             expanded: false,
-                            inside_reasoning: false,
+                            inside_reasoning,
                         });
                     }
                     AgentStreamEvent::CompactionFinished {
@@ -3765,17 +4840,21 @@ impl AverroesApp {
                     .find(|session| &session.id == session_id)
                 {
                     if let Some(message) = session.messages.last_mut() {
+                        let inside_reasoning = inside_reasoning || message.text.is_empty();
                         if let Some(activity) =
                             message.tool_activities.iter_mut().rev().find(|activity| {
                                 activity.call_id.as_deref() == Some(call_id.as_str())
-                                    && activity.state == ToolActivityState::Running
                             })
                         {
                             activity.name = name;
                             activity.input = format_tool_input(&input);
                             activity.inside_reasoning = inside_reasoning;
                         } else {
-                            let text_offset = message.text.len();
+                            let text_offset = if inside_reasoning {
+                                message.reasoning.len()
+                            } else {
+                                message.text.len()
+                            };
                             let group_id = message.assign_tool_group(inside_reasoning);
                             message.tool_activities.push(ToolActivity {
                                 call_id: Some(call_id),
@@ -3827,18 +4906,22 @@ impl AverroesApp {
                     if let Some(message) = session.messages.last_mut() {
                         if let Some(activity) =
                             message.tool_activities.iter_mut().rev().find(|activity| {
-                                activity.state == ToolActivityState::Running
-                                    && call_id
-                                        .as_deref()
-                                        .is_some_and(|id| activity.call_id.as_deref() == Some(id))
+                                call_id
+                                    .as_deref()
+                                    .is_some_and(|id| activity.call_id.as_deref() == Some(id))
                             })
                         {
                             activity.name = name;
                             activity.input = format_tool_input(&input);
                             activity.summary.clear();
                         } else {
-                            let text_offset = message.text.len();
-                            let group_id = message.assign_tool_group(false);
+                            let inside_reasoning = message.text.is_empty();
+                            let text_offset = if inside_reasoning {
+                                message.reasoning.len()
+                            } else {
+                                message.text.len()
+                            };
+                            let group_id = message.assign_tool_group(inside_reasoning);
                             message.tool_activities.push(ToolActivity {
                                 call_id,
                                 name,
@@ -3851,7 +4934,7 @@ impl AverroesApp {
                                 started_at: Instant::now(),
                                 duration_ms: None,
                                 expanded: false,
-                                inside_reasoning: false,
+                                inside_reasoning,
                             });
                         }
                     }
@@ -5131,6 +6214,7 @@ impl AverroesApp {
             .iter()
             .map(|attachment| attachment.path.clone())
             .collect::<Vec<_>>();
+        let attachments_for_error = attachments.clone();
         let display_text = composer_message_label(&text, &attachments);
         let title_source = if text.is_empty() {
             attachments
@@ -5148,7 +6232,10 @@ impl AverroesApp {
         }
         self.active_mut()
             .messages
-            .push(ShellMessage::user(display_text));
+            .push(ShellMessage::user_with_attachments(
+                display_text,
+                attachment_paths.clone(),
+            ));
         self.active_mut().messages.push(ShellMessage::assistant());
         self.active_mut().processing = true;
         self.active_mut().unread = false;
@@ -5168,19 +6255,19 @@ impl AverroesApp {
         let runtime = self.runtime.clone();
         let stream_session_id = session_id.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
-            let request_text = if attachment_paths.is_empty() {
-                Ok::<String, anyhow::Error>(text)
+            let request_content = if attachment_paths.is_empty() {
+                Ok::<(String, Option<MessageContent>), anyhow::Error>((text.clone(), None))
             } else {
                 match runtime
-                    .spawn_background(load_attachment_context(text, attachment_paths))
+                    .spawn_background(load_attachment_content(text, attachment_paths))
                     .await
                 {
-                    Ok(result) => result,
+                    Ok(result) => result.map(|(text, content)| (text, Some(content))),
                     Err(error) => Err(anyhow::anyhow!(error.to_string())),
                 }
             };
-            let request_text = match request_text {
-                Ok(request_text) => request_text,
+            let (request_text, request_content) = match request_content {
+                Ok(request_content) => request_content,
                 Err(error) => {
                     diagnostics::record(
                         DiagnosticLevel::Error,
@@ -5199,6 +6286,9 @@ impl AverroesApp {
                                 message.role = MessageRole::Error;
                                 message.text = format!("Could not attach files: {error}");
                             }
+                        }
+                        if app.active().id == stream_session_id {
+                            app.attachments = attachments_for_error.clone();
                         }
                         app.remeasure_active_conversation_tail(&stream_session_id);
                         app.persist_session(&stream_session_id, cx);
@@ -5298,7 +6388,14 @@ impl AverroesApp {
                     );
                 }
             }
-            let mut stream = runtime.spawn_agent_stream(agent.clone(), request_text);
+            let mut stream = match request_content {
+                Some(content) => runtime.spawn_agent_stream_with_content(
+                    agent.clone(),
+                    request_text,
+                    Some(content),
+                ),
+                None => runtime.spawn_agent_stream(agent.clone(), request_text),
+            };
             loop {
                 let Some(first_event) = stream.next_event().await else {
                     break;
@@ -5575,6 +6672,7 @@ impl AverroesApp {
         }
         self.active_session = self.active_session.min(self.sessions.len() - 1);
         self.route = Route::Chat;
+        self.project_settings_open = false;
         self.active_workspace_id = self.active().project_id.clone();
         self.show_context = false;
         self.selected_agent_thread = None;
@@ -5592,6 +6690,7 @@ impl AverroesApp {
         }
         self.active_session = index;
         self.route = Route::Chat;
+        self.project_settings_open = false;
         self.active_workspace_id = self.active().project_id.clone();
         self.refresh_conversation_folders();
         self.show_context = false;
@@ -5638,6 +6737,7 @@ impl AverroesApp {
             return;
         }
         self.route = Route::Chat;
+        self.project_settings_open = false;
         self.mark_active_read(cx);
         self.composer
             .update(cx, |state, cx| state.focus(window, cx));
@@ -5665,6 +6765,7 @@ impl AverroesApp {
             self.settings_tab = settings_entry_tab();
             self.route = Route::Connections;
         }
+        self.project_settings_open = false;
         if self.route == Route::Chat {
             self.mark_active_read(cx);
         }
@@ -5687,7 +6788,19 @@ impl AverroesApp {
             .iter()
             .enumerate()
             .map(|(index, message)| {
-                let label = composer_message_label(&message.text, &message.attachments);
+                let label = {
+                    let label = composer_message_label(&message.text, &message.attachments);
+                    if label.is_empty() {
+                        message
+                            .attachments
+                            .iter()
+                            .map(|attachment| composer_attachment_name(&attachment.path))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    } else {
+                        label
+                    }
+                };
                 div()
                     .id(SharedString::from(format!(
                         "queued-message-{}-{index}",
@@ -5770,6 +6883,7 @@ impl AverroesApp {
         conversation: ConversationSummary,
         active_id: &str,
         session_states: &HashMap<String, (bool, bool)>,
+        indented: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = UiTheme::current(cx);
@@ -5798,24 +6912,23 @@ impl AverroesApp {
             )))
             .flex_none()
             .w_full()
-            .h(px(29.0))
-            .pl(px(26.0))
-            .pr(px(9.0))
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .pl(if indented { px(30.0) } else { px(10.0) })
+            .pr(px(8.0))
             .flex()
             .items_center()
-            .rounded(px(7.0))
+            .rounded(px(SIDEBAR_RADIUS))
             .overflow_hidden()
             .cursor_pointer()
             .group(group)
-            .text_size(px(12.0))
-            .text_color(theme.muted)
+            .text_size(px(14.0))
+            .text_color(theme.foreground)
             .when(selected, |row| {
-                row.mt(px(1.0))
-                    .mb(px(1.0))
-                    .bg(theme.accent_soft)
+                row.bg(theme.surface_hover)
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.foreground)
             })
-            .hover(|style| style.bg(theme.accent_soft))
+            .hover(|style| style.bg(theme.surface_hover))
             .child(
                 div()
                     .flex_1()
@@ -5865,19 +6978,25 @@ impl AverroesApp {
             )))
             .flex_none()
             .w_full()
-            .h(px(31.0))
-            .px(px(9.0))
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .px(px(10.0))
             .flex()
             .items_center()
-            .rounded(px(7.0))
+            .gap(px(9.0))
+            .rounded(px(SIDEBAR_RADIUS))
             .overflow_hidden()
             .cursor_pointer()
             .group(group)
-            .text_size(px(13.0))
+            .text_size(px(14.0))
             .when(selected, |row| {
-                row.mt(px(1.0)).mb(px(1.0)).bg(theme.accent_soft)
+                row.bg(theme.surface_hover).font_weight(FontWeight::MEDIUM)
             })
-            .hover(|style| style.bg(theme.accent_soft))
+            .hover(|style| style.bg(theme.surface_hover))
+            .child(
+                Icon::new(IconName::Bell)
+                    .size(px(14.0))
+                    .text_color(theme.muted),
+            )
             .child(
                 div()
                     .flex_1()
@@ -5897,19 +7016,19 @@ impl AverroesApp {
     fn render_rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = UiTheme::current(cx);
         let active_id = self.active().id.to_string();
+        let complements_open = self.project_settings_open;
         let session_states = self
             .sessions
             .iter()
             .map(|session| (session.id.to_string(), (session.processing, session.unread)))
             .collect::<HashMap<_, _>>();
-        let (mut global_conversations, mut workspace_conversations) =
+        let (_, mut workspace_conversations) =
             group_conversations_by_workspace(&self.conversations, &self.projects);
         let is_home = self.route == Route::Home;
         if is_home || self.active_workspace_id.is_some() {
             // Conversations are scoped to the selected workspace. The home
             // screen is deliberately a workspace picker, so it has no chat
             // rows of its own.
-            global_conversations.clear();
             if let Some(active_workspace_id) = self.active_workspace_id.as_ref() {
                 workspace_conversations.retain(|id, _| id == active_workspace_id);
             } else {
@@ -5930,14 +7049,34 @@ impl AverroesApp {
                 } else {
                     self.active_workspace_id.as_ref() == conversation.project_id.as_ref()
                 };
-                needs_attention && belongs_to_visible_workspace
+                needs_attention && !conversation.pinned && belongs_to_visible_workspace
             })
             .cloned()
             .collect::<Vec<_>>();
         sort_conversation_summaries(&mut attention_conversations);
 
+        let mut pinned_conversations = self
+            .conversations
+            .iter()
+            .filter(|conversation| {
+                conversation.pinned
+                    && if is_home {
+                        conversation.project_id.is_some()
+                    } else {
+                        self.active_workspace_id.as_ref() == conversation.project_id.as_ref()
+                    }
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_conversation_summaries(&mut pinned_conversations);
+        let featured_conversation_ids = pinned_conversations
+            .iter()
+            .chain(attention_conversations.iter())
+            .map(|conversation| conversation.id.clone())
+            .collect::<HashSet<_>>();
+
         let mut pinned_rows = Vec::new();
-        for conversation in global_conversations {
+        for conversation in pinned_conversations {
             let id = conversation.id.clone();
             let select_id = id.clone();
             let selected = self.route == Route::Chat && id == active_id;
@@ -5952,26 +7091,33 @@ impl AverroesApp {
                 Some(conversation.pinned),
                 processing,
                 unread,
-                Vec::new(),
+                self.conversation_folders.clone(),
                 cx,
             );
             let row = div()
                 .id(SharedString::from(format!("conversation-{id}")))
                 .flex_none()
                 .w_full()
-                .h(px(31.0))
-                .px(px(9.0))
+                .h(px(SIDEBAR_ROW_HEIGHT))
+                .px(px(10.0))
                 .flex()
                 .items_center()
-                .rounded(px(7.0))
+                .gap(px(9.0))
+                .rounded(px(SIDEBAR_RADIUS))
                 .overflow_hidden()
                 .cursor_pointer()
                 .group(group)
-                .text_size(px(13.0))
+                .text_size(px(14.0))
                 .when(selected, |row| {
-                    row.mt(px(1.0)).mb(px(1.0)).bg(theme.accent_soft)
+                    row.bg(theme.surface_hover).font_weight(FontWeight::MEDIUM)
                 })
-                .hover(|style| style.bg(theme.accent_soft))
+                .hover(|style| style.bg(theme.surface_hover))
+                .child(
+                    Icon::default()
+                        .path("icons/pin.svg")
+                        .size(px(14.0))
+                        .text_color(theme.muted),
+                )
                 .child(
                     div()
                         .flex_1()
@@ -5986,9 +7132,7 @@ impl AverroesApp {
                     this.select_conversation(&select_id, window, cx)
                 }))
                 .into_any_element();
-            if conversation.pinned {
-                pinned_rows.push(row);
-            }
+            pinned_rows.push(row);
         }
         let attention_rows = attention_conversations
             .into_iter()
@@ -6003,166 +7147,157 @@ impl AverroesApp {
             .collect::<Vec<_>>();
 
         let mut project_rows = Vec::new();
-        if self.projects_expanded {
-            let visible_projects = if is_home {
-                self.projects.clone()
+        let mut recent_rows = Vec::new();
+        let visible_projects = if is_home {
+            self.projects.clone()
+        } else {
+            self.projects
+                .iter()
+                .filter(|project| self.active_workspace_id.as_ref() == Some(&project.id))
+                .cloned()
+                .collect()
+        };
+        for project in visible_projects {
+            let id = project.id.clone();
+            let mut conversations = if is_home {
+                Vec::new()
             } else {
-                self.projects
-                    .iter()
-                    .filter(|project| self.active_workspace_id.as_ref() == Some(&project.id))
-                    .cloned()
-                    .collect()
+                workspace_conversations.remove(&id).unwrap_or_default()
             };
-            for project in visible_projects {
-                let id = project.id.clone();
-                let conversations = if is_home {
-                    Vec::new()
-                } else {
-                    workspace_conversations.remove(&id).unwrap_or_default()
-                };
-                let conversation_count = conversations.len();
-                let new_work_project_id = id.clone();
-                let project_group = SharedString::from(format!("project-row-{id}"));
-                let new_conversation_project = project.clone();
-                let project_conversation_count = div()
+            conversations
+                .retain(|conversation| !featured_conversation_ids.contains(&conversation.id));
+            let conversation_count = conversations.len();
+            let new_work_project_id = id.clone();
+            let project_group = SharedString::from(format!("project-row-{id}"));
+            let new_conversation_project = project.clone();
+            let project_conversation_count = div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(10.0))
+                .text_color(theme.faint)
+                .when(conversation_count == 0, |this| this.opacity(0.0))
+                .group_hover(project_group.clone(), |style| style.opacity(0.0))
+                .child(conversation_count.to_string());
+            let new_conversation_button = Button::new(SharedString::from(format!(
+                "new-conversation-in-project-{id}"
+            )))
+            .ghost()
+            .small()
+            .with_size(px(24.0))
+            .icon(IconName::Plus)
+            .tooltip(i18n::text(cx, "sidebar.new_workspace_conversation"))
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .opacity(0.0)
+            .group_hover(project_group.clone(), |style| style.opacity(1.0))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.new_session_for_project(Some(new_conversation_project.clone()), window, cx)
+            }));
+            if is_home {
+                if !self.projects_expanded {
+                    continue;
+                }
+                project_rows.push(
+                    div()
+                        .id(SharedString::from(format!("project-{id}")))
+                        .flex_none()
+                        .w_full()
+                        .h(px(SIDEBAR_ROW_HEIGHT))
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(9.0))
+                        .rounded(px(SIDEBAR_RADIUS))
+                        .cursor_pointer()
+                        .group(project_group)
+                        .text_size(px(14.0))
+                        .hover(|style| style.bg(theme.surface_hover))
+                        .child(
+                            Icon::new(IconName::FolderClosed)
+                                .size(px(15.0))
+                                .text_color(theme.muted),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .child(project.name),
+                        )
+                        .child(
+                            div()
+                                .relative()
+                                .flex_none()
+                                .size(px(24.0))
+                                .child(project_conversation_count)
+                                .child(new_conversation_button),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_project(&new_work_project_id, window, cx)
+                        }))
+                        .into_any_element(),
+                );
+                continue;
+            }
+            let mut remaining = conversations;
+            for folder in self.conversation_folders.clone() {
+                let folder_id = folder.id.clone();
+                let folder_conversations = remaining
+                    .iter()
+                    .filter(|conversation| {
+                        self.conversation_folder_ids.get(&conversation.id) == Some(&folder_id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                remaining.retain(|conversation| {
+                    self.conversation_folder_ids.get(&conversation.id) != Some(&folder_id)
+                });
+                let folder_group =
+                    SharedString::from(format!("conversation-folder-row-{folder_id}"));
+                let expanded = self.expanded_conversation_folders.contains(&folder_id);
+                let folder_toggle_id = folder_id.clone();
+                let folder_group_for_hover = folder_group.clone();
+                let folder_for_new_conversation = folder.clone();
+                let folder_count = div()
                     .absolute()
                     .top(px(0.0))
-                    .left(px(0.0))
+                    .right(px(0.0))
                     .size(px(24.0))
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_size(px(10.0))
                     .text_color(theme.faint)
-                    .when(conversation_count == 0, |this| this.opacity(0.0))
-                    .group_hover(project_group.clone(), |style| style.opacity(0.0))
-                    .child(conversation_count.to_string());
+                    .when(folder_conversations.is_empty(), |this| this.opacity(0.0))
+                    .group_hover(folder_group_for_hover.clone(), |style| style.opacity(0.0))
+                    .child(folder_conversations.len().to_string());
                 let new_conversation_button = Button::new(SharedString::from(format!(
-                    "new-conversation-in-project-{id}"
+                    "new-conversation-in-folder-{folder_id}"
                 )))
                 .ghost()
                 .small()
                 .with_size(px(24.0))
                 .icon(IconName::Plus)
-                .tooltip(i18n::text(cx, "sidebar.new_workspace_conversation"))
+                .tooltip(i18n::text(cx, "folder.new_conversation"))
                 .absolute()
                 .top(px(0.0))
-                .left(px(0.0))
+                .right(px(0.0))
                 .opacity(0.0)
-                .group_hover(project_group.clone(), |style| style.opacity(1.0))
+                .group_hover(folder_group_for_hover, |style| style.opacity(1.0))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.new_session_for_project(Some(new_conversation_project.clone()), window, cx)
+                    this.new_session_in_conversation_folder(
+                        folder_for_new_conversation.clone(),
+                        window,
+                        cx,
+                    )
                 }));
-                if is_home {
-                    project_rows.push(
-                        div()
-                            .id(SharedString::from(format!("project-{id}")))
-                            .flex_none()
-                            .w_full()
-                            .h(px(31.0))
-                            .px(px(8.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .rounded(px(7.0))
-                            .cursor_pointer()
-                            .group(project_group)
-                            .text_size(px(13.0))
-                            .hover(|style| style.bg(theme.accent_soft))
-                            .child(
-                                Icon::new(IconName::Folder)
-                                    .size(px(15.0))
-                                    .text_color(theme.muted),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .overflow_hidden()
-                                    .child(project.name),
-                            )
-                            .child(
-                                div()
-                                    .relative()
-                                    .flex_none()
-                                    .size(px(24.0))
-                                    .child(project_conversation_count)
-                                    .child(new_conversation_button),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select_project(&new_work_project_id, window, cx)
-                            }))
-                            .into_any_element(),
-                    );
-                }
-                if conversations.is_empty() && self.conversation_folders.is_empty() {
-                    if !is_home {
-                        project_rows.push(
-                            div()
-                                .h(px(27.0))
-                                .pl(px(9.0))
-                                .flex()
-                                .items_center()
-                                .text_size(px(11.0))
-                                .text_color(theme.faint)
-                                .child(i18n::text(cx, "sidebar.no_conversations"))
-                                .into_any_element(),
-                        );
-                    }
-                    continue;
-                }
-                let mut remaining = conversations;
-                for folder in self.conversation_folders.clone() {
-                    let folder_id = folder.id.clone();
-                    let folder_conversations = remaining
-                        .iter()
-                        .filter(|conversation| {
-                            self.conversation_folder_ids.get(&conversation.id) == Some(&folder_id)
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    remaining.retain(|conversation| {
-                        self.conversation_folder_ids.get(&conversation.id) != Some(&folder_id)
-                    });
-                    let folder_group =
-                        SharedString::from(format!("conversation-folder-row-{folder_id}"));
-                    let expanded = self.expanded_conversation_folders.contains(&folder_id);
-                    let folder_toggle_id = folder_id.clone();
-                    let folder_dot_color = conversation_folder_dot_color(&folder.name);
-                    let folder_group_for_hover = folder_group.clone();
-                    let folder_for_new_conversation = folder.clone();
-                    let folder_count = div()
-                        .absolute()
-                        .top(px(0.0))
-                        .right(px(0.0))
-                        .size(px(24.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(10.0))
-                        .text_color(theme.faint)
-                        .group_hover(folder_group_for_hover.clone(), |style| style.opacity(0.0))
-                        .child(folder_conversations.len().to_string());
-                    let new_conversation_button = Button::new(SharedString::from(format!(
-                        "new-conversation-in-folder-{folder_id}"
-                    )))
-                    .ghost()
-                    .small()
-                    .with_size(px(24.0))
-                    .icon(IconName::Plus)
-                    .tooltip(i18n::text(cx, "folder.new_conversation"))
-                    .absolute()
-                    .top(px(0.0))
-                    .right(px(0.0))
-                    .opacity(0.0)
-                    .group_hover(folder_group_for_hover, |style| style.opacity(1.0))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.new_session_in_conversation_folder(
-                            folder_for_new_conversation.clone(),
-                            window,
-                            cx,
-                        )
-                    }));
+                if self.projects_expanded {
                     project_rows.push(
                         div()
                             .id(SharedString::from(format!(
@@ -6170,33 +7305,35 @@ impl AverroesApp {
                             )))
                             .flex_none()
                             .w_full()
-                            .h(px(29.0))
-                            .px(px(9.0))
+                            .h(px(SIDEBAR_ROW_HEIGHT))
+                            .px(px(10.0))
                             .flex()
                             .items_center()
-                            .gap(px(6.0))
-                            .rounded(px(7.0))
+                            .gap(px(7.0))
+                            .rounded(px(SIDEBAR_RADIUS))
                             .cursor_pointer()
                             .group(folder_group)
-                            .text_size(px(12.0))
-                            .text_color(theme.muted)
-                            .hover(|style| style.bg(theme.accent_soft))
+                            .text_size(px(14.0))
+                            .text_color(theme.foreground)
+                            .hover(|style| style.bg(theme.surface_hover))
                             .child(
                                 Icon::new(if expanded {
                                     IconName::ChevronDown
                                 } else {
                                     IconName::ChevronRight
                                 })
-                                .size(px(12.0)),
+                                .size(px(11.0))
+                                .text_color(theme.faint),
                             )
                             .child(
-                                div()
-                                    .flex_none()
-                                    .size(px(7.0))
-                                    .rounded_full()
-                                    .bg(folder_dot_color),
+                                Icon::new(if expanded {
+                                    IconName::FolderOpen
+                                } else {
+                                    IconName::FolderClosed
+                                })
+                                .size(px(15.0))
+                                .text_color(theme.muted),
                             )
-                            .child(Icon::new(IconName::Folder).size(px(14.0)))
                             .child(
                                 div()
                                     .flex_1()
@@ -6231,70 +7368,21 @@ impl AverroesApp {
                                 conversation,
                                 &active_id,
                                 &session_states,
+                                true,
                                 cx,
                             ));
                         }
                     }
                 }
-                if !remaining.is_empty() {
-                    let unfiled_expanded = self.unfiled_conversations_expanded;
-                    let unfiled_count = remaining.len();
-                    project_rows.push(
-                        div()
-                            .id(SharedString::from(format!("unfiled-conversations-{id}")))
-                            .flex_none()
-                            .w_full()
-                            .h(px(29.0))
-                            .px(px(9.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .rounded(px(7.0))
-                            .cursor_pointer()
-                            .text_size(px(12.0))
-                            .text_color(theme.faint)
-                            .hover(|style| style.bg(theme.accent_soft))
-                            .child(
-                                Icon::new(if unfiled_expanded {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                })
-                                .size(px(12.0)),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(i18n::text(cx, "folder.unfiled")),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(theme.faint)
-                                    .child(unfiled_count.to_string()),
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.unfiled_conversations_expanded =
-                                    !this.unfiled_conversations_expanded;
-                                cx.notify();
-                            }))
-                            .into_any_element(),
-                    );
-                    if unfiled_expanded {
-                        for conversation in remaining {
-                            project_rows.push(self.render_workspace_conversation_row(
-                                conversation,
-                                &active_id,
-                                &session_states,
-                                cx,
-                            ));
-                        }
-                    }
-                }
+            }
+            for conversation in remaining {
+                recent_rows.push(self.render_workspace_conversation_row(
+                    conversation,
+                    &active_id,
+                    &session_states,
+                    false,
+                    cx,
+                ));
             }
         }
 
@@ -6310,14 +7398,14 @@ impl AverroesApp {
                         result.conversation_id
                     )))
                     .w_full()
-                    .px(px(9.0))
-                    .py(px(7.0))
-                    .rounded(px(7.0))
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .rounded(px(SIDEBAR_RADIUS))
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme.accent_soft))
+                    .hover(|style| style.bg(theme.surface_hover))
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(px(13.0))
                             .text_color(theme.foreground)
                             .whitespace_nowrap()
                             .overflow_hidden()
@@ -6344,8 +7432,8 @@ impl AverroesApp {
         let search_panel = if self.conversation_search_open {
             div()
                 .flex_none()
-                .px(px(9.0))
-                .pb(px(8.0))
+                .px(px(SIDEBAR_GUTTER))
+                .pb(px(10.0))
                 .child(
                     Input::new(&self.conversation_search)
                         .prefix(IconName::Search)
@@ -6369,7 +7457,7 @@ impl AverroesApp {
         } else {
             div().into_any_element()
         };
-        let active_project_indicator = self
+        let active_project_footer = self
             .active_workspace_id
             .as_ref()
             .and_then(|project_id| {
@@ -6379,33 +7467,66 @@ impl AverroesApp {
             })
             .map(|project| {
                 div()
-                    .id("active-project-indicator")
+                    .id("active-project-footer")
                     .flex_none()
-                    .mx(px(9.0))
-                    .mb(px(8.0))
-                    .px(px(10.0))
-                    .py(px(8.0))
-                    .rounded(px(9.0))
-                    .bg(theme.surface_subtle)
+                    .border_t_1()
+                    .border_color(theme.border.opacity(0.72))
+                    .px(px(SIDEBAR_GUTTER))
+                    .py(px(10.0))
                     .child(
                         div()
+                            .id("active-project-footer-row")
+                            .h(px(48.0))
+                            .w_full()
+                            .px(px(8.0))
                             .flex()
                             .items_center()
-                            .gap(px(6.0))
-                            .text_size(px(10.0))
-                            .text_color(theme.faint)
-                            .child(Icon::new(IconName::Folder).size(px(13.0)))
-                            .child(i18n::text(cx, "sidebar.current_project")),
-                    )
-                    .child(
-                        div()
-                            .mt(px(3.0))
-                            .text_size(px(13.0))
-                            .text_color(theme.foreground)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(project.name.clone()),
+                            .gap(px(10.0))
+                            .rounded(px(SIDEBAR_RADIUS))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(px(30.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(9.0))
+                                    .bg(theme.surface_hover)
+                                    .child(
+                                        Icon::new(IconName::FolderOpen)
+                                            .size(px(15.0))
+                                            .text_color(theme.foreground),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.foreground)
+                                            .whitespace_nowrap()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .child(project.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt(px(1.0))
+                                            .text_size(px(11.0))
+                                            .text_color(theme.faint)
+                                            .child(i18n::text(cx, "sidebar.current_project")),
+                                    ),
+                            )
+                            .when(self.background_indexing, |this| {
+                                this.child(
+                                    Icon::new(IconName::Loader)
+                                        .size(px(13.0))
+                                        .text_color(theme.muted),
+                                )
+                            }),
                     )
             })
             .map(IntoElement::into_any_element);
@@ -6414,62 +7535,126 @@ impl AverroesApp {
             .flex_none()
             .flex()
             .flex_col()
-            .w(px(274.0))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
             .bg(theme.rail)
-            .pt(px(40.0))
+            .border_r_1()
+            .border_color(theme.border.opacity(0.72))
+            .pt(px(24.0))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .h(px(42.0))
-                    .px(px(17.0))
+                    .h(px(52.0))
+                    .px(px(18.0))
                     .child(
-                        div()
-                            .text_size(px(16.0))
-                            .font_weight(FontWeight::BOLD)
-                            .child(i18n::text(cx, "sidebar.brand")),
+                        div().flex().items_center().child(
+                            div()
+                                .text_size(px(18.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(i18n::text(cx, "sidebar.brand")),
+                        ),
                     )
                     .child(div().flex_1())
                     .child(
-                        Button::new("search-conversations")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Search)
-                            .tooltip(i18n::text(cx, "sidebar.search"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.conversation_search_open = !this.conversation_search_open;
-                                if this.conversation_search_open {
-                                    this.refresh_conversation_search(cx);
-                                    this.schedule_semantic_conversation_search(cx);
-                                } else {
-                                    this.conversation_search_results.clear();
-                                }
-                                cx.notify();
-                            })),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .child(
+                                Button::new("search-conversations")
+                                    .ghost()
+                                    .small()
+                                    .with_size(px(30.0))
+                                    .selected(self.conversation_search_open)
+                                    .icon(IconName::Search)
+                                    .tooltip(i18n::text(cx, "sidebar.search"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.conversation_search_open =
+                                            !this.conversation_search_open;
+                                        if this.conversation_search_open {
+                                            this.refresh_conversation_search(cx);
+                                            this.schedule_semantic_conversation_search(cx);
+                                        } else {
+                                            this.conversation_search_results.clear();
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("open-settings-nav")
+                                    .ghost()
+                                    .small()
+                                    .with_size(px(30.0))
+                                    .selected(self.route == Route::Connections)
+                                    .icon(IconName::Settings2)
+                                    .tooltip(i18n::text(cx, "settings.title"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.settings_tab = settings_entry_tab();
+                                        this.project_settings_open = false;
+                                        this.route = Route::Connections;
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
             .child(search_panel)
-            .children(active_project_indicator)
             .child(
-                div().flex_none().px(px(9.0)).pb(px(8.0)).child(
+                div().flex_none().px(px(SIDEBAR_GUTTER)).pb(px(2.0)).child(
                     div()
                         .id("new-work")
-                        .h(px(34.0))
-                        .px(px(8.0))
+                        .h(px(SIDEBAR_NAV_HEIGHT))
+                        .px(px(10.0))
                         .flex()
                         .items_center()
-                        .gap(px(9.0))
-                        .rounded(px(7.0))
+                        .gap(px(10.0))
+                        .rounded(px(SIDEBAR_RADIUS))
                         .cursor_pointer()
-                        .hover(|style| style.bg(theme.accent_soft))
+                        .hover(|style| style.bg(theme.surface_hover))
+                        .text_size(px(14.5))
+                        .font_weight(FontWeight::NORMAL)
                         .child(
                             Icon::default()
-                                .path("icons/message-square-plus.svg")
-                                .size(px(15.0)),
+                                .path("icons/square-pen.svg")
+                                .size(px(16.0))
+                                .text_color(theme.foreground),
                         )
                         .child(i18n::text(cx, "sidebar.new_work"))
                         .on_click(cx.listener(|this, _, window, cx| this.new_session(window, cx))),
+                ),
+            )
+            .child(
+                div().flex_none().px(px(SIDEBAR_GUTTER)).pb(px(12.0)).child(
+                    div()
+                        .id("open-complements-nav")
+                        .h(px(SIDEBAR_NAV_HEIGHT))
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .rounded(px(SIDEBAR_RADIUS))
+                        .cursor_pointer()
+                        .text_size(px(14.5))
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(theme.foreground)
+                        .when(complements_open, |this| {
+                            this.bg(theme.surface_hover).font_weight(FontWeight::MEDIUM)
+                        })
+                        .hover(|style| style.bg(theme.surface_hover).text_color(theme.foreground))
+                        .child(
+                            Icon::default()
+                                .path("tools/skills.svg")
+                                .size(px(16.0))
+                                .text_color(if complements_open {
+                                    theme.foreground
+                                } else {
+                                    theme.muted
+                                }),
+                        )
+                        .child(i18n::text(cx, "sidebar.complements"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_project_settings(window, cx)
+                        })),
                 ),
             )
             .child(
@@ -6477,34 +7662,34 @@ impl AverroesApp {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scrollbar()
-                    .px(px(8.0))
-                    .child(sidebar_heading(
-                        i18n::text(cx, "sidebar.pinned"),
-                        theme,
-                        12.0,
-                    ))
-                    .when(pinned_rows.is_empty(), |this| {
-                        this.child(sidebar_empty(i18n::text(cx, "sidebar.no_pinned"), theme))
+                    .px(px(SIDEBAR_GUTTER))
+                    .when(!pinned_rows.is_empty(), |this| {
+                        this.child(sidebar_heading(
+                            i18n::text(cx, "sidebar.pinned"),
+                            theme,
+                            14.0,
+                        ))
+                        .children(pinned_rows)
                     })
-                    .children(pinned_rows)
                     .when(!attention_rows.is_empty(), |this| {
                         this.child(sidebar_heading(
                             i18n::text(cx, "sidebar.attention"),
                             theme,
-                            16.0,
+                            14.0,
                         ))
                         .children(attention_rows)
                     })
                     .child(
                         div()
-                            .mt(px(12.0))
-                            .h(px(34.0))
-                            .pl(px(9.0))
-                            .pr(px(4.0))
+                            .mt(px(8.0))
+                            .h(px(36.0))
+                            .pl(px(10.0))
+                            .pr(px(3.0))
                             .flex()
                             .items_center()
                             .text_size(px(13.0))
-                            .text_color(theme.faint)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.muted)
                             .child(
                                 div()
                                     .id("projects-toggle")
@@ -6512,6 +7697,7 @@ impl AverroesApp {
                                     .h_full()
                                     .flex()
                                     .items_center()
+                                    .gap(px(4.0))
                                     .cursor_pointer()
                                     .child(i18n::text(
                                         cx,
@@ -6527,7 +7713,8 @@ impl AverroesApp {
                                         } else {
                                             IconName::ChevronRight
                                         })
-                                        .size(px(13.0)),
+                                        .size(px(11.0))
+                                        .text_color(theme.faint),
                                     )
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.projects_expanded = !this.projects_expanded;
@@ -6542,6 +7729,7 @@ impl AverroesApp {
                                 })
                                 .ghost()
                                 .small()
+                                .with_size(px(28.0))
                                 .icon(IconName::Plus)
                                 .tooltip(i18n::text(
                                     cx,
@@ -6562,64 +7750,17 @@ impl AverroesApp {
                                 )),
                             ),
                     )
-                    .children(project_rows),
+                    .children(project_rows)
+                    .when(!recent_rows.is_empty(), |this| {
+                        this.child(sidebar_heading(
+                            i18n::text(cx, "sidebar.recents"),
+                            theme,
+                            16.0,
+                        ))
+                        .children(recent_rows)
+                    }),
             )
-            .child(
-                div()
-                    .id("settings-nav")
-                    .flex_none()
-                    .h(px(50.0))
-                    .px(px(16.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(9.0))
-                    .cursor_pointer()
-                    .when(self.route == Route::Connections, |this| {
-                        this.bg(theme.accent_soft)
-                    })
-                    .hover(|style| style.bg(theme.accent_soft))
-                    .child(
-                        div()
-                            .size(px(18.0))
-                            .rounded(px(5.0))
-                            .bg(gpui::rgb(0x1ca7b8))
-                            .text_color(theme.rail)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(10.0))
-                            .font_weight(FontWeight::BOLD)
-                            .child("V"),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(13.0))
-                            .child(format!("v{APP_VERSION}")),
-                    )
-                    .when(self.background_indexing, |this| {
-                        this.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(4.0))
-                                .text_size(px(10.0))
-                                .text_color(theme.muted)
-                                .child(Icon::new(IconName::Loader).size(px(12.0)))
-                                .child(i18n::text(cx, "sidebar.indexing")),
-                        )
-                    })
-                    .child(
-                        Icon::new(IconName::Settings2)
-                            .size(px(15.0))
-                            .text_color(theme.muted),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.settings_tab = settings_entry_tab();
-                        this.route = Route::Connections;
-                        cx.notify();
-                    })),
-            )
+            .children(active_project_footer)
             .into_any_element()
     }
 
@@ -6663,12 +7804,53 @@ impl AverroesApp {
         let has_attachments = !attachment_chips.is_empty();
         // `Button::loading(true)` intentionally disables pointer events in
         // gpui-component. The composer action is also the stop action while a
-        // request is running, so keep the button interactive and use a clear
-        // stop icon instead of the component's loading mode.
-        let send_icon = if session.processing {
-            IconName::CircleX
+        // request is running, so keep the button interactive.
+        let send_button = Button::new(if compact { "send-new" } else { "send-open" })
+            .primary()
+            .with_size(px(28.0))
+            .rounded(px(14.0))
+            .tooltip(if session.processing {
+                i18n::text(cx, "composer.stop")
+            } else {
+                i18n::text(cx, "composer.send")
+            })
+            // Never disable the stop action for a request that is already in
+            // flight, even if its connection or model disappears meanwhile.
+            .disabled(!session.processing && (!has_connection || !has_model))
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.active().processing {
+                    this.stop_active_stream(cx);
+                } else {
+                    this.submit_message(window, cx);
+                }
+            }));
+        let send_button = if session.processing {
+            send_button
+                // A custom stop glyph avoids the double ring produced by a
+                // CircleX icon inside an already circular button.
+                .size(px(28.0))
+                .p_0()
+                .child(
+                    div()
+                        .size(px(8.0))
+                        .rounded(px(2.0))
+                        .bg(theme.background)
+                        .with_animation(
+                            format!("composer-stop-pulse-{}", session.id.as_str()),
+                            Animation::new(Duration::from_millis(900)).repeat(),
+                            |stop, delta| {
+                                let wave = if delta < 0.5 {
+                                    delta * 2.0
+                                } else {
+                                    (1.0 - delta) * 2.0
+                                };
+                                stop.opacity(0.68 + wave * 0.32)
+                            },
+                        ),
+                )
+                .into_any_element()
         } else {
-            IconName::ArrowUp
+            send_button.icon(IconName::ArrowUp).into_any_element()
         };
         div()
             .w_full()
@@ -6680,6 +7862,13 @@ impl AverroesApp {
             .border_color(theme.border)
             .rounded(px(12.0))
             .overflow_hidden()
+            .can_drop(|value, _, _| value.downcast_ref::<ExternalPaths>().is_some())
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style.bg(theme.accent_soft).border_color(theme.focus_ring)
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.add_dropped_attachments(paths, cx);
+            }))
             .child(
                 div()
                     .flex()
@@ -6766,26 +7955,7 @@ impl AverroesApp {
                             ),
                     )
                     .child(div().flex_1())
-                    .child(
-                        Button::new(if compact { "send-new" } else { "send-open" })
-                            .primary()
-                            .with_size(px(28.0))
-                            .rounded(ButtonRounded::Large)
-                            .icon(send_icon)
-                            .tooltip(if session.processing {
-                                i18n::text(cx, "composer.stop")
-                            } else {
-                                i18n::text(cx, "composer.send")
-                            })
-                            .disabled(!has_connection || !has_model)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if this.active().processing {
-                                    this.stop_active_stream(cx);
-                                } else {
-                                    this.submit_message(window, cx);
-                                }
-                            })),
-                    ),
+                    .child(send_button),
             )
             .into_any_element()
     }
@@ -7021,6 +8191,408 @@ impl AverroesApp {
             .into_any_element()
     }
 
+    fn render_project_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let Some(project) = self.active_project() else {
+            self.project_settings_open = false;
+            return self.render_chat(cx);
+        };
+        let project_name = project.name.clone();
+        let tabs = [
+            (ProjectSettingsTab::Mcp, "project.mcp", "mcp"),
+            (ProjectSettingsTab::Skills, "project.skills", "skills"),
+        ];
+        let tab_bar = div()
+            .flex_none()
+            .h(px(46.0))
+            .px(px(32.0))
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .children(tabs.into_iter().map(|(tab, label, key)| {
+                let selected = self.project_settings_tab == tab;
+                div()
+                    .id(SharedString::from(format!("project-settings-tab-{key}")))
+                    .h(px(32.0))
+                    .px(px(12.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(7.0))
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .text_color(if selected {
+                        theme.foreground
+                    } else {
+                        theme.muted
+                    })
+                    .when(selected, |this| this.bg(theme.surface))
+                    .hover(|style| style.bg(theme.surface))
+                    .child(i18n::text(cx, label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.project_settings_tab = tab;
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }));
+        let body = match self.project_settings_tab {
+            ProjectSettingsTab::Mcp => self.render_project_mcp_settings(&project, cx),
+            ProjectSettingsTab::Skills => self.render_project_skills_settings(&project, cx),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .size_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .h(px(72.0))
+                    .px(px(32.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(
+                        Button::new("project-settings-back")
+                            .secondary()
+                            .icon(IconName::ArrowLeft)
+                            .label(i18n::text(cx, "project.back_to_project"))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.close_project_settings(cx)),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(16.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(project_name),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.muted)
+                            .child(i18n::text(cx, "sidebar.complements")),
+                    ),
+            )
+            .child(tab_bar)
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_project_mcp_settings(
+        &mut self,
+        project: &WorkProject,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let query = self
+            .project_mcp_search
+            .read(cx)
+            .value()
+            .trim()
+            .to_ascii_lowercase();
+        let has_query = !query.is_empty();
+        let config = self
+            .runtime
+            .project_mcp_config(&project.root)
+            .unwrap_or_default();
+        let servers = config
+            .servers
+            .into_iter()
+            .filter(|(name, server)| {
+                if query.is_empty() {
+                    return true;
+                }
+                let endpoint = server
+                    .url
+                    .as_deref()
+                    .or(server.command.as_deref())
+                    .unwrap_or_default();
+                let searchable = format!("{} {} {}", name, endpoint, server.transport.label())
+                    .to_ascii_lowercase();
+                searchable.contains(&query)
+            })
+            .collect::<Vec<_>>();
+        let rows = servers
+            .into_iter()
+            .map(|(name, server)| {
+                let delete_name = name.clone();
+                let auth = match server.auth.kind {
+                    McpAuthType::None => i18n::text(cx, "project.auth_none").to_string(),
+                    McpAuthType::Bearer => i18n::text(cx, "project.auth_bearer").to_string(),
+                    McpAuthType::OAuth => i18n::text(cx, "project.auth_oauth").to_string(),
+                };
+                let endpoint = server
+                    .url
+                    .clone()
+                    .or(server.command.clone())
+                    .unwrap_or_else(|| i18n::text(cx, "project.not_configured").to_string());
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .p(px(14.0))
+                    .rounded(px(11.0))
+                    .bg(theme.surface_subtle)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
+                            .child(
+                                div()
+                                    .mt(px(4.0))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted)
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(format!(
+                                        "{} · {} · {}",
+                                        server.transport.label(),
+                                        auth,
+                                        endpoint
+                                    )),
+                            ),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("delete-mcp-{delete_name}")))
+                            .ghost()
+                            .small()
+                            .icon(IconName::Delete)
+                            .tooltip(i18n::text(cx, "project.remove_mcp"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.delete_project_mcp_server(&delete_name, cx)
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let add_local = Button::new("project-add-stdio")
+            .secondary()
+            .icon(IconName::Plus)
+            .label(i18n::text(cx, "project.add_local_mcp"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_project_mcp_dialog(McpTransport::Stdio, window, cx)
+            }));
+        let add_http = Button::new("project-add-http")
+            .secondary()
+            .icon(IconName::Plus)
+            .label(i18n::text(cx, "project.add_http_mcp"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_project_mcp_dialog(McpTransport::StreamableHttp, window, cx)
+            }));
+        let add_webmcp = Button::new("project-add-webmcp")
+            .secondary()
+            .icon(IconName::Plus)
+            .label(i18n::text(cx, "project.add_webmcp"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_project_mcp_dialog(McpTransport::WebMcp, window, cx)
+            }));
+        div()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scrollbar()
+            .child(
+                div()
+                    .mx_auto()
+                    .w_full()
+                    .max_w(px(900.0))
+                    .px(px(32.0))
+                    .py(px(28.0))
+                    .child(settings_page_title(
+                        i18n::text(cx, "project.mcp_title"),
+                        i18n::text(cx, "project.mcp_description"),
+                        theme,
+                    ))
+                    .child(
+                        div()
+                            .mt(px(12.0))
+                            .text_size(px(11.0))
+                            .text_color(theme.faint)
+                            .child(format!(
+                                "{}: {}",
+                                i18n::text(cx, "project.mcp_file"),
+                                self.runtime.project_mcp_file(&project.root).display()
+                            )),
+                    )
+                    .child(
+                        div()
+                            .mt(px(16.0))
+                            .child(Input::new(&self.project_mcp_search).prefix(IconName::Search)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(18.0))
+                            .flex()
+                            .gap(px(8.0))
+                            .child(add_local)
+                            .child(add_http)
+                            .child(add_webmcp),
+                    )
+                    .child(
+                        div()
+                            .mt(px(14.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .when(rows.is_empty(), |this| {
+                                this.child(if has_query {
+                                    settings_empty_state(
+                                        i18n::text(cx, "project.no_mcp_matches"),
+                                        "",
+                                        theme,
+                                    )
+                                } else {
+                                    settings_empty_state(
+                                        i18n::text(cx, "project.no_mcp"),
+                                        i18n::text(cx, "project.no_mcp_description"),
+                                        theme,
+                                    )
+                                })
+                            })
+                            .children(rows),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_project_skills_settings(
+        &mut self,
+        project: &WorkProject,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let query = self
+            .project_skill_search
+            .read(cx)
+            .value()
+            .trim()
+            .to_ascii_lowercase();
+        let has_query = !query.is_empty();
+        let skills = self
+            .runtime
+            .project_skills(&project.root)
+            .into_iter()
+            .filter(|skill| {
+                query.is_empty()
+                    || skill.name.to_ascii_lowercase().contains(&query)
+                    || skill.description.to_ascii_lowercase().contains(&query)
+                    || skill
+                        .path
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains(&query)
+            });
+        let rows = skills
+            .into_iter()
+            .map(|skill| {
+                let delete_name = skill.name.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .p(px(14.0))
+                    .rounded(px(11.0))
+                    .bg(theme.surface_subtle)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(skill.name))
+                            .when(!skill.description.trim().is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .mt(px(4.0))
+                                        .text_size(px(11.0))
+                                        .text_color(theme.muted)
+                                        .child(skill.description),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .mt(px(4.0))
+                                    .text_size(px(10.0))
+                                    .text_color(theme.faint)
+                                    .child(skill.path.display().to_string()),
+                            ),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("delete-skill-{delete_name}")))
+                            .ghost()
+                            .small()
+                            .icon(IconName::Delete)
+                            .tooltip(i18n::text(cx, "project.remove_skill"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.delete_project_skill(&delete_name, cx)
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        div()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scrollbar()
+            .child(
+                div()
+                    .mx_auto()
+                    .w_full()
+                    .max_w(px(900.0))
+                    .px(px(32.0))
+                    .py(px(28.0))
+                    .child(settings_page_title(
+                        i18n::text(cx, "project.skills_title"),
+                        i18n::text(cx, "project.skills_description"),
+                        theme,
+                    ))
+                    .child(
+                        div().mt(px(18.0)).flex().justify_end().child(
+                            Button::new("open-skill-marketplace")
+                                .primary()
+                                .icon(IconName::Plus)
+                                .label(i18n::text(cx, "project.skill_marketplace"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_skill_marketplace_dialog(window, cx)
+                                })),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .mt(px(16.0))
+                            .child(Input::new(&self.project_skill_search).prefix(IconName::Search)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(14.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .when(rows.is_empty(), |this| {
+                                this.child(if has_query {
+                                    settings_empty_state(
+                                        i18n::text(cx, "project.no_skills_matches"),
+                                        "",
+                                        theme,
+                                    )
+                                } else {
+                                    settings_empty_state(
+                                        i18n::text(cx, "project.no_skills"),
+                                        i18n::text(cx, "project.no_skills_description"),
+                                        theme,
+                                    )
+                                })
+                            })
+                            .children(rows),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_chat(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.sync_conversation_list_state();
         if let Some(thread_id) = self.agent_thread_view.clone() {
@@ -7087,6 +8659,35 @@ impl AverroesApp {
                 .into_any_element();
         }
 
+        let work_rail_markers = checkpoints
+            .iter()
+            .map(|checkpoint| {
+                let color = match checkpoint.status {
+                    CheckpointStatus::Completed => theme.success,
+                    CheckpointStatus::InProgress => theme.warning,
+                    CheckpointStatus::Blocked => theme.destructive,
+                    CheckpointStatus::Pending => theme.faint,
+                };
+                div()
+                    .flex_none()
+                    .size(px(6.0))
+                    .rounded_full()
+                    .bg(color)
+                    .into_any_element()
+            })
+            .chain(tasks.iter().map(|task| {
+                div()
+                    .flex_none()
+                    .size(px(6.0))
+                    .rounded_full()
+                    .bg(if task.status == TaskStatus::Done {
+                        theme.success
+                    } else {
+                        theme.faint
+                    })
+                    .into_any_element()
+            }))
+            .collect::<Vec<_>>();
         let checkpoint_rows = checkpoints
             .into_iter()
             .map(|checkpoint| {
@@ -7098,10 +8699,6 @@ impl AverroesApp {
                     CheckpointStatus::Blocked => (IconName::CircleX, theme.destructive),
                     CheckpointStatus::Pending => (IconName::Ellipsis, theme.faint),
                 };
-                let hover_group = SharedString::from(format!(
-                    "checkpoint-hover-{}-{checkpoint_id}",
-                    session_id.as_str()
-                ));
                 let detail = checkpoint
                     .detail
                     .clone()
@@ -7114,65 +8711,50 @@ impl AverroesApp {
                             .to_ascii_uppercase()
                     });
                 let title = checkpoint.title.clone();
-                let tooltip = div()
-                    .absolute()
-                    .left(px(31.0))
-                    .top(px(-5.0))
-                    .w(px(320.0))
-                    .p(px(10.0))
-                    .rounded(px(12.0))
-                    .bg(theme.surface)
-                    .shadow_md()
-                    .opacity(0.0)
-                    .group_hover(hover_group.clone(), |style| style.opacity(1.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(7.0))
-                            .child(Icon::new(icon).size(px(13.0)).text_color(color))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.foreground)
-                                    .child(title),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt(px(6.0))
-                            .max_h(px(34.0))
-                            .overflow_hidden()
-                            .text_size(px(12.0))
-                            .text_color(theme.muted)
-                            .child(detail),
-                    );
                 div()
                     .id(SharedString::from(format!(
                         "checkpoint-{}-{checkpoint_id}",
                         session_id.as_str()
                     )))
-                    .relative()
-                    .group(hover_group)
                     .flex()
-                    .items_center()
+                    .items_start()
+                    .gap(px(8.0))
                     .w_full()
-                    .h(px(30.0))
+                    .px(px(8.0))
+                    .py(px(7.0))
+                    .rounded(px(9.0))
+                    .child(
+                        Icon::new(icon)
+                            .flex_none()
+                            .mt(px(1.0))
+                            .size(px(14.0))
+                            .text_color(color),
+                    )
                     .child(
                         div()
-                            .w(px(23.0))
-                            .h(px(2.0))
-                            .rounded_full()
-                            .bg(color)
-                            .hover(|style| style.h(px(3.0))),
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .whitespace_normal()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.foreground)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .whitespace_normal()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.muted)
+                                    .child(detail),
+                            ),
                     )
-                    .child(tooltip)
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.surface_hover))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -7185,82 +8767,67 @@ impl AverroesApp {
             .into_iter()
             .map(|task| {
                 let done = task.status == TaskStatus::Done;
-                let hover_group =
-                    SharedString::from(format!("task-hover-{}-{}", session_id.as_str(), task.id));
                 let task_title = task.title.clone();
                 let task_status = if done { "DONE" } else { "PENDING" };
-                let tooltip = div()
-                    .absolute()
-                    .left(px(31.0))
-                    .top(px(-5.0))
-                    .w(px(320.0))
-                    .p(px(10.0))
-                    .rounded(px(12.0))
-                    .bg(theme.surface)
-                    .shadow_md()
-                    .opacity(0.0)
-                    .group_hover(hover_group.clone(), |style| style.opacity(1.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(7.0))
-                            .child(
-                                Icon::new(if done {
-                                    IconName::CircleCheck
-                                } else {
-                                    IconName::Ellipsis
-                                })
-                                .size(px(13.0))
-                                .text_color(if done {
-                                    theme.success
-                                } else {
-                                    theme.faint
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.foreground)
-                                    .child(task_title),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt(px(6.0))
-                            .text_size(px(11.0))
-                            .text_color(if done { theme.success } else { theme.faint })
-                            .child(task_status),
-                    );
                 div()
                     .id(SharedString::from(format!(
                         "task-{}-{}",
                         session_id.as_str(),
                         task.id
                     )))
-                    .relative()
-                    .group(hover_group)
                     .flex()
-                    .items_center()
+                    .items_start()
+                    .gap(px(8.0))
                     .w_full()
-                    .h(px(24.0))
-                    .child(div().w(px(15.0)).h(px(2.0)).rounded_full().bg(if done {
-                        theme.success
-                    } else {
-                        theme.faint
-                    }))
-                    .child(tooltip)
+                    .px(px(8.0))
+                    .py(px(7.0))
+                    .rounded(px(9.0))
+                    .child(
+                        Icon::new(if done {
+                            IconName::CircleCheck
+                        } else {
+                            IconName::Ellipsis
+                        })
+                        .flex_none()
+                        .mt(px(1.0))
+                        .size(px(14.0))
+                        .text_color(if done {
+                            theme.success
+                        } else {
+                            theme.faint
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .whitespace_normal()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.foreground)
+                                    .child(task_title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(if done { theme.success } else { theme.faint })
+                                    .child(task_status),
+                            ),
+                    )
+                    .hover(|style| style.bg(theme.surface_hover))
                     .into_any_element()
             })
             .collect::<Vec<_>>();
         let has_checkpoints = !checkpoint_rows.is_empty();
         let has_tasks = !task_rows.is_empty();
+        let work_rail_group =
+            SharedString::from(format!("conversation-work-rail-{}", session_id.as_str()));
         let header_actions = conversation_actions_button(
             session_id.to_string(),
             format!("header-conversation-actions-{}", session_id.as_str()),
@@ -7386,12 +8953,12 @@ impl AverroesApp {
                 div()
                     .flex_1()
                     .min_h(px(0.0))
+                    .relative()
                     .flex()
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .when(has_checkpoints || has_tasks, |this| this.pl(px(44.0)))
                             .flex()
                             .flex_col()
                             .child(
@@ -7421,19 +8988,77 @@ impl AverroesApp {
                                 .left(px(0.0))
                                 .top(px(0.0))
                                 .bottom(px(0.0))
-                                .w(px(44.0))
-                                .px(px(10.0))
-                                .py(px(20.0))
-                                .overflow_y_scrollbar()
-                                .when(has_checkpoints, |this| this.children(checkpoint_rows))
-                                .when(has_tasks, |this| {
-                                    this.child(div().h(px(if has_checkpoints {
-                                        12.0
-                                    } else {
-                                        0.0
-                                    })))
-                                    .children(task_rows)
-                                }),
+                                .w(px(WORK_RAIL_TRIGGER_WIDTH))
+                                .group(work_rail_group.clone())
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(10.0))
+                                        .top(px(20.0))
+                                        .max_h(px(220.0))
+                                        .px(px(5.0))
+                                        .py(px(8.0))
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .bg(theme.surface)
+                                        .overflow_hidden()
+                                        .children(work_rail_markers),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(10.0))
+                                        .top(px(8.0))
+                                        .bottom(px(8.0))
+                                        .w(px(WORK_RAIL_WIDTH))
+                                        .px(px(12.0))
+                                        .py(px(14.0))
+                                        .rounded(px(12.0))
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .bg(theme.surface)
+                                        .overflow_y_scrollbar()
+                                        .invisible()
+                                        .opacity(0.0)
+                                        .group_hover(work_rail_group, |style| {
+                                            style.visible().opacity(1.0)
+                                        })
+                                        .occlude()
+                                        .when(has_checkpoints, |this| {
+                                            this.child(
+                                                div()
+                                                    .px(px(8.0))
+                                                    .pb(px(6.0))
+                                                    .text_size(px(10.0))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(theme.faint)
+                                                    .child(i18n::text(cx, "chat.checkpoints")),
+                                            )
+                                            .children(checkpoint_rows)
+                                        })
+                                        .when(has_tasks, |this| {
+                                            this.child(div().h(px(if has_checkpoints {
+                                                12.0
+                                            } else {
+                                                0.0
+                                            })))
+                                            .child(
+                                                div()
+                                                    .px(px(8.0))
+                                                    .pb(px(6.0))
+                                                    .text_size(px(10.0))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(theme.faint)
+                                                    .child(i18n::text(cx, "chat.tasks")),
+                                            )
+                                            .children(task_rows)
+                                        }),
+                                ),
                         )
                     })
                     .when(self.show_context, |this| {
@@ -7637,6 +9262,17 @@ impl AverroesApp {
             .is_some_and(|messages| !messages.is_empty());
         let input_tokens = format_context_tokens(usage.input_tokens);
         let output_tokens = format_context_tokens(usage.output_tokens);
+        let cached_input_tokens = usage
+            .cache_read_input_tokens
+            .map(|tokens| format_context_tokens(Some(tokens)));
+        let cache_write_tokens = usage
+            .cache_creation_input_tokens
+            .filter(|tokens| *tokens > 0)
+            .map(|tokens| format_context_tokens(Some(tokens)));
+        let reasoning_tokens = usage
+            .reasoning_output_tokens
+            .filter(|tokens| *tokens > 0)
+            .map(|tokens| format_context_tokens(Some(tokens)));
         let context_limit = format_context_limit(usage.context_limit);
         let percentage = usage.percentage();
         let progress = percentage.map(|percentage| {
@@ -7895,6 +9531,51 @@ impl AverroesApp {
                             )
                             .child(output_tokens),
                     )
+                    .when_some(cached_input_tokens, |this, cached_input_tokens| {
+                        this.child(
+                            div()
+                                .mt(px(8.0))
+                                .flex()
+                                .justify_between()
+                                .text_size(px(11.0))
+                                .child(
+                                    div()
+                                        .text_color(theme.muted)
+                                        .child(i18n::text(cx, "chat.cached_input")),
+                                )
+                                .child(cached_input_tokens),
+                        )
+                    })
+                    .when_some(cache_write_tokens, |this, cache_write_tokens| {
+                        this.child(
+                            div()
+                                .mt(px(8.0))
+                                .flex()
+                                .justify_between()
+                                .text_size(px(11.0))
+                                .child(
+                                    div()
+                                        .text_color(theme.muted)
+                                        .child(i18n::text(cx, "chat.cache_write")),
+                                )
+                                .child(cache_write_tokens),
+                        )
+                    })
+                    .when_some(reasoning_tokens, |this, reasoning_tokens| {
+                        this.child(
+                            div()
+                                .mt(px(8.0))
+                                .flex()
+                                .justify_between()
+                                .text_size(px(11.0))
+                                .child(
+                                    div()
+                                        .text_color(theme.muted)
+                                        .child(i18n::text(cx, "chat.reasoning_tokens")),
+                                )
+                                .child(reasoning_tokens),
+                        )
+                    })
                     .child(
                         div()
                             .mt(px(8.0))
@@ -9794,7 +11475,13 @@ impl Render for AverroesApp {
         let theme = UiTheme::current(cx);
         let content = match self.route {
             Route::Home => self.render_home(cx),
-            Route::Chat => self.render_chat(cx),
+            Route::Chat => {
+                if self.project_settings_open {
+                    self.render_project_settings(cx)
+                } else {
+                    self.render_chat(cx)
+                }
+            }
             Route::Connections => self.render_connections(cx),
         };
         let sheet_layer = ComponentRoot::render_sheet_layer(window, cx);
@@ -9823,6 +11510,11 @@ impl Render for AverroesApp {
 
 fn averroes_logo_asset(_: &gpui::App) -> &'static str {
     "brand/averroes.png"
+}
+
+fn non_empty_input(input: &Entity<InputState>, cx: &App) -> Option<String> {
+    let value = input.read(cx).value().trim().to_owned();
+    (!value.is_empty()).then_some(value)
 }
 
 fn conversation_actions_button(
@@ -10204,10 +11896,10 @@ fn inherited_session_binding(
     } else {
         remembered.clone()
     };
-    if !active.tools.is_empty() {
-        inherited.tools = active.tools.clone();
-    }
-    ensure_binding_tools(&mut inherited, default_tools);
+    // A new conversation keeps the selected connection/model, but tool
+    // activation is conversation-local. Carrying the previous allow-list
+    // defeats lazy discovery and resends every old schema on the first turn.
+    inherited.tools = default_tools.to_vec();
     inherited
 }
 
@@ -10278,10 +11970,11 @@ fn sort_conversation_summaries(conversations: &mut [ConversationSummary]) {
 fn sidebar_heading(label: impl Into<SharedString>, theme: UiTheme, top: f32) -> AnyElement {
     let label = label.into();
     div()
-        .px(px(9.0))
+        .px(px(10.0))
         .pt(px(top))
-        .pb(px(7.0))
+        .pb(px(8.0))
         .text_size(px(13.0))
+        .font_weight(FontWeight::MEDIUM)
         .text_color(theme.faint)
         .child(label)
         .into_any_element()
@@ -10321,6 +12014,7 @@ fn tool_display_name(name: &str) -> String {
         "bash" | "shell" | "terminal" => "Shell".into(),
         "file_read" | "read_file" => "Read file".into(),
         "file_write" | "write_file" => "Write file".into(),
+        "patch" => "Apply patch".into(),
         "glob" | "find_files" => "Find files".into(),
         "grep" => "Search files".into(),
         "web_search_intrernal" => "Search web".into(),
@@ -10333,6 +12027,8 @@ fn tool_display_name(name: &str) -> String {
         "list_tools" => "List tools".into(),
         "list_skills" => "List skills".into(),
         "load_skill" => "Load skill".into(),
+        "search_skills" => "Search skills".into(),
+        "install_skill" => "Install skill".into(),
         "list_agents" => "List agents".into(),
         "call_agents" | "call_agent" => "Call agent".into(),
         "compact_conversation" => "Compact conversation".into(),
@@ -10356,6 +12052,7 @@ fn localized_tool_display_name(cx: &App, name: &str) -> SharedString {
         "bash" | "shell" | "terminal" => Some("tool.shell"),
         "file_read" | "read_file" => Some("tool.read_file"),
         "file_write" | "write_file" => Some("tool.write_file"),
+        "patch" => Some("tool.patch"),
         "glob" | "find_files" => Some("tool.find_files"),
         "grep" => Some("tool.search_files"),
         "web_search_intrernal" => Some("tool.search_web"),
@@ -10368,6 +12065,8 @@ fn localized_tool_display_name(cx: &App, name: &str) -> SharedString {
         "list_tools" => Some("tool.list_tools"),
         "list_skills" => Some("tool.list_skills"),
         "load_skill" => Some("tool.load_skill"),
+        "search_skills" => Some("tool.search_skills"),
+        "install_skill" => Some("tool.install_skill"),
         "list_agents" => Some("tool.list_agents"),
         "call_agents" | "call_agent" => Some("tool.call_agent"),
         "compact_conversation" => Some("tool.compact_conversation"),
@@ -10476,36 +12175,14 @@ fn agent_thread_status_color(status: AgentThreadStatus, theme: UiTheme) -> gpui:
     }
 }
 
-/// Returns a stable accent for a conversation folder without persisting any
-/// presentation state. Keeping the palette small makes the sidebar feel
-/// coherent while hashing the name ensures that the same folder keeps its
-/// identity after restarting the app.
-fn conversation_folder_dot_color(name: &str) -> gpui::Rgba {
-    const COLORS: [u32; 8] = [
-        0x5b8def, // blue
-        0x35b7a4, // teal
-        0xd98a5a, // orange
-        0x9c7aef, // purple
-        0xd26a8a, // pink
-        0x56a96f, // green
-        0xc3a44b, // amber
-        0x4ca3c7, // cyan
-    ];
-
-    let hash = name.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-    });
-    rgb(COLORS[(hash as usize) % COLORS.len()])
-}
-
 fn flatten_background<T>(
     result: Result<Result<T, crate::runtime::RuntimeError>, tokio::task::JoinError>,
 ) -> Result<T, crate::runtime::RuntimeError> {
     result.unwrap_or_else(|error| Err(crate::runtime::RuntimeError::Runtime(error.to_string())))
 }
 
-const MAX_ATTACHMENT_BYTES: u64 = 512 * 1024;
-const MAX_ATTACHMENT_TOTAL_BYTES: usize = 1_024 * 1_024;
+const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_ATTACHMENT_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 
 fn composer_attachment_name(path: &PathBuf) -> String {
     path.file_name()
@@ -10521,9 +12198,13 @@ fn composer_message_label(text: &str, attachments: &[ComposerAttachment]) -> Str
     }
     let names = attachments
         .iter()
+        .filter(|attachment| attachment_media_type(&attachment.path).is_none())
         .map(|attachment| composer_attachment_name(&attachment.path))
         .collect::<Vec<_>>()
         .join(", ");
+    if names.is_empty() {
+        return text.to_owned();
+    }
     if text.trim().is_empty() {
         format!("Attached files: {names}")
     } else {
@@ -10531,11 +12212,24 @@ fn composer_message_label(text: &str, attachments: &[ComposerAttachment]) -> Str
     }
 }
 
-async fn load_attachment_context(
+fn attachment_media_type(path: &PathBuf) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?;
+    match extension.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+async fn load_attachment_content(
     mut text: String,
     paths: Vec<PathBuf>,
-) -> Result<String, anyhow::Error> {
+) -> Result<(String, MessageContent), anyhow::Error> {
     let mut total_bytes = 0usize;
+    let original_text = text.clone();
+    let mut content_parts = Vec::new();
     for path in paths {
         let metadata = tokio::fs::metadata(&path)
             .await
@@ -10545,7 +12239,7 @@ async fn load_attachment_context(
         }
         if metadata.len() > MAX_ATTACHMENT_BYTES {
             return Err(anyhow::anyhow!(
-                "{} is larger than the 512 KB attachment limit",
+                "{} is larger than the 10 MB attachment limit",
                 path.display()
             ));
         }
@@ -10555,17 +12249,112 @@ async fn load_attachment_context(
             .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
         total_bytes = total_bytes.saturating_add(bytes.len());
         if total_bytes > MAX_ATTACHMENT_TOTAL_BYTES {
-            return Err(anyhow::anyhow!("attachments exceed the 1 MB total limit"));
+            return Err(anyhow::anyhow!("attachments exceed the 20 MB total limit"));
         }
-        let content = String::from_utf8(bytes)
-            .map_err(|_| anyhow::anyhow!("{} is not a UTF-8 text file", path.display()))?;
-        text.push_str("\n\n--- Attached file: ");
-        text.push_str(&path.to_string_lossy());
-        text.push_str(" ---\n");
-        text.push_str(&content);
-        text.push_str("\n--- End attached file ---");
+
+        if let Some(media_type) = attachment_media_type(&path) {
+            let label = format!("\n\n--- Attached image: {} ---", path.display());
+            text.push_str(&label);
+            content_parts.push(ContentPart::Text { text: label });
+            content_parts.push(ContentPart::Image {
+                source: ImageSource {
+                    media_type: media_type.to_string(),
+                    data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                },
+            });
+            continue;
+        }
+
+        let content = String::from_utf8(bytes).map_err(|_| {
+            anyhow::anyhow!(
+                "{} is not supported; attach a UTF-8 text file or a PNG, JPEG, GIF, or WebP image",
+                path.display()
+            )
+        })?;
+        let section = format!(
+            "\n\n--- Attached file: {} ---\n{}\n--- End attached file ---",
+            path.display(),
+            content
+        );
+        text.push_str(&section);
+        content_parts.push(ContentPart::Text { text: section });
     }
-    Ok(text)
+
+    if content_parts.is_empty() {
+        Ok((text.clone(), MessageContent::Text(text)))
+    } else {
+        if !original_text.is_empty() {
+            content_parts.insert(
+                0,
+                ContentPart::Text {
+                    text: original_text,
+                },
+            );
+        }
+        Ok((text, MessageContent::Parts(content_parts)))
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::{attachment_media_type, load_attachment_content};
+    use averroes_core::provider::types::{ContentPart, MessageContent};
+    use std::path::PathBuf;
+
+    #[test]
+    fn detects_supported_image_extensions_case_insensitively() {
+        assert_eq!(
+            attachment_media_type(&PathBuf::from("preview.PNG")),
+            Some("image/png")
+        );
+        assert_eq!(
+            attachment_media_type(&PathBuf::from("photo.jpeg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            attachment_media_type(&PathBuf::from("animation.GiF")),
+            Some("image/gif")
+        );
+        assert_eq!(
+            attachment_media_type(&PathBuf::from("asset.webp")),
+            Some("image/webp")
+        );
+        assert_eq!(attachment_media_type(&PathBuf::from("archive.zip")), None);
+    }
+
+    #[test]
+    fn image_attachment_becomes_provider_content_instead_of_utf8_text() {
+        let path = std::env::temp_dir().join(format!(
+            "averroes-attachment-test-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&path, [137_u8, 80, 78, 71, 13, 10, 26, 10]).unwrap();
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(load_attachment_content(
+                "describe this".into(),
+                vec![path.clone()],
+            ))
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert!(result.0.contains("Attached image"));
+        match result.1 {
+            MessageContent::Parts(parts) => {
+                assert!(matches!(
+                    parts.first(),
+                    Some(ContentPart::Text { text }) if text == "describe this"
+                ));
+                assert!(parts.iter().any(|part| matches!(
+                    part,
+                    ContentPart::Image { source }
+                        if source.media_type == "image/png" && !source.data.is_empty()
+                )));
+            }
+            MessageContent::Text(_) => panic!("image should be sent as provider content parts"),
+        }
+    }
 }
 
 fn sidebar_empty(label: impl Into<SharedString>, theme: UiTheme) -> AnyElement {
@@ -10579,16 +12368,36 @@ fn sidebar_empty(label: impl Into<SharedString>, theme: UiTheme) -> AnyElement {
         .into_any_element()
 }
 
-fn tool_activity_groups(activities: &[ToolActivity]) -> Vec<(usize, Vec<usize>)> {
+const LEGACY_REASONING_TOOL_GROUP_ID: usize = usize::MAX;
+
+fn tool_activity_belongs_to_reasoning(activity: &ToolActivity) -> bool {
+    // Older streams only marked calls as reasoning-owned when the provider
+    // emitted explicit reasoning tokens. A call at offset zero still happened
+    // before any visible answer, so it belongs in the reasoning/action trace.
+    activity.inside_reasoning || activity.text_offset == 0
+}
+
+fn tool_activity_groups_for_location(
+    activities: &[ToolActivity],
+    inside_reasoning: bool,
+) -> Vec<(usize, Vec<usize>)> {
     let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
     for (activity_index, activity) in activities.iter().enumerate() {
-        if activity.inside_reasoning {
+        if tool_activity_belongs_to_reasoning(activity) != inside_reasoning {
             continue;
         }
-        // Activities created by the live stream always have a group. The
-        // fallback keeps older in-memory messages renderable during a hot
-        // reload without ever mixing them with reasoning tools.
-        let group_id = activity.group_id.unwrap_or(activity_index);
+        // Older persisted reasoning activities had no group. They all use a
+        // reserved fallback so reopening an existing conversation compacts
+        // them together instead of rendering dozens of individual rows.
+        let group_id =
+            if inside_reasoning && (!activity.inside_reasoning || activity.group_id.is_none()) {
+                LEGACY_REASONING_TOOL_GROUP_ID
+            } else {
+                activity.group_id.unwrap_or_else(|| {
+                    debug_assert!(!inside_reasoning);
+                    activity_index
+                })
+            };
         if let Some((_, indexes)) = groups.iter_mut().find(|(id, _)| *id == group_id) {
             indexes.push(activity_index);
         } else {
@@ -10596,6 +12405,64 @@ fn tool_activity_groups(activities: &[ToolActivity]) -> Vec<(usize, Vec<usize>)>
         }
     }
     groups
+}
+
+fn tool_activity_groups(activities: &[ToolActivity]) -> Vec<(usize, Vec<usize>)> {
+    tool_activity_groups_for_location(activities, false)
+}
+
+fn reasoning_tool_activity_groups(activities: &[ToolActivity]) -> Vec<(usize, Vec<usize>)> {
+    tool_activity_groups_for_location(activities, true)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolStreamBlock {
+    Text {
+        start: usize,
+        end: usize,
+    },
+    Group {
+        group_id: usize,
+        activity_indices: Vec<usize>,
+    },
+}
+
+fn tool_group_stream_blocks(
+    text: &str,
+    groups: Vec<(usize, Vec<usize>)>,
+    activities: &[ToolActivity],
+) -> Vec<ToolStreamBlock> {
+    let mut blocks = Vec::with_capacity(groups.len() * 2 + 1);
+    let mut cursor = 0usize;
+    for (group_id, activity_indices) in groups {
+        let Some(first_activity_index) = activity_indices.first().copied() else {
+            continue;
+        };
+        let offset = activities[first_activity_index].text_offset.min(text.len());
+        let offset = if text.is_char_boundary(offset) {
+            offset.max(cursor)
+        } else {
+            cursor
+        };
+        if cursor < offset {
+            blocks.push(ToolStreamBlock::Text {
+                start: cursor,
+                end: offset,
+            });
+        }
+        blocks.push(ToolStreamBlock::Group {
+            group_id,
+            activity_indices,
+        });
+        cursor = offset;
+    }
+    if cursor < text.len() {
+        blocks.push(ToolStreamBlock::Text {
+            start: cursor,
+            end: text.len(),
+        });
+    }
+    blocks
 }
 
 fn render_tool_group(
@@ -10619,6 +12486,7 @@ fn render_tool_group(
                 message_index,
                 std::slice::from_ref(&activities[index]),
                 index,
+                hidden_count > 0,
                 theme,
                 cx,
             );
@@ -10628,7 +12496,10 @@ fn render_tool_group(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(5.0))
+                    .gap(px(0.0))
+                    .rounded(px(10.0))
+                    .bg(theme.surface_subtle)
+                    .overflow_hidden()
                     .child(render_tool_group_summary(
                         session_id,
                         message_index,
@@ -10663,6 +12534,7 @@ fn render_tool_group(
                     message_index,
                     std::slice::from_ref(&activities[*activity_index]),
                     *activity_index,
+                    false,
                     theme,
                     cx,
                 )
@@ -10798,6 +12670,7 @@ fn render_tool_activity(
     message_index: usize,
     activities: &[ToolActivity],
     activity_index_offset: usize,
+    nested: bool,
     theme: UiTheme,
     cx: &mut Context<AverroesApp>,
 ) -> AnyElement {
@@ -10873,14 +12746,23 @@ fn render_tool_activity(
             } else {
                 None
             };
-            div()
+            let mut activity_row = div()
                 .id(SharedString::from(activity_id.clone()))
                 .flex()
                 .flex_col()
-                .p(px(9.0))
-                .rounded(px(10.0))
-                .bg(theme.surface_subtle)
-                .hover(|style| style.bg(theme.surface_hover))
+                .p(px(9.0));
+            if nested {
+                activity_row = activity_row
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .pt(px(10.0));
+            } else {
+                activity_row = activity_row
+                    .rounded(px(10.0))
+                    .bg(theme.surface_subtle)
+                    .hover(|style| style.bg(theme.surface_hover));
+            }
+            activity_row
                 .child(
                     div()
                         .flex()
@@ -10951,7 +12833,7 @@ fn render_tool_activity(
     div()
         .flex()
         .flex_col()
-        .gap(px(5.0))
+        .when(!nested, |this| this.gap(px(5.0)))
         .children(rows)
         .into_any_element()
 }
@@ -10969,7 +12851,7 @@ fn agent_thread_blocks(message: &ShellMessage) -> Vec<AgentThreadBlock> {
         || message
             .tool_activities
             .iter()
-            .any(|activity| activity.inside_reasoning)
+            .any(tool_activity_belongs_to_reasoning)
     {
         blocks.push(AgentThreadBlock::Reasoning);
     }
@@ -10977,7 +12859,7 @@ fn agent_thread_blocks(message: &ShellMessage) -> Vec<AgentThreadBlock> {
     let text_len = message.text.len();
     let mut cursor = 0;
     for (activity_index, activity) in message.tool_activities.iter().enumerate() {
-        if activity.inside_reasoning {
+        if tool_activity_belongs_to_reasoning(activity) {
             continue;
         }
         let offset = activity.text_offset.min(text_len);
@@ -11090,6 +12972,7 @@ fn render_agent_thread_message(
                 thread_id,
                 message_index,
                 message,
+                streaming,
                 theme,
                 cx,
             )),
@@ -11128,30 +13011,49 @@ fn render_agent_thread_reasoning(
     thread_id: &str,
     message_index: usize,
     message: &ShellMessage,
+    streaming: bool,
     theme: UiTheme,
     cx: &mut Context<AverroesApp>,
 ) -> AnyElement {
     let expanded = message.reasoning_expanded;
-    let reasoning = normalize_reasoning_for_display(&message.reasoning);
-    let reasoning_content = if message.reasoning_complete {
-        render_markdown(theme, &reasoning)
-    } else {
-        render_streaming_markdown(theme, &reasoning)
-    };
-    let reasoning_tools = message
-        .tool_activities
-        .iter()
-        .enumerate()
-        .filter(|(_, activity)| activity.inside_reasoning)
-        .map(|(activity_index, activity)| {
-            render_agent_thread_tool_activity(
+    let reasoning_complete = reasoning_is_complete_for_display(message, streaming);
+    let reasoning_groups = reasoning_tool_activity_groups(&message.tool_activities);
+    let active_reasoning_group_id = streaming
+        .then(|| message.active_reasoning_tool_group())
+        .flatten();
+    let reasoning_blocks = tool_group_stream_blocks(
+        &message.reasoning,
+        reasoning_groups,
+        &message.tool_activities,
+    );
+    let reasoning_content = reasoning_blocks
+        .into_iter()
+        .filter_map(|block| match block {
+            ToolStreamBlock::Text { start, end } => {
+                message.reasoning.get(start..end).map(|segment| {
+                    let segment = normalize_reasoning_for_display(segment);
+                    let element = if !reasoning_complete && end == message.reasoning.len() {
+                        render_streaming_markdown(theme, &segment)
+                    } else {
+                        render_markdown(theme, &segment)
+                    };
+                    element.into_any_element()
+                })
+            }
+            ToolStreamBlock::Group {
+                group_id,
+                activity_indices,
+            } => Some(render_agent_thread_tool_group(
                 thread_id,
                 message_index,
-                activity_index,
-                activity,
+                group_id,
+                &activity_indices,
+                &message.tool_activities,
+                active_reasoning_group_id,
+                message.is_tool_group_expanded(group_id),
                 theme,
                 cx,
-            )
+            )),
         })
         .collect::<Vec<_>>();
     let toggle_thread_id = thread_id.to_owned();
@@ -11187,7 +13089,7 @@ fn render_agent_thread_reasoning(
                     })),
                 )
                 .child(div().flex_1())
-                .child(if message.reasoning_complete {
+                .child(if reasoning_complete {
                     Icon::new(IconName::Check)
                         .size(px(12.0))
                         .text_color(theme.success)
@@ -11214,8 +13116,7 @@ fn render_agent_thread_reasoning(
                             .flex()
                             .flex_col()
                             .gap(px(7.0))
-                            .child(reasoning_content)
-                            .children(reasoning_tools),
+                            .children(reasoning_content),
                     ),
             )
         })
@@ -11225,12 +13126,14 @@ fn render_agent_thread_reasoning(
 #[cfg(test)]
 mod agent_thread_render_tests {
     use super::{
-        agent_thread_blocks, AgentThreadBlock, ShellMessage, ToolActivity, ToolActivityState,
+        agent_thread_blocks, reasoning_is_complete_for_display, reasoning_tool_activity_groups,
+        tool_activity_groups, tool_group_stream_blocks, AgentThreadBlock, ShellMessage,
+        ToolActivity, ToolActivityState, ToolStreamBlock, LEGACY_REASONING_TOOL_GROUP_ID,
     };
     use std::time::Instant;
 
     #[test]
-    fn agent_response_keeps_reasoning_tools_and_text_in_separate_blocks() {
+    fn pre_answer_tools_stay_in_reasoning_without_a_duplicate_outer_block() {
         let mut message = ShellMessage::assistant();
         message.reasoning = "Planning".into();
         message.text = "Answer".into();
@@ -11253,11 +13156,342 @@ mod agent_thread_render_tests {
             agent_thread_blocks(&message),
             vec![
                 AgentThreadBlock::Reasoning,
-                AgentThreadBlock::Tool(0),
                 AgentThreadBlock::Text { start: 0, end: 6 },
             ]
         );
     }
+
+    #[test]
+    fn tool_after_visible_text_keeps_its_inline_position() {
+        let mut message = ShellMessage::assistant();
+        message.reasoning = "Planning".into();
+        message.text = "Answer".into();
+        message.tool_activities.push(ToolActivity {
+            call_id: Some("call-inline".into()),
+            name: "web_search".into(),
+            text_offset: 3,
+            group_id: Some(0),
+            input: "{}".into(),
+            summary: "Search complete".into(),
+            output: "Result".into(),
+            state: ToolActivityState::Completed,
+            started_at: Instant::now(),
+            duration_ms: Some(10),
+            expanded: false,
+            inside_reasoning: false,
+        });
+
+        assert_eq!(
+            agent_thread_blocks(&message),
+            vec![
+                AgentThreadBlock::Reasoning,
+                AgentThreadBlock::Text { start: 0, end: 3 },
+                AgentThreadBlock::Tool(0),
+                AgentThreadBlock::Text { start: 3, end: 6 },
+            ]
+        );
+    }
+
+    #[test]
+    fn reasoning_stays_active_until_the_whole_turn_finishes() {
+        let mut message = ShellMessage::assistant();
+        message.reasoning = "Calling a tool".into();
+        message.reasoning_complete = true;
+
+        assert!(!reasoning_is_complete_for_display(&message, true));
+        assert!(reasoning_is_complete_for_display(&message, false));
+    }
+
+    #[test]
+    fn reasoning_and_inline_tools_have_exclusive_compact_groups() {
+        let activity = ToolActivity {
+            call_id: Some("outside-1".into()),
+            name: "file_read".into(),
+            text_offset: 3,
+            group_id: Some(4),
+            input: "{}".into(),
+            summary: String::new(),
+            output: String::new(),
+            state: ToolActivityState::Completed,
+            started_at: Instant::now(),
+            duration_ms: Some(1),
+            expanded: false,
+            inside_reasoning: false,
+        };
+        let mut reasoning_one = activity.clone();
+        reasoning_one.call_id = Some("reasoning-1".into());
+        reasoning_one.group_id = None;
+        reasoning_one.inside_reasoning = true;
+        let mut reasoning_two = reasoning_one.clone();
+        reasoning_two.call_id = Some("reasoning-2".into());
+        let mut outside_two = activity.clone();
+        outside_two.call_id = Some("outside-2".into());
+        let activities = vec![activity, reasoning_one, reasoning_two, outside_two];
+
+        assert_eq!(tool_activity_groups(&activities), vec![(4, vec![0, 3])]);
+        assert_eq!(
+            reasoning_tool_activity_groups(&activities),
+            vec![(LEGACY_REASONING_TOOL_GROUP_ID, vec![1, 2])]
+        );
+    }
+
+    #[test]
+    fn legacy_pre_answer_tools_merge_into_one_reasoning_group() {
+        let legacy_outer = ToolActivity {
+            call_id: Some("legacy-outer".into()),
+            name: "discover_tools".into(),
+            text_offset: 0,
+            group_id: Some(0),
+            input: "{}".into(),
+            summary: String::new(),
+            output: String::new(),
+            state: ToolActivityState::Completed,
+            started_at: Instant::now(),
+            duration_ms: Some(1),
+            expanded: false,
+            inside_reasoning: false,
+        };
+        let mut legacy_reasoning = legacy_outer.clone();
+        legacy_reasoning.call_id = Some("legacy-reasoning".into());
+        legacy_reasoning.name = "file_read".into();
+        legacy_reasoning.group_id = None;
+        legacy_reasoning.inside_reasoning = true;
+        let activities = vec![legacy_outer, legacy_reasoning];
+
+        assert!(tool_activity_groups(&activities).is_empty());
+        assert_eq!(
+            reasoning_tool_activity_groups(&activities),
+            vec![(LEGACY_REASONING_TOOL_GROUP_ID, vec![0, 1])]
+        );
+    }
+
+    #[test]
+    fn reasoning_tool_groups_keep_their_inline_stream_position() {
+        let activity = ToolActivity {
+            call_id: Some("reasoning-1".into()),
+            name: "file_read".into(),
+            text_offset: 4,
+            group_id: Some(5),
+            input: "{}".into(),
+            summary: String::new(),
+            output: String::new(),
+            state: ToolActivityState::Completed,
+            started_at: Instant::now(),
+            duration_ms: Some(1),
+            expanded: false,
+            inside_reasoning: true,
+        };
+        let mut second = activity.clone();
+        second.call_id = Some("reasoning-2".into());
+        second.text_offset = 8;
+        second.group_id = Some(6);
+        let activities = vec![activity, second];
+        let groups = reasoning_tool_activity_groups(&activities);
+
+        assert_eq!(
+            tool_group_stream_blocks("abcdefghijkl", groups, &activities),
+            vec![
+                ToolStreamBlock::Text { start: 0, end: 4 },
+                ToolStreamBlock::Group {
+                    group_id: 5,
+                    activity_indices: vec![0],
+                },
+                ToolStreamBlock::Text { start: 4, end: 8 },
+                ToolStreamBlock::Group {
+                    group_id: 6,
+                    activity_indices: vec![1],
+                },
+                ToolStreamBlock::Text { start: 8, end: 12 },
+            ]
+        );
+    }
+}
+
+fn render_agent_thread_tool_group(
+    thread_id: &str,
+    message_index: usize,
+    group_id: usize,
+    activity_indices: &[usize],
+    activities: &[ToolActivity],
+    active_group_id: Option<usize>,
+    expanded: bool,
+    theme: UiTheme,
+    cx: &mut Context<AverroesApp>,
+) -> AnyElement {
+    match ToolGroupRenderMode::for_group(expanded, active_group_id, group_id, activity_indices) {
+        ToolGroupRenderMode::Latest {
+            index,
+            hidden_count,
+        } => {
+            let latest = render_agent_thread_tool_activity(
+                thread_id,
+                message_index,
+                index,
+                &activities[index],
+                theme,
+                cx,
+            );
+            if hidden_count == 0 {
+                latest
+            } else {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.0))
+                    .child(render_agent_thread_tool_group_summary(
+                        thread_id,
+                        message_index,
+                        group_id,
+                        activity_indices,
+                        activities,
+                        false,
+                        theme,
+                        cx,
+                    ))
+                    .child(latest)
+                    .into_any_element()
+            }
+        }
+        ToolGroupRenderMode::Expanded => div()
+            .flex()
+            .flex_col()
+            .gap(px(5.0))
+            .child(render_agent_thread_tool_group_summary(
+                thread_id,
+                message_index,
+                group_id,
+                activity_indices,
+                activities,
+                true,
+                theme,
+                cx,
+            ))
+            .children(activity_indices.iter().map(|activity_index| {
+                render_agent_thread_tool_activity(
+                    thread_id,
+                    message_index,
+                    *activity_index,
+                    &activities[*activity_index],
+                    theme,
+                    cx,
+                )
+            }))
+            .into_any_element(),
+        ToolGroupRenderMode::Collapsed => render_agent_thread_tool_group_summary(
+            thread_id,
+            message_index,
+            group_id,
+            activity_indices,
+            activities,
+            false,
+            theme,
+            cx,
+        ),
+    }
+}
+
+fn render_agent_thread_tool_group_summary(
+    thread_id: &str,
+    message_index: usize,
+    group_id: usize,
+    activity_indices: &[usize],
+    activities: &[ToolActivity],
+    expanded: bool,
+    theme: UiTheme,
+    cx: &mut Context<AverroesApp>,
+) -> AnyElement {
+    let names = activity_indices
+        .iter()
+        .map(|index| activities[*index].name.as_str())
+        .collect::<Vec<_>>();
+    let name_summary = summarize_tool_names(&names)
+        .iter()
+        .map(|item| {
+            let label = localized_tool_display_name(cx, &item.name);
+            if item.count == 1 {
+                label.to_string()
+            } else {
+                format!("{} ×{}", label, item.count)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let group_title = i18n::format(
+        cx,
+        "chat.tool_group",
+        &[("count", activity_indices.len().to_string())],
+    );
+    let status = activity_indices
+        .iter()
+        .map(|index| activities[*index].state)
+        .find(|state| *state == ToolActivityState::Failed)
+        .or_else(|| {
+            activity_indices
+                .iter()
+                .map(|index| activities[*index].state)
+                .find(|state| *state == ToolActivityState::Running)
+        })
+        .or_else(|| {
+            activity_indices
+                .iter()
+                .map(|index| activities[*index].state)
+                .find(|state| *state == ToolActivityState::Interrupted)
+        })
+        .unwrap_or(ToolActivityState::Completed);
+    let toggle_thread_id = thread_id.to_owned();
+
+    div()
+        .id(SharedString::from(format!(
+            "agent-thread-tool-group-{thread_id}-{message_index}-{group_id}"
+        )))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .w_full()
+        .p(px(9.0))
+        .rounded(px(10.0))
+        .bg(theme.surface_subtle)
+        .hover(|style| style.bg(theme.surface_hover))
+        .cursor_pointer()
+        .on_click(cx.listener(move |app, _, _, cx| {
+            app.toggle_agent_thread_tool_group(&toggle_thread_id, message_index, group_id, cx);
+        }))
+        .child(tool_icon(&activities[activity_indices[0]].name, 14.0).text_color(theme.muted))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(div().text_size(px(12.0)).child(group_title))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted)
+                        .child(name_summary),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(tool_activity_state_color(status, theme))
+                .child(localized_tool_activity_state_label(cx, status)),
+        )
+        .child(
+            Icon::new(if expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            })
+            .size(px(13.0))
+            .text_color(theme.faint),
+        )
+        .into_any_element()
 }
 
 fn render_agent_thread_tool_activity(
@@ -11693,6 +13927,50 @@ fn render_assistant_text_segment(
     }
 }
 
+fn render_image_attachments(
+    message_id: &str,
+    attachments: &[PathBuf],
+    theme: UiTheme,
+) -> Vec<AnyElement> {
+    attachments
+        .iter()
+        .filter(|path| attachment_media_type(path).is_some())
+        .enumerate()
+        .map(|(index, path)| {
+            let fallback_name = composer_attachment_name(path);
+            div()
+                .id(SharedString::from(format!("{message_id}-image-{index}")))
+                .max_w(px(460.0))
+                .max_h(px(360.0))
+                .rounded(px(10.0))
+                .overflow_hidden()
+                .bg(theme.background)
+                .child(
+                    img(path.clone())
+                        .max_w(px(460.0))
+                        .max_h(px(360.0))
+                        .with_fallback(move || {
+                            div()
+                                .p(px(10.0))
+                                .text_size(px(12.0))
+                                .text_color(theme.muted)
+                                .child(fallback_name.clone())
+                                .into_any_element()
+                        }),
+                )
+                .into_any_element()
+        })
+        .collect()
+}
+
+fn reasoning_is_complete_for_display(message: &ShellMessage, streaming: bool) -> bool {
+    // `ReasoningFinished` closes one provider response, not necessarily the
+    // whole agent turn. Tool calls can run after that response and trigger a
+    // new reasoning phase, so the disclosure stays active until the turn's
+    // stream itself has settled.
+    message.reasoning_complete && !streaming
+}
+
 fn render_message(
     session_id: &SessionId,
     index: usize,
@@ -11710,22 +13988,31 @@ fn render_message(
     let body = message.text.clone();
 
     if message.role == MessageRole::User {
+        let message_id = format!("message-{}-{index}", session_id.as_str());
+        let image_attachments = render_image_attachments(&message_id, &message.attachments, theme);
+        let has_images = !image_attachments.is_empty();
         return div()
             .flex()
             .justify_end()
             .child(
                 div()
                     .max_w(px(620.0))
-                    .px(px(15.0))
+                    .px(if has_images { px(8.0) } else { px(15.0) })
                     .py(px(11.0))
                     .rounded(px(13.0))
                     .bg(theme.surface_subtle)
                     .child(
-                        TextView::markdown(
-                            format!("message-{}-{index}", session_id.as_str()),
-                            body,
-                        )
-                        .selectable(true),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .when(!body.trim().is_empty(), |this| {
+                                this.child(
+                                    TextView::markdown(message_id.clone(), body.clone())
+                                        .selectable(true),
+                                )
+                            })
+                            .children(image_attachments),
                     ),
             )
             .into_any_element();
@@ -11736,31 +14023,53 @@ fn render_message(
     let copy_text = message.text.clone();
     let copy_disabled = copy_text.is_empty();
     let retry_session_id = session_id.clone();
-    let reasoning_element = if message.reasoning.is_empty() {
+    let has_reasoning_tools = message
+        .tool_activities
+        .iter()
+        .any(tool_activity_belongs_to_reasoning);
+    let reasoning_element = if message.reasoning.is_empty() && !has_reasoning_tools {
         None
     } else {
-        let reasoning_text = normalize_reasoning_for_display(&message.reasoning);
         let reasoning_expanded = message.reasoning_expanded;
         let reasoning_session_id = session_id.clone();
-        let reasoning_content = if message.reasoning_complete {
-            render_markdown(theme, &reasoning_text)
-        } else {
-            render_streaming_markdown(theme, &reasoning_text)
-        };
-        let reasoning_tools = message
-            .tool_activities
-            .iter()
-            .enumerate()
-            .filter(|(_, activity)| activity.inside_reasoning)
-            .map(|(activity_index, activity)| {
-                render_tool_activity(
+        let reasoning_complete = reasoning_is_complete_for_display(message, streaming);
+        let reasoning_groups = reasoning_tool_activity_groups(&message.tool_activities);
+        let active_reasoning_group_id = streaming
+            .then(|| message.active_reasoning_tool_group())
+            .flatten();
+        let reasoning_blocks = tool_group_stream_blocks(
+            &message.reasoning,
+            reasoning_groups,
+            &message.tool_activities,
+        );
+        let reasoning_content = reasoning_blocks
+            .into_iter()
+            .filter_map(|block| match block {
+                ToolStreamBlock::Text { start, end } => {
+                    message.reasoning.get(start..end).map(|segment| {
+                        let segment = normalize_reasoning_for_display(segment);
+                        let element = if !reasoning_complete && end == message.reasoning.len() {
+                            render_streaming_markdown(theme, &segment)
+                        } else {
+                            render_markdown(theme, &segment)
+                        };
+                        element.into_any_element()
+                    })
+                }
+                ToolStreamBlock::Group {
+                    group_id,
+                    activity_indices,
+                } => Some(render_tool_group(
                     &reasoning_session_id,
                     index,
-                    std::slice::from_ref(activity),
-                    activity_index,
+                    group_id,
+                    &activity_indices,
+                    &message.tool_activities,
+                    active_reasoning_group_id,
+                    message.is_tool_group_expanded(group_id),
                     theme,
                     cx,
-                )
+                )),
             })
             .collect::<Vec<_>>();
         let toggle_reasoning_session_id = reasoning_session_id.clone();
@@ -11798,7 +14107,7 @@ fn render_message(
                             )),
                         )
                         .child(div().flex_1())
-                        .child(if message.reasoning_complete {
+                        .child(if reasoning_complete {
                             Icon::new(IconName::Check)
                                 .size(px(12.0))
                                 .text_color(theme.success)
@@ -11824,8 +14133,7 @@ fn render_message(
                                     .flex()
                                     .flex_col()
                                     .gap(px(7.0))
-                                    .child(reasoning_content)
-                                    .children(reasoning_tools),
+                                    .children(reasoning_content),
                             ),
                     )
                 }),
@@ -12318,7 +14626,7 @@ mod workspace_grouping_tests {
     }
 
     #[test]
-    fn new_conversations_inherit_the_active_connection_model_and_tools() {
+    fn new_conversations_inherit_the_active_model_but_reset_tools() {
         let active = SessionBinding {
             connection_id: Some(ConnectionId("active".into())),
             model_id: Some("active-model".into()),
@@ -12334,7 +14642,10 @@ mod workspace_grouping_tests {
 
         let inherited = inherited_session_binding(&active, &remembered, &["bash".into()]);
 
-        assert_eq!(inherited, active);
+        assert_eq!(inherited.connection_id, active.connection_id);
+        assert_eq!(inherited.model_id, active.model_id);
+        assert_eq!(inherited.reasoning_effort, active.reasoning_effort);
+        assert_eq!(inherited.tools, vec!["bash"]);
     }
 
     #[test]

@@ -198,8 +198,8 @@ pub(super) fn rebuild_vector_table(
         "CREATE VIRTUAL TABLE \"{VECTOR_TABLE}\" USING vector(\
             dim={dimension}, type=float4, metric=cosine,\
             m=16, ef_construction=200, ef_search=64, sync_every=128,\
-            metadata='conversation_id TEXT, message_position INTEGER, chunk_index INTEGER,\
-                      content_hash TEXT, connection_id TEXT, model_id TEXT'\
+            metadata=\"conversation_id TEXT, message_position INTEGER, chunk_index INTEGER,\
+                      content_hash TEXT, connection_id TEXT, model_id TEXT\"\
         );"
     );
     connection.execute_batch(&create_sql)?;
@@ -262,18 +262,18 @@ pub(super) fn vector_search(
 
     let query_json = serde_json::to_string(query)?;
     let mut statement = connection.prepare(&format!(
-        "SELECT v.conversation_id, c.title, c.project_id, c.updated_at, e.text, v.distance\
-         FROM \"{VECTOR_TABLE}\" v\
-         JOIN conversations c ON c.id = v.conversation_id\
-         JOIN conversation_embeddings e\
-           ON e.conversation_id = v.conversation_id\
-          AND e.content_hash = v.content_hash\
-          AND e.connection_id = v.connection_id\
-          AND e.model_id = v.model_id\
-         WHERE knn_match(v.distance, vector_from_json(?1, 'float4'))\
-           AND v.connection_id = ?2\
-           AND v.model_id = ?3\
-         ORDER BY v.distance ASC\
+        "SELECT v.conversation_id, c.title, c.project_id, c.updated_at, e.text, v.distance
+         FROM \"{VECTOR_TABLE}\" v
+         JOIN conversations c ON c.id = v.conversation_id
+         JOIN conversation_embeddings e
+           ON e.conversation_id = v.conversation_id
+          AND e.content_hash = v.content_hash
+          AND e.connection_id = v.connection_id
+          AND e.model_id = v.model_id
+         WHERE knn_match(v.distance, vector_from_json(?1, 'float4'))
+           AND v.connection_id = ?2
+           AND v.model_id = ?3
+         ORDER BY v.distance ASC
          LIMIT ?4"
     ))?;
     let rows = statement.query_map(

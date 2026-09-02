@@ -10,11 +10,14 @@ pub mod file_write;
 pub mod glob;
 pub mod global_memory;
 pub mod grep;
+pub mod install_skill;
 pub mod list_agents;
 pub mod list_skills;
 pub mod list_tools;
 pub mod load_skill;
+pub mod patch;
 pub mod search_memory;
+pub mod search_skills;
 mod shell_session;
 pub mod task;
 mod web_browser;
@@ -30,6 +33,7 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(bash::BashTool::default());
     registry.register(file_read::FileReadTool);
     registry.register(file_write::FileWriteTool);
+    registry.register(patch::PatchTool);
     registry.register(glob::GlobTool);
     registry.register(grep::GrepTool);
     registry.register(web_fetch::WebFetchTool::default());
@@ -44,6 +48,14 @@ pub fn register_all(registry: &ToolRegistry) {
 pub fn register_skill_tools(registry: &ToolRegistry, index: Arc<SkillIndex>) {
     registry.register(list_skills::ListSkillsTool::new(index.clone()));
     registry.register(load_skill::LoadSkillTool::new(index));
+}
+
+pub fn register_skill_marketplace_tools(
+    registry: &ToolRegistry,
+    marketplace: Arc<dyn crate::tool::SkillMarketplaceBackend>,
+) {
+    registry.register(search_skills::SearchSkillsTool::new(marketplace.clone()));
+    registry.register(install_skill::InstallSkillTool::new(marketplace));
 }
 
 #[cfg(test)]
@@ -64,5 +76,6 @@ mod tests {
             .bootstrap_names()
             .iter()
             .any(|name| name == "compact_conversation"));
+        assert!(registry.get("patch").is_some());
     }
 }

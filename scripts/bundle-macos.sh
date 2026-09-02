@@ -150,10 +150,20 @@ if [[ ! "${binary_architectures}" =~ ^[[:space:]]*${EXPECTED_ARCH}[[:space:]]*$ 
     exit 1
 fi
 
+VECTOR_LIBRARY="$(find "${TARGET_DIR}/release/deps" -maxdepth 1 -type f -name 'libsqlite_vector_rs-*.dylib' -print -quit)"
+if [[ -z "${VECTOR_LIBRARY}" ]]; then
+    echo "sqlite-vector-rs library was not created under ${TARGET_DIR}/release/deps" >&2
+    exit 1
+fi
+
 echo "Creating ${BUNDLE}..."
 rm -rf "${BUNDLE}"
 mkdir -p "${BUNDLE}/Contents/MacOS" "${BUNDLE}/Contents/Resources"
 ditto "${BINARY}" "${BUNDLE}/Contents/MacOS/${APP_NAME}"
+# The vector extension is a loadable module, so it must travel with the app.
+# Keep a stable filename beside the executable; the runtime supplies the
+# explicit sqlite3 entrypoint and therefore does not depend on Cargo's hash.
+ditto "${VECTOR_LIBRARY}" "${BUNDLE}/Contents/MacOS/libsqlite_vector_rs.dylib"
 
 if [[ -f "${ICON}" ]]; then
     ditto "${ICON}" "${BUNDLE}/Contents/Resources/AppIcon.icns"

@@ -288,10 +288,18 @@ impl Provider for GenericProvider {
         let usage = raw.get("usage").map(|u| TokenUsage {
             input_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
             output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
-            cache_read_input_tokens: u.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+            cache_read_input_tokens: u
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_u64)),
             cache_creation_input_tokens: u
                 .get("cache_creation_input_tokens")
                 .and_then(|v| v.as_u64()),
+            reasoning_output_tokens: u
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(Value::as_u64),
         });
 
         let stop_reason = choice["finish_reason"].as_str().map(|s| s.to_string());

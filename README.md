@@ -113,7 +113,7 @@ catalog before enabling tools for a task. The built-in groups are:
 - Web: `web_search`, `web_fetch` (the latter uses OxiBrowser and contributes
   opened pages to conversation sources).
 - Discovery: `discover_tools`, `enable_tools`, `list_tools`.
-- Skills: `list_skills`, `load_skill`.
+- Skills: `list_skills`, `load_skill`, `search_skills`, `install_skill`.
 - Tasks: `task_list`, `add_task`, `mark_task_as_done`.
 - Memory: `create_global_memory`, `delete_global_memory`,
   `search_deep_memory`, `get_deep_memory`.
@@ -140,6 +140,36 @@ skills/
 
 Skills are indexed at startup and loaded on demand, keeping the active prompt
 small while allowing the agent to use project-specific workflows.
+
+## Project MCP configuration
+
+Each project can keep its non-secret MCP configuration in `mcp.yaml` at the
+project root. The file uses an `mcpServers` map and keeps transport separate
+from authentication:
+
+```yaml
+mcpServers:
+  local-files:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+  remote-tools:
+    transport: streamable_http
+    url: https://example.com/mcp
+    auth:
+      type: oauth
+      authorization_server: https://example.com/oauth
+      scopes: [read]
+  web-tools:
+    transport: webmcp
+    url: https://example.com/app
+```
+
+`stdio`, Streamable HTTP, and legacy HTTP+SSE MCP servers are invoked as
+JSON-RPC tools. A `webmcp` entry is opened in the browser and reads the page's
+`document.modelContext` tools. OAuth access tokens are referenced from the
+project file but stored encrypted in Averroes' Keychain-backed credential
+vault; secrets are never written to `mcp.yaml`.
 
 ## Memory, search, and compaction
 

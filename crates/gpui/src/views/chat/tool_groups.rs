@@ -16,6 +16,7 @@ pub(crate) enum ToolGroupEvent {
 pub(crate) struct ToolGroupTracker {
     next_group_id: usize,
     active_group_id: Option<usize>,
+    reasoning_group_id: Option<usize>,
 }
 
 impl ToolGroupTracker {
@@ -28,6 +29,7 @@ impl ToolGroupTracker {
         Self {
             next_group_id,
             active_group_id: None,
+            reasoning_group_id: None,
         }
     }
 
@@ -35,12 +37,24 @@ impl ToolGroupTracker {
         self.active_group_id
     }
 
+    pub(crate) fn active_reasoning_group_id(&self) -> Option<usize> {
+        self.reasoning_group_id
+    }
+
     pub(crate) fn apply(&mut self, event: ToolGroupEvent) -> Option<usize> {
         match event {
             ToolGroupEvent::Tool {
                 inside_reasoning: true,
+            } => Some(self.reasoning_group_id.unwrap_or_else(|| {
+                let group_id = self.next_group_id;
+                self.next_group_id = self.next_group_id.saturating_add(1);
+                self.reasoning_group_id = Some(group_id);
+                group_id
+            })),
+            ToolGroupEvent::Reasoning => {
+                self.reasoning_group_id = None;
+                None
             }
-            | ToolGroupEvent::Reasoning => None,
             ToolGroupEvent::Tool {
                 inside_reasoning: false,
             } => Some(self.active_group_id.unwrap_or_else(|| {
@@ -51,6 +65,7 @@ impl ToolGroupTracker {
             })),
             ToolGroupEvent::AssistantText => {
                 self.active_group_id = None;
+                self.reasoning_group_id = None;
                 None
             }
         }
@@ -102,9 +117,8 @@ impl ToolGroupRenderMode {
     }
 }
 
-/// Assigns group IDs to tool events. Non-tool events return `None`; reasoning
-/// tools also return `None` because they belong to the reasoning spoiler and
-/// must never create an independent visible group.
+/// Assigns group IDs to tool events. Reasoning tools use a separate compact
+/// group, so they never leak into the inline group outside the disclosure.
 #[cfg(test)]
 pub(crate) fn group_ids_for_events(events: &[ToolGroupEvent]) -> Vec<Option<usize>> {
     let mut tracker = ToolGroupTracker::default();
@@ -154,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_does_not_close_or_create_a_visible_group() {
+    fn reasoning_text_closes_its_inline_tool_group() {
         assert_eq!(
             group_ids_for_events(&[
                 ToolGroupEvent::Tool {
@@ -166,10 +180,13 @@ mod tests {
                 },
                 ToolGroupEvent::Reasoning,
                 ToolGroupEvent::Tool {
+                    inside_reasoning: true,
+                },
+                ToolGroupEvent::Tool {
                     inside_reasoning: false,
                 },
             ]),
-            vec![Some(0), None, None, None, Some(0)]
+            vec![Some(0), None, Some(1), None, Some(2), Some(0)]
         );
     }
 

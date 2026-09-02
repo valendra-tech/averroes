@@ -51,6 +51,9 @@ impl OpenAiProvider {
             default_model: "gpt-4o".to_string(),
             responses_api: None,
             context_windows: vec![
+                ("gpt-5.6-sol".to_string(), 1_050_000),
+                ("gpt-5.6-terra".to_string(), 1_050_000),
+                ("gpt-5.6-luna".to_string(), 1_050_000),
                 ("gpt-4o".to_string(), 128_000),
                 ("gpt-4o-mini".to_string(), 128_000),
                 ("gpt-4-turbo".to_string(), 128_000),
@@ -192,6 +195,10 @@ impl OpenAiProvider {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(Value::as_u64),
             cache_creation_input_tokens: None,
+            reasoning_output_tokens: u
+                .get("output_tokens_details")
+                .and_then(|d| d.get("reasoning_tokens"))
+                .and_then(Value::as_u64),
         })
     }
 
@@ -336,10 +343,18 @@ impl Provider for OpenAiProvider {
         let usage = raw.get("usage").map(|u| TokenUsage {
             input_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
             output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
-            cache_read_input_tokens: u.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+            cache_read_input_tokens: u
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_u64)),
             cache_creation_input_tokens: u
                 .get("cache_creation_input_tokens")
                 .and_then(|v| v.as_u64()),
+            reasoning_output_tokens: u
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(Value::as_u64),
         });
 
         let stop_reason = choice["finish_reason"].as_str().map(|s| s.to_string());
@@ -424,6 +439,7 @@ impl Provider for OpenAiProvider {
             .iter()
             .find(|(m, _)| m == model)
             .map(|(_, w)| *w)
+            .or_else(|| (model == "gpt-5.6" || model.starts_with("gpt-5.6-")).then_some(1_050_000))
             .unwrap_or(128_000)
     }
 
@@ -486,10 +502,36 @@ mod tests {
     #[test]
     fn test_context_window() {
         let provider = OpenAiProvider::new("test-key".into());
+        assert_eq!(provider.context_window("gpt-5.6-sol"), 1_050_000);
+        assert_eq!(provider.context_window("gpt-5.6-terra"), 1_050_000);
+        assert_eq!(provider.context_window("gpt-5.6-luna"), 1_050_000);
+        assert_eq!(
+            provider.context_window("gpt-5.6-luna-2026-08-01"),
+            1_050_000
+        );
         assert_eq!(provider.context_window("gpt-4o"), 128_000);
         assert_eq!(provider.context_window("gpt-4o-mini"), 128_000);
         assert_eq!(provider.context_window("gpt-4-turbo"), 128_000);
         assert_eq!(provider.context_window("unknown-model"), 128_000);
+    }
+
+    #[test]
+    fn responses_usage_preserves_cache_and_reasoning_breakdowns() {
+        let response = serde_json::json!({
+            "usage": {
+                "input_tokens": 50_000,
+                "output_tokens": 2_000,
+                "input_tokens_details": { "cached_tokens": 48_000 },
+                "output_tokens_details": { "reasoning_tokens": 1_500 }
+            }
+        });
+
+        let usage = OpenAiProvider::parse_responses_usage(&response).unwrap();
+
+        assert_eq!(usage.input_tokens, 50_000);
+        assert_eq!(usage.cache_read_input_tokens, Some(48_000));
+        assert_eq!(usage.output_tokens, 2_000);
+        assert_eq!(usage.reasoning_output_tokens, Some(1_500));
     }
 
     #[test]

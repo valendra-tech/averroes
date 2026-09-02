@@ -37,7 +37,9 @@ pub struct AgentCallRequest {
     pub parent_objective: String,
     /// The configured delegated agent to run.
     pub agent_id: String,
-    /// The parent's currently enabled tools, copied into the child agent.
+    /// The parent's currently enabled tools as a capability hint. The
+    /// runtime gives the child the same scoped registry but only enables its
+    /// compact discovery bootstrap initially.
     pub tools: Vec<String>,
     pub prompt: String,
     pub model_id: Option<String>,

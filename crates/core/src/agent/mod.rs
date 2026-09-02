@@ -9,7 +9,8 @@ mod tools;
 use crate::agent::orchestration::AgentRunner;
 use crate::compaction::strategies::{HybridStrategy, SummaryStrategy, TrimStrategy};
 use crate::compaction::{
-    sanitize_tool_history, CompactionConfig, CompactionStrategy, CompactionStrategyType,
+    compact_tool_outputs, sanitize_tool_history, CompactionConfig, CompactionStrategy,
+    CompactionStrategyType,
 };
 use crate::provider::types::{MessageContent, Role};
 use crate::provider::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolDefinition};
@@ -30,7 +31,7 @@ pub(super) fn is_delegation_tool(name: &str) -> bool {
     matches!(name, "list_agents" | "call_agent" | "call_agents")
 }
 
-use budget::{message_text, usage_input_tokens, GovernedProvider, RunStateGuard};
+use budget::{message_text, GovernedProvider, RunStateGuard};
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -276,9 +277,13 @@ impl Agent {
 
     /// Restores the provider-reported usage associated with a persisted
     /// conversation. Unknown usage is intentionally not turned into a guess.
-    pub fn set_context_usage(&self, usage: ContextUsage) {
-        *self.last_context_usage.lock().unwrap() =
-            (usage.input_tokens.is_some() || usage.output_tokens.is_some()).then_some(usage);
+    pub fn set_context_usage(&self, mut usage: ContextUsage) {
+        let has_usage = usage.input_tokens.is_some() || usage.output_tokens.is_some();
+        if has_usage {
+            let runtime = self.runtime_snapshot();
+            usage.context_limit = runtime.provider.context_window(&runtime.model) as u64;
+        }
+        *self.last_context_usage.lock().unwrap() = has_usage.then_some(usage);
     }
 
     /// Returns the latest compact, model-generated understanding of this
@@ -373,17 +378,13 @@ impl Agent {
 
             let mut context = String::from(concat!(
                 "## Workspace Skills\n\n",
-                "Compare the user's request with this workspace skill catalogue. ",
-                "When a skill is relevant, load it and follow its instructions for this turn.\n\n",
+                "Available skill names are listed compactly below. Compare them with the user's request. ",
+                "When a skill clearly applies, load that exact skill directly and follow it for this turn. ",
+                "Use the filtered skill listing only when the names are not enough to decide.\n\n",
             ));
             let mut catalog_count = 0;
             for skill in index.list() {
-                let description = skill.description.trim();
-                let entry = if description.is_empty() {
-                    format!("- `{}`\n", skill.name)
-                } else {
-                    format!("- `{}`: {description}\n", skill.name)
-                };
+                let entry = format!("- `{}`\n", skill.name);
                 if context.len().saturating_add(entry.len()) > MAX_SKILL_CATALOG_BYTES {
                     break;
                 }
@@ -483,7 +484,7 @@ impl Agent {
     }
 
     pub async fn run(&self, user_input: &str) -> Result<String> {
-        self.run_inner(user_input, None).await
+        self.run_inner(user_input, None, None).await
     }
 
     pub async fn run_streaming(
@@ -491,12 +492,26 @@ impl Agent {
         user_input: &str,
         events: tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>,
     ) -> Result<String> {
-        self.run_inner(user_input, Some(events)).await
+        self.run_inner(user_input, None, Some(events)).await
+    }
+
+    /// Runs a request whose user message contains provider-native content,
+    /// such as an image part. `user_input` remains the text projection used
+    /// for skill resolution and diagnostics.
+    pub async fn run_streaming_with_content(
+        &self,
+        user_input: &str,
+        content: MessageContent,
+        events: tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>,
+    ) -> Result<String> {
+        self.run_inner(user_input, Some(content), Some(events))
+            .await
     }
 
     async fn run_inner(
         &self,
         user_input: &str,
+        user_content: Option<MessageContent>,
         stream_events: Option<tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
     ) -> Result<String> {
         let _run_lock = self.run_lock.lock().await;
@@ -505,9 +520,20 @@ impl Agent {
 
         {
             let mut msgs = self.messages.lock().await;
+            if let Some(system_prompt) = msgs
+                .iter_mut()
+                .find(|message| message.role == Role::System)
+                .and_then(|message| match &mut message.content {
+                    MessageContent::Text(text) => Some(text),
+                    MessageContent::Parts(_) => None,
+                })
+            {
+                crate::prompt::refresh_system_environment_time(system_prompt);
+            }
             msgs.push(ChatMessage {
                 role: Role::User,
-                content: MessageContent::Text(user_input.to_string()),
+                content: user_content
+                    .unwrap_or_else(|| MessageContent::Text(user_input.to_string())),
                 tool_call_id: None,
                 tool_calls: None,
             });
@@ -543,11 +569,7 @@ impl Agent {
             };
             let response = match response_result {
                 Ok(response) => response,
-                Err(error)
-                    if is_context_error(&error)
-                        && context_retries < 2
-                        && self.should_compact_with_runtime(&runtime).await =>
-                {
+                Err(error) if is_context_error(&error) && context_retries < 2 => {
                     context_retries += 1;
                     crate::observability::diagnostics::record(
                         crate::observability::diagnostics::DiagnosticLevel::Warning,
@@ -633,12 +655,6 @@ impl Agent {
     async fn should_compact_with_runtime(&self, runtime: &AgentRuntime) -> bool {
         let context_limit = runtime.provider.context_window(&runtime.model);
         let message_count = self.messages.lock().await.len();
-        let minimum_messages = match self.config.compaction.strategy {
-            CompactionStrategyType::Trim | CompactionStrategyType::Hybrid => {
-                self.config.compaction.keep_last + 2
-            }
-            CompactionStrategyType::Summary => 2,
-        };
         let usage_pressure = self
             .last_context_usage
             .lock()
@@ -647,7 +663,7 @@ impl Agent {
             .and_then(|usage| usage.input_tokens)
             .is_some_and(|input_tokens| {
                 input_tokens as f64 > self.config.compaction.threshold * context_limit as f64
-                    && message_count > minimum_messages
+                    && message_count > 2
             });
         usage_pressure
     }
@@ -687,6 +703,7 @@ impl Agent {
             if let Some(context) = self.understood_context.read().unwrap().clone() {
                 insert_understood_context(&mut msgs, &context);
             }
+            let msgs = compact_tool_outputs(msgs);
             let original_messages = msgs.len();
             let result = strategy
                 .compact(
@@ -713,6 +730,7 @@ impl Agent {
                 if let Some(context) = self.understood_context.read().unwrap().clone() {
                     insert_understood_context(&mut msgs, &context);
                 }
+                let msgs = compact_tool_outputs(msgs);
                 TrimStrategy
                     .compact(
                         &msgs,
@@ -726,7 +744,7 @@ impl Agent {
             }
             Err(error) => return Err(anyhow::anyhow!(error.to_string())),
         };
-        compacted.messages = sanitize_tool_history(compacted.messages);
+        compacted.messages = compact_tool_outputs(sanitize_tool_history(compacted.messages));
 
         let understood_context = extract_understood_context(&compacted.messages);
         compacted.messages.retain(|message| {
@@ -741,6 +759,10 @@ impl Agent {
             let mut msgs = self.messages.lock().await;
             *msgs = compacted.messages;
         }
+        // The previous provider measurement describes the pre-compaction
+        // request and must never trigger another compaction by itself. The
+        // next model response will replace it with an exact fresh value.
+        *self.last_context_usage.lock().unwrap() = None;
         if let Some(events) = events {
             let _ = events.send(AgentStreamEvent::CompactionFinished {
                 reason,
@@ -761,11 +783,7 @@ impl Agent {
         let Some(provider_usage) = response.usage.as_ref() else {
             return;
         };
-        let usage = ContextUsage::from_usage(
-            usage_input_tokens(provider_usage),
-            provider_usage.output_tokens,
-            context_limit,
-        );
+        let usage = ContextUsage::from_provider_usage(provider_usage, context_limit);
         *self.last_context_usage.lock().unwrap() = Some(usage);
         if let Some(events) = events {
             let _ = events.send(AgentStreamEvent::ContextUpdated { usage });
@@ -1151,6 +1169,7 @@ mod tests {
                         output_tokens: 3,
                         cache_read_input_tokens: None,
                         cache_creation_input_tokens: None,
+                        reasoning_output_tokens: None,
                     }),
                 }),
             ]);
@@ -1683,6 +1702,7 @@ mod tests {
                 output_tokens: 1,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                reasoning_output_tokens: None,
             }),
             reasoning: None,
             stop_reason: None,
@@ -1745,6 +1765,7 @@ mod tests {
                 output_tokens: 2,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                reasoning_output_tokens: None,
             }),
             reasoning: None,
             stop_reason: None,
@@ -1836,6 +1857,7 @@ mod tests {
                 output_tokens: 0,
                 cache_read_input_tokens: Some(5),
                 cache_creation_input_tokens: Some(7),
+                reasoning_output_tokens: Some(2),
             }),
             reasoning: None,
             stop_reason: None,
@@ -1857,7 +1879,11 @@ mod tests {
         agent.run("x").await.unwrap();
 
         assert_eq!(governor.tokens_available(), 100);
-        assert_eq!(agent.context_usage().await.input_tokens, Some(0));
+        let usage = agent.context_usage().await;
+        assert_eq!(usage.input_tokens, Some(0));
+        assert_eq!(usage.cache_read_input_tokens, Some(5));
+        assert_eq!(usage.cache_creation_input_tokens, Some(7));
+        assert_eq!(usage.reasoning_output_tokens, Some(2));
     }
 
     fn stream_request() -> ChatRequest {
@@ -2214,6 +2240,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hybrid_compaction_can_trigger_for_a_short_tool_heavy_history() {
+        let agent = Agent::new(
+            AgentConfig {
+                system_prompt: None,
+                compaction: CompactionConfig {
+                    strategy: CompactionStrategyType::Hybrid,
+                    threshold: 0.8,
+                    keep_last: 20,
+                },
+                ..Default::default()
+            },
+            Arc::new(SmallContextProvider),
+            test_tool_registry(),
+            Arc::new(ResourceGovernor::new(1, 100_000)),
+            "short-heavy-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        *agent.messages.lock().await = vec![
+            ChatMessage {
+                role: ProviderRole::User,
+                content: MessageContent::Text("question".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ProviderRole::Assistant,
+                content: MessageContent::Text("tool call".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ProviderRole::Tool,
+                content: MessageContent::Text("large result".into()),
+                tool_call_id: Some("call-1".into()),
+                tool_calls: None,
+            },
+        ];
+        *agent.last_context_usage.lock().unwrap() = Some(ContextUsage::from_usage(9, 0, 10));
+
+        let runtime = agent.runtime_snapshot();
+
+        assert!(agent.should_compact_with_runtime(&runtime).await);
+    }
+
+    #[tokio::test]
+    async fn completed_compaction_discards_the_pre_compaction_usage_sample() {
+        let provider = Arc::new(TestProvider::new(vec![]));
+        let agent = compaction_agent(
+            CompactionStrategyType::Summary,
+            provider,
+            Arc::new(ResourceGovernor::new(1, 100_000)),
+        );
+        seed_compaction_messages(&agent).await;
+        *agent.last_context_usage.lock().unwrap() =
+            Some(ContextUsage::from_usage(180_000, 20, 200_000));
+
+        let runtime = agent.runtime_snapshot();
+        agent.compact_with_runtime(&runtime).await.unwrap();
+
+        assert!(agent.last_context_usage.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn compaction_does_not_use_history_signals_without_provider_usage() {
         let agent = Agent::new(
             AgentConfig {
@@ -2560,6 +2649,42 @@ mod tests {
             .unwrap();
         assert!(context.contains("release"));
         assert!(context.contains("Always verify the changelog"));
+    }
+
+    #[tokio::test]
+    async fn skill_catalog_prioritizes_all_names_over_verbose_descriptions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let skills = workspace.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        for index in 0..30 {
+            std::fs::write(
+                skills.join(format!("a-{index:02}.md")),
+                format!("# {}\n", "verbose description ".repeat(35)),
+            )
+            .unwrap();
+        }
+        std::fs::write(skills.join("z-daily-work.md"), "# Daily work\n").unwrap();
+        let index = Arc::new(
+            crate::skill::SkillIndex::build(crate::skill::SkillLoader::new(vec![skills])).unwrap(),
+        );
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "compact-skill-catalog".into(),
+            workspace.path().to_path_buf(),
+        );
+        agent.set_skill_index(Some(index));
+
+        let context = agent
+            .resolve_skill_context("What should I focus on?")
+            .await
+            .unwrap();
+
+        assert!(context.contains("`z-daily-work`"));
+        assert!(context.len() <= MAX_SKILL_CATALOG_BYTES);
+        assert!(!context.contains("verbose description"));
     }
 
     #[tokio::test]

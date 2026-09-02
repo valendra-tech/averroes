@@ -17,6 +17,7 @@ const DATABASE_FILE: &str = "averroes.db";
 const LAST_BINDING_KEY: &str = "last_session_binding";
 const EMBEDDING_CONFIG_KEY: &str = "conversation_embedding_config";
 const GLOBAL_MEMORY_PROMPT_KEY: &str = "global_memory_system_prompt";
+const VECTOR_EXTENSION_ENTRYPOINT: &str = "sqlite3_sqlitevectorrs_init";
 
 pub struct WorkDatabase {
     path: PathBuf,
@@ -842,7 +843,10 @@ fn load_vector_extension(connection: &Connection) -> Result<(), WorkDatabaseErro
         connection
             .load_extension_enable()
             .map_err(|error| WorkDatabaseError::Io(error.to_string()))?;
-        let result = connection.load_extension(&path, None::<&str>);
+        // Cargo adds a hash to libraries built in `target/*/deps`. If the
+        // entrypoint is left empty, SQLite derives it from that filename and
+        // looks for a hash-specific symbol that the extension does not export.
+        let result = connection.load_extension(&path, Some(VECTOR_EXTENSION_ENTRYPOINT));
         let disable_result = connection.load_extension_disable();
         result
             .map_err(|error| WorkDatabaseError::Io(error.to_string()))
@@ -934,6 +938,37 @@ mod tests {
     }
 
     #[test]
+    fn migration_corrects_the_legacy_gpt_5_6_context_limit() {
+        let (_directory, database) = database();
+        {
+            let connection = database.connection.lock();
+            connection
+                .execute(
+                    "INSERT INTO conversations
+                     (id, title, created_at, updated_at, binding_json, context_usage_json)
+                     VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
+                    params![
+                        "legacy-gpt-5-6-context",
+                        "Legacy context",
+                        now(),
+                        r#"{"model_id":"gpt-5.6-luna"}"#,
+                        r#"{"input_tokens":172258,"output_tokens":20,"context_limit":128000}"#,
+                    ],
+                )
+                .unwrap();
+            schema::migrate(&connection).unwrap();
+        }
+
+        let conversation = database
+            .conversation("legacy-gpt-5-6-context")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(conversation.context_usage.context_limit, 1_050_000);
+        assert_eq!(conversation.context_usage.input_tokens, Some(172_258));
+    }
+
+    #[test]
     fn saves_projects_and_reopens_the_same_root() {
         let (directory, database) = database();
         let root = directory.path().join("project");
@@ -1017,7 +1052,14 @@ mod tests {
             context_summary: Some(
                 "Objective: ship the interface.\nNext action: verify the release.".into(),
             ),
-            context_usage: crate::agent::ContextUsage::from_usage(42, 7, 100),
+            context_usage: crate::agent::ContextUsage {
+                input_tokens: Some(42),
+                output_tokens: Some(7),
+                cache_read_input_tokens: Some(30),
+                cache_creation_input_tokens: Some(2),
+                reasoning_output_tokens: Some(5),
+                context_limit: 100,
+            },
             messages: vec![WorkMessage {
                 role: WorkMessageRole::User,
                 text: "Make it excellent".into(),

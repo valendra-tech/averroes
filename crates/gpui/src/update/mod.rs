@@ -9,7 +9,7 @@ pub(crate) mod release;
 
 pub(crate) use client::UpdateClient;
 pub(crate) use release::{
-    release_update, validate_asset_url, Architecture, GithubRelease, UpdateInfo,
+    releases_update, validate_asset_url, Architecture, GithubRelease, UpdateInfo,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -349,6 +349,7 @@ impl Provider for AnthropicProvider {
             output_tokens: u["output_tokens"].as_u64().unwrap_or(0),
             cache_read_input_tokens: u["cache_read_input_tokens"].as_u64(),
             cache_creation_input_tokens: u["cache_creation_input_tokens"].as_u64(),
+            reasoning_output_tokens: None,
         });
 
         let stop_reason = response_body["stop_reason"].as_str().map(String::from);
