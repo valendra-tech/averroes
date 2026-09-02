@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
+use super::resolve_file_path;
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 
 /// Applies compact unified diffs, including the `*** Begin Patch` format used
@@ -53,7 +54,7 @@ impl Tool for PatchTool {
     }
 
     fn description(&self) -> &str {
-        "Apply a compact unified diff to workspace files. Accepts the *** Begin Patch format or standard unified diff format. Use this instead of rewriting complete files."
+        "Apply a compact unified diff to files inside or outside the workspace. Accepts absolute paths, ../ paths, the *** Begin Patch format, or standard unified diff format. Use this instead of rewriting complete files."
     }
 
     fn parameters(&self) -> Value {
@@ -167,9 +168,9 @@ async fn prepare_changes(
     let mut seen = Vec::with_capacity(patches.len());
 
     for file_patch in patches {
-        let source = resolve_workspace_path(workspace, &file_patch.path)?;
+        let source = resolve_patch_path(workspace, &file_patch.path)?;
         let destination = match file_patch.destination.as_deref() {
-            Some(path) => resolve_workspace_path(workspace, path)?,
+            Some(path) => resolve_patch_path(workspace, path)?,
             None => source.clone(),
         };
         if seen
@@ -263,62 +264,12 @@ async fn prepare_changes(
     Ok(changes)
 }
 
-fn resolve_workspace_path(
-    workspace: &Path,
-    raw_path: &str,
-) -> std::result::Result<PathBuf, String> {
-    let relative = normalize_relative_path(raw_path)?;
-    let workspace = workspace
-        .canonicalize()
-        .map_err(|error| format!("cannot access workspace '{}': {error}", workspace.display()))?;
-    let candidate = workspace.join(relative);
-
-    // Resolve the nearest existing ancestor so a symlinked parent cannot
-    // redirect a patch outside the active workspace.
-    let mut ancestor = candidate.as_path();
-    while !ancestor.exists() {
-        ancestor = ancestor
-            .parent()
-            .ok_or_else(|| format!("invalid workspace path '{}': no parent", raw_path))?;
-    }
-    let canonical_ancestor = ancestor
-        .canonicalize()
-        .map_err(|error| format!("cannot resolve '{}': {error}", raw_path))?;
-    if !canonical_ancestor.starts_with(&workspace) {
-        return Err(format!("patch path escapes the workspace: {raw_path}"));
-    }
-    Ok(candidate)
-}
-
-fn normalize_relative_path(raw_path: &str) -> std::result::Result<PathBuf, String> {
+fn resolve_patch_path(workspace: &Path, raw_path: &str) -> std::result::Result<PathBuf, String> {
     let path = raw_path.trim().trim_matches('"');
     if path.is_empty() {
         return Err("patch contains an empty file path".into());
     }
-    let path = Path::new(path);
-    if path.is_absolute() {
-        return Err(format!("absolute patch paths are not allowed: {raw_path}"));
-    }
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(component) => normalized.push(component),
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(format!("patch path escapes the workspace: {raw_path}"));
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(format!("absolute patch paths are not allowed: {raw_path}"));
-            }
-        }
-    }
-    if normalized.as_os_str().is_empty() {
-        return Err(format!("invalid patch path: {raw_path}"));
-    }
-    Ok(normalized)
+    Ok(resolve_file_path(workspace, path))
 }
 
 fn parse_patch(input: &str) -> std::result::Result<Vec<FilePatch>, String> {
@@ -687,9 +638,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_paths_that_escape_the_workspace() {
-        let error = normalize_relative_path("../../secret.txt").unwrap_err();
-        assert!(error.contains("escapes"));
+    fn resolves_paths_outside_the_workspace() {
+        let workspace = Path::new("/tmp/project/workspace");
+        assert_eq!(
+            resolve_patch_path(workspace, "../../secret.txt").unwrap(),
+            Path::new("/tmp/project/workspace/../../secret.txt")
+        );
+        assert_eq!(
+            resolve_patch_path(workspace, "/tmp/shared/secret.txt").unwrap(),
+            Path::new("/tmp/shared/secret.txt")
+        );
     }
 
     #[tokio::test]
@@ -720,5 +678,44 @@ mod tests {
             .unwrap();
         assert_eq!(result.content, "Patch applied successfully to 1 file(s).");
         assert_eq!(tokio::fs::read_to_string(file).await.unwrap(), "after\n");
+    }
+
+    #[tokio::test]
+    async fn applies_a_patch_outside_the_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let external = directory.path().join("shared/message.txt");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(external.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&external, "before\n").await.unwrap();
+        let context = ToolContext {
+            working_dir: workspace,
+            session_id: "test".into(),
+            agent_id: "test".into(),
+            enabled_tools: Vec::new(),
+            available_tools: Vec::new(),
+            tool_activation: Arc::new(crate::tool::ToolActivation::default()),
+            conversation_context: Vec::new(),
+            agent_runner: None,
+            memory_search_backend: None,
+            agent_event_sink: None,
+        };
+
+        PatchTool
+            .execute(
+                &context,
+                &json!({
+                    "patch": "*** Begin Patch\n*** Update File: ../shared/message.txt\n@@\n-before\n+after\n*** End Patch"
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(external).await.unwrap(),
+            "after\n"
+        );
     }
 }

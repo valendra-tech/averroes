@@ -28,7 +28,22 @@ pub mod web_search_intrernal;
 
 use crate::skill::SkillIndex;
 use crate::tool::ToolRegistry;
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+/// Resolve a tool path without confining it to the active workspace.
+/// Relative paths still start at the workspace; absolute paths and `..`
+/// components intentionally remain valid so tools can work across projects.
+pub(crate) fn resolve_file_path(working_dir: &Path, requested: &str) -> PathBuf {
+    let requested = Path::new(requested);
+    if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        working_dir.join(requested)
+    }
+}
 
 pub fn register_all(registry: &ToolRegistry) {
     registry.register(bash::BashTool::default());
