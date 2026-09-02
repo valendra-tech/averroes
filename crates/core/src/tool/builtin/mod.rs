@@ -1,5 +1,6 @@
 pub mod ask_user;
 pub mod bash;
+pub mod browser;
 pub mod call_agents;
 pub mod checkpoint;
 pub mod deep_memory;
@@ -37,6 +38,7 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(glob::GlobTool);
     registry.register(grep::GrepTool);
     registry.register(web_fetch::WebFetchTool::default());
+    registry.register(browser::BrowserTool::default());
     registry.register(web_search_intrernal::WebSearchTool);
     registry.register(discover_tools::DiscoverToolsTool);
     registry.register(enable_tools::EnableToolsTool);
@@ -77,5 +79,6 @@ mod tests {
             .iter()
             .any(|name| name == "compact_conversation"));
         assert!(registry.get("patch").is_some());
+        assert!(registry.get("browser").is_some());
     }
 }

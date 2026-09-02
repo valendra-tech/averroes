@@ -4380,7 +4380,7 @@ impl AverroesApp {
                     }
                 }
             }
-            "web_fetch" => {
+            "web_fetch" | "browser" => {
                 let Some(url) = metadata.get("url").and_then(|value| value.as_str()) else {
                     return;
                 };
@@ -12416,7 +12416,8 @@ fn tool_display_name(name: &str) -> String {
         "glob" | "find_files" => "Find files".into(),
         "grep" => "Search files".into(),
         "web_search_intrernal" => "Search web".into(),
-        "web_fetch" => "Open web page".into(),
+        "web_fetch" => "Fetch URL".into(),
+        "browser" => "Use browser".into(),
         "checkpoint" => "Checkpoint".into(),
         "task_list" => "List tasks".into(),
         "add_task" => "Add task".into(),
@@ -12454,7 +12455,8 @@ fn localized_tool_display_name(cx: &App, name: &str) -> SharedString {
         "glob" | "find_files" => Some("tool.find_files"),
         "grep" => Some("tool.search_files"),
         "web_search_intrernal" => Some("tool.search_web"),
-        "web_fetch" => Some("tool.open_web_page"),
+        "web_fetch" => Some("tool.fetch_url"),
+        "browser" => Some("tool.browser"),
         "checkpoint" => Some("tool.checkpoint"),
         "task_list" => Some("tool.list_tasks"),
         "add_task" => Some("tool.add_task"),

@@ -234,3 +234,15 @@ impl Agent {
 fn is_parallel_web_tool(name: &str) -> bool {
     matches!(name, "web_fetch" | "web_search_intrernal")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_parallel_web_tool;
+
+    #[test]
+    fn only_stateless_web_reads_run_in_parallel() {
+        assert!(is_parallel_web_tool("web_fetch"));
+        assert!(is_parallel_web_tool("web_search_intrernal"));
+        assert!(!is_parallel_web_tool("browser"));
+    }
+}
