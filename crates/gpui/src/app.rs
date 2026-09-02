@@ -1465,10 +1465,16 @@ impl AverroesApp {
                                 div()
                                     .max_h(px(180.0))
                                     .overflow_y_scrollbar()
-                                    .text_size(px(12.0))
-                                    .text_color(UiTheme::current(cx).muted)
-                                    .whitespace_normal()
-                                    .child(info.release_notes.clone()),
+                                    .w_full()
+                                    .min_w(px(0.0))
+                                    .pr(px(8.0))
+                                    .child(
+                                        TextView::markdown(
+                                            format!("update-release-notes-{}", info.version),
+                                            info.release_notes.clone(),
+                                        )
+                                        .selectable(true),
+                                    ),
                             )
                             .child(
                                 Link::new("update-release-link")
