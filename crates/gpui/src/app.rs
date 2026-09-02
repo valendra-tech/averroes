@@ -58,7 +58,7 @@ use semver::Version;
 use serde_json::json;
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -309,6 +309,56 @@ struct RemoteLiveReply {
     text: String,
     last_edit: Instant,
     edit_in_flight: bool,
+}
+
+#[derive(Clone)]
+struct RemoteTelegramAttachment {
+    file_id: String,
+    file_name: String,
+    file_size: Option<u64>,
+}
+
+fn remote_telegram_attachment(message: &TelegramMessage) -> Option<RemoteTelegramAttachment> {
+    message
+        .document
+        .as_ref()
+        .map(|document| RemoteTelegramAttachment {
+            file_id: document.file_id.clone(),
+            file_name: document
+                .file_name
+                .clone()
+                .unwrap_or_else(|| "attachment.txt".into()),
+            file_size: document.file_size,
+        })
+        .or_else(|| {
+            message.photo.last().map(|photo| RemoteTelegramAttachment {
+                file_id: photo.file_id.clone(),
+                file_name: "photo.jpg".into(),
+                file_size: photo.file_size,
+            })
+        })
+}
+
+fn remote_attachment_path(file_name: &str) -> PathBuf {
+    let fallback = "attachment";
+    let file_name = Path::new(file_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback);
+    let safe_name = file_name
+        .chars()
+        .filter_map(|character| {
+            (character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
+                .then_some(character)
+        })
+        .collect::<String>();
+    let safe_name = (!safe_name.is_empty())
+        .then_some(safe_name)
+        .unwrap_or_else(|| fallback.into());
+    std::env::temp_dir().join(format!(
+        "averroes-telegram-{}-{safe_name}",
+        uuid::Uuid::new_v4()
+    ))
 }
 
 #[derive(Clone)]
@@ -2748,7 +2798,8 @@ impl AverroesApp {
         self.remote_agent_chat_users
             .insert(message.chat.id, user_id);
 
-        let text = message.text.unwrap_or_default();
+        let attachment = remote_telegram_attachment(&message);
+        let text = message.text.or(message.caption).unwrap_or_default();
         let command = text
             .split_whitespace()
             .next()
@@ -2757,22 +2808,48 @@ impl AverroesApp {
             .next()
             .unwrap_or_default()
             .to_ascii_lowercase();
-        match command.as_str() {
-            "/start" | "/help" => {
-                self.send_remote_text(
-                    message.chat.id,
-                    &i18n::text(cx, "remote_agent.bot_welcome"),
-                    Some(welcome_keyboard(cx)),
-                    cx,
-                );
+        if attachment.is_none() {
+            match command.as_str() {
+                "/start" | "/help" => {
+                    self.send_remote_text(
+                        message.chat.id,
+                        &i18n::text(cx, "remote_agent.bot_welcome"),
+                        Some(welcome_keyboard(cx)),
+                        cx,
+                    );
+                    return;
+                }
+                "/subscribe" => {
+                    self.subscribe_remote_chat(message.chat.id, cx);
+                    return;
+                }
+                "/unsubscribe" => {
+                    self.unsubscribe_remote_chat(message.chat.id, cx);
+                    return;
+                }
+                "/status" => {
+                    self.send_remote_status(message.chat.id, cx);
+                    return;
+                }
+                "/screenshot" => {
+                    self.send_remote_screenshot(message.chat.id, cx);
+                    return;
+                }
+                _ => {}
             }
-            "/subscribe" => self.subscribe_remote_chat(message.chat.id, cx),
-            "/unsubscribe" => self.unsubscribe_remote_chat(message.chat.id, cx),
-            "/status" => self.send_remote_status(message.chat.id, cx),
-            "/screenshot" => self.send_remote_screenshot(message.chat.id, cx),
-            _ if text.trim().is_empty() => {}
-            _ if self.answer_remote_user_question(message.chat.id, None, text.clone(), cx) => {}
-            _ => self.forward_remote_text(message.chat.id, text, window, cx),
+        }
+        if attachment.is_none() && text.trim().is_empty() {
+            return;
+        }
+        if attachment.is_none()
+            && self.answer_remote_user_question(message.chat.id, None, text.clone(), cx)
+        {
+            return;
+        }
+        if let Some(attachment) = attachment {
+            self.forward_remote_attachment(message.chat.id, text, attachment, window, cx);
+        } else {
+            self.forward_remote_text(message.chat.id, text, window, cx);
         }
     }
 
@@ -3202,6 +3279,118 @@ impl AverroesApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.forward_remote_input(chat_id, text, Vec::new(), window, cx);
+    }
+
+    fn forward_remote_attachment(
+        &mut self,
+        chat_id: i64,
+        text: String,
+        attachment: RemoteTelegramAttachment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.remote_agent_chats.contains_key(&chat_id) {
+            self.send_remote_text(
+                chat_id,
+                &i18n::text(cx, "remote_agent.bot_not_subscribed"),
+                Some(welcome_keyboard(cx)),
+                cx,
+            );
+            return;
+        }
+        if attachment
+            .file_size
+            .is_some_and(|size| size > MAX_ATTACHMENT_BYTES)
+        {
+            self.send_remote_text(
+                chat_id,
+                &i18n::text(cx, "remote_agent.bot_attachment_too_large"),
+                Some(subscribed_keyboard(cx)),
+                cx,
+            );
+            return;
+        }
+        let Some(client) = self.remote_agent_client.clone() else {
+            self.send_remote_text(
+                chat_id,
+                &i18n::text(cx, "remote_agent.bot_attachment_download_failed"),
+                Some(subscribed_keyboard(cx)),
+                cx,
+            );
+            return;
+        };
+        self.send_remote_text(
+            chat_id,
+            &i18n::format(
+                cx,
+                "remote_agent.bot_attachment_downloading",
+                &[("name", attachment.file_name.clone())],
+            ),
+            None,
+            cx,
+        );
+        let path = remote_attachment_path(&attachment.file_name);
+        let runtime = self.runtime.clone();
+        let file_id = attachment.file_id;
+        let request = runtime.spawn_background(async move {
+            let bytes = client
+                .download_file(&file_id, MAX_ATTACHMENT_BYTES as usize)
+                .await?;
+            tokio::fs::write(&path, bytes)
+                .await
+                .map_err(|error| format!("could not save Telegram attachment: {error}"))?;
+            Ok::<PathBuf, String>(path)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = request.await;
+            _ = this.update_in(cx, |app, window, cx| match result {
+                Ok(Ok(path)) => app.forward_remote_input(
+                    chat_id,
+                    text,
+                    vec![ComposerAttachment { path }],
+                    window,
+                    cx,
+                ),
+                Ok(Err(error)) => {
+                    diagnostics::record(
+                        DiagnosticLevel::Warning,
+                        "remote_agent.telegram",
+                        format!("Could not download Telegram attachment: {error}"),
+                    );
+                    app.send_remote_text(
+                        chat_id,
+                        &i18n::text(cx, "remote_agent.bot_attachment_download_failed"),
+                        Some(subscribed_keyboard(cx)),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    diagnostics::record(
+                        DiagnosticLevel::Warning,
+                        "remote_agent.telegram",
+                        format!("Telegram attachment download task failed: {error}"),
+                    );
+                    app.send_remote_text(
+                        chat_id,
+                        &i18n::text(cx, "remote_agent.bot_attachment_download_failed"),
+                        Some(subscribed_keyboard(cx)),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn forward_remote_input(
+        &mut self,
+        chat_id: i64,
+        text: String,
+        attachments: Vec<ComposerAttachment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session_id) = self.remote_agent_chats.get(&chat_id).cloned() else {
             self.send_remote_text(
                 chat_id,
@@ -3243,7 +3432,7 @@ impl AverroesApp {
             let session = &mut self.sessions[session_index];
             session.queued_messages.push(QueuedMessage {
                 text,
-                attachments: Vec::new(),
+                attachments,
                 remote_origin_chat_id: Some(chat_id),
             });
             session.queue_autostart = true;
@@ -3259,7 +3448,7 @@ impl AverroesApp {
             chat_id,
             session_id,
             text,
-            Vec::new(),
+            attachments,
             false,
             Some(chat_id),
             window,
@@ -3329,7 +3518,7 @@ impl AverroesApp {
                             chat_id,
                             message_id,
                             text: String::new(),
-                            last_edit: Instant::now(),
+                            last_edit: Instant::now() - REMOTE_LIVE_EDIT_INTERVAL,
                             edit_in_flight: false,
                         },
                     );
@@ -8128,8 +8317,11 @@ impl AverroesApp {
         let Some(reply) = self.remote_agent_live_replies.get_mut(session_id) else {
             return;
         };
+        let was_empty = reply.text.is_empty();
         reply.text.push_str(delta);
-        if reply.edit_in_flight || reply.last_edit.elapsed() < REMOTE_LIVE_EDIT_INTERVAL {
+        if reply.edit_in_flight
+            || (!was_empty && reply.last_edit.elapsed() < REMOTE_LIVE_EDIT_INTERVAL)
+        {
             return;
         }
         self.schedule_remote_live_edit(session_id, cx);
@@ -8208,6 +8400,7 @@ impl AverroesApp {
         let chat_id = reply.chat_id;
         let message_id = reply.message_id;
         let text = format!("🤖 {}", reply.text);
+        let sent_text_len = reply.text.len();
         let runtime = self.runtime.clone();
         let session_id = session_id.clone();
         let request = runtime.spawn_background(async move {
@@ -8215,10 +8408,16 @@ impl AverroesApp {
         });
         cx.spawn(async move |this, cx| {
             let result = request.await;
-            _ = this.update(cx, |app, _| {
+            let successful = matches!(&result, Ok(Ok(())));
+            _ = this.update(cx, |app, cx| {
+                let mut needs_follow_up = false;
                 if let Some(reply) = app.remote_agent_live_replies.get_mut(&session_id) {
                     reply.edit_in_flight = false;
                     reply.last_edit = Instant::now();
+                    needs_follow_up = successful && reply.text.len() > sent_text_len;
+                }
+                if needs_follow_up {
+                    app.schedule_remote_live_edit(&session_id, cx);
                 }
             });
             if let Ok(Err(error)) = result {

@@ -36,6 +36,23 @@ pub(crate) struct TelegramMessage {
     pub from: Option<TelegramUser>,
     pub chat: TelegramChat,
     pub text: Option<String>,
+    pub caption: Option<String>,
+    pub document: Option<TelegramDocument>,
+    #[serde(default)]
+    pub photo: Vec<TelegramPhotoSize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TelegramDocument {
+    pub file_id: String,
+    pub file_name: Option<String>,
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TelegramPhotoSize {
+    pub file_id: String,
+    pub file_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +84,11 @@ struct TelegramBot {
 #[derive(Debug, Clone, Deserialize)]
 struct TelegramSentMessage {
     pub message_id: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TelegramFile {
+    file_path: String,
 }
 
 impl TelegramClient {
@@ -208,6 +230,46 @@ impl TelegramClient {
             .ok_or_else(|| "Telegram did not return the uploaded photo message".into())
     }
 
+    pub(crate) async fn download_file(
+        &self,
+        file_id: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, String> {
+        let file = self
+            .call::<TelegramFile>("getFile", json!({ "file_id": file_id }))
+            .await?;
+        let response = self
+            .http
+            .get(format!(
+                "{TELEGRAM_API}/file/bot{}/{}",
+                self.token, file.file_path
+            ))
+            .send()
+            .await
+            .map_err(|error| format!("Telegram file download failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Telegram file download failed with HTTP {}",
+                response.status()
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Err(format!("Telegram file is larger than {max_bytes} bytes"));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| format!("Telegram file download could not be read: {error}"))?
+            .to_vec();
+        if bytes.len() > max_bytes {
+            return Err(format!("Telegram file is larger than {max_bytes} bytes"));
+        }
+        Ok(bytes)
+    }
+
     pub(crate) async fn send_text_chunks(
         &self,
         chat_id: i64,
@@ -324,11 +386,40 @@ fn split_text(text: &str, max_chars: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_text;
+    use super::{split_text, TelegramMessage};
 
     #[test]
     fn splits_unicode_text_without_breaking_characters() {
         let chunks = split_text("aé界", 2);
         assert_eq!(chunks, vec!["aé", "界"]);
+    }
+
+    #[test]
+    fn deserializes_documents_and_captioned_photos() {
+        let document = serde_json::json!({
+            "message_id": 1,
+            "chat": { "id": 10 },
+            "document": {
+                "file_id": "document-file",
+                "file_name": "notes.txt",
+                "file_size": 123
+            }
+        });
+        let photo = serde_json::json!({
+            "message_id": 2,
+            "chat": { "id": 10 },
+            "caption": "Review this image",
+            "photo": [{ "file_id": "photo-file", "file_size": 456 }]
+        });
+
+        let document = serde_json::from_value::<TelegramMessage>(document).unwrap();
+        let photo = serde_json::from_value::<TelegramMessage>(photo).unwrap();
+
+        assert_eq!(
+            document.document.unwrap().file_name.as_deref(),
+            Some("notes.txt")
+        );
+        assert_eq!(photo.caption.as_deref(), Some("Review this image"));
+        assert_eq!(photo.photo[0].file_id, "photo-file");
     }
 }
