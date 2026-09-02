@@ -14,6 +14,19 @@ pub struct WorkProject {
     pub last_opened_at: i64,
 }
 
+/// A persisted item in the first-run welcome checklist.
+///
+/// Some items are completed explicitly by the user, while others are kept in
+/// sync with real application state by the UI. Keeping both kinds in SQLite
+/// makes an interrupted setup resumable across launches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkOnboardingStep {
+    pub id: String,
+    pub completed: bool,
+    pub completed_at: Option<i64>,
+    pub updated_at: i64,
+}
+
 /// A virtual project/folder that groups conversations inside one workspace.
 /// It is intentionally not a filesystem path: the workspace remains the
 /// execution context, while this entity is only a navigation organization.

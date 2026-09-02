@@ -73,6 +73,11 @@ const SIDEBAR_NAV_HEIGHT: f32 = 38.0;
 const SIDEBAR_RADIUS: f32 = 10.0;
 const WORK_RAIL_WIDTH: f32 = 336.0;
 const WORK_RAIL_TRIGGER_WIDTH: f32 = 36.0;
+const ONBOARDING_INTRODUCTION: &str = "welcome_introduction";
+const ONBOARDING_ACTIVE_CONNECTION: &str = "active_connection";
+const ONBOARDING_WORKSPACE: &str = "workspace_available";
+const ONBOARDING_FIRST_CONVERSATION: &str = "first_conversation";
+const ONBOARDING_STEP_COUNT: usize = 4;
 
 fn stream_event_requires_immediate_flush(event: &AgentStreamEvent) -> bool {
     matches!(
@@ -606,6 +611,24 @@ struct Notice {
     text: String,
 }
 
+#[derive(Clone, Copy)]
+enum WelcomeAction {
+    AcknowledgeIntroduction,
+    ConfigureConnection,
+    OpenWorkspace,
+    StartConversation,
+}
+
+#[derive(Clone, Copy)]
+struct WelcomeStepSpec {
+    id: &'static str,
+    number: &'static str,
+    title_key: &'static str,
+    description_key: &'static str,
+    action_key: &'static str,
+    action: WelcomeAction,
+}
+
 pub struct AverroesApp {
     runtime: Arc<AppRuntime>,
     route: Route,
@@ -662,6 +685,7 @@ pub struct AverroesApp {
     copilot_busy: bool,
     projects: Vec<WorkProject>,
     conversations: Vec<ConversationSummary>,
+    onboarding_steps: HashMap<String, bool>,
     conversation_folders: Vec<WorkConversationFolder>,
     conversation_folder_ids: HashMap<String, String>,
     expanded_conversation_folders: HashSet<String>,
@@ -690,6 +714,7 @@ pub struct AverroesApp {
     show_sources: bool,
     show_tool_activity: bool,
     show_context: bool,
+    work_rail_hovered: bool,
     conversation_list: ListState,
     conversation_list_session: Option<SessionId>,
     selected_agent_thread: Option<String>,
@@ -1057,6 +1082,20 @@ impl AverroesApp {
             .database
             .conversation_summaries(80)
             .unwrap_or_default();
+        let onboarding_steps = match runtime.database.onboarding_steps() {
+            Ok(steps) => steps
+                .into_iter()
+                .map(|step| (step.id, step.completed))
+                .collect(),
+            Err(error) => {
+                diagnostics::record(
+                    DiagnosticLevel::Warning,
+                    "welcome.storage",
+                    format!("Could not load welcome progress: {error}"),
+                );
+                HashMap::new()
+            }
+        };
         let embedding_status = runtime.database.embedding_index_status().ok();
         // Conversation entries have highly variable height (Markdown, tool
         // output, source cards). GPUI's variable-height list only lays out
@@ -1127,6 +1166,7 @@ impl AverroesApp {
             copilot_busy: false,
             projects,
             conversations,
+            onboarding_steps,
             conversation_folders: Vec::new(),
             conversation_folder_ids: HashMap::new(),
             expanded_conversation_folders: HashSet::new(),
@@ -1153,6 +1193,7 @@ impl AverroesApp {
             show_sources: true,
             show_tool_activity: true,
             show_context: false,
+            work_rail_hovered: false,
             conversation_list,
             conversation_list_session: None,
             selected_agent_thread: None,
@@ -1164,6 +1205,7 @@ impl AverroesApp {
             app.refresh_codex_account(cx);
         }
         app.sync_selectors_to_active(window, cx);
+        app.reconcile_onboarding_steps();
         // Refresh configured remote catalogs concurrently. Each Copilot
         // request re-discovers GitHub's current per-account API endpoint, so
         // model availability and routing never depend on a stale startup URL.
@@ -1791,7 +1833,10 @@ impl AverroesApp {
             return;
         }
         match self.runtime.database.remember_binding(&binding) {
-            Ok(()) => self.remembered_binding = binding,
+            Ok(()) => {
+                self.remembered_binding = binding;
+                self.reconcile_onboarding_steps();
+            }
             Err(error) => self.show_error(error.to_string(), cx),
         }
     }
@@ -1833,6 +1878,84 @@ impl AverroesApp {
         }
         if let Ok(status) = self.runtime.database.embedding_index_status() {
             self.embedding_status = Some(status);
+        }
+        self.reconcile_onboarding_steps();
+    }
+
+    fn has_active_connection(&self) -> bool {
+        !self.runtime.connections().is_empty()
+    }
+
+    fn reconcile_onboarding_steps(&mut self) {
+        let introduction_complete = self
+            .onboarding_steps
+            .get(ONBOARDING_INTRODUCTION)
+            .copied()
+            .unwrap_or(false);
+        let expected = [
+            (ONBOARDING_INTRODUCTION, introduction_complete),
+            (ONBOARDING_ACTIVE_CONNECTION, self.has_active_connection()),
+            (ONBOARDING_WORKSPACE, !self.projects.is_empty()),
+            (
+                ONBOARDING_FIRST_CONVERSATION,
+                !self.conversations.is_empty(),
+            ),
+        ];
+
+        for (step_id, completed) in expected {
+            if self.onboarding_steps.get(step_id).copied() == Some(completed) {
+                continue;
+            }
+            match self
+                .runtime
+                .database
+                .set_onboarding_step(step_id, completed)
+            {
+                Ok(()) => {
+                    self.onboarding_steps.insert(step_id.into(), completed);
+                }
+                Err(error) => diagnostics::record(
+                    DiagnosticLevel::Warning,
+                    "welcome.storage",
+                    format!("Could not persist welcome step {step_id}: {error}"),
+                ),
+            }
+        }
+    }
+
+    fn complete_welcome_introduction(&mut self, cx: &mut Context<Self>) {
+        match self
+            .runtime
+            .database
+            .set_onboarding_step(ONBOARDING_INTRODUCTION, true)
+        {
+            Ok(()) => {
+                self.onboarding_steps
+                    .insert(ONBOARDING_INTRODUCTION.into(), true);
+                cx.notify();
+            }
+            Err(error) => self.show_error(error.to_string(), cx),
+        }
+    }
+
+    fn handle_welcome_action(
+        &mut self,
+        action: WelcomeAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            WelcomeAction::AcknowledgeIntroduction => {
+                self.complete_welcome_introduction(cx);
+            }
+            WelcomeAction::ConfigureConnection => {
+                self.settings_tab = SettingsTab::Models;
+                self.project_settings_open = false;
+                self.route = Route::Connections;
+                cx.notify();
+            }
+            WelcomeAction::OpenWorkspace => self.open_workspace(window, cx),
+            WelcomeAction::StartConversation => self.new_session(window, cx),
         }
     }
 
@@ -5248,7 +5371,10 @@ impl AverroesApp {
         let binding = self.active().binding.clone();
         if binding.is_ready() {
             match self.runtime.database.remember_binding(&binding) {
-                Ok(()) => self.remembered_binding = binding,
+                Ok(()) => {
+                    self.remembered_binding = binding;
+                    self.reconcile_onboarding_steps();
+                }
                 Err(error) => {
                     self.notice = Some(Notice {
                         success: false,
@@ -5279,7 +5405,10 @@ impl AverroesApp {
         let binding = self.active().binding.clone();
         if binding.is_ready() {
             match self.runtime.database.remember_binding(&binding) {
-                Ok(()) => self.remembered_binding = binding,
+                Ok(()) => {
+                    self.remembered_binding = binding;
+                    self.reconcile_onboarding_steps();
+                }
                 Err(error) => {
                     self.notice = Some(Notice {
                         success: false,
@@ -5813,6 +5942,7 @@ impl AverroesApp {
         self.model_choices = initial_model_choices(&self.runtime);
         self.refresh_model_picker(window, cx);
         self.sync_agent_model_selector(window, cx);
+        self.reconcile_onboarding_steps();
     }
 
     fn save_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5970,6 +6100,7 @@ impl AverroesApp {
                     self.show_error(error.to_string(), cx);
                     return;
                 }
+                self.reconcile_onboarding_steps();
                 self.refresh_connections(window, cx);
                 self.refresh_embedding_connections(window, cx);
                 self.notice = Some(Notice {
@@ -8052,8 +8183,169 @@ impl AverroesApp {
         .pb(px(22.0))
     }
 
+    fn render_welcome_step(
+        &self,
+        step_id: &'static str,
+        number: &'static str,
+        title: SharedString,
+        description: SharedString,
+        action_label: SharedString,
+        action: WelcomeAction,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        div()
+            .id(SharedString::from(format!("welcome-step-{step_id}")))
+            .w_full()
+            .px(px(16.0))
+            .py(px(14.0))
+            .flex()
+            .items_center()
+            .gap(px(13.0))
+            .rounded(px(11.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface)
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.surface_hover).border_color(theme.faint))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(30.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(theme.accent_soft)
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.foreground)
+                    .child(number),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.muted)
+                            .child(description),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded(px(7.0))
+                    .bg(theme.surface_subtle)
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(action_label),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.handle_welcome_action(action, window, cx)
+            }))
+            .into_any_element()
+    }
+
     fn render_home(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = UiTheme::current(cx);
+        let completed_steps = [
+            ONBOARDING_INTRODUCTION,
+            ONBOARDING_ACTIVE_CONNECTION,
+            ONBOARDING_WORKSPACE,
+            ONBOARDING_FIRST_CONVERSATION,
+        ]
+        .into_iter()
+        .filter(|step_id| {
+            self.onboarding_steps
+                .get(*step_id)
+                .copied()
+                .unwrap_or(false)
+        })
+        .count();
+        let setup_complete = completed_steps == ONBOARDING_STEP_COUNT;
+        let progress_label = i18n::format(
+            cx,
+            "home.setup_progress",
+            &[
+                ("complete", completed_steps.to_string()),
+                ("total", ONBOARDING_STEP_COUNT.to_string()),
+            ],
+        );
+
+        let has_workspace = !self.projects.is_empty();
+        let step_specs = [
+            WelcomeStepSpec {
+                id: ONBOARDING_INTRODUCTION,
+                number: "01",
+                title_key: "home.step_intro_title",
+                description_key: "home.step_intro_description",
+                action_key: "home.step_intro_action",
+                action: WelcomeAction::AcknowledgeIntroduction,
+            },
+            WelcomeStepSpec {
+                id: ONBOARDING_ACTIVE_CONNECTION,
+                number: "02",
+                title_key: "home.step_connection_title",
+                description_key: "home.step_connection_description",
+                action_key: "home.step_connection_action",
+                action: WelcomeAction::ConfigureConnection,
+            },
+            WelcomeStepSpec {
+                id: ONBOARDING_WORKSPACE,
+                number: "03",
+                title_key: "home.step_workspace_title",
+                description_key: "home.step_workspace_description",
+                action_key: "home.step_workspace_action",
+                action: WelcomeAction::OpenWorkspace,
+            },
+            WelcomeStepSpec {
+                id: ONBOARDING_FIRST_CONVERSATION,
+                number: "04",
+                title_key: "home.step_conversation_title",
+                description_key: "home.step_conversation_description",
+                action_key: if has_workspace {
+                    "home.step_conversation_action"
+                } else {
+                    "home.step_workspace_action"
+                },
+                action: if has_workspace {
+                    WelcomeAction::StartConversation
+                } else {
+                    WelcomeAction::OpenWorkspace
+                },
+            },
+        ];
+        let pending_steps = step_specs
+            .into_iter()
+            .filter(|step| !self.onboarding_steps.get(step.id).copied().unwrap_or(false))
+            .map(|step| {
+                self.render_welcome_step(
+                    step.id,
+                    step.number,
+                    i18n::text(cx, step.title_key),
+                    i18n::text(cx, step.description_key),
+                    i18n::text(cx, step.action_key),
+                    step.action,
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>();
+
         let project_cards = self
             .projects
             .clone()
@@ -8064,13 +8356,16 @@ impl AverroesApp {
                     .id(SharedString::from(format!("home-project-{}", project.id)))
                     .w_full()
                     .px(px(14.0))
-                    .py(px(11.0))
+                    .py(px(12.0))
                     .flex()
                     .items_center()
                     .gap(px(11.0))
                     .rounded(px(9.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface)
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme.accent_soft))
+                    .hover(|style| style.bg(theme.surface_hover))
                     .child(
                         Icon::new(IconName::Folder)
                             .size(px(16.0))
@@ -8109,83 +8404,155 @@ impl AverroesApp {
             })
             .collect::<Vec<_>>();
 
+        let setup_panel = div()
+            .w_full()
+            .p(px(18.0))
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .rounded(px(14.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface_subtle)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(i18n::text(cx, "home.setup_title")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.muted)
+                            .child(progress_label),
+                    ),
+            )
+            .child(div().w_full().h(px(4.0)).flex().gap(px(4.0)).children(
+                (0..ONBOARDING_STEP_COUNT).map(|index| {
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .rounded_full()
+                        .bg(if index < completed_steps {
+                            theme.success
+                        } else {
+                            theme.border
+                        })
+                }),
+            ))
+            .children(pending_steps);
+
         div()
             .flex_1()
             .min_w(px(0.0))
             .h_full()
             .flex()
-            .items_center()
             .justify_center()
             .overflow_y_scrollbar()
             .child(
                 div()
                     .w_full()
-                    .max_w(px(700.0))
+                    .max_w(px(820.0))
                     .px(px(28.0))
+                    .py(px(46.0))
                     .flex()
                     .flex_col()
-                    .gap(px(24.0))
+                    .gap(px(26.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(16.0))
+                            .child(img(averroes_logo_asset(cx)).size(px(64.0)))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(28.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(i18n::text(cx, "home.title")),
+                                    )
+                                    .child(
+                                        div()
+                                            .max_w(px(620.0))
+                                            .text_size(px(14.0))
+                                            .text_color(theme.muted)
+                                            .child(i18n::text(cx, "home.subtitle")),
+                                    ),
+                            ),
+                    )
+                    .when(!setup_complete, |home| home.child(setup_panel))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .items_center()
-                            .gap(px(9.0))
-                            .child(img(averroes_logo_asset(cx)).size(px(88.0)))
-                            .child(
-                                div()
-                                    .text_size(px(28.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(i18n::text(cx, "home.title")),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(14.0))
-                                    .text_color(theme.muted)
-                                    .child(i18n::text(cx, "home.subtitle")),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_center()
                             .gap(px(10.0))
                             .child(
-                                Button::new("home-open-project")
-                                    .primary()
-                                    .label(i18n::text(cx, "home.open_project"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_workspace(window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("home-new-conversation")
-                                    .secondary()
-                                    .label(i18n::text(cx, "home.new_conversation"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.new_session(window, cx)
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt(px(8.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(7.0))
-                            .child(
                                 div()
-                                    .text_size(px(12.0))
-                                    .text_color(theme.faint)
-                                    .child(i18n::text(cx, "home.recent_workspaces")),
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(14.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(i18n::text(cx, "home.recent_workspaces")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.0))
+                                            .child(
+                                                div()
+                                                    .px(px(8.0))
+                                                    .py(px(3.0))
+                                                    .rounded_full()
+                                                    .bg(theme.surface_subtle)
+                                                    .text_size(px(11.0))
+                                                    .text_color(theme.muted)
+                                                    .child(self.projects.len().to_string()),
+                                            )
+                                            .child(
+                                                Button::new("home-open-project")
+                                                    .small()
+                                                    .secondary()
+                                                    .label(i18n::text(cx, "home.open_project"))
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.open_workspace(window, cx)
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
                             )
                             .when(project_cards.is_empty(), |this| {
                                 this.child(sidebar_empty(
-                                    i18n::text(cx, "sidebar.no_conversations"),
+                                    i18n::text(cx, "home.no_workspaces"),
                                     theme,
                                 ))
                             })
-                            .children(project_cards),
+                            .children(project_cards)
+                            .when(!self.projects.is_empty(), |workspaces| {
+                                workspaces.child(
+                                    div().mt(px(2.0)).flex().justify_end().child(
+                                        Button::new("home-new-conversation")
+                                            .primary()
+                                            .label(i18n::text(cx, "home.new_conversation"))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.new_session(window, cx)
+                                            })),
+                                    ),
+                                )
+                            }),
                     ),
             )
             .into_any_element()
@@ -8668,23 +9035,46 @@ impl AverroesApp {
                     CheckpointStatus::Blocked => theme.destructive,
                     CheckpointStatus::Pending => theme.faint,
                 };
+                let checkpoint_id = checkpoint.id.clone();
+                let message_position = checkpoint.message_position;
                 div()
+                    .id(SharedString::from(format!(
+                        "checkpoint-marker-{}-{checkpoint_id}",
+                        session_id.as_str()
+                    )))
                     .flex_none()
-                    .size(px(6.0))
+                    .size(px(18.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .rounded_full()
-                    .bg(color)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.surface_hover))
+                    .child(div().size(px(6.0)).rounded_full().bg(color))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.scroll_to_checkpoint(message_position, cx);
+                    }))
                     .into_any_element()
             })
             .chain(tasks.iter().map(|task| {
+                let task_id = task.id.clone();
                 div()
+                    .id(SharedString::from(format!(
+                        "task-marker-{}-{task_id}",
+                        session_id.as_str()
+                    )))
                     .flex_none()
-                    .size(px(6.0))
-                    .rounded_full()
-                    .bg(if task.status == TaskStatus::Done {
-                        theme.success
-                    } else {
-                        theme.faint
-                    })
+                    .size(px(18.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(div().size(px(6.0)).rounded_full().bg(
+                        if task.status == TaskStatus::Done {
+                            theme.success
+                        } else {
+                            theme.faint
+                        },
+                    ))
                     .into_any_element()
             }))
             .collect::<Vec<_>>();
@@ -8826,8 +9216,6 @@ impl AverroesApp {
             .collect::<Vec<_>>();
         let has_checkpoints = !checkpoint_rows.is_empty();
         let has_tasks = !task_rows.is_empty();
-        let work_rail_group =
-            SharedString::from(format!("conversation-work-rail-{}", session_id.as_str()));
         let header_actions = conversation_actions_button(
             session_id.to_string(),
             format!("header-conversation-actions-{}", session_id.as_str()),
@@ -8984,20 +9372,33 @@ impl AverroesApp {
                     .when(has_checkpoints || has_tasks, |this| {
                         this.child(
                             div()
+                                .id(SharedString::from(format!(
+                                    "conversation-work-rail-{}",
+                                    session_id.as_str()
+                                )))
                                 .absolute()
                                 .left(px(0.0))
                                 .top(px(0.0))
                                 .bottom(px(0.0))
-                                .w(px(WORK_RAIL_TRIGGER_WIDTH))
-                                .group(work_rail_group.clone())
+                                .w(px(if self.work_rail_hovered {
+                                    WORK_RAIL_TRIGGER_WIDTH + WORK_RAIL_WIDTH
+                                } else {
+                                    WORK_RAIL_TRIGGER_WIDTH
+                                }))
+                                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                    if this.work_rail_hovered != *hovered {
+                                        this.work_rail_hovered = *hovered;
+                                        cx.notify();
+                                    }
+                                }))
                                 .child(
                                     div()
                                         .absolute()
                                         .left(px(10.0))
                                         .top(px(20.0))
                                         .max_h(px(220.0))
-                                        .px(px(5.0))
-                                        .py(px(8.0))
+                                        .px(px(2.0))
+                                        .py(px(4.0))
                                         .flex()
                                         .flex_col()
                                         .items_center()
@@ -9009,56 +9410,53 @@ impl AverroesApp {
                                         .overflow_hidden()
                                         .children(work_rail_markers),
                                 )
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left(px(10.0))
-                                        .top(px(8.0))
-                                        .bottom(px(8.0))
-                                        .w(px(WORK_RAIL_WIDTH))
-                                        .px(px(12.0))
-                                        .py(px(14.0))
-                                        .rounded(px(12.0))
-                                        .border_1()
-                                        .border_color(theme.border)
-                                        .bg(theme.surface)
-                                        .overflow_y_scrollbar()
-                                        .invisible()
-                                        .opacity(0.0)
-                                        .group_hover(work_rail_group, |style| {
-                                            style.visible().opacity(1.0)
-                                        })
-                                        .occlude()
-                                        .when(has_checkpoints, |this| {
-                                            this.child(
-                                                div()
-                                                    .px(px(8.0))
-                                                    .pb(px(6.0))
-                                                    .text_size(px(10.0))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(theme.faint)
-                                                    .child(i18n::text(cx, "chat.checkpoints")),
-                                            )
-                                            .children(checkpoint_rows)
-                                        })
-                                        .when(has_tasks, |this| {
-                                            this.child(div().h(px(if has_checkpoints {
-                                                12.0
-                                            } else {
-                                                0.0
-                                            })))
-                                            .child(
-                                                div()
-                                                    .px(px(8.0))
-                                                    .pb(px(6.0))
-                                                    .text_size(px(10.0))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(theme.faint)
-                                                    .child(i18n::text(cx, "chat.tasks")),
-                                            )
-                                            .children(task_rows)
-                                        }),
-                                ),
+                                .when(self.work_rail_hovered, |rail| {
+                                    rail.child(
+                                        div()
+                                            .absolute()
+                                            .left(px(WORK_RAIL_TRIGGER_WIDTH))
+                                            .top(px(8.0))
+                                            .bottom(px(8.0))
+                                            .w(px(WORK_RAIL_WIDTH))
+                                            .px(px(12.0))
+                                            .py(px(14.0))
+                                            .rounded(px(12.0))
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .bg(theme.surface)
+                                            .overflow_y_scrollbar()
+                                            .occlude()
+                                            .when(has_checkpoints, |this| {
+                                                this.child(
+                                                    div()
+                                                        .px(px(8.0))
+                                                        .pb(px(6.0))
+                                                        .text_size(px(10.0))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(theme.faint)
+                                                        .child(i18n::text(cx, "chat.checkpoints")),
+                                                )
+                                                .children(checkpoint_rows)
+                                            })
+                                            .when(has_tasks, |this| {
+                                                this.child(div().h(px(if has_checkpoints {
+                                                    12.0
+                                                } else {
+                                                    0.0
+                                                })))
+                                                .child(
+                                                    div()
+                                                        .px(px(8.0))
+                                                        .pb(px(6.0))
+                                                        .text_size(px(10.0))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(theme.faint)
+                                                        .child(i18n::text(cx, "chat.tasks")),
+                                                )
+                                                .children(task_rows)
+                                            }),
+                                    )
+                                }),
                         )
                     })
                     .when(self.show_context, |this| {

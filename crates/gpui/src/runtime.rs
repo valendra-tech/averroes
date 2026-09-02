@@ -248,6 +248,21 @@ impl AgentThreadRegistry {
         self.threads.write().insert(thread.id.clone(), thread);
     }
 
+    fn restore(&self, threads: impl IntoIterator<Item = AgentThreadSnapshot>) {
+        let mut current = self.threads.write();
+        for mut thread in threads {
+            if thread.status == AgentThreadStatus::Running {
+                thread.status = AgentThreadStatus::Interrupted;
+            }
+            let should_restore = current
+                .get(&thread.id)
+                .is_none_or(|existing| thread.updated_at > existing.updated_at);
+            if should_restore {
+                current.insert(thread.id.clone(), thread);
+            }
+        }
+    }
+
     fn get(&self, thread_id: &str) -> Option<AgentThreadSnapshot> {
         self.threads.read().get(thread_id).cloned()
     }
@@ -288,6 +303,16 @@ impl Default for AgentThreadRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn delegated_agent_tools(
+    existing: Option<&AgentThreadSnapshot>,
+    bootstrap_tools: Vec<String>,
+) -> Vec<String> {
+    existing
+        .map(|thread| thread.enabled_tools.clone())
+        .filter(|tools| !tools.is_empty())
+        .unwrap_or(bootstrap_tools)
 }
 
 /// Resolves the explicit connection assigned to a configured delegated
@@ -451,7 +476,8 @@ impl RuntimeAgentRunner {
             .ok_or_else(|| format!("agent '{}' is not available", request.agent_id))?;
         let lock = self.threads.lock_for(thread_id);
         let _thread_guard = lock.lock().await;
-        if let Some(existing) = self.threads.get(thread_id) {
+        let existing_thread = self.threads.get(thread_id);
+        if let Some(existing) = existing_thread.as_ref() {
             if existing.agent_id != request.agent_id {
                 return Err(format!(
                     "thread '{thread_id}' already belongs to agent '{}'",
@@ -479,6 +505,10 @@ impl RuntimeAgentRunner {
             .unwrap_or_else(|| self.default_model.clone());
         let title = delegated_agent_title(&request.prompt);
         let now = averroes_core::work::now();
+        let tools = delegated_agent_tools(
+            existing_thread.as_ref(),
+            self.tool_registry.bootstrap_names(),
+        );
         let running = AgentThreadSnapshot {
             id: thread_id.to_owned(),
             thread_id: thread_id.to_owned(),
@@ -487,6 +517,7 @@ impl RuntimeAgentRunner {
             title,
             model_id: model_id.clone(),
             status: AgentThreadStatus::Running,
+            enabled_tools: tools.clone(),
             prompt: request.prompt.clone(),
             output: String::new(),
             created_at: now,
@@ -510,12 +541,9 @@ impl RuntimeAgentRunner {
                 request.parent_objective.trim()
             )
         };
-        // Keep the child request small. It still receives the exact same
-        // scoped registry (including workspace MCP tools), so it has the same
-        // capabilities, but discovery decides which full schemas are needed
-        // for this objective. Sending every active parent schema here was
-        // enough to hit provider tool-count limits before the child started.
-        let tools = self.tool_registry.bootstrap_names();
+        // A new child starts with the compact discovery bootstrap. Continuing
+        // an existing thread restores only the tools that child activated in
+        // earlier turns, without inheriting every schema from the parent.
         let agent = Arc::new(Agent::new(
             AgentConfig {
                 name: format!("delegated-{}", &thread_id[..thread_id.len().min(8)]),
@@ -585,22 +613,92 @@ impl RuntimeAgentRunner {
         self.threads
             .set_context(thread_id, agent.conversation_history().await);
         let now = averroes_core::work::now();
-        let finished = match result {
-            Ok(output) => AgentThreadSnapshot {
-                status: AgentThreadStatus::Completed,
-                output,
-                updated_at: now,
-                ..running
-            },
-            Err(error) => AgentThreadSnapshot {
-                status: AgentThreadStatus::Failed,
-                output: error.to_string(),
-                updated_at: now,
-                ..running
-            },
+        let (status, output) = match result {
+            Ok(output) => (AgentThreadStatus::Completed, output),
+            Err(error) => (AgentThreadStatus::Failed, error.to_string()),
+        };
+        let finished = AgentThreadSnapshot {
+            status,
+            output,
+            updated_at: now,
+            enabled_tools: agent.enabled_tool_names(),
+            ..running
         };
         self.threads.upsert(finished.clone());
         Ok(finished)
+    }
+}
+
+#[cfg(test)]
+mod delegated_agent_tool_tests {
+    use super::{delegated_agent_tools, AgentThreadRegistry};
+    use averroes_core::agent::orchestration::{AgentThreadSnapshot, AgentThreadStatus};
+
+    fn thread_with_tools(enabled_tools: Vec<String>) -> AgentThreadSnapshot {
+        AgentThreadSnapshot {
+            id: "thread-1".into(),
+            thread_id: "thread-1".into(),
+            agent_id: "researcher".into(),
+            parent_session_id: "conversation-1".into(),
+            title: "Research".into(),
+            model_id: "model-1".into(),
+            status: AgentThreadStatus::Completed,
+            enabled_tools,
+            prompt: "First turn".into(),
+            output: "Done".into(),
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    #[test]
+    fn continuing_a_thread_restores_its_activated_tools() {
+        let existing = thread_with_tools(vec![
+            "discover_tools".into(),
+            "shell".into(),
+            "file_read".into(),
+        ]);
+
+        assert_eq!(
+            delegated_agent_tools(Some(&existing), vec!["discover_tools".into()]),
+            vec!["discover_tools", "shell", "file_read"]
+        );
+    }
+
+    #[test]
+    fn a_new_or_legacy_thread_uses_only_bootstrap_tools() {
+        let legacy = thread_with_tools(Vec::new());
+        let bootstrap = vec!["discover_tools".into(), "enable_tools".into()];
+
+        assert_eq!(
+            delegated_agent_tools(Some(&legacy), bootstrap.clone()),
+            bootstrap
+        );
+    }
+
+    #[test]
+    fn restored_threads_keep_tools_and_do_not_replace_newer_live_state() {
+        let registry = AgentThreadRegistry::new();
+        let mut saved = thread_with_tools(vec!["web_search".into()]);
+        saved.status = AgentThreadStatus::Running;
+        registry.restore([saved]);
+
+        let restored = registry.get("thread-1").expect("saved thread restored");
+        assert_eq!(restored.enabled_tools, vec!["web_search"]);
+        assert_eq!(restored.status, AgentThreadStatus::Interrupted);
+
+        let mut live = thread_with_tools(vec!["shell".into()]);
+        live.updated_at = 3;
+        registry.upsert(live);
+        registry.restore([thread_with_tools(vec!["file_read".into()])]);
+
+        assert_eq!(
+            registry
+                .get("thread-1")
+                .expect("live thread retained")
+                .enabled_tools,
+            vec!["shell"]
+        );
     }
 }
 
@@ -2002,6 +2100,9 @@ impl AppRuntime {
         working_dir: Option<&Path>,
     ) -> Result<Arc<Agent>, RuntimeError> {
         self.validate_binding(binding)?;
+        if let Some(conversation) = self.database.conversation(session_id.as_str())? {
+            self.agent_threads.restore(conversation.agent_threads);
+        }
         let connection_id = binding
             .connection_id
             .as_ref()

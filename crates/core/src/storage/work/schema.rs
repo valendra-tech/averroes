@@ -99,6 +99,12 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             value TEXT NOT NULL,
             updated_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS onboarding_steps (
+            step_id TEXT PRIMARY KEY,
+            completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1)),
+            completed_at INTEGER,
+            updated_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS global_memories (
             id TEXT PRIMARY KEY,
             content TEXT NOT NULL,
@@ -209,7 +215,7 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX conversation_embeddings_model
              ON conversation_embeddings(connection_id, model_id, conversation_id);",
     )?;
-    connection.pragma_update(None, "user_version", 12)?;
+    connection.pragma_update(None, "user_version", 13)?;
     Ok(())
 }
 

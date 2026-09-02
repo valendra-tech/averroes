@@ -216,14 +216,30 @@ impl Render for RootView {
     }
 }
 
-fn active_component_root(cx: &App) -> Option<gpui::WindowHandle<ComponentRoot>> {
-    // Native menu callbacks can run while the menu itself has focus. In that
-    // moment `active_window()` may not point at the GPUI window anymore. Use
-    // the platform window stack first and fall back to GPUI's live handles.
-    cx.window_stack()
+fn first_live_preference<T: Copy + Eq>(
+    live_items: &[T],
+    preferred_items: impl IntoIterator<Item = T>,
+) -> Option<T> {
+    preferred_items
         .into_iter()
-        .flatten()
-        .chain(cx.windows())
+        .find_map(|preferred| live_items.iter().copied().find(|live| *live == preferred))
+}
+
+fn active_component_root(cx: &App) -> Option<gpui::WindowHandle<ComponentRoot>> {
+    // The native macOS window stack can retain a closed window briefly. Only
+    // use it to order handles that GPUI still reports as live; updating a stale
+    // handle fails with `window not found`.
+    let live_windows = cx.windows();
+    let preferred_window = first_live_preference(
+        &live_windows,
+        cx.active_window()
+            .into_iter()
+            .chain(cx.window_stack().into_iter().flatten()),
+    );
+
+    preferred_window
+        .into_iter()
+        .chain(live_windows)
         .find_map(|window| window.downcast::<ComponentRoot>())
 }
 
@@ -352,11 +368,22 @@ fn open_averroes_window(cx: &mut App) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::application_quit_mode;
+    use super::{application_quit_mode, first_live_preference};
     use gpui::QuitMode;
 
     #[test]
     fn closing_the_last_window_quits_the_desktop_process() {
         assert_eq!(application_quit_mode(), QuitMode::LastWindowClosed);
+    }
+
+    #[test]
+    fn stale_platform_windows_are_not_selected() {
+        let live_windows = [11, 17];
+        let platform_order = [5, 17, 11];
+
+        assert_eq!(
+            first_live_preference(&live_windows, platform_order),
+            Some(17)
+        );
     }
 }

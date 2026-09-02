@@ -327,6 +327,12 @@ impl Agent {
         self.messages.lock().await.clone()
     }
 
+    /// Returns the complete activation set so a reconstructed delegated
+    /// agent can continue the same thread without rediscovering its tools.
+    pub fn enabled_tool_names(&self) -> Vec<String> {
+        self.tool_activation.names()
+    }
+
     pub fn reconfigure_provider(
         &self,
         provider: Arc<dyn Provider>,
