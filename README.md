@@ -160,16 +160,17 @@ The tag-triggered release pipeline has `validate`, `build`, and `publish` jobs.
 A pushed valid SemVer tag `vX.Y.Z` on a commit reachable from `main` starts the
 pipeline. Publishing a GitHub Release manually does not start it.
 
-The pipeline builds arm64 and x86_64 DMGs. Both are Developer ID signed with
-the hardened runtime and secure timestamps, notarized, stapled, and Gatekeeper
-validated before publishing.
+The pipeline currently builds the arm64 DMG. The Intel build is commented out
+temporarily. The active DMG is Developer ID signed with the hardened runtime
+and secure timestamp, notarized, stapled, and Gatekeeper validated before
+publishing.
 
-A public GitHub Release is created only after both architecture builds succeed.
-A failure creates no public Release, although a failure after draft creation can
+A public GitHub Release is created only after the active arm64 build succeeds. A
+failure creates no public Release, although a failure after draft creation can
 leave a draft Release for maintainers.
 
-Each release includes `SHA256SUMS.txt`. From the directory containing the
-downloaded assets, verify them with:
+Each release includes the arm64 DMG and `SHA256SUMS.txt`. From the directory
+containing the downloaded assets, verify them with:
 
 ```bash
 shasum -a 256 -c SHA256SUMS.txt
