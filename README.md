@@ -156,14 +156,48 @@ invoke.
 
 ## macOS releases
 
-Every published GitHub Release triggers
-`.github/workflows/macos-release.yml`. The workflow:
+The tag-triggered release pipeline has `validate`, `build`, and `publish` jobs.
+A pushed valid SemVer tag `vX.Y.Z` on a commit reachable from `main` starts the
+pipeline. Publishing a GitHub Release manually does not start it.
 
-1. Checks out the published release tag.
-2. Builds the Rust application with the release version from that tag.
-3. Creates architecture-specific `.app` and `.dmg` artifacts.
-4. Includes an `/Applications` symlink in the DMG.
-5. Uploads both DMGs to the release.
+The pipeline builds arm64 and x86_64 DMGs. Both are Developer ID signed with
+the hardened runtime and secure timestamps, notarized, stapled, and Gatekeeper
+validated before publishing.
+
+A public GitHub Release is created only after both architecture builds succeed.
+A failure creates no public Release, although a failure after draft creation can
+leave a draft Release for maintainers.
+
+Each release includes `SHA256SUMS.txt`. From the directory containing the
+downloaded assets, verify them with:
+
+```bash
+shasum -a 256 -c SHA256SUMS.txt
+```
+
+macOS 13.0 is the supported runtime minimum.
+
+Create a release tag from current `main` with:
+
+```bash
+git checkout main
+git pull --ff-only
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+GitHub Actions requires these secrets:
+
+- `APPLE_CERTIFICATE_BASE64`
+- `APPLE_CERTIFICATE_PASSWORD`
+- `APPLE_CODESIGN_IDENTITY`
+- `APPLE_API_KEY_BASE64`
+- `APPLE_API_KEY_ID`
+- `APPLE_API_ISSUER_ID`
+
+Retain the legacy `APPLE_ID`, `APPLE_TEAM_ID`, and
+`APPLE_APP_SPECIFIC_PASSWORD` secrets only until the first API-key release
+succeeds, then remove them.
 
 The application checks for newer releases at startup. When an update is
 available, the user can download and open the verified DMG from the update
@@ -175,8 +209,10 @@ To build a DMG locally on macOS:
 VERSION=1.2.3 scripts/bundle-macos.sh
 ```
 
-The script requires `cargo`, `hdiutil`, `plutil`, and `ditto`. Code signing is
-optional and can be enabled with `CODESIGN_IDENTITY`.
+The script requires `cargo`, `hdiutil`, `plutil`, `ditto`, `vtool`, and `lipo`.
+Packaging verifies the macOS 13.0 target and binary architecture.
+`CODESIGN_IDENTITY` is optional, and `CODESIGN_KEYCHAIN` can select an explicit
+isolated signing keychain. Local packaging does not notarize DMGs.
 
 ## License
 
