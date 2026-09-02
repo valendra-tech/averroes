@@ -438,8 +438,12 @@ build_shell_lines = executable_shell_lines(build_runs)
 workflow_keychain_mutations = build_shell_lines.select do |line|
   keychain_configuration_mutation?(line)
 end
-assert!(workflow_keychain_mutations.empty?,
-        "workflow must not change the runner keychain search list or default keychain")
+assert!(build_runs.match?(/security\s+list-keychains\s+-d\s+user\s*>\s+"\$\{ORIGINAL_KEYCHAINS_PATH\}"/),
+        "workflow must save the original keychain search list")
+assert!(build_runs.match?(/security\s+list-keychains\s+-d\s+user\s+-s\s+"\$\{KEYCHAIN_PATH\}"/),
+        "workflow must prepend the signing keychain to the search list")
+assert!(!workflow_keychain_mutations.empty?,
+        "workflow must expose the temporary signing keychain while signing")
 assert!(build_runs.match?(/security\s+find-identity\s+-v\s+-p\s+codesigning\s+"\$\{KEYCHAIN_PATH\}"/) &&
         build_runs.match?(/APPLE_CODESIGN_IDENTITY/),
         "workflow must verify the configured signing identity in the temporary keychain")
@@ -462,6 +466,8 @@ cleanup_text = cleanup_steps
   .map { |step| step["run"] if step.is_a?(Hash) }
   .compact
   .join("\n")
+assert!(cleanup_text.match?(/security\s+list-keychains\s+-d\s+user\s+-s/),
+        "workflow must restore the original keychain search list during cleanup")
 assert!(cleanup_text.match?(/\brm\s+-[^\n]*f[^\n]*CERTIFICATE_PATH/),
         "credential cleanup must remove the temporary certificate")
 assert!(cleanup_text.match?(/\brm\s+-[^\n]*f[^\n]*API_KEY_PATH/),
