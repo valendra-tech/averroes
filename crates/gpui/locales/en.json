@@ -254,6 +254,7 @@
   "tool.read_file": "Read file",
   "tool.write_file": "Write file",
   "tool.patch": "Apply patch",
+  "tool.change_directory": "Change directory",
   "tool.find_files": "Find files",
   "tool.search_files": "Search files",
   "tool.search_web": "Search web",
