@@ -555,7 +555,7 @@ impl RuntimeAgentRunner {
                 // A delegated agent receives the same registry and starts
                 // with only the compact discovery bootstrap tools.
                 tools,
-                max_iterations: 12,
+                max_iterations: 24,
                 compaction: self.compaction.clone(),
                 reasoning_effort: self.reasoning_effort.clone(),
                 allow_delegation: false,
@@ -2224,7 +2224,7 @@ impl AppRuntime {
             model: model.to_owned(),
             system_prompt: Some(system_prompt.clone()),
             tools: tools.clone(),
-            max_iterations: 30,
+            max_iterations: 50,
             compaction: compaction_config(&config),
             ..Default::default()
         };

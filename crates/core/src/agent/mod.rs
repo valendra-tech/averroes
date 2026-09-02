@@ -29,6 +29,13 @@ const MAX_AUTO_SKILL_CONTEXT_BYTES: usize = 32 * 1024;
 const MAX_SKILL_CATALOG_BYTES: usize = 8 * 1024;
 const PROVIDER_INITIAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_SILENT_PROVIDER_RETRIES: usize = 1;
+const ITERATION_LIMIT_FINAL_CONTEXT: &str = concat!(
+    "[Tool execution budget reached]\n\n",
+    "Tool use is disabled for this response. Use the results already available in the conversation ",
+    "to answer the user now. Summarize what was completed, clearly identify anything still unfinished, ",
+    "and do not claim that unverified work succeeded. Respond in the user's language."
+);
+const ITERATION_LIMIT_FALLBACK: &str = "I reached the tool execution safety limit. The work completed so far is preserved; ask me to continue and I will resume from there.";
 
 pub(super) fn is_delegation_tool(name: &str) -> bool {
     matches!(name, "list_agents" | "call_agent" | "call_agents")
@@ -42,6 +49,8 @@ pub struct AgentConfig {
     pub model: String,
     pub system_prompt: Option<String>,
     pub tools: Vec<String>,
+    /// Maximum number of tool-call rounds before the agent must synthesize a
+    /// final response from the work completed so far.
     pub max_iterations: usize,
     pub compaction: CompactionConfig,
     pub temperature: Option<f32>,
@@ -549,7 +558,8 @@ impl Agent {
         }
 
         let mut context_retries = 0;
-        for _iteration in 0..self.config.max_iterations {
+        let mut tool_iterations = 0;
+        while tool_iterations < self.config.max_iterations {
             let runtime = self.runtime_snapshot();
             if self.should_compact_with_runtime(&runtime).await {
                 if let Err(error) = self
@@ -614,6 +624,7 @@ impl Agent {
                 .as_ref()
                 .map_or(false, |tc| !tc.is_empty())
             {
+                tool_iterations += 1;
                 self.set_state(AgentState::Acting);
 
                 let tool_execution =
@@ -643,9 +654,76 @@ impl Agent {
             return Ok(message_text(&response.message));
         }
 
-        self.set_state(AgentState::Errored);
+        crate::observability::diagnostics::record(
+            crate::observability::diagnostics::DiagnosticLevel::Warning,
+            "agent.iterations",
+            format!(
+                "Tool execution budget reached after {tool_iterations} round(s); requesting a final response without tools."
+            ),
+        );
+
+        let runtime = self.runtime_snapshot();
+        if self.should_compact_with_runtime(&runtime).await {
+            if let Err(error) = self
+                .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
+                .await
+            {
+                self.set_state(AgentState::Errored);
+                run_state.finish();
+                return Err(error);
+            }
+        }
+
+        let runtime = self.runtime_snapshot();
+        let messages = self.messages.lock().await.clone();
+        // The final synthesis does not need the per-turn skill catalogue. In
+        // addition to saving context, omitting it avoids instructions that
+        // may encourage another tool call when tools are deliberately off.
+        let mut request = self.build_request(messages, runtime.model.clone(), None);
+        request.tools.clear();
+        insert_system_context(
+            &mut request.messages,
+            ITERATION_LIMIT_FINAL_CONTEXT.to_owned(),
+        );
+
+        self.set_state(AgentState::Thinking);
+        let response_result = match stream_events.as_ref() {
+            Some(events) => {
+                self.chat_stream_with_events(&runtime, request, events)
+                    .await
+            }
+            None => self.chat_with_governor(&runtime, request).await,
+        };
+        let response = match response_result {
+            Ok(response) => response,
+            Err(error) => {
+                self.set_state(AgentState::Errored);
+                run_state.finish();
+                return Err(error);
+            }
+        };
+        self.record_context_usage(
+            &response,
+            runtime.provider.context_window(&runtime.model),
+            stream_events.as_ref(),
+        );
+
+        let mut final_message = response.message;
+        final_message.tool_calls = None;
+        let mut final_text = message_text(&final_message);
+        if final_text.trim().is_empty() {
+            final_text = ITERATION_LIMIT_FALLBACK.to_owned();
+            final_message.content = MessageContent::Text(final_text.clone());
+            if let Some(events) = stream_events.as_ref() {
+                let _ = events.send(AgentStreamEvent::TextDelta {
+                    text: final_text.clone(),
+                });
+            }
+        }
+        self.messages.lock().await.push(final_message);
+        self.set_state(AgentState::Completed);
         run_state.finish();
-        Err(anyhow::anyhow!("Max iterations reached"))
+        Ok(final_text)
     }
 
     async fn chat_with_governor(
@@ -918,6 +996,7 @@ mod tests {
     struct TestProvider {
         responses: Vec<ChatResponse>,
         call_count: std::sync::Mutex<usize>,
+        requests: std::sync::Mutex<Vec<ChatRequest>>,
     }
 
     struct BlockingProvider {
@@ -1001,6 +1080,7 @@ mod tests {
             Self {
                 responses,
                 call_count: std::sync::Mutex::new(0),
+                requests: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -1021,7 +1101,8 @@ mod tests {
 
     #[async_trait]
     impl Provider for TestProvider {
-        async fn chat(&self, _r: ChatRequest) -> crate::provider::Result<ChatResponse> {
+        async fn chat(&self, request: ChatRequest) -> crate::provider::Result<ChatResponse> {
+            self.requests.lock().unwrap().push(request);
             let mut count = self.call_count.lock().unwrap();
             let idx = *count;
             *count += 1;
@@ -2542,17 +2623,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_agent_run_max_iterations() {
+    async fn test_agent_synthesizes_after_tool_iteration_budget_is_exhausted() {
         let provider = Arc::new(TestProvider::new({
             let mut responses = Vec::new();
-            for _ in 0..3 {
+            for index in 0..2 {
                 responses.push(ChatResponse {
                     message: ChatMessage {
                         role: ProviderRole::Assistant,
                         content: MessageContent::Text(String::new()),
                         tool_call_id: None,
                         tool_calls: Some(vec![ToolCall {
-                            id: "tc_loop".into(),
+                            id: format!("tc_loop_{index}"),
                             call_type: "function".into(),
                             function: FunctionCall {
                                 name: "echo".into(),
@@ -2565,6 +2646,19 @@ mod tests {
                     stop_reason: None,
                 });
             }
+            responses.push(ChatResponse {
+                message: ChatMessage {
+                    role: ProviderRole::Assistant,
+                    content: MessageContent::Text(
+                        "I completed two tool rounds and still need to continue.".into(),
+                    ),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                usage: None,
+                reasoning: None,
+                stop_reason: None,
+            });
             responses
         }));
 
@@ -2573,16 +2667,29 @@ mod tests {
                 max_iterations: 2,
                 ..test_agent_config()
             },
-            provider,
+            provider.clone(),
             test_tool_registry(),
             test_governor(),
             "session-3".into(),
             PathBuf::from("/tmp"),
         );
 
-        let result = agent.run("loop forever").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Max iterations"));
+        let result = agent.run("loop forever").await.unwrap();
+        assert_eq!(
+            result,
+            "I completed two tool rounds and still need to continue."
+        );
+        assert_eq!(agent.state().await, AgentState::Completed);
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(!requests[0].tools.is_empty());
+        assert!(!requests[1].tools.is_empty());
+        assert!(requests[2].tools.is_empty());
+        assert!(requests[2].messages.iter().any(|message| {
+            message.role == ProviderRole::System
+                && message_text(message).contains("Tool execution budget reached")
+        }));
     }
 
     #[tokio::test]
