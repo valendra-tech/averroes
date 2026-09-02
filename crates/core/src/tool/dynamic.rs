@@ -246,6 +246,9 @@ mod tests {
 
         let result = tool.execute(&context, &json!({})).await.unwrap();
 
-        assert_eq!(result.content.trim(), nested.display().to_string());
+        assert_eq!(
+            result.content.trim(),
+            nested.canonicalize().unwrap().display().to_string()
+        );
     }
 }
