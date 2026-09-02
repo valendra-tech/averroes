@@ -168,6 +168,8 @@ mod tests {
         assert!(prompt.contains("Use `discover_tools`"));
         assert!(prompt.contains("discover `list_agents` and `call_agents`"));
         assert!(prompt.contains("Internet research delegation"));
+        assert!(prompt.contains("Use `web_fetch` first"));
+        assert!(prompt.contains("enable `browser` only"));
         assert!(prompt.contains("one independent delegated agent for the request by default"));
         assert!(prompt.contains("must never launch another subagent"));
         assert!(prompt.contains("Context management is automatic"));

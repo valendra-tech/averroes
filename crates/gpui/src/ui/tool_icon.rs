@@ -42,6 +42,7 @@ mod tests {
         assert_eq!(tool_icon_path("file_write"), "tools/file-write.svg");
         assert_eq!(tool_icon_path("patch"), "tools/file-write.svg");
         assert_eq!(tool_icon_path("web_fetch"), "tools/globe.svg");
+        assert_eq!(tool_icon_path("browser"), "tools/globe.svg");
         assert_eq!(tool_icon_path("add_task"), "tools/task.svg");
         assert_eq!(tool_icon_path("ask_user"), "tools/ask-user.svg");
         assert_eq!(tool_icon_path("search_skills"), "tools/skills.svg");

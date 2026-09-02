@@ -257,6 +257,8 @@
   "tool.search_files": "Search files",
   "tool.search_web": "Search web",
   "tool.open_web_page": "Open web page",
+  "tool.fetch_url": "Fetch URL",
+  "tool.browser": "Use browser",
   "tool.checkpoint": "Checkpoint",
   "tool.list_tasks": "List tasks",
   "tool.add_task": "Add task",
