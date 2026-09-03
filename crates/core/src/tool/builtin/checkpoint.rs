@@ -32,7 +32,7 @@ impl Tool for CheckpointTool {
     }
 
     fn description(&self) -> &str {
-        "Creates or updates a visible work checkpoint for the current conversation. Reuse the same id as a task progresses."
+        "Creates or updates a visible work checkpoint. Reuse the same id. Title is the hover label: a short completed or current outcome, never a plan or narration."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -45,7 +45,7 @@ impl Tool for CheckpointTool {
                 },
                 "title": {
                     "type": "string",
-                    "description": "Short action-oriented task title."
+                    "description": "Short hover label, at most ~8 words. State the outcome or current milestone, not what you are about to do."
                 },
                 "status": {
                     "type": "string",
@@ -53,7 +53,7 @@ impl Tool for CheckpointTool {
                 },
                 "detail": {
                     "type": "string",
-                    "description": "Optional concise progress or blocker detail."
+                    "description": "Optional. Only a blocker or a concrete result. Never a plan, next step, or tool narration. Omit it when the title is enough."
                 }
             },
             "required": ["title", "status"],

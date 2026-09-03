@@ -4,6 +4,7 @@ mod app;
 mod i18n;
 mod keychain;
 mod remote_agent;
+mod telegram_markdown;
 mod runtime;
 mod session;
 mod shortcuts;

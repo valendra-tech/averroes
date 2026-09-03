@@ -2267,8 +2267,6 @@ impl AppRuntime {
             Vec::new()
         };
         let system_prompt = self.prompt.build_system(
-            &scoped_tools,
-            &tools,
             &working_dir.display().to_string(),
             project_instructions
                 .as_ref()

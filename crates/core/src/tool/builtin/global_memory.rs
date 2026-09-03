@@ -23,7 +23,7 @@ impl Tool for CreateGlobalMemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Save one user-confirmed, long-lived preference or fact to global memory. Ask the user for explicit approval before calling this tool."
+        "Save one user-confirmed, long-lived preference, taste, or fact about the user. Always ask first and pass only the approved sentence. Never save task details or secrets."
     }
 
     fn parameters(&self) -> Value {

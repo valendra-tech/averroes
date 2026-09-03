@@ -4,6 +4,7 @@
 //! It only translates Telegram updates into a small transport API. The app
 //! remains responsible for authorization, session routing, and agent runs.
 
+use crate::telegram_markdown::{markdown_to_telegram_html, telegram_html_chunks};
 use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -151,7 +152,8 @@ impl TelegramClient {
     ) -> Result<i64, String> {
         let mut body = json!({
             "chat_id": chat_id,
-            "text": text,
+            "text": markdown_to_telegram_html(text),
+            "parse_mode": "HTML",
             "disable_web_page_preview": true,
         });
         if let Some(reply_markup) = reply_markup {
@@ -172,7 +174,8 @@ impl TelegramClient {
             "editMessageText",
             json!({
                 "chat_id": chat_id,
-                "message_id": message_id,
+                "messagemarkdown_to_telegram_html(text),
+                "parse_mode": "HTML": message_id,
                 "text": text,
                 "disable_web_page_preview": true,
             }),
@@ -204,7 +207,8 @@ impl TelegramClient {
             .mime_str("image/png")
             .map_err(|error| format!("could not prepare screenshot upload: {error}"))?;
         let form = Form::new()
-            .text("chat_id", chat_id.to_string())
+            .text("chat_id", markdown_to_telegram_html(caption))
+            .text("parse_mode", "HTML"))
             .text("caption", caption.to_owned())
             .part("photo", photo);
         let response = self
@@ -275,7 +279,7 @@ impl TelegramClient {
         chat_id: i64,
         text: &str,
         reply_markup: Option<Value>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Stelegram_html_chunks
         let chunks = split_text(text, MAX_TELEGRAM_TEXT);
         if chunks.is_empty() {
             self.send_message(chat_id, "…", reply_markup).await?;

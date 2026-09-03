@@ -80,7 +80,6 @@ const SIDEBAR_GUTTER: f32 = 12.0;
 const SIDEBAR_ROW_HEIGHT: f32 = 34.0;
 const SIDEBAR_NAV_HEIGHT: f32 = 38.0;
 const SIDEBAR_RADIUS: f32 = 10.0;
-const WORK_RAIL_WIDTH: f32 = 336.0;
 const WORK_RAIL_TRIGGER_WIDTH: f32 = 36.0;
 const ONBOARDING_INTRODUCTION: &str = "welcome_introduction";
 const ONBOARDING_ACTIVE_CONNECTION: &str = "active_connection";
@@ -880,7 +879,6 @@ pub struct AverroesApp {
     show_sources: bool,
     show_tool_activity: bool,
     show_context: bool,
-    work_rail_hovered: bool,
     conversation_list: ListState,
     conversation_list_session: Option<SessionId>,
     selected_agent_thread: Option<String>,
@@ -1427,7 +1425,6 @@ impl AverroesApp {
             show_sources: true,
             show_tool_activity: true,
             show_context: false,
-            work_rail_hovered: false,
             conversation_list,
             conversation_list_session: None,
             selected_agent_thread: None,
@@ -10873,193 +10870,50 @@ impl AverroesApp {
         let work_rail_markers = checkpoints
             .iter()
             .map(|checkpoint| {
-                let color = match checkpoint.status {
-                    CheckpointStatus::Completed => theme.success,
-                    CheckpointStatus::InProgress => theme.warning,
-                    CheckpointStatus::Blocked => theme.destructive,
-                    CheckpointStatus::Pending => theme.faint,
-                };
-                let checkpoint_id = checkpoint.id.clone();
-                let message_position = checkpoint.message_position;
-                div()
-                    .id(SharedString::from(format!(
-                        "checkpoint-marker-{}-{checkpoint_id}",
-                        session_id.as_str()
-                    )))
-                    .flex_none()
-                    .size(px(18.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme.surface_hover))
-                    .child(div().size(px(6.0)).rounded_full().bg(color))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.scroll_to_checkpoint(message_position, cx);
-                    }))
-                    .into_any_element()
-            })
-            .chain(tasks.iter().map(|task| {
-                let task_id = task.id.clone();
-                div()
-                    .id(SharedString::from(format!(
-                        "task-marker-{}-{task_id}",
-                        session_id.as_str()
-                    )))
-                    .flex_none()
-                    .size(px(18.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(div().size(px(6.0)).rounded_full().bg(
-                        if task.status == TaskStatus::Done {
-                            theme.success
-                        } else {
-                            theme.faint
-                        },
-                    ))
-                    .into_any_element()
-            }))
-            .collect::<Vec<_>>();
-        let checkpoint_rows = checkpoints
-            .into_iter()
-            .map(|checkpoint| {
-                let checkpoint_id = checkpoint.id.clone();
-                let message_position = checkpoint.message_position;
                 let (icon, color) = match checkpoint.status {
                     CheckpointStatus::Completed => (IconName::CircleCheck, theme.success),
                     CheckpointStatus::InProgress => (IconName::Loader, theme.warning),
                     CheckpointStatus::Blocked => (IconName::CircleX, theme.destructive),
                     CheckpointStatus::Pending => (IconName::Ellipsis, theme.faint),
                 };
-                let detail = checkpoint
-                    .detail
-                    .clone()
-                    .filter(|detail| !detail.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        checkpoint
-                            .status
-                            .as_str()
-                            .replace('_', " ")
-                            .to_ascii_uppercase()
-                    });
-                let title = checkpoint.title.clone();
-                div()
-                    .id(SharedString::from(format!(
-                        "checkpoint-{}-{checkpoint_id}",
-                        session_id.as_str()
-                    )))
-                    .flex()
-                    .items_start()
-                    .gap(px(8.0))
-                    .w_full()
-                    .px(px(8.0))
-                    .py(px(7.0))
-                    .rounded(px(9.0))
-                    .child(
-                        Icon::new(icon)
-                            .flex_none()
-                            .mt(px(1.0))
-                            .size(px(14.0))
-                            .text_color(color),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(3.0))
-                            .child(
-                                div()
-                                    .min_w(px(0.0))
-                                    .whitespace_normal()
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.foreground)
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .min_w(px(0.0))
-                                    .whitespace_normal()
-                                    .text_size(px(10.0))
-                                    .text_color(theme.muted)
-                                    .child(detail),
-                            ),
-                    )
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme.surface_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.scroll_to_checkpoint(message_position, cx);
-                    }))
-                    .into_any_element()
+                let checkpoint_id = checkpoint.id.clone();
+                let message_position = checkpoint.message_position;
+                let tooltip = checkpoint.title.clone();
+                Button::new(SharedString::from(format!(
+                    "checkpoint-marker-{}-{checkpoint_id}",
+                    session_id.as_str()
+                )))
+                .ghost()
+                .small()
+                .icon(icon)
+                .text_color(color)
+                .tooltip(tooltip)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.scroll_to_checkpoint(message_position, cx);
+                }))
+                .into_any_element()
             })
-            .collect::<Vec<_>>();
-        let task_rows = tasks
-            .into_iter()
-            .map(|task| {
+            .chain(tasks.iter().map(|task| {
+                let task_id = task.id.clone();
                 let done = task.status == TaskStatus::Done;
-                let task_title = task.title.clone();
-                let task_status = if done { "DONE" } else { "PENDING" };
-                div()
-                    .id(SharedString::from(format!(
-                        "task-{}-{}",
-                        session_id.as_str(),
-                        task.id
-                    )))
-                    .flex()
-                    .items_start()
-                    .gap(px(8.0))
-                    .w_full()
-                    .px(px(8.0))
-                    .py(px(7.0))
-                    .rounded(px(9.0))
-                    .child(
-                        Icon::new(if done {
-                            IconName::CircleCheck
-                        } else {
-                            IconName::Ellipsis
-                        })
-                        .flex_none()
-                        .mt(px(1.0))
-                        .size(px(14.0))
-                        .text_color(if done {
-                            theme.success
-                        } else {
-                            theme.faint
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap(px(3.0))
-                            .child(
-                                div()
-                                    .min_w(px(0.0))
-                                    .whitespace_normal()
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.foreground)
-                                    .child(task_title),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(if done { theme.success } else { theme.faint })
-                                    .child(task_status),
-                            ),
-                    )
-                    .hover(|style| style.bg(theme.surface_hover))
-                    .into_any_element()
-            })
+                let tooltip = task.title.clone();
+                Button::new(SharedString::from(format!(
+                    "task-marker-{}-{task_id}",
+                    session_id.as_str()
+                )))
+                .ghost()
+                .small()
+                .icon(if done {
+                    IconName::CircleCheck
+                } else {
+                    IconName::Ellipsis
+                })
+                .text_color(if done { theme.success } else { theme.faint })
+                .tooltip(tooltip)
+                .into_any_element()
+            }))
             .collect::<Vec<_>>();
-        let has_checkpoints = !checkpoint_rows.is_empty();
-        let has_tasks = !task_rows.is_empty();
+        let has_work_markers = !work_rail_markers.is_empty();
         let header_actions = conversation_actions_button(
             session_id.to_string(),
             format!("header-conversation-actions-{}", session_id.as_str()),
@@ -11213,7 +11067,7 @@ impl AverroesApp {
                                     .child(self.render_composer_stack(false, cx)),
                             ),
                     )
-                    .when(has_checkpoints || has_tasks, |this| {
+                    .when(has_work_markers, |this| {
                         this.child(
                             div()
                                 .id(SharedString::from(format!(
@@ -11224,21 +11078,11 @@ impl AverroesApp {
                                 .left(px(0.0))
                                 .top(px(0.0))
                                 .bottom(px(0.0))
-                                .w(px(if self.work_rail_hovered {
-                                    WORK_RAIL_TRIGGER_WIDTH + WORK_RAIL_WIDTH
-                                } else {
-                                    WORK_RAIL_TRIGGER_WIDTH
-                                }))
-                                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                    if this.work_rail_hovered != *hovered {
-                                        this.work_rail_hovered = *hovered;
-                                        cx.notify();
-                                    }
-                                }))
+                                .w(px(WORK_RAIL_TRIGGER_WIDTH))
                                 .child(
                                     div()
                                         .absolute()
-                                        .left(px(10.0))
+                                        .left(px(4.0))
                                         .top(px(20.0))
                                         .max_h(px(220.0))
                                         .px(px(2.0))
@@ -11253,54 +11097,7 @@ impl AverroesApp {
                                         .bg(theme.surface)
                                         .overflow_hidden()
                                         .children(work_rail_markers),
-                                )
-                                .when(self.work_rail_hovered, |rail| {
-                                    rail.child(
-                                        div()
-                                            .absolute()
-                                            .left(px(WORK_RAIL_TRIGGER_WIDTH))
-                                            .top(px(8.0))
-                                            .bottom(px(8.0))
-                                            .w(px(WORK_RAIL_WIDTH))
-                                            .px(px(12.0))
-                                            .py(px(14.0))
-                                            .rounded(px(12.0))
-                                            .border_1()
-                                            .border_color(theme.border)
-                                            .bg(theme.surface)
-                                            .overflow_y_scrollbar()
-                                            .occlude()
-                                            .when(has_checkpoints, |this| {
-                                                this.child(
-                                                    div()
-                                                        .px(px(8.0))
-                                                        .pb(px(6.0))
-                                                        .text_size(px(10.0))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(theme.faint)
-                                                        .child(i18n::text(cx, "chat.checkpoints")),
-                                                )
-                                                .children(checkpoint_rows)
-                                            })
-                                            .when(has_tasks, |this| {
-                                                this.child(div().h(px(if has_checkpoints {
-                                                    12.0
-                                                } else {
-                                                    0.0
-                                                })))
-                                                .child(
-                                                    div()
-                                                        .px(px(8.0))
-                                                        .pb(px(6.0))
-                                                        .text_size(px(10.0))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(theme.faint)
-                                                        .child(i18n::text(cx, "chat.tasks")),
-                                                )
-                                                .children(task_rows)
-                                            }),
-                                    )
-                                }),
+                                ),
                         )
                     })
                     .when(self.show_context, |this| {
@@ -15790,15 +15587,9 @@ fn render_agent_thread_message(
                 cx,
             )),
             AgentThreadBlock::Text { start, end } => message.text.get(start..end).map(|text| {
-                if streaming {
-                    render_streaming_markdown(theme, text)
-                        .text_size(px(14.0))
-                        .into_any_element()
-                } else {
-                    TextView::markdown(format!("{message_id}-text-{start}"), text.to_owned())
-                        .selectable(true)
-                        .into_any_element()
-                }
+                TextView::markdown(format!("{message_id}-text-{start}"), text.to_owned())
+                    .selectable(true)
+                    .into_any_element()
             }),
         })
         .collect::<Vec<_>>();
@@ -15822,6 +15613,7 @@ fn render_agent_thread_reasoning(
 ) -> AnyElement {
     let expanded = message.reasoning_expanded;
     let reasoning_complete = reasoning_is_complete_for_display(message, streaming);
+    let reasoning_text_streaming = reasoning_text_is_streaming(message, streaming);
     let reasoning_groups = reasoning_tool_activity_groups(&message.tool_activities);
     let active_reasoning_group_id = streaming
         .then(|| message.active_reasoning_tool_group())
@@ -15839,7 +15631,7 @@ fn render_agent_thread_reasoning(
                     render_reasoning_text_segment(
                         format!("agent-thread-reasoning-text-{thread_id}-{message_index}-{start}"),
                         segment,
-                        !reasoning_complete && end == message.reasoning.len(),
+                        reasoning_text_streaming && end == message.reasoning.len(),
                         theme,
                     )
                 })
@@ -15933,9 +15725,10 @@ fn render_agent_thread_reasoning(
 #[cfg(test)]
 mod agent_thread_render_tests {
     use super::{
-        agent_thread_blocks, reasoning_is_complete_for_display, reasoning_tool_activity_groups,
-        tool_activity_groups, tool_group_stream_blocks, AgentThreadBlock, ShellMessage,
-        ToolActivity, ToolActivityState, ToolStreamBlock, LEGACY_REASONING_TOOL_GROUP_ID,
+        agent_thread_blocks, reasoning_is_complete_for_display, reasoning_text_is_streaming,
+        reasoning_tool_activity_groups, tool_activity_groups, tool_group_stream_blocks,
+        AgentThreadBlock, ShellMessage, ToolActivity, ToolActivityState, ToolStreamBlock,
+        LEGACY_REASONING_TOOL_GROUP_ID,
     };
     use std::time::Instant;
 
@@ -16007,6 +15800,7 @@ mod agent_thread_render_tests {
 
         assert!(!reasoning_is_complete_for_display(&message, true));
         assert!(reasoning_is_complete_for_display(&message, false));
+        assert!(!reasoning_text_is_streaming(&message, true));
     }
 
     #[test]
@@ -16800,6 +16594,10 @@ fn reasoning_is_complete_for_display(message: &ShellMessage, streaming: bool) ->
     message.reasoning_complete && !streaming
 }
 
+fn reasoning_text_is_streaming(message: &ShellMessage, streaming: bool) -> bool {
+    streaming && !message.reasoning_complete
+}
+
 fn render_message(
     session_id: &SessionId,
     index: usize,
@@ -16862,6 +16660,7 @@ fn render_message(
         let reasoning_expanded = message.reasoning_expanded;
         let reasoning_session_id = session_id.clone();
         let reasoning_complete = reasoning_is_complete_for_display(message, streaming);
+        let reasoning_text_streaming = reasoning_text_is_streaming(message, streaming);
         let reasoning_groups = reasoning_tool_activity_groups(&message.tool_activities);
         let active_reasoning_group_id = streaming
             .then(|| message.active_reasoning_tool_group())
@@ -16882,7 +16681,7 @@ fn render_message(
                                 reasoning_session_id.as_str()
                             ),
                             segment,
-                            !reasoning_complete && end == message.reasoning.len(),
+                            reasoning_text_streaming && end == message.reasoning.len(),
                             theme,
                         )
                     })
