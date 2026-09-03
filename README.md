@@ -18,16 +18,62 @@ with care.
 - Multiple connections to the same provider, with credentials kept outside the
   conversation data.
 - Workspace-aware `AGENTS.md` instructions and on-demand Markdown skills.
-- Built-in tools for files, shell sessions, web research, tasks, memory,
-  checkpoints, questions, and delegated agents.
-- Global memory for durable user-approved facts and deep memory for searching
-  older conversation context through the local embedding index.
+- Built-in tools for files, patches, shell sessions, web research, a local
+  browser, macOS desktop control, tasks, memory, checkpoints, questions, and
+  delegated agents.
+- Global memory for durable user-approved facts, with an explicit ask before
+  anything is stored, and deep memory for searching older conversation context
+  through the local embedding index.
+- Per-project MCP servers (`stdio`, Streamable HTTP, and page-level WebMCP)
+  with OAuth tokens kept in the Keychain vault, never in `mcp.yaml`.
+- Remote Agent: the same live conversation on Telegram, with access control,
+  approvals, and optional desktop screenshots.
 - SQLite persistence for conversations, messages, usage, sources, tool events,
   tasks, checkpoints, and embedding metadata.
 - Live tool and reasoning activity in the UI, grouped without hiding the
   underlying event order.
 - macOS update checks and release DMGs generated automatically from GitHub
   Releases.
+
+## Install
+
+Averroes ships as a signed, notarized macOS app. The current public build is
+arm64. macOS 13.0 is the supported runtime minimum.
+
+### From GitHub Releases
+
+1. Open the latest [GitHub Release](https://github.com/valendra-tech/averroes/releases).
+2. Download the arm64 DMG and `SHA256SUMS.txt`.
+3. Verify the archive:
+
+```bash
+shasum -a 256 -c SHA256SUMS.txt
+```
+
+4. Open the DMG and drag Averroes to Applications.
+
+The application checks for newer releases at startup. When an update is
+available, download and open the verified DMG from the update dialog.
+
+### From source
+
+Requires Rust stable with Cargo, on macOS:
+
+```bash
+git clone git@github.com:valendra-tech/averroes.git
+cd averroes
+cargo run -p averroes-gpui
+```
+
+To build a local DMG:
+
+```bash
+VERSION=1.2.3 scripts/bundle-macos.sh
+```
+
+The script requires `cargo`, `hdiutil`, `plutil`, `ditto`, `vtool`, and `lipo`.
+Local packaging does not notarize. A configured provider connection is required
+for model requests; Ollama can be used locally without an API key.
 
 ## Repository layout
 
@@ -109,13 +155,15 @@ that credentials, model catalogs, and connection metadata remain consistent.
 The registry is extensible and the agent discovers the complete registered
 catalog before enabling tools for a task. The built-in groups are:
 
-- Workspace: `bash`, `file_read`, `file_write`, `glob`, `grep`, `checkpoint`.
-- Web: `web_search`, `web_fetch` (the latter uses OxiBrowser and contributes
-  opened pages to conversation sources).
+- Workspace: `bash`, `change_directory`, `file_read`, `file_write`, `patch`,
+  `glob`, `grep`, `checkpoint`.
+- Web: `web_search`, `web_fetch`, and `browser` (OxiBrowser; fetch and browser
+  contribute opened pages to conversation sources).
+- Desktop: `desktop_screenshot`, `desktop_input` (macOS UI capture and input).
 - Discovery: `discover_tools`, `enable_tools`, `list_tools`.
 - Skills: `list_skills`, `load_skill`, `search_skills`, `install_skill`.
 - Tasks: `task_list`, `add_task`, `mark_task_as_done`.
-- Memory: `create_global_memory`, `delete_global_memory`,
+- Memory: `create_global_memory`, `delete_global_memory`, `search_memory`,
   `search_deep_memory`, `get_deep_memory`.
 - Agents and interaction: `list_agents`, `call_agents`, `ask_user`.
 
