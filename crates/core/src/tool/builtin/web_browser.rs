@@ -1,5 +1,6 @@
 //! Shared OxiBrowser lifecycle and URL validation for internet tools.
 
+use oxibrowser_core::network::IpFilter;
 use oxibrowser_core::{Browser, BrowserConfig};
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,6 +88,13 @@ pub(crate) fn validate_url(tool: &str, raw_url: &str) -> Result<String> {
         });
     }
 
+    if !IpFilter::block_private().is_hostname_allowed(url.host_str().unwrap()) {
+        return Err(ToolError::InvalidParams {
+            tool: tool.into(),
+            message: "The URL host is private, local, or could not be resolved safely".into(),
+        });
+    }
+
     Ok(url.to_string())
 }
 
@@ -109,6 +117,13 @@ mod tests {
     fn runtime_stays_off_until_a_page_is_requested() {
         let runtime = BrowserRuntime::default();
         assert!(runtime.browser.get().is_none());
+    }
+
+    #[test]
+    fn rejects_private_and_local_hosts_before_navigation() {
+        assert!(validate_url("browser", "http://127.0.0.1").is_err());
+        assert!(validate_url("browser", "http://[::1]").is_err());
+        assert!(validate_url("browser", "http://localhost").is_err());
     }
 
     #[tokio::test]

@@ -4,10 +4,10 @@ mod app;
 mod i18n;
 mod keychain;
 mod remote_agent;
-mod telegram_markdown;
 mod runtime;
 mod session;
 mod shortcuts;
+mod telegram_markdown;
 #[path = "views/chat/tool_details.rs"]
 mod tool_details;
 #[path = "views/chat/tool_groups.rs"]

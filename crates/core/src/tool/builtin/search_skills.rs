@@ -12,6 +12,7 @@ pub struct SearchSkillsTool {
     marketplace: Arc<dyn SkillMarketplaceBackend>,
 }
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchSkillsParams {
     #[serde(default)]
     query: Option<String>,

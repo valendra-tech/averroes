@@ -1,13 +1,37 @@
 use super::shell_session::{default_input_wait, ShellSessionManager};
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 
+const MAX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const MIN_COMMAND_TIMEOUT: Duration = Duration::from_millis(100);
+
 #[derive(Default)]
 pub struct BashTool {
     sessions: ShellSessionManager,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BashParams {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    input: Option<String>,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    detach: bool,
+    #[serde(default)]
+    wait_ms: Option<u64>,
+    #[serde(default)]
+    timeout: Option<u64>,
+    #[serde(default)]
+    close: bool,
 }
 
 #[async_trait]
@@ -42,11 +66,16 @@ impl Tool for BashTool {
                 },
                 "wait_ms": {
                     "type": "integer",
+                    "minimum": 100,
+                    "maximum": 120000,
                     "description": "How long to collect output for detached commands or input-only calls, in milliseconds."
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Optional timeout in milliseconds"
+                    "minimum": 100,
+                    "maximum": 600000,
+                    "default": 120000,
+                    "description": "Optional timeout in milliseconds for an attached command."
                 },
                 "close": {
                     "type": "boolean",
@@ -62,19 +91,20 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
+        let params: BashParams =
+            serde_json::from_value(params.clone()).map_err(|error| ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: error.to_string(),
+            })?;
         let current_dir = ctx.current_dir();
         let session_name = params
-            .get("session")
-            .and_then(Value::as_str)
+            .session
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("default");
 
-        if params
-            .get("close")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+        if params.close {
             let closed = self
                 .sessions
                 .close(&ctx.session_id, session_name, &current_dir)
@@ -95,8 +125,8 @@ impl Tool for BashTool {
             })));
         }
 
-        let command = params.get("command").and_then(Value::as_str);
-        let input = params.get("input").and_then(Value::as_str);
+        let command = params.command.as_deref();
+        let input = params.input.as_deref();
         if command.is_none_or(|value| value.trim().is_empty()) && input.is_none() {
             return Err(ToolError::InvalidParams {
                 tool: self.name().into(),
@@ -113,37 +143,22 @@ impl Tool for BashTool {
                 message: error.to_string(),
             })?;
         let output = if let Some(command) = command.filter(|value| !value.trim().is_empty()) {
-            if params
-                .get("detach")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
+            if params.detach {
                 session
-                    .start_detached(
-                        command,
-                        default_input_wait(params.get("wait_ms").and_then(Value::as_u64)),
-                    )
+                    .start_detached(command, default_input_wait(params.wait_ms))
                     .await
             } else {
-                let timeout = params
-                    .get("timeout")
-                    .and_then(Value::as_u64)
-                    .map(Duration::from_millis)
-                    .unwrap_or_else(|| Duration::from_secs(120));
-                session.run_command(command, timeout).await
+                session
+                    .run_command(command, command_timeout(params.timeout))
+                    .await
             }
         } else if let Some(input) = input {
             session
-                .send_input(
-                    input,
-                    default_input_wait(params.get("wait_ms").and_then(Value::as_u64)),
-                )
+                .send_input(input, default_input_wait(params.wait_ms))
                 .await
         } else {
             session
-                .read_output(default_input_wait(
-                    params.get("wait_ms").and_then(Value::as_u64),
-                ))
+                .read_output(default_input_wait(params.wait_ms))
                 .await
         }
         .map_err(|error| ToolError::Execution {
@@ -177,5 +192,34 @@ impl Tool for BashTool {
         } else {
             Ok(ToolResult::ok(content).with_metadata(metadata))
         }
+    }
+}
+
+fn command_timeout(value: Option<u64>) -> Duration {
+    value
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_COMMAND_TIMEOUT)
+        .clamp(MIN_COMMAND_TIMEOUT, MAX_COMMAND_TIMEOUT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_timeout_is_bounded() {
+        assert_eq!(command_timeout(None), DEFAULT_COMMAND_TIMEOUT);
+        assert_eq!(command_timeout(Some(0)), MIN_COMMAND_TIMEOUT);
+        assert_eq!(command_timeout(Some(u64::MAX)), MAX_COMMAND_TIMEOUT);
+    }
+
+    #[test]
+    fn parameters_reject_unknown_fields() {
+        let result = serde_json::from_value::<BashParams>(json!({
+            "command": "pwd",
+            "unexpected": true
+        }));
+
+        assert!(result.is_err());
     }
 }

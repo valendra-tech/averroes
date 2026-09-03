@@ -6,6 +6,9 @@ use crate::remote_agent::{
 use crate::runtime::{AppRuntime, MarketplaceSkill};
 use crate::session::SessionId;
 use crate::shortcuts::{CloseSession, FocusInput, NewSession, Quit, SendMessage, ToggleSettings};
+use crate::telegram_markdown::{
+    format_remote_live_markdown, RemoteLiveToolLine, RemoteLiveToolStatus,
+};
 use crate::tool_details::{render_tool_detail, ToolDetailSection};
 use crate::tool_groups::{
     summarize_tool_names, ToolGroupEvent, ToolGroupRenderMode, ToolGroupTracker,
@@ -173,6 +176,8 @@ fn stream_event_requires_immediate_flush(event: &AgentStreamEvent) -> bool {
         event,
         AgentStreamEvent::ToolPreparing { .. }
             | AgentStreamEvent::ToolStarted { .. }
+            | AgentStreamEvent::ToolConfirmationRequested { .. }
+            | AgentStreamEvent::ToolConfirmationResolved { .. }
             | AgentStreamEvent::ToolFinished { .. }
             | AgentStreamEvent::ReasoningFinished
             | AgentStreamEvent::ContextUpdated { .. }
@@ -247,6 +252,16 @@ enum ToolActivityState {
     Interrupted,
 }
 
+// Kept out of the rendered text. This preserves reasoning boundaries in the
+// existing persisted column without changing the SQLite schema.
+const REASONING_BLOCK_SEPARATOR: &str = "\u{001e}";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReasoningBlockState {
+    complete: bool,
+    expanded: bool,
+}
+
 #[derive(Debug, Clone)]
 struct ToolActivity {
     /// Provider tool-call ID, when the provider exposes one. This lets the
@@ -277,10 +292,12 @@ struct ShellMessage {
     text: String,
     attachments: Vec<PathBuf>,
     reasoning: String,
+    reasoning_blocks: Vec<ReasoningBlockState>,
     reasoning_complete: bool,
     reasoning_expanded: bool,
     animate_in: bool,
     tool_activities: Vec<ToolActivity>,
+    stream_blocks: Vec<AgentThreadBlock>,
     tool_groups: ToolGroupTracker,
     expanded_tool_groups: HashSet<usize>,
 }
@@ -427,10 +444,12 @@ impl ShellMessage {
             text,
             attachments,
             reasoning: String::new(),
+            reasoning_blocks: Vec::new(),
             reasoning_complete: true,
             reasoning_expanded: false,
             animate_in: false,
             tool_activities: Vec::new(),
+            stream_blocks: Vec::new(),
             tool_groups: ToolGroupTracker::default(),
             expanded_tool_groups: HashSet::new(),
         }
@@ -442,10 +461,12 @@ impl ShellMessage {
             text: String::new(),
             attachments: Vec::new(),
             reasoning: String::new(),
+            reasoning_blocks: Vec::new(),
             reasoning_complete: false,
             reasoning_expanded: false,
             animate_in: true,
             tool_activities: Vec::new(),
+            stream_blocks: Vec::new(),
             tool_groups: ToolGroupTracker::default(),
             expanded_tool_groups: HashSet::new(),
         }
@@ -457,10 +478,12 @@ impl ShellMessage {
             text: text.into(),
             attachments: Vec::new(),
             reasoning: String::new(),
+            reasoning_blocks: Vec::new(),
             reasoning_complete: true,
             reasoning_expanded: false,
             animate_in: false,
             tool_activities: Vec::new(),
+            stream_blocks: Vec::new(),
             tool_groups: ToolGroupTracker::default(),
             expanded_tool_groups: HashSet::new(),
         }
@@ -475,8 +498,132 @@ impl ShellMessage {
         self.tool_groups.close_on_assistant_text();
     }
 
-    fn reasoning_arrived(&mut self) {
-        self.tool_groups.apply(ToolGroupEvent::Reasoning);
+    fn append_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let start = self.text.len();
+        self.text.push_str(text);
+        let end = self.text.len();
+        match self.stream_blocks.last_mut() {
+            Some(AgentThreadBlock::Text {
+                start: _,
+                end: block_end,
+            }) if *block_end == start => {
+                *block_end = end;
+            }
+            _ => self
+                .stream_blocks
+                .push(AgentThreadBlock::Text { start, end }),
+        }
+        self.assistant_text_arrived();
+    }
+
+    fn push_tool_activity(&mut self, activity: ToolActivity) {
+        let activity_index = self.tool_activities.len();
+        if activity.inside_reasoning {
+            let block_index = self.reasoning_blocks.len().saturating_sub(1);
+            if !self.stream_blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    AgentThreadBlock::Reasoning { block_index: index }
+                        if *index == block_index
+                )
+            }) {
+                self.stream_blocks
+                    .push(AgentThreadBlock::Reasoning { block_index });
+            }
+        }
+        self.tool_activities.push(activity);
+        self.stream_blocks
+            .push(AgentThreadBlock::Tool { activity_index });
+    }
+
+    fn append_reasoning(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let starts_new_block = match self.reasoning_blocks.last() {
+            None => true,
+            Some(block) if !block.complete => false,
+            Some(_) => self
+                .stream_blocks
+                .last()
+                .is_none_or(|stream_block| match stream_block {
+                    AgentThreadBlock::Reasoning { .. } => false,
+                    AgentThreadBlock::Text { .. } => true,
+                    AgentThreadBlock::Tool { activity_index } => self
+                        .tool_activities
+                        .get(*activity_index)
+                        .is_none_or(|activity| !activity.inside_reasoning),
+                }),
+        };
+        if starts_new_block {
+            if !self.reasoning.is_empty() {
+                self.reasoning.push_str(REASONING_BLOCK_SEPARATOR);
+            }
+            self.reasoning_blocks.push(ReasoningBlockState {
+                complete: false,
+                expanded: true,
+            });
+            self.tool_groups.apply(ToolGroupEvent::Reasoning);
+        }
+        let block_index = self.reasoning_blocks.len().saturating_sub(1);
+        if !matches!(
+            self.stream_blocks.last(),
+            Some(AgentThreadBlock::Reasoning {
+                block_index: index
+            }) if *index == block_index
+        ) {
+            self.stream_blocks
+                .push(AgentThreadBlock::Reasoning { block_index });
+        }
+        self.reasoning.push_str(text);
+        if let Some(block) = self.reasoning_blocks.last_mut() {
+            block.complete = false;
+            block.expanded = true;
+        }
+        self.reasoning_complete = false;
+        self.reasoning_expanded = true;
+    }
+
+    fn finish_reasoning(&mut self) {
+        if let Some(block) = self.reasoning_blocks.last_mut() {
+            block.complete = true;
+            block.expanded = false;
+        }
+        self.reasoning_complete = true;
+        self.reasoning_expanded = false;
+    }
+
+    fn toggle_reasoning_block(&mut self, block_index: usize) {
+        self.ensure_reasoning_blocks();
+        if let Some(block) = self.reasoning_blocks.get_mut(block_index) {
+            block.expanded = !block.expanded;
+            self.reasoning_expanded = self.reasoning_blocks.iter().any(|block| block.expanded);
+        }
+    }
+
+    fn ensure_reasoning_blocks(&mut self) {
+        if !self.reasoning_blocks.is_empty() {
+            return;
+        }
+        if !self.reasoning.is_empty() {
+            self.reasoning_blocks = reasoning_block_states(
+                &self.reasoning,
+                self.reasoning_complete,
+                self.reasoning_expanded,
+            );
+        } else if self
+            .tool_activities
+            .iter()
+            .any(tool_activity_belongs_to_reasoning)
+        {
+            self.reasoning_blocks.push(ReasoningBlockState {
+                complete: self.reasoning_complete,
+                expanded: self.reasoning_expanded,
+            });
+        }
     }
 
     fn is_tool_group_expanded(&self, group_id: usize) -> bool {
@@ -551,12 +698,114 @@ fn work_tool_activity_from_shell(activity: &ToolActivity) -> WorkToolActivity {
     }
 }
 
+fn reasoning_block_states(
+    reasoning: &str,
+    reasoning_complete: bool,
+    reasoning_expanded: bool,
+) -> Vec<ReasoningBlockState> {
+    let block_count = reasoning
+        .match_indices(REASONING_BLOCK_SEPARATOR)
+        .count()
+        .saturating_add(usize::from(!reasoning.is_empty()));
+    if block_count == 0 {
+        return Vec::new();
+    }
+    (0..block_count)
+        .map(|index| ReasoningBlockState {
+            complete: index + 1 < block_count || reasoning_complete,
+            expanded: index + 1 == block_count && reasoning_expanded,
+        })
+        .collect()
+}
+
+fn reasoning_block_ranges(reasoning: &str) -> Vec<(usize, usize)> {
+    if reasoning.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for (separator_start, separator) in reasoning.match_indices(REASONING_BLOCK_SEPARATOR) {
+        ranges.push((start, separator_start));
+        start = separator_start + separator.len();
+    }
+    ranges.push((start, reasoning.len()));
+    ranges
+}
+
+fn reasoning_block_ranges_for_message(message: &ShellMessage) -> Vec<(usize, usize)> {
+    let mut ranges = reasoning_block_ranges(&message.reasoning);
+    if ranges.is_empty()
+        && message
+            .tool_activities
+            .iter()
+            .any(tool_activity_belongs_to_reasoning)
+    {
+        ranges.push((0, 0));
+    }
+    ranges
+}
+
+fn reasoning_blocks_for_message(message: &ShellMessage) -> Vec<ReasoningBlockState> {
+    if !message.reasoning_blocks.is_empty() {
+        return message.reasoning_blocks.clone();
+    }
+    let mut blocks = reasoning_block_states(
+        &message.reasoning,
+        message.reasoning_complete,
+        message.reasoning_expanded,
+    );
+    if blocks.is_empty()
+        && message
+            .tool_activities
+            .iter()
+            .any(tool_activity_belongs_to_reasoning)
+    {
+        blocks.push(ReasoningBlockState {
+            complete: message.reasoning_complete,
+            expanded: message.reasoning_expanded,
+        });
+    }
+    blocks
+}
+
+fn reasoning_block_index_for_offset(ranges: &[(usize, usize)], offset: usize) -> usize {
+    ranges
+        .iter()
+        .enumerate()
+        .find_map(|(index, (_, end))| {
+            (index + 1 == ranges.len() || offset <= *end).then_some(index)
+        })
+        .unwrap_or_else(|| ranges.len().saturating_sub(1))
+}
+
+fn reasoning_tool_activity_groups_for_block(
+    reasoning: &str,
+    activities: &[ToolActivity],
+    ranges: &[(usize, usize)],
+    block_index: usize,
+) -> Vec<(usize, Vec<usize>)> {
+    reasoning_tool_activity_groups(activities)
+        .into_iter()
+        .filter(|(_, activity_indices)| {
+            activity_indices.first().is_some_and(|activity_index| {
+                let offset = activities[*activity_index].text_offset.min(reasoning.len());
+                reasoning_block_index_for_offset(ranges, offset) == block_index
+            })
+        })
+        .collect()
+}
+
 fn shell_message_from_work(message: WorkMessage) -> ShellMessage {
     let tool_groups = ToolGroupTracker::from_persisted_group_ids(
         message
             .tool_activities
             .iter()
             .filter_map(|activity| activity.group_id),
+    );
+    let reasoning_blocks = reasoning_block_states(
+        &message.reasoning,
+        message.reasoning_complete,
+        message.reasoning_expanded,
     );
     ShellMessage {
         role: match message.role {
@@ -567,6 +816,7 @@ fn shell_message_from_work(message: WorkMessage) -> ShellMessage {
         text: message.text,
         attachments: Vec::new(),
         reasoning: message.reasoning,
+        reasoning_blocks,
         reasoning_complete: message.reasoning_complete,
         reasoning_expanded: message.reasoning_expanded,
         animate_in: false,
@@ -575,6 +825,7 @@ fn shell_message_from_work(message: WorkMessage) -> ShellMessage {
             .into_iter()
             .map(shell_tool_activity_from_work)
             .collect(),
+        stream_blocks: Vec::new(),
         tool_groups,
         expanded_tool_groups: message.expanded_tool_groups.into_iter().collect(),
     }
@@ -628,6 +879,7 @@ struct ShellSession {
     queued_messages: Vec<QueuedMessage>,
     queue_autostart: bool,
     pending_user_question: Option<averroes_core::tool::builtin::ask_user::UserQuestion>,
+    pending_user_question_session_id: Option<String>,
     context_usage: ContextUsage,
     agent_threads: Vec<AgentThreadSnapshot>,
     agent_thread_transcripts: HashMap<String, AgentThreadTranscript>,
@@ -658,6 +910,7 @@ impl ShellSession {
             queued_messages: Vec::new(),
             queue_autostart: false,
             pending_user_question: None,
+            pending_user_question_session_id: None,
             context_usage: ContextUsage::unknown(0),
             agent_threads: Vec::new(),
             agent_thread_transcripts: HashMap::new(),
@@ -698,6 +951,7 @@ impl ShellSession {
             queued_messages: Vec::new(),
             queue_autostart: false,
             pending_user_question: None,
+            pending_user_question_session_id: None,
             context_usage: conversation.context_usage,
             agent_threads: conversation
                 .agent_threads
@@ -3230,12 +3484,19 @@ impl AverroesApp {
         else {
             return false;
         };
+        let answer_session_id = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.pending_user_question_session_id.clone())
+            .map(SessionId)
+            .unwrap_or_else(|| session_id.clone());
         let answer_for_relay = answer.clone();
         if expected_question_id.is_some_and(|question_id| question_id != question.id)
             || answer.trim().is_empty()
             || !self
                 .runtime
-                .answer_user_question(&session_id, &question.id, answer)
+                .answer_user_question(&answer_session_id, &question.id, answer)
         {
             self.send_remote_text(
                 chat_id,
@@ -3251,6 +3512,7 @@ impl AverroesApp {
             .find(|session| session.id == session_id)
         {
             session.pending_user_question = None;
+            session.pending_user_question_session_id = None;
         }
         self.relay_remote_user_answer(
             &session_id,
@@ -3751,6 +4013,8 @@ impl AverroesApp {
     }
 
     fn persist_active(&mut self, cx: &mut Context<Self>) -> bool {
+        let session_id = self.active().id.clone();
+        self.sync_runtime_agent_threads(&session_id);
         let snapshot = self.active().snapshot();
         match self.runtime.database.save_conversation(&snapshot) {
             Ok(()) => {
@@ -3777,6 +4041,7 @@ impl AverroesApp {
         let Some(index) = self.sessions.iter().position(|session| &session.id == id) else {
             return false;
         };
+        self.sync_runtime_agent_threads(id);
         let snapshot = self.sessions[index].snapshot();
         let saved = match self.runtime.database.save_conversation(&snapshot) {
             Ok(()) => {
@@ -3797,6 +4062,28 @@ impl AverroesApp {
         };
         cx.notify();
         saved
+    }
+
+    fn sync_runtime_agent_threads(&mut self, session_id: &SessionId) {
+        let updates = self.runtime.agent_threads_for(session_id.as_str());
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| &session.id == session_id)
+        else {
+            return;
+        };
+        for thread in updates {
+            if let Some(existing) = session
+                .agent_threads
+                .iter_mut()
+                .find(|existing| existing.id == thread.id)
+            {
+                *existing = thread;
+            } else {
+                session.agent_threads.push(thread);
+            }
+        }
     }
 
     fn persist_pending_conversation_folder(
@@ -3830,13 +4117,6 @@ impl AverroesApp {
                 self.refresh_conversation_folders();
             }
             Err(error) => self.show_error(error.to_string(), cx),
-        }
-    }
-
-    fn persist_session_binding(&mut self, id: &SessionId, cx: &mut Context<Self>) {
-        self.persist_session(id, cx);
-        if self.active().id == *id {
-            self.remember_active_setup(cx);
         }
     }
 
@@ -4187,12 +4467,29 @@ impl AverroesApp {
         // Dropping the GPUI task also drops AgentStreamHandle, which aborts
         // the provider task and closes the stream. Keep the partial assistant
         // bubble visible so a forced follow-up has an honest transcript.
-        let _stream_task = self.active_mut().task.take();
+        drop(self.active_mut().task.take());
+        self.runtime
+            .interrupt_agent_threads_for(session_id.as_str());
+        let pending_question_session_id = self
+            .active()
+            .pending_user_question_session_id
+            .clone()
+            .unwrap_or_else(|| session_id.to_string());
+        let pending_question_id = self
+            .active()
+            .pending_user_question
+            .as_ref()
+            .map(|question| question.id.clone());
+        self.runtime.cancel_user_question(
+            &SessionId(pending_question_session_id),
+            pending_question_id.as_deref(),
+        );
         let session = self.active_mut();
         session.processing = false;
         session.queue_autostart = false;
         session.context_busy = false;
         session.pending_user_question = None;
+        session.pending_user_question_session_id = None;
         if let Some(message) = session.messages.last_mut() {
             message.reasoning_complete = true;
             for activity in &mut message.tool_activities {
@@ -5649,7 +5946,7 @@ impl AverroesApp {
                         message.text.len()
                     };
                     let group_id = message.assign_tool_group(inside_reasoning);
-                    message.tool_activities.push(ToolActivity {
+                    message.push_tool_activity(ToolActivity {
                         call_id: None,
                         name: "compact_conversation".into(),
                         text_offset,
@@ -5720,7 +6017,7 @@ impl AverroesApp {
                     message.text.len()
                 };
                 let group_id = message.assign_tool_group(inside_reasoning);
-                message.tool_activities.push(ToolActivity {
+                message.push_tool_activity(ToolActivity {
                     call_id: None,
                     name: "compact_conversation".into(),
                     text_offset,
@@ -5927,6 +6224,7 @@ impl AverroesApp {
         &mut self,
         session_id: &SessionId,
         message_index: usize,
+        block_index: usize,
         cx: &mut Context<Self>,
     ) {
         let toggled = self
@@ -5935,7 +6233,7 @@ impl AverroesApp {
             .find(|session| &session.id == session_id)
             .and_then(|session| session.messages.get_mut(message_index))
             .map(|message| {
-                message.reasoning_expanded = !message.reasoning_expanded;
+                message.toggle_reasoning_block(block_index);
             })
             .is_some();
 
@@ -5999,6 +6297,7 @@ impl AverroesApp {
         &mut self,
         thread_id: &str,
         message_index: usize,
+        block_index: usize,
         cx: &mut Context<Self>,
     ) {
         let toggled = self
@@ -6007,7 +6306,7 @@ impl AverroesApp {
             .get_mut(thread_id)
             .and_then(|transcript| transcript.messages.get_mut(message_index))
             .map(|message| {
-                message.reasoning_expanded = !message.reasoning_expanded;
+                message.toggle_reasoning_block(block_index);
             })
             .is_some();
         if toggled {
@@ -6079,13 +6378,55 @@ impl AverroesApp {
         session_id: &SessionId,
         thread_id: &str,
         event: AgentStreamEvent,
+        cx: &mut Context<Self>,
     ) {
         match event {
             AgentStreamEvent::DelegatedAgentStarted { thread } => {
                 self.start_agent_thread_transcript(session_id, &thread);
             }
             AgentStreamEvent::DelegatedAgentEvent { thread_id, event } => {
-                self.apply_delegated_agent_event(session_id, &thread_id, *event);
+                self.apply_delegated_agent_event(session_id, &thread_id, *event, cx);
+            }
+            AgentStreamEvent::ToolConfirmationRequested {
+                session_id: confirmation_session_id,
+                question,
+                ..
+            } => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| &session.id == session_id)
+                {
+                    session.pending_user_question = Some(question.clone());
+                    session.pending_user_question_session_id = Some(confirmation_session_id);
+                }
+                self.send_remote_user_question(session_id, &question, cx);
+                self.refresh_remote_live_reply(session_id, true, cx);
+            }
+            AgentStreamEvent::ToolConfirmationResolved {
+                session_id: confirmation_session_id,
+                question_id,
+                ..
+            } => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| &session.id == session_id)
+                {
+                    if session
+                        .pending_user_question
+                        .as_ref()
+                        .is_some_and(|question| {
+                            question.id == question_id
+                                && session.pending_user_question_session_id.as_deref()
+                                    == Some(confirmation_session_id.as_str())
+                        })
+                    {
+                        session.pending_user_question = None;
+                        session.pending_user_question_session_id = None;
+                    }
+                }
+                self.refresh_remote_live_reply(session_id, true, cx);
             }
             event => {
                 let Some(session) = self
@@ -6109,17 +6450,14 @@ impl AverroesApp {
                 match event {
                     AgentStreamEvent::TextDelta { text } => {
                         if !text.is_empty() {
-                            message.text.push_str(&text);
-                            message.assistant_text_arrived();
+                            message.append_text(&text);
                         }
                     }
                     AgentStreamEvent::ReasoningDelta { text } => {
-                        message.reasoning.push_str(&text);
-                        message.reasoning_arrived();
-                        message.reasoning_complete = false;
+                        message.append_reasoning(&text);
                     }
                     AgentStreamEvent::ReasoningFinished => {
-                        message.reasoning_complete = true;
+                        message.finish_reasoning();
                     }
                     AgentStreamEvent::ToolPreparing {
                         call_id,
@@ -6143,7 +6481,7 @@ impl AverroesApp {
                                 message.text.len()
                             };
                             let group_id = message.assign_tool_group(inside_reasoning);
-                            message.tool_activities.push(ToolActivity {
+                            message.push_tool_activity(ToolActivity {
                                 call_id: Some(call_id),
                                 name,
                                 text_offset,
@@ -6187,7 +6525,7 @@ impl AverroesApp {
                                 message.text.len()
                             };
                             let group_id = message.assign_tool_group(inside_reasoning);
-                            message.tool_activities.push(ToolActivity {
+                            message.push_tool_activity(ToolActivity {
                                 call_id,
                                 name,
                                 text_offset,
@@ -6236,7 +6574,7 @@ impl AverroesApp {
                                 message.text.len()
                             };
                             let group_id = message.assign_tool_group(inside_reasoning);
-                            message.tool_activities.push(ToolActivity {
+                            message.push_tool_activity(ToolActivity {
                                 call_id,
                                 name,
                                 text_offset,
@@ -6256,6 +6594,8 @@ impl AverroesApp {
                             });
                         }
                     }
+                    AgentStreamEvent::ToolConfirmationRequested { .. }
+                    | AgentStreamEvent::ToolConfirmationResolved { .. } => {}
                     AgentStreamEvent::CompactionStarted { reason } => {
                         let inside_reasoning = message.text.is_empty();
                         let text_offset = if inside_reasoning {
@@ -6264,7 +6604,7 @@ impl AverroesApp {
                             message.text.len()
                         };
                         let group_id = message.assign_tool_group(inside_reasoning);
-                        message.tool_activities.push(ToolActivity {
+                        message.push_tool_activity(ToolActivity {
                             call_id: None,
                             name: "compact_conversation".into(),
                             text_offset,
@@ -6319,7 +6659,49 @@ impl AverroesApp {
                 self.start_agent_thread_transcript(session_id, &thread);
             }
             AgentStreamEvent::DelegatedAgentEvent { thread_id, event } => {
-                self.apply_delegated_agent_event(session_id, &thread_id, *event);
+                self.apply_delegated_agent_event(session_id, &thread_id, *event, cx);
+            }
+            AgentStreamEvent::ToolConfirmationRequested {
+                session_id: confirmation_session_id,
+                question,
+                ..
+            } => {
+                let remote_user_question = question.clone();
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| &session.id == session_id)
+                {
+                    session.pending_user_question = Some(question);
+                    session.pending_user_question_session_id = Some(confirmation_session_id);
+                }
+                self.send_remote_user_question(session_id, &remote_user_question, cx);
+                self.refresh_remote_live_reply(session_id, true, cx);
+            }
+            AgentStreamEvent::ToolConfirmationResolved {
+                session_id: confirmation_session_id,
+                question_id,
+                ..
+            } => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| &session.id == session_id)
+                {
+                    if session
+                        .pending_user_question
+                        .as_ref()
+                        .is_some_and(|question| {
+                            question.id == question_id
+                                && session.pending_user_question_session_id.as_deref()
+                                    == Some(confirmation_session_id.as_str())
+                        })
+                    {
+                        session.pending_user_question = None;
+                        session.pending_user_question_session_id = None;
+                    }
+                }
+                self.refresh_remote_live_reply(session_id, true, cx);
             }
             AgentStreamEvent::TextDelta { text } => {
                 let Some(session) = self
@@ -6331,11 +6713,10 @@ impl AverroesApp {
                 };
                 if let Some(message) = session.messages.last_mut() {
                     if !text.is_empty() {
-                        message.text.push_str(&text);
-                        message.assistant_text_arrived();
+                        message.append_text(&text);
                     }
                 }
-                self.relay_remote_stream_delta(session_id, &text, cx);
+                self.refresh_remote_live_reply(session_id, false, cx);
             }
             AgentStreamEvent::ReasoningDelta { text } => {
                 let Some(session) = self
@@ -6346,13 +6727,9 @@ impl AverroesApp {
                     return;
                 };
                 if let Some(message) = session.messages.last_mut() {
-                    message.reasoning.push_str(&text);
-                    message.reasoning_arrived();
-                    // A tool loop can start a second reasoning phase in the
-                    // same assistant bubble. Re-open its live state until
-                    // the provider signals the next completed phase.
-                    message.reasoning_complete = false;
+                    message.append_reasoning(&text);
                 }
+                self.refresh_remote_live_reply(session_id, false, cx);
             }
             AgentStreamEvent::ReasoningFinished => {
                 if let Some(session) = self
@@ -6361,9 +6738,10 @@ impl AverroesApp {
                     .find(|session| &session.id == session_id)
                 {
                     if let Some(message) = session.messages.last_mut() {
-                        message.reasoning_complete = true;
+                        message.finish_reasoning();
                     }
                 }
+                self.refresh_remote_live_reply(session_id, true, cx);
             }
             AgentStreamEvent::ToolPreparing {
                 call_id,
@@ -6393,7 +6771,7 @@ impl AverroesApp {
                                 message.text.len()
                             };
                             let group_id = message.assign_tool_group(inside_reasoning);
-                            message.tool_activities.push(ToolActivity {
+                            message.push_tool_activity(ToolActivity {
                                 call_id: Some(call_id),
                                 name,
                                 text_offset,
@@ -6410,6 +6788,7 @@ impl AverroesApp {
                         }
                     }
                 }
+                self.refresh_remote_live_reply(session_id, true, cx);
             }
             AgentStreamEvent::ToolStarted {
                 call_id,
@@ -6440,6 +6819,7 @@ impl AverroesApp {
                 {
                     if user_question.is_some() {
                         session.pending_user_question = user_question;
+                        session.pending_user_question_session_id = Some(session_id.to_string());
                     }
                     if let Some(message) = session.messages.last_mut() {
                         if let Some(activity) =
@@ -6460,7 +6840,7 @@ impl AverroesApp {
                                 message.text.len()
                             };
                             let group_id = message.assign_tool_group(inside_reasoning);
-                            message.tool_activities.push(ToolActivity {
+                            message.push_tool_activity(ToolActivity {
                                 call_id,
                                 name,
                                 text_offset,
@@ -6480,6 +6860,7 @@ impl AverroesApp {
                 if let Some(question) = remote_user_question.as_ref() {
                     self.send_remote_user_question(session_id, question, cx);
                 }
+                self.refresh_remote_live_reply(session_id, true, cx);
             }
             AgentStreamEvent::ToolFinished {
                 call_id,
@@ -6488,19 +6869,9 @@ impl AverroesApp {
                 summary,
                 output,
                 metadata,
+                images,
             } => {
                 self.record_web_sources(session_id, &name, metadata.as_ref());
-                let enabled_tools = (name == "enable_tools" && success)
-                    .then(|| {
-                        metadata
-                            .as_ref()
-                            .and_then(|metadata| metadata.get("enabled_tools"))
-                            .and_then(|tools| {
-                                serde_json::from_value::<Vec<String>>(tools.clone()).ok()
-                            })
-                    })
-                    .flatten();
-                let mut binding_changed = false;
                 if let Some(session) = self
                     .sessions
                     .iter_mut()
@@ -6519,31 +6890,15 @@ impl AverroesApp {
                         } else {
                             ToolActivityState::Failed
                         };
-                        activity.summary = summary;
-                        activity.output = output;
+                        activity.summary = summary.clone();
+                        activity.output = output.clone();
                         activity.duration_ms =
                             Some(activity.started_at.elapsed().as_millis() as u64);
                     }
                     if name == "ask_user" {
                         session.pending_user_question = None;
+                        session.pending_user_question_session_id = None;
                     }
-                    if let Some(enabled_tools) = enabled_tools {
-                        binding_changed = apply_enabled_tools(&mut session.binding, enabled_tools);
-                        if binding_changed {
-                            diagnostics::record(
-                                DiagnosticLevel::Info,
-                                "tools.discovery",
-                                format!(
-                                    "Persisting {} activated tool(s) for conversation {}.",
-                                    session.binding.tools.len(),
-                                    session.id
-                                ),
-                            );
-                        }
-                    }
-                }
-                if binding_changed {
-                    self.persist_session_binding(session_id, cx);
                 }
                 if let Some(thread) = metadata
                     .as_ref()
@@ -6584,6 +6939,10 @@ impl AverroesApp {
                 if let Some(task) = task {
                     self.update_task(session_id, task);
                 }
+                self.refresh_remote_live_reply(session_id, true, cx);
+                if success && !images.is_empty() {
+                    self.relay_remote_tool_images(session_id, &name, &summary, images, cx);
+                }
             }
             AgentStreamEvent::ContextUpdated { usage } => {
                 if let Some(session) = self
@@ -6603,6 +6962,7 @@ impl AverroesApp {
                 {
                     session.context_busy = true;
                 }
+                self.refresh_remote_live_reply(session_id, true, cx);
             }
             AgentStreamEvent::CompactionFinished {
                 original_messages,
@@ -6626,6 +6986,7 @@ impl AverroesApp {
                         session.context_summary = understood_context;
                     }
                 }
+                self.refresh_remote_live_reply(session_id, true, cx);
             }
         }
         self.remeasure_active_conversation_tail(session_id);
@@ -6710,9 +7071,16 @@ impl AverroesApp {
             return;
         }
         let answer_for_relay = answer.clone();
+        let answer_session_id = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .and_then(|session| session.pending_user_question_session_id.clone())
+            .map(SessionId)
+            .unwrap_or_else(|| session_id.clone());
         if !self
             .runtime
-            .answer_user_question(session_id, &question.id, answer)
+            .answer_user_question(&answer_session_id, &question.id, answer)
         {
             self.show_error(i18n::text(cx, "notice.question_missing"), cx);
             return;
@@ -6723,6 +7091,7 @@ impl AverroesApp {
             .find(|session| &session.id == session_id)
         {
             session.pending_user_question = None;
+            session.pending_user_question_session_id = None;
         }
         self.relay_remote_user_answer(session_id, &answer_for_relay, None, cx);
         self.ask_user_input
@@ -8233,7 +8602,7 @@ impl AverroesApp {
                             );
                             if let Some(message) = session.messages.last_mut() {
                                 if message.text.is_empty() {
-                                    message.text = response;
+                                    message.append_text(&response);
                                 }
                             }
                         }
@@ -8302,26 +8671,123 @@ impl AverroesApp {
         }
     }
 
-    fn relay_remote_stream_delta(
+    fn refresh_remote_live_reply(
         &mut self,
         session_id: &SessionId,
-        delta: &str,
+        immediate: bool,
         cx: &mut Context<Self>,
     ) {
-        if delta.is_empty() {
+        if !self.remote_agent_live_replies.contains_key(session_id) {
             return;
         }
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+        else {
+            return;
+        };
+        let Some(message) = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+        else {
+            return;
+        };
+        let tools = message
+            .tool_activities
+            .iter()
+            .map(|activity| RemoteLiveToolLine {
+                name: activity.name.clone(),
+                status: match activity.state {
+                    ToolActivityState::Running => RemoteLiveToolStatus::Running,
+                    ToolActivityState::Failed | ToolActivityState::Interrupted => {
+                        RemoteLiveToolStatus::Failed
+                    }
+                    ToolActivityState::Completed => RemoteLiveToolStatus::Done,
+                },
+                summary: activity.summary.clone(),
+            })
+            .collect::<Vec<_>>();
+        let text = format_remote_live_markdown(
+            &normalize_reasoning_for_display(&message.reasoning),
+            &tools,
+            &message.text,
+        );
         let Some(reply) = self.remote_agent_live_replies.get_mut(session_id) else {
             return;
         };
+        if reply.text == text {
+            return;
+        }
         let was_empty = reply.text.is_empty();
-        reply.text.push_str(delta);
+        reply.text = text;
         if reply.edit_in_flight
-            || (!was_empty && reply.last_edit.elapsed() < REMOTE_LIVE_EDIT_INTERVAL)
+            || (!immediate && !was_empty && reply.last_edit.elapsed() < REMOTE_LIVE_EDIT_INTERVAL)
         {
             return;
         }
         self.schedule_remote_live_edit(session_id, cx);
+    }
+
+    fn relay_remote_tool_images(
+        &self,
+        session_id: &SessionId,
+        tool_name: &str,
+        summary: &str,
+        images: Vec<ImageSource>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(chat_id) = self
+            .remote_agent_live_replies
+            .get(session_id)
+            .map(|reply| reply.chat_id)
+        else {
+            return;
+        };
+        let Some(client) = self.remote_agent_client.clone() else {
+            return;
+        };
+        let caption = format!("`{tool_name}`\n{}", clip_remote_caption(summary));
+        let tool_name = tool_name.to_owned();
+        let runtime = self.runtime.clone();
+        let request = runtime.spawn_background(async move {
+            for (index, image) in images.into_iter().enumerate() {
+                if !matches!(
+                    image.media_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/jpg" | "image/webp" | "image/gif"
+                ) {
+                    continue;
+                }
+                let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(image.data) else {
+                    diagnostics::record(
+                        DiagnosticLevel::Warning,
+                        "remote_agent.telegram",
+                        format!("Could not decode image from {tool_name}"),
+                    );
+                    continue;
+                };
+                if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
+                    continue;
+                }
+                let file_name = remote_image_file_name(&tool_name, index, &image.media_type);
+                if let Err(error) = client
+                    .send_image(chat_id, bytes, &file_name, &image.media_type, &caption)
+                    .await
+                {
+                    diagnostics::record(
+                        DiagnosticLevel::Warning,
+                        "remote_agent.telegram",
+                        format!("Could not send Telegram tool image: {error}"),
+                    );
+                }
+            }
+        });
+        cx.spawn(async move |_, _| {
+            let _ = request.await;
+        })
+        .detach();
     }
 
     fn relay_remote_user_message(
@@ -8397,7 +8863,7 @@ impl AverroesApp {
         let chat_id = reply.chat_id;
         let message_id = reply.message_id;
         let text = format!("🤖 {}", reply.text);
-        let sent_text_len = reply.text.len();
+        let sent_text = reply.text.clone();
         let runtime = self.runtime.clone();
         let session_id = session_id.clone();
         let request = runtime.spawn_background(async move {
@@ -8411,7 +8877,7 @@ impl AverroesApp {
                 if let Some(reply) = app.remote_agent_live_replies.get_mut(&session_id) {
                     reply.edit_in_flight = false;
                     reply.last_edit = Instant::now();
-                    needs_follow_up = successful && reply.text.len() > sent_text_len;
+                    needs_follow_up = successful && reply.text != sent_text;
                 }
                 if needs_follow_up {
                     app.schedule_remote_live_edit(&session_id, cx);
@@ -14448,19 +14914,11 @@ fn reasoning_effort_from_label(label: &str) -> Option<String> {
 }
 
 fn ensure_binding_tools(binding: &mut SessionBinding, default_tools: &[String]) -> bool {
-    if binding.tools.is_empty() {
+    if binding.tools != default_tools {
         binding.tools = default_tools.to_vec();
         return true;
     }
     false
-}
-
-fn apply_enabled_tools(binding: &mut SessionBinding, enabled_tools: Vec<String>) -> bool {
-    if binding.tools == enabled_tools {
-        return false;
-    }
-    binding.tools = enabled_tools;
-    true
 }
 
 fn conversation_has_unread_update(
@@ -14494,9 +14952,8 @@ fn inherited_session_binding(
     } else {
         remembered.clone()
     };
-    // A new conversation keeps the selected connection/model, but tool
-    // activation is conversation-local. Carrying the previous allow-list
-    // defeats lazy discovery and resends every old schema on the first turn.
+    // A new conversation keeps the selected connection/model while receiving
+    // the complete current tool catalog.
     inherited.tools = default_tools.to_vec();
     inherited
 }
@@ -14592,6 +15049,30 @@ fn format_context_limit(limit: u64) -> String {
     }
 }
 
+fn clip_remote_caption(summary: &str) -> String {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return String::new();
+    }
+    let mut chars = summary.chars();
+    let clipped: String = chars.by_ref().take(900).collect();
+    if chars.next().is_some() {
+        format!("{clipped}…")
+    } else {
+        clipped
+    }
+}
+
+fn remote_image_file_name(tool_name: &str, index: usize, media_type: &str) -> String {
+    let ext = match media_type {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "png",
+    };
+    format!("{tool_name}-{index}.{ext}")
+}
+
 fn format_tool_input(input: &serde_json::Value) -> String {
     serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string())
 }
@@ -14676,6 +15157,121 @@ fn localized_tool_display_name(cx: &App, name: &str) -> SharedString {
     };
     key.map(|key| i18n::text(cx, key))
         .unwrap_or_else(|| SharedString::new(tool_display_name(name)))
+}
+
+fn tool_activity_title(cx: &App, activity: &ToolActivity) -> SharedString {
+    let label = localized_tool_display_name(cx, &activity.name);
+    let Some(argument) = tool_activity_argument(&activity.name, &activity.input, &activity.summary)
+    else {
+        return label;
+    };
+    let label = label.to_string();
+    let title = match activity.name.as_str() {
+        "call_agents" | "call_agent" => {
+            i18n::format(cx, "tool.call_agent_for", &[("agent", argument)])
+        }
+        "web_search_intrernal" | "web_search" => {
+            i18n::format(cx, "tool.search_web_for", &[("query", argument)])
+        }
+        "web_fetch" => i18n::format(cx, "tool.fetch_url_for", &[("url", argument)]),
+        _ => format!("{label}: {argument}"),
+    };
+    SharedString::new(title)
+}
+
+fn tool_activity_argument(name: &str, input: &str, summary: &str) -> Option<String> {
+    let params = serde_json::from_str::<serde_json::Value>(input).ok();
+    let string_value = |key: &str| {
+        params
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(|value| match value {
+                serde_json::Value::String(text) => Some(text.clone()),
+                serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                    Some(value.to_string())
+                }
+                _ => None,
+            })
+    };
+
+    let argument = match name {
+        "call_agents" | "call_agent" => summary
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("agent_name:").map(str::trim))
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| string_value("agent_name"))
+            .or_else(|| string_value("agent_id"))
+            .or_else(|| Some("default".into())),
+        "browser" => {
+            let action = string_value("action");
+            let detail = ["url", "target", "value"]
+                .iter()
+                .find_map(|key| string_value(key));
+            match (action, detail) {
+                (Some(action), Some(detail)) => Some(format!("{action} {detail}")),
+                (Some(action), None) => Some(action),
+                (None, Some(detail)) => Some(detail),
+                (None, None) => None,
+            }
+        }
+        "desktop_screenshot" => {
+            let action = string_value("action");
+            let detail = ["target", "application", "title"]
+                .iter()
+                .find_map(|key| string_value(key));
+            match (action, detail) {
+                (Some(action), Some(detail)) => Some(format!("{action} {detail}")),
+                (Some(action), None) => Some(action),
+                (None, Some(detail)) => Some(detail),
+                (None, None) => None,
+            }
+        }
+        "desktop_input" => {
+            let action = string_value("action");
+            let detail = ["key", "text", "button"]
+                .iter()
+                .find_map(|key| string_value(key));
+            match (action, detail) {
+                (Some(action), Some(detail)) => Some(format!("{action} {detail}")),
+                (Some(action), None) => Some(action),
+                (None, Some(detail)) => Some(detail),
+                (None, None) => None,
+            }
+        }
+        "bash" | "shell" | "terminal" => string_value("command").or_else(|| string_value("input")),
+        "file_read" | "read_file" | "file_write" | "write_file" => string_value("file_path"),
+        "change_directory" => string_value("path"),
+        "glob" | "find_files" => string_value("pattern"),
+        "grep" => string_value("pattern").or_else(|| string_value("path")),
+        "checkpoint" | "add_task" => string_value("title"),
+        "ask_user" => string_value("question"),
+        "list_skills" | "search_skills" | "search_memory" | "search_deep_memory" => {
+            string_value("query")
+        }
+        "load_skill" => string_value("name"),
+        "install_skill" => string_value("name").or_else(|| string_value("skill_id")),
+        "create_global_memory" => string_value("content"),
+        "delete_global_memory" => string_value("memory_id"),
+        "compact_conversation" => string_value("reason"),
+        _ => None,
+    }?;
+
+    compact_tool_argument(&argument)
+}
+
+fn compact_tool_argument(value: &str) -> Option<String> {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.is_empty() {
+        return None;
+    }
+    let mut characters = value.chars();
+    let clipped = characters.by_ref().take(96).collect::<String>();
+    Some(if characters.next().is_some() {
+        format!("{clipped}...")
+    } else {
+        clipped
+    })
 }
 
 fn localized_tool_activity_state_label(cx: &App, state: ToolActivityState) -> SharedString {
@@ -15033,6 +15629,7 @@ fn tool_group_stream_blocks(
     text: &str,
     groups: Vec<(usize, Vec<usize>)>,
     activities: &[ToolActivity],
+    text_offset_base: usize,
 ) -> Vec<ToolStreamBlock> {
     let mut blocks = Vec::with_capacity(groups.len() * 2 + 1);
     let mut cursor = 0usize;
@@ -15040,7 +15637,10 @@ fn tool_group_stream_blocks(
         let Some(first_activity_index) = activity_indices.first().copied() else {
             continue;
         };
-        let offset = activities[first_activity_index].text_offset.min(text.len());
+        let offset = activities[first_activity_index]
+            .text_offset
+            .saturating_sub(text_offset_base)
+            .min(text.len());
         let offset = if text.is_char_boundary(offset) {
             offset.max(cursor)
         } else {
@@ -15378,7 +15978,7 @@ fn render_tool_activity(
                                 .min_w(px(0.0))
                                 .text_size(px(12.0))
                                 .text_color(theme.foreground)
-                                .child(localized_tool_display_name(cx, &activity.name))
+                                .child(tool_activity_title(cx, activity))
                                 .when(opens_agent, |this| {
                                     this.cursor_pointer().on_click(cx.listener(
                                         move |app, _, _, cx| {
@@ -15442,20 +16042,44 @@ fn render_tool_activity(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentThreadBlock {
-    Reasoning,
-    Tool(usize),
+    Reasoning { block_index: usize },
+    Tool { activity_index: usize },
     Text { start: usize, end: usize },
 }
 
-fn agent_thread_blocks(message: &ShellMessage) -> Vec<AgentThreadBlock> {
+fn ordered_message_blocks(message: &ShellMessage) -> Vec<AgentThreadBlock> {
+    if !message.stream_blocks.is_empty() {
+        let mut blocks = Vec::new();
+        let mut reasoning_blocks = HashSet::new();
+        for block in message.stream_blocks.iter().copied() {
+            match block {
+                AgentThreadBlock::Reasoning { block_index } => {
+                    if reasoning_blocks.insert(block_index) {
+                        blocks.push(block);
+                    }
+                }
+                AgentThreadBlock::Tool { activity_index } => {
+                    if message
+                        .tool_activities
+                        .get(activity_index)
+                        .is_some_and(|activity| !activity.inside_reasoning)
+                    {
+                        blocks.push(block);
+                    }
+                }
+                AgentThreadBlock::Text { start, end } if start < end => blocks.push(block),
+                AgentThreadBlock::Text { .. } => {}
+            }
+        }
+        return blocks;
+    }
+
     let mut blocks = Vec::new();
-    if !message.reasoning.is_empty()
-        || message
-            .tool_activities
-            .iter()
-            .any(tool_activity_belongs_to_reasoning)
-    {
-        blocks.push(AgentThreadBlock::Reasoning);
+    let reasoning_block_count = reasoning_block_ranges_for_message(message)
+        .len()
+        .max(reasoning_blocks_for_message(message).len());
+    for block_index in 0..reasoning_block_count {
+        blocks.push(AgentThreadBlock::Reasoning { block_index });
     }
 
     let text_len = message.text.len();
@@ -15476,7 +16100,7 @@ fn agent_thread_blocks(message: &ShellMessage) -> Vec<AgentThreadBlock> {
                 end: offset,
             });
         }
-        blocks.push(AgentThreadBlock::Tool(activity_index));
+        blocks.push(AgentThreadBlock::Tool { activity_index });
         cursor = offset;
     }
     if cursor < text_len {
@@ -15486,6 +16110,10 @@ fn agent_thread_blocks(message: &ShellMessage) -> Vec<AgentThreadBlock> {
         });
     }
     blocks
+}
+
+fn agent_thread_blocks(message: &ShellMessage) -> Vec<AgentThreadBlock> {
+    ordered_message_blocks(message)
 }
 
 fn render_agent_thread_transcript(
@@ -15570,15 +16198,16 @@ fn render_agent_thread_message(
     let content = blocks
         .into_iter()
         .filter_map(|block| match block {
-            AgentThreadBlock::Reasoning => Some(render_agent_thread_reasoning(
+            AgentThreadBlock::Reasoning { block_index } => Some(render_agent_thread_reasoning(
                 thread_id,
                 message_index,
                 message,
+                block_index,
                 streaming,
                 theme,
                 cx,
             )),
-            AgentThreadBlock::Tool(activity_index) => Some(render_agent_thread_tool_activity(
+            AgentThreadBlock::Tool { activity_index } => Some(render_agent_thread_tool_activity(
                 thread_id,
                 message_index,
                 activity_index,
@@ -15603,7 +16232,251 @@ fn render_agent_thread_message(
         .into_any_element()
 }
 
+#[derive(Clone)]
+enum ReasoningRenderTarget {
+    Session {
+        session_id: SessionId,
+        message_index: usize,
+    },
+    AgentThread {
+        thread_id: String,
+        message_index: usize,
+    },
+}
+
+fn render_reasoning_block(
+    target: ReasoningRenderTarget,
+    block_index: usize,
+    message: &ShellMessage,
+    streaming: bool,
+    theme: UiTheme,
+    cx: &mut Context<AverroesApp>,
+) -> Option<AnyElement> {
+    let ranges = reasoning_block_ranges_for_message(message);
+    let states = reasoning_blocks_for_message(message);
+    let block_count = ranges.len().max(states.len());
+    let (start, end) = ranges.get(block_index).copied().unwrap_or_else(|| {
+        let end = message.reasoning.len();
+        (end, end)
+    });
+    let state = states
+        .get(block_index)
+        .copied()
+        .unwrap_or(ReasoningBlockState {
+            complete: message.reasoning_complete,
+            expanded: message.reasoning_expanded,
+        });
+    let block_text = message.reasoning.get(start..end)?;
+    let reasoning_groups = reasoning_tool_activity_groups_for_block(
+        &message.reasoning,
+        &message.tool_activities,
+        &ranges,
+        block_index,
+    );
+    if block_text.is_empty() && reasoning_groups.is_empty() {
+        return None;
+    }
+    let active_reasoning_group_id = streaming
+        .then(|| message.active_reasoning_tool_group())
+        .flatten();
+    let text_id_prefix = match &target {
+        ReasoningRenderTarget::Session {
+            session_id,
+            message_index,
+        } => format!(
+            "reasoning-text-{}-{message_index}-{block_index}",
+            session_id.as_str()
+        ),
+        ReasoningRenderTarget::AgentThread {
+            thread_id,
+            message_index,
+        } => format!("agent-thread-reasoning-text-{thread_id}-{message_index}-{block_index}"),
+    };
+    let reasoning_content = if state.expanded {
+        tool_group_stream_blocks(
+            block_text,
+            reasoning_groups,
+            &message.tool_activities,
+            start,
+        )
+        .into_iter()
+        .filter_map(|block| match block {
+            ToolStreamBlock::Text { start, end } => block_text.get(start..end).map(|segment| {
+                render_reasoning_text_segment(
+                    format!("{text_id_prefix}-{start}"),
+                    segment,
+                    streaming && !state.complete && end == block_text.len(),
+                    theme,
+                )
+            }),
+            ToolStreamBlock::Group {
+                group_id,
+                activity_indices,
+            } => Some(match &target {
+                ReasoningRenderTarget::Session {
+                    session_id,
+                    message_index,
+                } => render_tool_group(
+                    session_id,
+                    *message_index,
+                    group_id,
+                    &activity_indices,
+                    &message.tool_activities,
+                    active_reasoning_group_id,
+                    message.is_tool_group_expanded(group_id),
+                    theme,
+                    cx,
+                ),
+                ReasoningRenderTarget::AgentThread {
+                    thread_id,
+                    message_index,
+                } => render_agent_thread_tool_group(
+                    thread_id,
+                    *message_index,
+                    group_id,
+                    &activity_indices,
+                    &message.tool_activities,
+                    active_reasoning_group_id,
+                    message.is_tool_group_expanded(group_id),
+                    theme,
+                    cx,
+                ),
+            }),
+        })
+        .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let reasoning_label = if block_count > 1 {
+        format!("{} {}", i18n::text(cx, "chat.reasoning"), block_index + 1)
+    } else {
+        i18n::text(cx, "chat.reasoning").to_string()
+    };
+    let reasoning_complete = state.complete || (!streaming && message.reasoning_complete);
+    let (panel_id, toggle_id) = match &target {
+        ReasoningRenderTarget::Session {
+            session_id,
+            message_index,
+        } => (
+            format!(
+                "reasoning-{}-{message_index}-{block_index}",
+                session_id.as_str()
+            ),
+            format!(
+                "toggle-reasoning-{}-{message_index}-{block_index}",
+                session_id.as_str()
+            ),
+        ),
+        ReasoningRenderTarget::AgentThread {
+            thread_id,
+            message_index,
+        } => (
+            format!("agent-thread-reasoning-{thread_id}-{message_index}-{block_index}"),
+            format!("agent-thread-toggle-reasoning-{thread_id}-{message_index}-{block_index}"),
+        ),
+    };
+    let toggle_target = target.clone();
+    Some(
+        div()
+            .id(panel_id.clone())
+            .w_full()
+            .px(px(12.0))
+            .py(px(9.0))
+            .rounded(px(10.0))
+            .bg(theme.surface_subtle)
+            .text_color(theme.muted)
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        Button::new(toggle_id)
+                            .ghost()
+                            .small()
+                            .icon(if state.expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .label(reasoning_label)
+                            .on_click(cx.listener(move |app, _, _, cx| match &toggle_target {
+                                ReasoningRenderTarget::Session {
+                                    session_id,
+                                    message_index,
+                                } => app.toggle_reasoning(
+                                    session_id,
+                                    *message_index,
+                                    block_index,
+                                    cx,
+                                ),
+                                ReasoningRenderTarget::AgentThread {
+                                    thread_id,
+                                    message_index,
+                                } => app.toggle_agent_thread_reasoning(
+                                    thread_id,
+                                    *message_index,
+                                    block_index,
+                                    cx,
+                                ),
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(if reasoning_complete {
+                        Icon::new(IconName::Check)
+                            .size(px(12.0))
+                            .text_color(theme.success)
+                            .into_any_element()
+                    } else {
+                        render_activity_indicator(panel_id.clone(), theme, 3.0)
+                    }),
+            )
+            .when(state.expanded, |this| {
+                this.child(
+                    div()
+                        .mt(px(7.0))
+                        .pt(px(7.0))
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .text_size(px(12.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(7.0))
+                                .children(reasoning_content),
+                        ),
+                )
+            })
+            .into_any_element(),
+    )
+}
+
 fn render_agent_thread_reasoning(
+    thread_id: &str,
+    message_index: usize,
+    message: &ShellMessage,
+    block_index: usize,
+    streaming: bool,
+    theme: UiTheme,
+    cx: &mut Context<AverroesApp>,
+) -> AnyElement {
+    render_reasoning_block(
+        ReasoningRenderTarget::AgentThread {
+            thread_id: thread_id.to_owned(),
+            message_index,
+        },
+        block_index,
+        message,
+        streaming,
+        theme,
+        cx,
+    )
+    .unwrap_or_else(|| div().into_any_element())
+}
+
+fn render_all_agent_thread_reasoning(
     thread_id: &str,
     message_index: usize,
     message: &ShellMessage,
@@ -15611,124 +16484,170 @@ fn render_agent_thread_reasoning(
     theme: UiTheme,
     cx: &mut Context<AverroesApp>,
 ) -> AnyElement {
-    let expanded = message.reasoning_expanded;
-    let reasoning_complete = reasoning_is_complete_for_display(message, streaming);
-    let reasoning_text_streaming = reasoning_text_is_streaming(message, streaming);
-    let reasoning_groups = reasoning_tool_activity_groups(&message.tool_activities);
-    let active_reasoning_group_id = streaming
-        .then(|| message.active_reasoning_tool_group())
-        .flatten();
-    let reasoning_content = if expanded {
-        tool_group_stream_blocks(
-            &message.reasoning,
-            reasoning_groups,
-            &message.tool_activities,
-        )
-        .into_iter()
-        .filter_map(|block| match block {
-            ToolStreamBlock::Text { start, end } => {
-                message.reasoning.get(start..end).map(|segment| {
-                    render_reasoning_text_segment(
-                        format!("agent-thread-reasoning-text-{thread_id}-{message_index}-{start}"),
-                        segment,
-                        reasoning_text_streaming && end == message.reasoning.len(),
-                        theme,
-                    )
-                })
-            }
-            ToolStreamBlock::Group {
-                group_id,
-                activity_indices,
-            } => Some(render_agent_thread_tool_group(
-                thread_id,
-                message_index,
-                group_id,
-                &activity_indices,
+    let ranges = reasoning_block_ranges_for_message(message);
+    let states = reasoning_blocks_for_message(message);
+    let block_count = ranges.len().max(states.len());
+    let panels = (0..block_count)
+        .filter_map(|block_index| {
+            let (start, end) = ranges.get(block_index).copied().unwrap_or_else(|| {
+                let end = message.reasoning.len();
+                (end, end)
+            });
+            let state = states.get(block_index).copied().unwrap_or(ReasoningBlockState {
+                complete: message.reasoning_complete,
+                expanded: message.reasoning_expanded,
+            });
+            let block_text = message.reasoning.get(start..end)?;
+            let reasoning_groups = reasoning_tool_activity_groups_for_block(
+                &message.reasoning,
                 &message.tool_activities,
-                active_reasoning_group_id,
-                message.is_tool_group_expanded(group_id),
-                theme,
-                cx,
-            )),
-        })
-        .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let toggle_thread_id = thread_id.to_owned();
-    div()
-        .id(SharedString::from(format!(
-            "agent-thread-reasoning-{thread_id}-{message_index}"
-        )))
-        .w_full()
-        .px(px(12.0))
-        .py(px(9.0))
-        .rounded(px(10.0))
-        .bg(theme.surface_subtle)
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .items_center()
-                .gap(px(4.0))
-                .child(
-                    Button::new(format!(
-                        "agent-thread-toggle-reasoning-{thread_id}-{message_index}"
-                    ))
-                    .ghost()
-                    .small()
-                    .icon(if expanded {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .label(i18n::text(cx, "chat.reasoning"))
-                    .on_click(cx.listener(move |app, _, _, cx| {
-                        app.toggle_agent_thread_reasoning(&toggle_thread_id, message_index, cx);
-                    })),
+                &ranges,
+                block_index,
+            );
+            let active_reasoning_group_id = streaming
+                .then(|| message.active_reasoning_tool_group())
+                .flatten();
+            let reasoning_content = if state.expanded {
+                tool_group_stream_blocks(
+                    block_text,
+                    reasoning_groups,
+                    &message.tool_activities,
+                    start,
                 )
-                .child(div().flex_1())
-                .child(if reasoning_complete {
-                    Icon::new(IconName::Check)
-                        .size(px(12.0))
-                        .text_color(theme.success)
-                        .into_any_element()
-                } else {
-                    render_activity_indicator(
-                        format!("agent-thread-reasoning-{thread_id}-{message_index}"),
+                .into_iter()
+                .filter_map(|block| match block {
+                    ToolStreamBlock::Text { start, end } => {
+                        block_text.get(start..end).map(|segment| {
+                            render_reasoning_text_segment(
+                                format!(
+                                    "agent-thread-reasoning-text-{thread_id}-{message_index}-{block_index}-{start}"
+                                ),
+                                segment,
+                                streaming && !state.complete && end == block_text.len(),
+                                theme,
+                            )
+                        })
+                    }
+                    ToolStreamBlock::Group {
+                        group_id,
+                        activity_indices,
+                    } => Some(render_agent_thread_tool_group(
+                        thread_id,
+                        message_index,
+                        group_id,
+                        &activity_indices,
+                        &message.tool_activities,
+                        active_reasoning_group_id,
+                        message.is_tool_group_expanded(group_id),
                         theme,
-                        3.0,
-                    )
-                }),
-        )
-        .when(expanded, |this| {
-            this.child(
+                        cx,
+                    )),
+                })
+                .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let toggle_thread_id = thread_id.to_owned();
+            let reasoning_label = if block_count > 1 {
+                format!("{} {}", i18n::text(cx, "chat.reasoning"), block_index + 1)
+            } else {
+                i18n::text(cx, "chat.reasoning").to_string()
+            };
+            let reasoning_complete = state.complete || (!streaming && message.reasoning_complete);
+            Some(
                 div()
-                    .mt(px(7.0))
-                    .pt(px(7.0))
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .text_size(px(12.0))
-                    .text_color(theme.muted)
+                    .id(SharedString::from(format!(
+                        "agent-thread-reasoning-{thread_id}-{message_index}-{block_index}"
+                    )))
+                    .w_full()
+                    .px(px(12.0))
+                    .py(px(9.0))
+                    .rounded(px(10.0))
+                    .bg(theme.surface_subtle)
                     .child(
                         div()
+                            .w_full()
                             .flex()
-                            .flex_col()
-                            .gap(px(7.0))
-                            .children(reasoning_content),
-                    ),
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(
+                                Button::new(format!(
+                                    "agent-thread-toggle-reasoning-{thread_id}-{message_index}-{block_index}"
+                                ))
+                                .ghost()
+                                .small()
+                                .icon(if state.expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .label(reasoning_label)
+                                .on_click(cx.listener(move |app, _, _, cx| {
+                                    app.toggle_agent_thread_reasoning(
+                                        &toggle_thread_id,
+                                        message_index,
+                                        block_index,
+                                        cx,
+                                    );
+                                })),
+                            )
+                            .child(div().flex_1())
+                            .child(if reasoning_complete {
+                                Icon::new(IconName::Check)
+                                    .size(px(12.0))
+                                    .text_color(theme.success)
+                                    .into_any_element()
+                            } else {
+                                render_activity_indicator(
+                                    format!(
+                                        "agent-thread-reasoning-{thread_id}-{message_index}-{block_index}"
+                                    ),
+                                    theme,
+                                    3.0,
+                                )
+                            }),
+                    )
+                    .when(state.expanded, |this| {
+                        this.child(
+                            div()
+                                .mt(px(7.0))
+                                .pt(px(7.0))
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .text_size(px(12.0))
+                                .text_color(theme.muted)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(7.0))
+                                        .children(reasoning_content),
+                                ),
+                        )
+                    })
+                    .into_any_element(),
             )
         })
+        .collect::<Vec<_>>();
+
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(7.0))
+        .children(panels)
         .into_any_element()
 }
 
 #[cfg(test)]
 mod agent_thread_render_tests {
     use super::{
-        agent_thread_blocks, reasoning_is_complete_for_display, reasoning_text_is_streaming,
-        reasoning_tool_activity_groups, tool_activity_groups, tool_group_stream_blocks,
-        AgentThreadBlock, ShellMessage, ToolActivity, ToolActivityState, ToolStreamBlock,
-        LEGACY_REASONING_TOOL_GROUP_ID,
+        agent_thread_blocks, reasoning_block_ranges, reasoning_block_ranges_for_message,
+        reasoning_block_states, reasoning_is_complete_for_display, reasoning_text_is_streaming,
+        reasoning_tool_activity_groups, reasoning_tool_activity_groups_for_block,
+        tool_activity_groups, tool_group_stream_blocks, AgentThreadBlock, ReasoningBlockState,
+        ShellMessage, ToolActivity, ToolActivityState, ToolStreamBlock,
+        LEGACY_REASONING_TOOL_GROUP_ID, REASONING_BLOCK_SEPARATOR,
     };
     use std::time::Instant;
 
@@ -15755,7 +16674,7 @@ mod agent_thread_render_tests {
         assert_eq!(
             agent_thread_blocks(&message),
             vec![
-                AgentThreadBlock::Reasoning,
+                AgentThreadBlock::Reasoning { block_index: 0 },
                 AgentThreadBlock::Text { start: 0, end: 6 },
             ]
         );
@@ -15784,9 +16703,9 @@ mod agent_thread_render_tests {
         assert_eq!(
             agent_thread_blocks(&message),
             vec![
-                AgentThreadBlock::Reasoning,
+                AgentThreadBlock::Reasoning { block_index: 0 },
                 AgentThreadBlock::Text { start: 0, end: 3 },
-                AgentThreadBlock::Tool(0),
+                AgentThreadBlock::Tool { activity_index: 0 },
                 AgentThreadBlock::Text { start: 3, end: 6 },
             ]
         );
@@ -15890,7 +16809,7 @@ mod agent_thread_render_tests {
         let groups = reasoning_tool_activity_groups(&activities);
 
         assert_eq!(
-            tool_group_stream_blocks("abcdefghijkl", groups, &activities),
+            tool_group_stream_blocks("abcdefghijkl", groups, &activities, 0),
             vec![
                 ToolStreamBlock::Text { start: 0, end: 4 },
                 ToolStreamBlock::Group {
@@ -15904,6 +16823,136 @@ mod agent_thread_render_tests {
                 },
                 ToolStreamBlock::Text { start: 8, end: 12 },
             ]
+        );
+    }
+
+    #[test]
+    fn reasoning_blocks_preserve_text_order_and_legacy_state() {
+        let reasoning = format!("First phase{REASONING_BLOCK_SEPARATOR}Second phase");
+        let ranges = reasoning_block_ranges(&reasoning);
+        assert_eq!(
+            ranges,
+            vec![
+                (0, "First phase".len()),
+                ("First phase\u{001e}".len(), reasoning.len())
+            ]
+        );
+
+        let states = reasoning_block_states(&reasoning, true, false);
+        assert_eq!(
+            states,
+            vec![
+                ReasoningBlockState {
+                    complete: true,
+                    expanded: false,
+                },
+                ReasoningBlockState {
+                    complete: true,
+                    expanded: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn new_reasoning_phase_reopens_and_closes_only_its_own_spoiler() {
+        let mut message = ShellMessage::assistant();
+        message.append_reasoning("First phase");
+        assert_eq!(
+            message.reasoning_blocks,
+            vec![ReasoningBlockState {
+                complete: false,
+                expanded: true,
+            }]
+        );
+
+        message.finish_reasoning();
+        message.append_text("Interim answer");
+        message.append_reasoning("Second phase");
+
+        assert_eq!(
+            message.reasoning,
+            format!("First phase{REASONING_BLOCK_SEPARATOR}Second phase")
+        );
+        assert_eq!(
+            message.reasoning_blocks,
+            vec![
+                ReasoningBlockState {
+                    complete: true,
+                    expanded: false,
+                },
+                ReasoningBlockState {
+                    complete: false,
+                    expanded: true,
+                },
+            ]
+        );
+        assert!(!message.reasoning_complete);
+        assert!(message.reasoning_expanded);
+    }
+
+    #[test]
+    fn reasoning_tools_stay_in_one_phase_without_external_content() {
+        let mut message = ShellMessage::assistant();
+        message.append_reasoning("First");
+        let first_offset = message.reasoning.len();
+        let first_group_id = message
+            .assign_tool_group(true)
+            .expect("first reasoning tool gets a group");
+        message.tool_activities.push(ToolActivity {
+            call_id: Some("first-tool".into()),
+            name: "file_read".into(),
+            text_offset: first_offset,
+            group_id: Some(first_group_id),
+            input: "{}".into(),
+            summary: String::new(),
+            output: String::new(),
+            state: ToolActivityState::Completed,
+            started_at: Instant::now(),
+            duration_ms: Some(1),
+            expanded: false,
+            inside_reasoning: true,
+        });
+
+        message.finish_reasoning();
+        message.append_reasoning("Second");
+        let second_offset = message.reasoning.len();
+        let second_group_id = message
+            .assign_tool_group(true)
+            .expect("second reasoning tool gets a group");
+        message.tool_activities.push(ToolActivity {
+            call_id: Some("second-tool".into()),
+            name: "grep".into(),
+            text_offset: second_offset,
+            group_id: Some(second_group_id),
+            input: "{}".into(),
+            summary: String::new(),
+            output: String::new(),
+            state: ToolActivityState::Completed,
+            started_at: Instant::now(),
+            duration_ms: Some(1),
+            expanded: false,
+            inside_reasoning: true,
+        });
+
+        let ranges = reasoning_block_ranges_for_message(&message);
+        assert_eq!(
+            reasoning_tool_activity_groups_for_block(
+                &message.reasoning,
+                &message.tool_activities,
+                &ranges,
+                0,
+            ),
+            vec![(first_group_id, vec![0, 1])]
+        );
+        assert_eq!(
+            reasoning_tool_activity_groups_for_block(
+                &message.reasoning,
+                &message.tool_activities,
+                &ranges,
+                1,
+            ),
+            Vec::new()
         );
     }
 }
@@ -16122,7 +17171,7 @@ fn render_agent_thread_tool_activity(
                 .flex_1()
                 .min_w(px(0.0))
                 .text_size(px(12.0))
-                .child(localized_tool_display_name(cx, &activity.name)),
+                .child(tool_activity_title(cx, activity)),
         )
         .child(
             div()
@@ -16598,6 +17647,93 @@ fn reasoning_text_is_streaming(message: &ShellMessage, streaming: bool) -> bool 
     streaming && !message.reasoning_complete
 }
 
+fn render_ordered_message_content(
+    session_id: &SessionId,
+    message_index: usize,
+    message: &ShellMessage,
+    streaming: bool,
+    show_tool_activity: bool,
+    theme: UiTheme,
+    cx: &mut Context<AverroesApp>,
+) -> Vec<AnyElement> {
+    let mut blocks = ordered_message_blocks(message).into_iter().peekable();
+    let mut elements = Vec::new();
+    let mut text_segment_index = 0;
+    let active_group_id = streaming.then(|| message.active_tool_group()).flatten();
+
+    while let Some(block) = blocks.next() {
+        match block {
+            AgentThreadBlock::Reasoning { block_index } => {
+                if let Some(reasoning) = render_reasoning_block(
+                    ReasoningRenderTarget::Session {
+                        session_id: session_id.clone(),
+                        message_index,
+                    },
+                    block_index,
+                    message,
+                    streaming,
+                    theme,
+                    cx,
+                ) {
+                    elements.push(reasoning);
+                }
+            }
+            AgentThreadBlock::Text { start, end } => {
+                if let Some(text) = message.text.get(start..end).filter(|text| !text.is_empty()) {
+                    elements.push(render_assistant_text_segment(
+                        session_id,
+                        message_index,
+                        text_segment_index,
+                        text,
+                        streaming && end == message.text.len(),
+                        theme,
+                    ));
+                    text_segment_index += 1;
+                }
+            }
+            AgentThreadBlock::Tool { activity_index } => {
+                if !show_tool_activity {
+                    continue;
+                }
+                let Some(activity) = message.tool_activities.get(activity_index) else {
+                    continue;
+                };
+                let group_id = activity.group_id.unwrap_or(activity_index);
+                let mut activity_indices = vec![activity_index];
+                while let Some(AgentThreadBlock::Tool {
+                    activity_index: next_activity_index,
+                }) = blocks.peek().copied()
+                {
+                    let Some(next_activity) = message.tool_activities.get(next_activity_index)
+                    else {
+                        break;
+                    };
+                    if next_activity.inside_reasoning
+                        || next_activity.group_id.unwrap_or(next_activity_index) != group_id
+                    {
+                        break;
+                    }
+                    blocks.next();
+                    activity_indices.push(next_activity_index);
+                }
+                elements.push(render_tool_group(
+                    session_id,
+                    message_index,
+                    group_id,
+                    &activity_indices,
+                    &message.tool_activities,
+                    active_group_id,
+                    message.is_tool_group_expanded(group_id),
+                    theme,
+                    cx,
+                ));
+            }
+        }
+    }
+
+    elements
+}
+
 fn render_message(
     session_id: &SessionId,
     index: usize,
@@ -16650,186 +17786,20 @@ fn render_message(
     let copy_text = message.text.clone();
     let copy_disabled = copy_text.is_empty();
     let retry_session_id = session_id.clone();
-    let has_reasoning_tools = message
-        .tool_activities
-        .iter()
-        .any(tool_activity_belongs_to_reasoning);
-    let reasoning_element = if message.reasoning.is_empty() && !has_reasoning_tools {
-        None
-    } else {
-        let reasoning_expanded = message.reasoning_expanded;
-        let reasoning_session_id = session_id.clone();
-        let reasoning_complete = reasoning_is_complete_for_display(message, streaming);
-        let reasoning_text_streaming = reasoning_text_is_streaming(message, streaming);
-        let reasoning_groups = reasoning_tool_activity_groups(&message.tool_activities);
-        let active_reasoning_group_id = streaming
-            .then(|| message.active_reasoning_tool_group())
-            .flatten();
-        let reasoning_content = if reasoning_expanded {
-            tool_group_stream_blocks(
-                &message.reasoning,
-                reasoning_groups,
-                &message.tool_activities,
-            )
-            .into_iter()
-            .filter_map(|block| match block {
-                ToolStreamBlock::Text { start, end } => {
-                    message.reasoning.get(start..end).map(|segment| {
-                        render_reasoning_text_segment(
-                            format!(
-                                "reasoning-text-{}-{index}-{start}",
-                                reasoning_session_id.as_str()
-                            ),
-                            segment,
-                            reasoning_text_streaming && end == message.reasoning.len(),
-                            theme,
-                        )
-                    })
-                }
-                ToolStreamBlock::Group {
-                    group_id,
-                    activity_indices,
-                } => Some(render_tool_group(
-                    &reasoning_session_id,
-                    index,
-                    group_id,
-                    &activity_indices,
-                    &message.tool_activities,
-                    active_reasoning_group_id,
-                    message.is_tool_group_expanded(group_id),
-                    theme,
-                    cx,
-                )),
-            })
-            .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let toggle_reasoning_session_id = reasoning_session_id.clone();
-        Some(
-            div()
-                .id(format!("reasoning-{}-{index}", session_id.as_str()))
-                .px(px(12.0))
-                .py(px(9.0))
-                .rounded(px(10.0))
-                .bg(theme.surface_subtle)
-                .text_color(theme.muted)
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .gap(px(4.0))
-                        .child(
-                            Button::new(format!(
-                                "toggle-reasoning-{}-{index}",
-                                session_id.as_str()
-                            ))
-                            .ghost()
-                            .small()
-                            .icon(if reasoning_expanded {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .label(i18n::text(cx, "chat.reasoning"))
-                            .on_click(cx.listener(
-                                move |app, _, _, cx| {
-                                    app.toggle_reasoning(&toggle_reasoning_session_id, index, cx);
-                                },
-                            )),
-                        )
-                        .child(div().flex_1())
-                        .child(if reasoning_complete {
-                            Icon::new(IconName::Check)
-                                .size(px(12.0))
-                                .text_color(theme.success)
-                                .into_any_element()
-                        } else {
-                            render_activity_indicator(
-                                format!("reasoning-{}-{index}", session_id.as_str()),
-                                theme,
-                                3.0,
-                            )
-                        }),
-                )
-                .when(reasoning_expanded, |this| {
-                    this.child(
-                        div()
-                            .mt(px(7.0))
-                            .pt(px(7.0))
-                            .border_t_1()
-                            .border_color(theme.border)
-                            .text_size(px(12.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(7.0))
-                                    .children(reasoning_content),
-                            ),
-                    )
-                }),
-        )
-    };
-    let content_elements = if assistant && show_tool_activity && !message.tool_activities.is_empty()
+    let content_elements = if assistant
+        && (!body.is_empty()
+            || !message.reasoning.is_empty()
+            || !message.tool_activities.is_empty())
     {
-        let groups = tool_activity_groups(&message.tool_activities);
-        let mut elements = Vec::with_capacity(groups.len() * 2 + 1);
-        let text = message.text.as_str();
-        let mut cursor = 0usize;
-        let mut segment_index = 0usize;
-        let active_group_id = streaming.then(|| message.active_tool_group()).flatten();
-
-        for (group_id, activity_indices) in groups {
-            let first_activity_index = activity_indices[0];
-            let offset = message.tool_activities[first_activity_index]
-                .text_offset
-                .min(text.len());
-            let offset = if text.is_char_boundary(offset) {
-                offset.max(cursor)
-            } else {
-                cursor
-            };
-            if let Some(segment) = text
-                .get(cursor..offset)
-                .filter(|segment| !segment.is_empty())
-            {
-                elements.push(render_assistant_text_segment(
-                    session_id,
-                    index,
-                    segment_index,
-                    segment,
-                    false,
-                    theme,
-                ));
-                segment_index += 1;
-            }
-            elements.push(render_tool_group(
-                session_id,
-                index,
-                group_id,
-                &activity_indices,
-                &message.tool_activities,
-                active_group_id,
-                message.is_tool_group_expanded(group_id),
-                theme,
-                cx,
-            ));
-            cursor = offset;
-        }
-
-        if let Some(segment) = text.get(cursor..).filter(|segment| !segment.is_empty()) {
-            elements.push(render_assistant_text_segment(
-                session_id,
-                index,
-                segment_index,
-                segment,
-                streaming,
-                theme,
-            ));
-        }
-        elements
+        render_ordered_message_content(
+            session_id,
+            index,
+            message,
+            streaming,
+            show_tool_activity,
+            theme,
+            cx,
+        )
     } else if assistant && body.is_empty() && streaming {
         vec![render_activity_indicator(
             format!("message-working-{}-{index}", session_id.as_str()),
@@ -16874,7 +17844,6 @@ fn render_message(
                         .child(i18n::text(cx, "chat.error")),
                 )
         })
-        .when_some(reasoning_element, |this, reasoning| this.child(reasoning))
         .children(content_elements)
         .when_some(user_question_element, |this, question| this.child(question))
         .when_some(source_summary_element, |this, sources| this.child(sources))
@@ -17260,7 +18229,7 @@ mod workspace_grouping_tests {
     }
 
     #[test]
-    fn new_conversations_inherit_the_active_model_but_reset_tools() {
+    fn new_conversations_inherit_the_active_model_and_all_tools() {
         let active = SessionBinding {
             connection_id: Some(ConnectionId("active".into())),
             model_id: Some("active-model".into()),
@@ -17274,50 +18243,31 @@ mod workspace_grouping_tests {
             tools: vec!["web_fetch".into()],
         };
 
-        let inherited = inherited_session_binding(&active, &remembered, &["bash".into()]);
+        let inherited =
+            inherited_session_binding(&active, &remembered, &["bash".into(), "file_read".into()]);
 
         assert_eq!(inherited.connection_id, active.connection_id);
         assert_eq!(inherited.model_id, active.model_id);
         assert_eq!(inherited.reasoning_effort, active.reasoning_effort);
-        assert_eq!(inherited.tools, vec!["bash"]);
+        assert_eq!(inherited.tools, vec!["bash", "file_read"]);
     }
 
     #[test]
-    fn enabled_tool_updates_report_when_the_binding_needs_persistence() {
+    fn tool_bindings_are_normalized_to_the_current_catalog() {
         let mut binding = SessionBinding {
-            connection_id: Some(ConnectionId("connection".into())),
-            model_id: Some("model".into()),
-            reasoning_effort: None,
             tools: vec!["discover_tools".into()],
+            ..Default::default()
         };
-
-        assert!(apply_enabled_tools(
-            &mut binding,
-            vec!["discover_tools".into(), "web_search_intrernal".into()],
-        ));
-        assert_eq!(
-            binding.tools,
-            vec!["discover_tools", "web_search_intrernal"]
-        );
-        assert!(!apply_enabled_tools(
-            &mut binding,
-            vec!["discover_tools".into(), "web_search_intrernal".into()],
-        ));
-    }
-
-    #[test]
-    fn legacy_empty_tool_bindings_are_filled_only_once() {
-        let mut binding = SessionBinding::default();
 
         assert!(ensure_binding_tools(
             &mut binding,
-            &["discover_tools".into(), "enable_tools".into()],
+            &["bash".into(), "file_read".into()],
         ));
         assert!(!ensure_binding_tools(
             &mut binding,
-            &["different_default".into()],
+            &["bash".into(), "file_read".into()],
         ));
-        assert_eq!(binding.tools, vec!["discover_tools", "enable_tools"]);
+        assert_eq!(binding.tools, vec!["bash", "file_read"]);
     }
 
     #[test]

@@ -3,8 +3,12 @@
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 use crate::work::WorkDatabase;
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+const MAX_GLOBAL_MEMORY_CONTENT_CHARS: usize = 2_000;
+const MAX_GLOBAL_MEMORY_ID_CHARS: usize = 128;
 
 pub struct CreateGlobalMemoryTool {
     database: Arc<WorkDatabase>,
@@ -14,6 +18,12 @@ impl CreateGlobalMemoryTool {
     pub fn new(database: Arc<WorkDatabase>) -> Self {
         Self { database }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateGlobalMemoryParams {
+    content: String,
 }
 
 #[async_trait]
@@ -32,6 +42,7 @@ impl Tool for CreateGlobalMemoryTool {
             "properties": {
                 "content": {
                     "type": "string",
+                    "maxLength": MAX_GLOBAL_MEMORY_CONTENT_CHARS,
                     "description": "A concise, durable fact or preference approved by the user"
                 }
             },
@@ -45,15 +56,26 @@ impl Tool for CreateGlobalMemoryTool {
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
-        let content = params
-            .get("content")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|content| !content.is_empty())
-            .ok_or_else(|| ToolError::InvalidParams {
+        let params: CreateGlobalMemoryParams =
+            serde_json::from_value(params.clone()).map_err(|error| ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: error.to_string(),
+            })?;
+        let content = params.content.trim();
+        if content.is_empty() {
+            return Err(ToolError::InvalidParams {
                 tool: self.name().into(),
                 message: "content is required".into(),
-            })?;
+            });
+        }
+        if content.chars().count() > MAX_GLOBAL_MEMORY_CONTENT_CHARS {
+            return Err(ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: format!(
+                    "content cannot exceed {MAX_GLOBAL_MEMORY_CONTENT_CHARS} characters"
+                ),
+            });
+        }
         let (memory, prompt) = self
             .database
             .create_global_memory(content)
@@ -84,6 +106,12 @@ impl DeleteGlobalMemoryTool {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteGlobalMemoryParams {
+    memory_id: String,
+}
+
 #[async_trait]
 impl Tool for DeleteGlobalMemoryTool {
     fn name(&self) -> &str {
@@ -100,6 +128,7 @@ impl Tool for DeleteGlobalMemoryTool {
             "properties": {
                 "memory_id": {
                     "type": "string",
+                    "maxLength": MAX_GLOBAL_MEMORY_ID_CHARS,
                     "description": "The full or eight-character global-memory ID to delete"
                 }
             },
@@ -113,15 +142,24 @@ impl Tool for DeleteGlobalMemoryTool {
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
-        let memory_id = params
-            .get("memory_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| ToolError::InvalidParams {
+        let params: DeleteGlobalMemoryParams =
+            serde_json::from_value(params.clone()).map_err(|error| ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: error.to_string(),
+            })?;
+        let memory_id = params.memory_id.trim();
+        if memory_id.is_empty() {
+            return Err(ToolError::InvalidParams {
                 tool: self.name().into(),
                 message: "memory_id is required".into(),
-            })?;
+            });
+        }
+        if memory_id.chars().count() > MAX_GLOBAL_MEMORY_ID_CHARS {
+            return Err(ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: format!("memory_id cannot exceed {MAX_GLOBAL_MEMORY_ID_CHARS} characters"),
+            });
+        }
         let (deleted, prompt) = self
             .database
             .delete_global_memory(memory_id)
@@ -193,6 +231,43 @@ mod tests {
             .execute(&context(), &json!({"memory_id": &id[..8]}))
             .await
             .unwrap();
+        assert_eq!(database.global_memory_prompt().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_parameters_before_persistence() {
+        let (_directory, database) = database();
+        let create = CreateGlobalMemoryTool::new(database.clone());
+        let create_invalid = [
+            json!({"content": ""}),
+            json!({
+                "content": "x".repeat(MAX_GLOBAL_MEMORY_CONTENT_CHARS + 1)
+            }),
+            json!({"content": 42}),
+            json!({"content": "valid", "unexpected": true}),
+        ];
+        for params in create_invalid {
+            assert!(matches!(
+                create.execute(&context(), &params).await,
+                Err(ToolError::InvalidParams { .. })
+            ));
+        }
+
+        let delete = DeleteGlobalMemoryTool::new(database.clone());
+        let delete_invalid = [
+            json!({"memory_id": ""}),
+            json!({
+                "memory_id": "x".repeat(MAX_GLOBAL_MEMORY_ID_CHARS + 1)
+            }),
+            json!({"memory_id": 42}),
+            json!({"memory_id": "valid", "unexpected": true}),
+        ];
+        for params in delete_invalid {
+            assert!(matches!(
+                delete.execute(&context(), &params).await,
+                Err(ToolError::InvalidParams { .. })
+            ));
+        }
         assert_eq!(database.global_memory_prompt().unwrap(), None);
     }
 }

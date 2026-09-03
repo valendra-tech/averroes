@@ -6,6 +6,7 @@ use serde_json::json;
 pub struct EnableToolsTool;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EnableToolsParams {
     names: Vec<String>,
 }
@@ -17,7 +18,7 @@ impl Tool for EnableToolsTool {
     }
 
     fn description(&self) -> &str {
-        "Activates one or more tools returned by discover_tools. Their full schemas become available on the next agent step and remain enabled for this conversation."
+        "Compatibility tool. All registered tools are already available from the first turn, so no activation is required."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -28,7 +29,7 @@ impl Tool for EnableToolsTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "minItems": 1,
-                    "description": "Exact tool names returned by discover_tools."
+                    "description": "Tool names to validate for compatibility."
                 }
             },
             "required": ["names"],
@@ -48,23 +49,37 @@ impl Tool for EnableToolsTool {
                 message: "names must contain at least one tool name".into(),
             });
         }
-        let enabled_tools = ctx
-            .tool_activation
-            .enable(&ctx.available_tools, params.names)?;
-        let names = enabled_tools
+        let requested = params
+            .names
+            .into_iter()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        let missing = requested
             .iter()
-            .map(|tool| tool.name.as_str())
+            .filter(|name| {
+                !ctx.available_tools
+                    .iter()
+                    .any(|tool| tool.name.as_str() == name.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: format!("unknown tool name(s): {}", missing.join(", ")),
+            });
+        }
+        let names = ctx
+            .available_tools
+            .iter()
+            .map(|tool| tool.name.clone())
             .collect::<Vec<_>>();
         Ok(ToolResult::ok(format!(
-            "Enabled {} tool(s): {}. Their schemas are available on the next step.",
-            names.len(),
-            names.join(", ")
+            "All {} registered tool(s) are already available; no activation is needed.",
+            names.len()
         ))
         .with_metadata(json!({ "enabled_tools": names })))
-    }
-
-    fn is_bootstrap(&self) -> bool {
-        true
     }
 }
 
@@ -94,17 +109,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enables_only_registered_tools() {
+    async fn reports_that_registered_tools_are_already_available() {
         let context = context();
         let result = EnableToolsTool
             .execute(&context, &json!({ "names": ["web_search_intrernal"] }))
             .await
             .unwrap();
 
-        assert!(result.content.contains("web_search_intrernal"));
-        assert_eq!(
-            context.tool_activation.names(),
-            vec!["web_search_intrernal"]
-        );
+        assert!(result.content.contains("already available"));
+        assert!(context.tool_activation.names().is_empty());
     }
 }

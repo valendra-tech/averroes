@@ -6,6 +6,7 @@ use serde_json::json;
 pub struct ListToolsTool;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListToolsParams {
     #[serde(default)]
     query: Option<String>,
@@ -18,7 +19,7 @@ impl Tool for ListToolsTool {
     }
 
     fn description(&self) -> &str {
-        "Lists the exact tools currently enabled for this conversation and model. Use discover_tools to inspect the complete registered catalog, then enable_tools for anything else."
+        "Lists the tools currently available for this conversation and model. Use discover_tools when you need compact descriptions of the complete catalog."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -76,10 +77,6 @@ impl Tool for ListToolsTool {
     }
 
     fn is_read_only(&self) -> bool {
-        true
-    }
-
-    fn is_bootstrap(&self) -> bool {
         true
     }
 }

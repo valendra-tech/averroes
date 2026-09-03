@@ -160,7 +160,6 @@ catalog before enabling tools for a task. The built-in groups are:
 - Web: `web_search`, `web_fetch`, and `browser` (OxiBrowser; fetch and browser
   contribute opened pages to conversation sources).
 - Desktop: `desktop_screenshot`, `desktop_input` (macOS UI capture and input).
-- Discovery: `discover_tools`, `enable_tools`, `list_tools`.
 - Skills: `list_skills`, `load_skill`, `search_skills`, `install_skill`.
 - Tasks: `task_list`, `add_task`, `mark_task_as_done`.
 - Memory: `create_global_memory`, `delete_global_memory`, `search_memory`,

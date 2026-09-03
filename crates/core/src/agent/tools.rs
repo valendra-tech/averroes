@@ -1,6 +1,7 @@
 use super::{Agent, AgentStreamEvent};
 use crate::provider::types::{ContentPart, MessageContent, Role, ToolCall};
 use crate::provider::{ChatMessage, ChatResponse};
+use crate::tool::builtin::ask_user::redact_confirmation_params;
 use crate::tool::{EnabledTool, ToolContext, ToolResult};
 use anyhow::Result;
 use futures::future::join_all;
@@ -106,7 +107,7 @@ impl Agent {
                 )
             } else {
                 format!(
-                    "Tool '{}' is not enabled. Use discover_tools, then enable_tools, before invoking it.",
+                    "Tool '{}' is not available in this request.",
                     tool_call.function.name
                 )
             };
@@ -123,6 +124,7 @@ impl Agent {
                     summary: message.clone(),
                     output: message.clone(),
                     metadata: None,
+                    images: Vec::new(),
                 });
             }
             return ToolCallExecution {
@@ -151,6 +153,7 @@ impl Agent {
                         summary: format!("invalid arguments: {error}"),
                         output: format!("Invalid arguments: {error}"),
                         metadata: None,
+                        images: Vec::new(),
                     });
                 }
                 return ToolCallExecution {
@@ -168,7 +171,7 @@ impl Agent {
             let _ = events.send(AgentStreamEvent::ToolStarted {
                 call_id: Some(tool_call.id.clone()),
                 name: tool_call.function.name.clone(),
-                input: params.clone(),
+                input: redact_confirmation_params(&params),
             });
         }
 
@@ -211,6 +214,7 @@ impl Agent {
                 summary,
                 output,
                 metadata: result.metadata.clone(),
+                images: result.images.clone(),
             });
         }
 

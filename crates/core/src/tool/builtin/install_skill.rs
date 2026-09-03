@@ -12,6 +12,7 @@ pub struct InstallSkillTool {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InstallSkillParams {
     skill_id: String,
     #[serde(default)]
@@ -93,20 +94,10 @@ impl Tool for InstallSkillTool {
                 tool: self.name().into(),
                 message: "skill_id must contain a source and skill slug separated by '/'".into(),
             })?;
-        let source = params
-            .source
-            .as_deref()
-            .map(str::trim)
-            .filter(|source| !source.is_empty())
-            .unwrap_or(derived_source.as_str())
-            .to_owned();
-        let slug = params
-            .slug
-            .as_deref()
-            .map(str::trim)
-            .filter(|slug| !slug.is_empty())
-            .unwrap_or(derived_slug.as_str())
-            .to_owned();
+        validate_optional_identity("source", params.source.as_deref(), &derived_source)?;
+        validate_optional_identity("slug", params.slug.as_deref(), &derived_slug)?;
+        let source = derived_source;
+        let slug = derived_slug;
         let name = params
             .name
             .as_deref()
@@ -162,9 +153,22 @@ fn split_skill_id(skill_id: &str) -> Option<(String, String)> {
     Some((source.to_owned(), slug.to_owned()))
 }
 
+fn validate_optional_identity(field: &str, supplied: Option<&str>, expected: &str) -> Result<()> {
+    let Some(supplied) = supplied.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if supplied != expected {
+        return Err(ToolError::InvalidParams {
+            tool: "install_skill".into(),
+            message: format!("{field} must match the value derived from skill_id"),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::split_skill_id;
+    use super::{split_skill_id, validate_optional_identity};
 
     #[test]
     fn splits_repository_skill_ids_at_the_last_segment() {
@@ -182,5 +186,18 @@ mod tests {
         assert!(split_skill_id("skill-only").is_none());
         assert!(split_skill_id("/skill").is_none());
         assert!(split_skill_id("source/").is_none());
+    }
+
+    #[test]
+    fn rejects_identity_fields_that_do_not_match_the_skill_id() {
+        assert!(
+            validate_optional_identity("source", Some("other/repository"), "owner/repository")
+                .is_err()
+        );
+        assert!(validate_optional_identity("slug", Some("other-skill"), "skill").is_err());
+        assert!(
+            validate_optional_identity("source", Some("owner/repository"), "owner/repository")
+                .is_ok()
+        );
     }
 }

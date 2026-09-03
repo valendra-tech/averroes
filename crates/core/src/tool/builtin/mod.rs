@@ -23,7 +23,7 @@ pub mod search_memory;
 pub mod search_skills;
 mod shell_session;
 pub mod task;
-mod web_browser;
+pub(crate) mod web_browser;
 pub mod web_fetch;
 #[path = "web_search.rs"]
 pub mod web_search_intrernal;
@@ -59,10 +59,7 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(browser::BrowserTool::default());
     desktop::register(registry);
     registry.register(web_search_intrernal::WebSearchTool);
-    registry.register(discover_tools::DiscoverToolsTool);
-    registry.register(enable_tools::EnableToolsTool);
     registry.register(list_agents::ListAgentsTool);
-    registry.register(list_tools::ListToolsTool);
     registry.register(call_agents::CallAgentsTool);
 }
 
@@ -102,5 +99,9 @@ mod tests {
         assert!(registry.get("change_directory").is_some());
         assert!(registry.get("desktop_screenshot").is_some());
         assert!(registry.get("desktop_input").is_some());
+        assert!(registry.get("discover_tools").is_none());
+        assert!(registry.get("enable_tools").is_none());
+        assert!(registry.get("list_tools").is_none());
+        assert!(registry.get("list_agents").is_some());
     }
 }

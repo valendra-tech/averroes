@@ -4,6 +4,10 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+pub(crate) const MAX_SKILL_CONTENT_BYTES: usize = 256 * 1024;
+pub(crate) const SKILL_CONTENT_TRUNCATION_NOTICE: &str =
+    "\n\n[Skill content truncated at 256 KiB.]\n";
+
 pub struct SkillLoader {
     skill_dirs: Vec<PathBuf>,
 }
@@ -192,7 +196,7 @@ impl SkillLoader {
                 meta.path.display()
             ),
         );
-        let mut file = match fs::File::open(&meta.path) {
+        let file = match fs::File::open(&meta.path) {
             Ok(file) => file,
             Err(source) => {
                 diagnostics::record(
@@ -210,8 +214,11 @@ impl SkillLoader {
                 });
             }
         };
-        let mut content = String::new();
-        if let Err(source) = file.read_to_string(&mut content) {
+        let mut bytes = Vec::new();
+        if let Err(source) = file
+            .take(MAX_SKILL_CONTENT_BYTES.saturating_add(4) as u64)
+            .read_to_end(&mut bytes)
+        {
             diagnostics::record(
                 DiagnosticLevel::Error,
                 "skills.loader",
@@ -226,13 +233,41 @@ impl SkillLoader {
                 source,
             });
         }
+        let mut content = String::from_utf8(bytes).map_err(|error| {
+            let source = std::io::Error::new(std::io::ErrorKind::InvalidData, error);
+            diagnostics::record(
+                DiagnosticLevel::Error,
+                "skills.loader",
+                format!(
+                    "Could not decode skill '{}' at {}: {source}.",
+                    meta.name,
+                    meta.path.display()
+                ),
+            );
+            SkillError::Io {
+                path: meta.path.clone(),
+                source,
+            }
+        })?;
+        let truncated = content.len() > MAX_SKILL_CONTENT_BYTES;
+        if truncated {
+            let content_limit =
+                MAX_SKILL_CONTENT_BYTES.saturating_sub(SKILL_CONTENT_TRUNCATION_NOTICE.len());
+            let mut boundary = content_limit.min(content.len());
+            while boundary > 0 && !content.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            content.truncate(boundary);
+            content.push_str(SKILL_CONTENT_TRUNCATION_NOTICE);
+        }
         diagnostics::record(
             DiagnosticLevel::Success,
             "skills.loader",
             format!(
-                "Loaded skill '{}' successfully ({} bytes).",
+                "Loaded skill '{}' successfully ({} bytes{}).",
                 meta.name,
-                content.len()
+                content.len(),
+                if truncated { ", truncated" } else { "" }
             ),
         );
         Ok(content)
@@ -399,6 +434,32 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "useful");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncates_oversized_skill_content_at_a_utf8_boundary() {
+        let dir = std::env::temp_dir().join("averroes-skill-test-large");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = create_temp_skill_file(
+            &dir,
+            "large.md",
+            &format!("# Large\n{}", "🙂".repeat(MAX_SKILL_CONTENT_BYTES)),
+        );
+        let loader = SkillLoader::new(vec![dir.clone()]);
+        let meta = SkillMeta {
+            name: "large".into(),
+            description: String::new(),
+            triggers: Vec::new(),
+            path,
+        };
+
+        let content = loader.load_content(&meta).unwrap();
+
+        assert!(content.len() <= MAX_SKILL_CONTENT_BYTES);
+        assert!(content.ends_with(SKILL_CONTENT_TRUNCATION_NOTICE));
+        assert!(std::str::from_utf8(content.as_bytes()).is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1,16 +1,30 @@
 use async_trait::async_trait;
 use base64::Engine as _;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 use super::resolve_file_path;
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 
 pub struct FileReadTool;
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileReadParams {
+    file_path: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
 const DEFAULT_LINE_LIMIT: usize = 400;
 const MAX_LINE_LIMIT: usize = 2_000;
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_TEXT_OUTPUT_BYTES: usize = 64 * 1024;
+const LINE_TRUNCATION_NOTICE: &str = "... [line truncated]\n";
+const OUTPUT_TRUNCATION_NOTICE: &str =
+    "\nOutput truncated at 64 KiB. Reduce limit or read a narrower range.\n";
 
 #[async_trait]
 impl Tool for FileReadTool {
@@ -44,7 +58,8 @@ impl Tool for FileReadTool {
                     "description": "The maximum number of lines to read"
                 }
             },
-            "required": ["file_path"]
+            "required": ["file_path"],
+            "additionalProperties": false
         })
     }
 
@@ -53,46 +68,90 @@ impl Tool for FileReadTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
-        let file_path = params["file_path"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidParams {
+        let params: FileReadParams =
+            serde_json::from_value(params.clone()).map_err(|error| ToolError::InvalidParams {
                 tool: self.name().into(),
-                message: "Missing required parameter: file_path".into(),
+                message: error.to_string(),
             })?;
+        let file_path = params.file_path.as_str();
 
         let full_path = resolve_file_path(&ctx.current_dir(), file_path);
+
+        let offset = params.offset.unwrap_or(1);
+        if offset == 0 {
+            return Err(ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: "offset must be at least 1".into(),
+            });
+        }
+        let limit = params.limit.unwrap_or(DEFAULT_LINE_LIMIT);
+        if !(1..=MAX_LINE_LIMIT).contains(&limit) {
+            return Err(ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: format!("limit must be between 1 and {MAX_LINE_LIMIT}"),
+            });
+        }
 
         if let Some(media_type) = image_media_type(&full_path) {
             return read_image(self.name(), &full_path, media_type).await;
         }
 
-        let content =
-            tokio::fs::read_to_string(&full_path)
+        let file =
+            tokio::fs::File::open(&full_path)
                 .await
-                .map_err(|e| ToolError::Execution {
+                .map_err(|error| ToolError::Execution {
                     tool: self.name().into(),
-                    message: format!("Failed to read file '{}': {e}", full_path.display()),
+                    message: format!("Failed to read file '{}': {error}", full_path.display()),
                 })?;
+        let mut reader = BufReader::new(file);
+        let selected_end = offset.saturating_add(limit);
+        let mut total_lines = 0usize;
+        let mut body = String::new();
+        let mut output_truncated = false;
 
-        let all_lines: Vec<&str> = content.lines().collect();
-        let total_lines = all_lines.len();
+        while let Some((line, line_truncated)) = read_line_limited(
+            &mut reader,
+            if output_truncated {
+                0
+            } else if (offset..selected_end).contains(&(total_lines + 1)) {
+                let prefix_len = format!("{}: ", total_lines + 1).len();
+                MAX_TEXT_OUTPUT_BYTES
+                    .saturating_sub(body.len().saturating_add(prefix_len))
+                    .saturating_sub(LINE_TRUNCATION_NOTICE.len())
+            } else {
+                0
+            },
+        )
+        .await
+        .map_err(|error| ToolError::Execution {
+            tool: self.name().into(),
+            message: format!("Failed to read file '{}': {error}", full_path.display()),
+        })? {
+            total_lines = total_lines.saturating_add(1);
+            let line_number = total_lines;
+            if !(offset..selected_end).contains(&line_number) {
+                continue;
+            }
 
-        let offset = positive_integer_param(self.name(), params, "offset", 1, None)?;
-        let limit = positive_integer_param(
-            self.name(),
-            params,
-            "limit",
-            DEFAULT_LINE_LIMIT,
-            Some(MAX_LINE_LIMIT),
-        )?;
+            let prefix = format!("{line_number}: ");
+            if body.len().saturating_add(prefix.len()) >= MAX_TEXT_OUTPUT_BYTES {
+                output_truncated = true;
+                continue;
+            }
+            body.push_str(&prefix);
+            body.push_str(&String::from_utf8_lossy(&line));
+            if line_truncated {
+                body.push_str(LINE_TRUNCATION_NOTICE);
+                output_truncated = true;
+            } else {
+                body.push('\n');
+            }
+        }
 
-        let start = offset;
-        let end = (start.saturating_add(limit).min(total_lines + 1)).saturating_sub(1);
+        let start_line = offset;
+        let end_line = selected_end.saturating_sub(1).min(total_lines);
 
-        let start_idx = (start.saturating_sub(1)).min(total_lines);
-        let end_idx = end.min(total_lines);
-
-        if start_idx >= total_lines {
+        if start_line > total_lines {
             let output = format!(
                 "File '{}' ({} lines total): requested offset {} exceeds file length",
                 full_path.display(),
@@ -105,12 +164,13 @@ impl Tool for FileReadTool {
                 "end": null,
                 "has_more": false,
                 "next_offset": null,
-                "file_path": full_path.display().to_string()
+                "file_path": full_path.display().to_string(),
+                "output_truncated": false
             })));
         }
 
-        let selected = &all_lines[start_idx..end_idx];
-        let line_range_header = if selected.len() == total_lines {
+        let selected_line_count = end_line.saturating_sub(start_line).saturating_add(1);
+        let line_range_header = if selected_line_count == total_lines {
             format!(
                 "File '{}' ({} lines total):\n",
                 full_path.display(),
@@ -120,37 +180,72 @@ impl Tool for FileReadTool {
             format!(
                 "File '{}' (lines {}-{} of {}):\n",
                 full_path.display(),
-                start_idx + 1,
-                end_idx,
+                start_line,
+                end_line,
                 total_lines
             )
         };
 
-        let mut body = String::new();
-        for (i, line) in selected.iter().enumerate() {
-            let line_num = start_idx + i + 1;
-            body.push_str(&format!("{line_num}: {line}\n"));
-        }
-
-        let has_more = end_idx < total_lines;
-        let next_offset = has_more.then_some(end_idx + 1);
+        let has_more = end_line < total_lines;
+        let next_offset = has_more.then_some(end_line + 1);
         if has_more {
             body.push_str(&format!(
                 "\nMore lines available. Continue with offset {}.\n",
-                next_offset.unwrap_or(end_idx + 1)
+                next_offset.unwrap_or(end_line + 1)
             ));
+        }
+        if output_truncated && body.len() < MAX_TEXT_OUTPUT_BYTES {
+            let remaining = MAX_TEXT_OUTPUT_BYTES - body.len();
+            body.push_str(
+                &OUTPUT_TRUNCATION_NOTICE[..OUTPUT_TRUNCATION_NOTICE.len().min(remaining)],
+            );
         }
 
         Ok(
             ToolResult::ok(format!("{line_range_header}{body}")).with_metadata(json!({
                 "total_lines": total_lines,
-                "start": start_idx + 1,
-                "end": end_idx,
+                "start": start_line,
+                "end": end_line,
                 "has_more": has_more,
                 "next_offset": next_offset,
-                "file_path": full_path.display().to_string()
+                "file_path": full_path.display().to_string(),
+                "output_truncated": output_truncated
             })),
         )
+    }
+}
+
+async fn read_line_limited<R>(
+    reader: &mut R,
+    capture_limit: usize,
+) -> std::io::Result<Option<(Vec<u8>, bool)>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut captured = Vec::new();
+    let mut truncated = false;
+    let mut saw_bytes = false;
+
+    loop {
+        let buffer = reader.fill_buf().await?;
+        if buffer.is_empty() {
+            return Ok(saw_bytes.then_some((captured, truncated)));
+        }
+        saw_bytes = true;
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(buffer.len());
+        let consumed = newline.map_or(buffer.len(), |position| position + 1);
+        let remaining = capture_limit.saturating_sub(captured.len());
+        let copied = remaining.min(content_len);
+        captured.extend_from_slice(&buffer[..copied]);
+        if copied < content_len {
+            truncated = true;
+        }
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            return Ok(Some((captured, truncated)));
+        }
     }
 }
 
@@ -217,41 +312,6 @@ fn has_image_signature(media_type: &str, bytes: &[u8]) -> bool {
         }
         _ => false,
     }
-}
-
-fn positive_integer_param(
-    tool: &str,
-    params: &Value,
-    name: &str,
-    default: usize,
-    maximum: Option<usize>,
-) -> Result<usize> {
-    let Some(value) = params.get(name) else {
-        return Ok(default);
-    };
-    let value = value.as_u64().ok_or_else(|| ToolError::InvalidParams {
-        tool: tool.into(),
-        message: format!("{name} must be a positive integer"),
-    })?;
-    let value = usize::try_from(value).map_err(|_| ToolError::InvalidParams {
-        tool: tool.into(),
-        message: format!("{name} is too large"),
-    })?;
-    if value == 0 {
-        return Err(ToolError::InvalidParams {
-            tool: tool.into(),
-            message: format!("{name} must be at least 1"),
-        });
-    }
-    if let Some(maximum) = maximum {
-        if value > maximum {
-            return Err(ToolError::InvalidParams {
-                tool: tool.into(),
-                message: format!("{name} must not exceed {maximum}"),
-            });
-        }
-    }
-    Ok(value)
 }
 
 #[cfg(test)]

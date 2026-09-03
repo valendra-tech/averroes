@@ -15,6 +15,7 @@ use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 
 const MAX_AUTOMATIC_SESSIONS: usize = 8;
 const MAX_BROWSER_CONTENT_CHARS: usize = 16_000;
+const MAX_BROWSER_SCREENSHOT_BYTES: usize = 20 * 1024 * 1024;
 const MAX_INTERACTIVE_ELEMENTS: usize = 30;
 const DEFAULT_SCROLL_Y: f64 = 600.0;
 
@@ -31,6 +32,7 @@ struct BrowserSession {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BrowserParams {
     action: String,
     #[serde(default)]
@@ -70,6 +72,20 @@ impl Tool for BrowserTool {
 
     fn description(&self) -> &str {
         "Interact with one automatic browser session for this conversation. Use only when web_fetch is insufficient because JavaScript, cookies, clicks, forms, or navigation state are required."
+    }
+
+    fn requires_confirmation_for(&self, params: &Value) -> bool {
+        params
+            .get("action")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|action| {
+                matches!(
+                    action.as_str(),
+                    "click" | "fill" | "type" | "press" | "select" | "check" | "uncheck"
+                )
+            })
     }
 
     fn parameters(&self) -> Value {
@@ -298,6 +314,7 @@ impl BrowserTool {
                     .screenshot(width)
                     .await
                     .map_err(|error| browser_error(action, error))?;
+                validate_screenshot_size(png.len())?;
                 Ok(ToolResult::ok(format!(
                     "Captured the current page as a {width}px-wide PNG screenshot."
                 ))
@@ -564,6 +581,20 @@ fn bound_browser_content(content: &str) -> String {
     }
 }
 
+fn validate_screenshot_size(size: usize) -> Result<()> {
+    if size > MAX_BROWSER_SCREENSHOT_BYTES {
+        return Err(browser_error(
+            "screenshot",
+            format!(
+                "screenshot is {} MiB; the limit is {} MiB",
+                size.div_ceil(1024 * 1024),
+                MAX_BROWSER_SCREENSHOT_BYTES / 1024 / 1024
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn target_selector(target: &str) -> Result<String> {
     let target = target.trim();
     if target.is_empty() {
@@ -638,6 +669,18 @@ mod tests {
     }
 
     #[test]
+    fn only_state_changing_actions_require_confirmation() {
+        let tool = BrowserTool::default();
+
+        assert!(tool.requires_confirmation_for(&json!({ "action": "click" })));
+        assert!(tool.requires_confirmation_for(&json!({ "action": "fill" })));
+        assert!(tool.requires_confirmation_for(&json!({ "action": "press" })));
+        assert!(!tool.requires_confirmation_for(&json!({ "action": "inspect" })));
+        assert!(!tool.requires_confirmation_for(&json!({ "action": "screenshot" })));
+        assert!(!tool.requires_confirmation_for(&json!({ "action": "close" })));
+    }
+
+    #[test]
     fn least_recently_used_session_is_selected_for_eviction() {
         let sessions = HashMap::from([("one".into(), 8), ("two".into(), 2), ("three".into(), 5)]);
 
@@ -661,6 +704,13 @@ mod tests {
             format_interactive_elements(&controls),
             "[e1] button — Submit · Submit the form"
         );
+    }
+
+    #[test]
+    fn rejects_oversized_screenshot_payloads() {
+        let error = validate_screenshot_size(MAX_BROWSER_SCREENSHOT_BYTES + 1).unwrap_err();
+
+        assert!(error.to_string().contains("limit is 20 MiB"));
     }
 
     #[tokio::test]

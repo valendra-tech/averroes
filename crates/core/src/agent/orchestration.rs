@@ -37,9 +37,8 @@ pub struct AgentCallRequest {
     pub parent_objective: String,
     /// The configured delegated agent to run.
     pub agent_id: String,
-    /// The parent's currently enabled tools as a capability hint. The
-    /// runtime gives the child the same scoped registry but only enables its
-    /// compact discovery bootstrap initially.
+    /// The parent's tool names as a capability hint for the delegated agent.
+    /// The runtime gives the child the complete scoped registry.
     pub tools: Vec<String>,
     pub prompt: String,
     pub model_id: Option<String>,
@@ -59,9 +58,8 @@ pub struct AgentThreadSnapshot {
     pub title: String,
     pub model_id: String,
     pub status: AgentThreadStatus,
-    /// Tool schemas activated by this delegated thread. Keeping them on the
-    /// thread snapshot lets a later call continue with the same capabilities
-    /// instead of restarting from the discovery bootstrap.
+    /// Tool schemas available to this delegated thread. The field is retained
+    /// in the snapshot for compatibility with persisted conversations.
     #[serde(default)]
     pub enabled_tools: Vec<String>,
     pub prompt: String,
