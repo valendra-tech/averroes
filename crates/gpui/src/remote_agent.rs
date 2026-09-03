@@ -150,9 +150,19 @@ impl TelegramClient {
         text: &str,
         reply_markup: Option<Value>,
     ) -> Result<i64, String> {
+        self.send_html_message(chat_id, &markdown_to_telegram_html(text), reply_markup)
+            .await
+    }
+
+    async fn send_html_message(
+        &self,
+        chat_id: i64,
+        html: &str,
+        reply_markup: Option<Value>,
+    ) -> Result<i64, String> {
         let mut body = json!({
             "chat_id": chat_id,
-            "text": markdown_to_telegram_html(text),
+            "text": html,
             "parse_mode": "HTML",
             "disable_web_page_preview": true,
         });
@@ -174,9 +184,9 @@ impl TelegramClient {
             "editMessageText",
             json!({
                 "chat_id": chat_id,
-                "messagemarkdown_to_telegram_html(text),
-                "parse_mode": "HTML": message_id,
-                "text": text,
+                "message_id": message_id,
+                "text": markdown_to_telegram_html(text),
+                "parse_mode": "HTML",
                 "disable_web_page_preview": true,
             }),
         )
@@ -207,9 +217,9 @@ impl TelegramClient {
             .mime_str("image/png")
             .map_err(|error| format!("could not prepare screenshot upload: {error}"))?;
         let form = Form::new()
-            .text("chat_id", markdown_to_telegram_html(caption))
-            .text("parse_mode", "HTML"))
-            .text("caption", caption.to_owned())
+            .text("chat_id", chat_id.to_string())
+            .text("caption", markdown_to_telegram_html(caption))
+            .text("parse_mode", "HTML")
             .part("photo", photo);
         let response = self
             .http
@@ -279,14 +289,14 @@ impl TelegramClient {
         chat_id: i64,
         text: &str,
         reply_markup: Option<Value>,
-    ) -> Result<(), Stelegram_html_chunks
-        let chunks = split_text(text, MAX_TELEGRAM_TEXT);
+    ) -> Result<(), String> {
+        let chunks = telegram_html_chunks(text, MAX_TELEGRAM_TEXT);
         if chunks.is_empty() {
-            self.send_message(chat_id, "…", reply_markup).await?;
+            self.send_html_message(chat_id, "…", reply_markup).await?;
             return Ok(());
         }
         for (index, chunk) in chunks.iter().enumerate() {
-            self.send_message(
+            self.send_html_message(
                 chat_id,
                 chunk,
                 (index + 1 == chunks.len())
