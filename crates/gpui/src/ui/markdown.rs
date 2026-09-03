@@ -4,24 +4,57 @@ use std::borrow::Cow;
 
 /// Makes provider reasoning readable without changing the stored value.
 ///
-/// Some OpenAI-compatible gateways concatenate summary chunks with `****` and
-/// omit the line break between them. That marker is transport noise rather
+/// Some OpenAI-compatible gateways concatenate summary chunks with `****` or
+/// split a `**` wrapper across lines. Those markers are transport noise rather
 /// than useful Markdown. Keep the original reasoning in the conversation and
 /// only repair it at the last moment before rendering.
 pub fn normalize_reasoning_for_display(content: &str) -> Cow<'_, str> {
-    if !content.contains('\r') && !content.contains("****") {
+    if !content.contains('\r')
+        && !content.contains("****")
+        && !content.lines().any(has_unpaired_strong_delimiter)
+    {
         return Cow::Borrowed(content);
     }
 
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
-    Cow::Owned(
+    let normalized = if normalized.contains("****") {
         normalized
             .split("****")
             .map(str::trim)
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
-            .join("\n\n"),
-    )
+            .join("\n\n")
+    } else {
+        normalized
+    };
+
+    if normalized.lines().any(has_unpaired_strong_delimiter) {
+        Cow::Owned(strip_unpaired_strong_delimiters(&normalized))
+    } else {
+        Cow::Owned(normalized)
+    }
+}
+
+fn has_unpaired_strong_delimiter(line: &str) -> bool {
+    line.match_indices("**").count() % 2 == 1
+}
+
+fn strip_unpaired_strong_delimiters(content: &str) -> String {
+    let mut normalized = String::with_capacity(content.len());
+    for line in content.split_inclusive('\n') {
+        let (line, newline) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |line| (line, "\n"));
+        let line = if has_unpaired_strong_delimiter(line) {
+            let line = line.strip_prefix("**").unwrap_or(line);
+            line.strip_suffix("**").unwrap_or(line)
+        } else {
+            line
+        };
+        normalized.push_str(line);
+        normalized.push_str(newline);
+    }
+    normalized
 }
 
 /// Renders a response while it is still arriving from a provider.
@@ -63,5 +96,19 @@ mod tests {
         let normalized = normalize_reasoning_for_display(content);
         assert_eq!(normalized, content);
         assert!(matches!(normalized, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn reasoning_display_strips_unpaired_strong_delimiters_per_line() {
+        assert_eq!(
+            normalize_reasoning_for_display("**Preparing the review\nLoading a skill**"),
+            "Preparing the review\nLoading a skill"
+        );
+    }
+
+    #[test]
+    fn reasoning_display_keeps_well_formed_strong_markdown() {
+        let content = "**Checkpoint complete**";
+        assert_eq!(normalize_reasoning_for_display(content), content);
     }
 }

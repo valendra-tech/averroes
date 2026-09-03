@@ -52,7 +52,7 @@ impl Tool for TaskListTool {
     }
 
     fn description(&self) -> &str {
-        "Lists the persistent tasks for the current conversation, including their stable IDs and completion state."
+        "Lists persistent tasks for this conversation: stable id, title, and pending/done. Call before mark_task_as_done when the id is unknown."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -101,7 +101,7 @@ impl Tool for AddTaskTool {
     }
 
     fn description(&self) -> &str {
-        "Adds one concise, persistent task to the current conversation. Use it for actionable work that should remain visible until completed."
+        "Adds one pending persistent task. Title is a short remaining action, not a plan or status update. Skip one-shot or trivial work."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -110,7 +110,7 @@ impl Tool for AddTaskTool {
             "properties": {
                 "title": {
                     "type": "string",
-                    "description": "Short, action-oriented task title."
+                    "description": "Short action that remains to do. Not a plan, status update, or narration."
                 }
             },
             "required": ["title"],
@@ -160,7 +160,7 @@ impl Tool for MarkTaskAsDoneTool {
     }
 
     fn description(&self) -> &str {
-        "Marks a persistent task as done. Call task_list first when the task ID is unknown."
+        "Marks a persistent task done by the exact task_id from task_list. Do not invent ids. Call immediately when the work is finished."
     }
 
     fn parameters(&self) -> serde_json::Value {
