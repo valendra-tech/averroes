@@ -6,6 +6,7 @@ use serde_json::json;
 pub struct DiscoverToolsTool;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DiscoverToolsParams {
     #[serde(default)]
     query: Option<String>,
@@ -20,7 +21,7 @@ impl Tool for DiscoverToolsTool {
     }
 
     fn description(&self) -> &str {
-        "Returns the complete registered tool catalog as compact name-and-description pairs. Choose the tools you need, then use enable_tools before invoking them."
+        "Returns the complete registered tool catalog as compact name-and-description pairs. Tool schemas are already available for this conversation."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -68,10 +69,6 @@ impl Tool for DiscoverToolsTool {
     }
 
     fn is_read_only(&self) -> bool {
-        true
-    }
-
-    fn is_bootstrap(&self) -> bool {
         true
     }
 }

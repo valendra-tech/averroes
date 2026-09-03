@@ -16,6 +16,7 @@ impl CheckpointTool {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CheckpointParams {
     #[serde(default)]
     id: Option<String>,

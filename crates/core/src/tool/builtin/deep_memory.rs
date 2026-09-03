@@ -3,11 +3,27 @@
 use crate::tool::{MemorySearchBackend, Result, Tool, ToolContext, ToolError, ToolResult};
 use crate::work::{DeepMemoryExcerpt, WorkDatabase, WorkMessageRole};
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
 pub struct SearchDeepMemoryTool {
     database: Arc<WorkDatabase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchDeepMemoryParams {
+    query: String,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetDeepMemoryParams {
+    conversation_id: String,
+    start: Option<usize>,
+    limit: Option<usize>,
 }
 
 impl SearchDeepMemoryTool {
@@ -43,12 +59,19 @@ impl Tool for SearchDeepMemoryTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
-        let query = required_string(self.name(), params, "query")?;
-        let limit = params
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(6)
-            .clamp(1, 12) as usize;
+        let params: SearchDeepMemoryParams =
+            serde_json::from_value(params.clone()).map_err(|error| ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: error.to_string(),
+            })?;
+        let query = required_string(self.name(), &params.query, "query")?;
+        let limit = params.limit.unwrap_or(6);
+        if !(1..=12).contains(&limit) {
+            return Err(ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: "limit must be between 1 and 12".into(),
+            });
+        }
         let results = search(
             &self.database,
             ctx.memory_search_backend.as_ref(),
@@ -114,13 +137,21 @@ impl Tool for GetDeepMemoryTool {
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
-        let conversation_id = required_string(self.name(), params, "conversation_id")?;
-        let start = params.get("start").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let limit = params
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(8)
-            .clamp(1, 20) as usize;
+        let params: GetDeepMemoryParams =
+            serde_json::from_value(params.clone()).map_err(|error| ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: error.to_string(),
+            })?;
+        let conversation_id =
+            required_string(self.name(), &params.conversation_id, "conversation_id")?;
+        let start = params.start.unwrap_or(0);
+        let limit = params.limit.unwrap_or(8);
+        if !(1..=20).contains(&limit) {
+            return Err(ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: "limit must be between 1 and 20".into(),
+            });
+        }
         let excerpt = self
             .database
             .deep_memory_excerpt(conversation_id, start, limit)
@@ -165,16 +196,15 @@ async fn search(
     }
 }
 
-fn required_string<'a>(tool: &str, params: &'a Value, key: &str) -> Result<&'a str> {
-    params
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ToolError::InvalidParams {
+fn required_string<'a>(tool: &str, value: &'a str, key: &str) -> Result<&'a str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ToolError::InvalidParams {
             tool: tool.into(),
             message: format!("{key} is required"),
-        })
+        });
+    }
+    Ok(value)
 }
 
 fn format_excerpt(excerpt: &DeepMemoryExcerpt) -> String {

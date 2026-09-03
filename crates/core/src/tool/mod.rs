@@ -8,6 +8,7 @@ use crate::agent::orchestration::AgentRunner;
 use crate::work::ConversationSearchResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -60,11 +61,9 @@ pub struct ToolContext {
     /// The tool schemas advertised to the provider for the current request.
     pub enabled_tools: Vec<EnabledTool>,
     /// Compact descriptors for every tool registered in this agent's scoped
-    /// registry. Discovery tools can inspect it without exposing every schema
-    /// in every provider request.
+    /// registry.
     pub available_tools: Vec<EnabledTool>,
-    /// Mutable per-conversation activation state shared by the agent loop and
-    /// its discovery tools.
+    /// Per-agent execution state shared by tools that need a current directory.
     pub tool_activation: Arc<ToolActivation>,
     /// A deliberately reduced, read-only snapshot for delegated agents.
     pub conversation_context: Vec<crate::provider::ChatMessage>,
@@ -140,7 +139,7 @@ impl ToolActivation {
         self.names.read().unwrap().iter().cloned().collect()
     }
 
-    fn current_directory(&self, fallback: &Path) -> PathBuf {
+    pub(crate) fn current_directory(&self, fallback: &Path) -> PathBuf {
         self.current_directory
             .read()
             .unwrap()
@@ -262,8 +261,15 @@ pub trait Tool: Send + Sync {
         false
     }
 
-    /// Discovery roots are always exposed. All other registered tools can be
-    /// found through `discover_tools` and activated on demand.
+    /// Whether this particular invocation needs approval. Mixed tools can
+    /// keep read-only actions available while gating only state-changing ones.
+    fn requires_confirmation_for(&self, params: &Value) -> bool {
+        let _ = params;
+        self.requires_confirmation()
+    }
+
+    /// Legacy marker retained for integrations that used to define a bootstrap
+    /// catalogue. The application exposes every registered tool immediately.
     fn is_bootstrap(&self) -> bool {
         false
     }

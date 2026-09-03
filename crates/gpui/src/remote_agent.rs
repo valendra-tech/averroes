@@ -211,10 +211,28 @@ impl TelegramClient {
         bytes: Vec<u8>,
         caption: &str,
     ) -> Result<i64, String> {
+        self.send_image(
+            chat_id,
+            bytes,
+            "averroes-screenshot.png",
+            "image/png",
+            caption,
+        )
+        .await
+    }
+
+    pub(crate) async fn send_image(
+        &self,
+        chat_id: i64,
+        bytes: Vec<u8>,
+        file_name: &str,
+        media_type: &str,
+        caption: &str,
+    ) -> Result<i64, String> {
         let url = self.endpoint("sendPhoto");
         let photo = Part::bytes(bytes)
-            .file_name("averroes-screenshot.png")
-            .mime_str("image/png")
+            .file_name(file_name.to_owned())
+            .mime_str(media_type)
             .map_err(|error| format!("could not prepare screenshot upload: {error}"))?;
         let form = Form::new()
             .text("chat_id", chat_id.to_string())

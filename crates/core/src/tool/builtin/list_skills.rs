@@ -2,7 +2,10 @@ use crate::observability::diagnostics::{self, DiagnosticLevel};
 use crate::skill::SkillIndex;
 use crate::tool::{Result, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
+use serde::Deserialize;
 use std::sync::Arc;
+
+const MAX_QUERY_CHARS: usize = 1_000;
 
 pub struct ListSkillsTool {
     pub index: Arc<SkillIndex>,
@@ -12,6 +15,14 @@ impl ListSkillsTool {
     pub fn new(index: Arc<SkillIndex>) -> Self {
         Self { index }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListSkillsParams {
+    query: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[async_trait]
@@ -28,6 +39,7 @@ impl Tool for ListSkillsTool {
             "properties": {
                 "query": {
                     "type": "string",
+                    "maxLength": MAX_QUERY_CHARS,
                     "description": "Optional text matched against skill names and descriptions."
                 },
                 "limit": {
@@ -41,7 +53,8 @@ impl Tool for ListSkillsTool {
                     "description": "Zero-based offset for the next page.",
                     "minimum": 0
                 }
-            }
+            },
+            "additionalProperties": false
         })
     }
     fn is_read_only(&self) -> bool {
@@ -49,22 +62,29 @@ impl Tool for ListSkillsTool {
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: &serde_json::Value) -> Result<ToolResult> {
-        let query = params
-            .get("query")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .unwrap_or_default();
+        let params: ListSkillsParams = serde_json::from_value(params.clone()).map_err(|error| {
+            crate::tool::ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: error.to_string(),
+            }
+        })?;
+        let query = params.query.as_deref().map(str::trim).unwrap_or_default();
+        if query.chars().count() > MAX_QUERY_CHARS {
+            return Err(crate::tool::ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: format!("query cannot exceed {MAX_QUERY_CHARS} characters"),
+            });
+        }
         let normalized_query = normalize_search_text(query);
         let query_terms = normalized_query.split_whitespace().collect::<Vec<_>>();
-        let limit = params
-            .get("limit")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(12)
-            .clamp(1, 25) as usize;
-        let offset = params
-            .get("offset")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as usize;
+        let limit = params.limit.unwrap_or(12);
+        if !(1..=25).contains(&limit) {
+            return Err(crate::tool::ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: "limit must be between 1 and 25".into(),
+            });
+        }
+        let offset = params.offset.unwrap_or(0);
         let matching = self
             .index
             .list()
@@ -150,7 +170,33 @@ fn normalize_search_text(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{concise_description, normalize_search_text};
+    use super::{concise_description, normalize_search_text, ListSkillsTool, MAX_QUERY_CHARS};
+    use crate::skill::{SkillIndex, SkillLoader};
+    use crate::tool::{Tool, ToolActivation, ToolContext, ToolError};
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn context() -> ToolContext {
+        ToolContext {
+            working_dir: PathBuf::from("/tmp"),
+            session_id: "session".into(),
+            agent_id: "agent".into(),
+            enabled_tools: Vec::new(),
+            available_tools: Vec::new(),
+            tool_activation: Arc::new(ToolActivation::default()),
+            conversation_context: Vec::new(),
+            agent_runner: None,
+            memory_search_backend: None,
+            agent_event_sink: None,
+        }
+    }
+
+    fn tool() -> ListSkillsTool {
+        ListSkillsTool::new(Arc::new(
+            SkillIndex::build(SkillLoader::new(Vec::new())).unwrap(),
+        ))
+    }
 
     #[test]
     fn descriptions_are_single_line_and_bounded() {
@@ -170,5 +216,25 @@ mod tests {
         assert!(query
             .split_whitespace()
             .all(|term| skill.split_whitespace().any(|word| word.contains(term))));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_parameters_at_execution_boundary() {
+        let tool = tool();
+        let invalid = [
+            json!({"query": "x".repeat(MAX_QUERY_CHARS + 1)}),
+            json!({"limit": 0}),
+            json!({"limit": 26}),
+            json!({"offset": -1}),
+            json!({"unexpected": true}),
+            json!({"query": 42}),
+        ];
+
+        for params in invalid {
+            assert!(matches!(
+                tool.execute(&context(), &params).await,
+                Err(ToolError::InvalidParams { .. })
+            ));
+        }
     }
 }

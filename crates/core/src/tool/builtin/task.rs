@@ -36,11 +36,13 @@ impl MarkTaskAsDoneTool {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddTaskParams {
     title: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MarkTaskAsDoneParams {
     task_id: String,
 }

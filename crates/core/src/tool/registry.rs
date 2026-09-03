@@ -1,16 +1,28 @@
 use super::{EnabledTool, Result, Tool, ToolContext, ToolError, ToolRef, ToolResult};
+use crate::tool::builtin::ask_user::{
+    confirmation_approved, redact_confirmation_params, AskUserBroker,
+};
 use dashmap::DashMap;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 pub struct ToolRegistry {
     tools: DashMap<String, ToolRef>,
+    confirmation_broker: Option<Arc<AskUserBroker>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: DashMap::new(),
+            confirmation_broker: None,
+        }
+    }
+
+    pub fn with_confirmation_broker(broker: Arc<AskUserBroker>) -> Self {
+        Self {
+            tools: DashMap::new(),
+            confirmation_broker: Some(broker),
         }
     }
 
@@ -54,8 +66,8 @@ impl ToolRegistry {
         catalog
     }
 
-    /// Names of the minimal tools that seed a new conversation before it
-    /// discovers and activates more specific capabilities.
+    /// Legacy bootstrap names retained for compatibility. Runtime agents use
+    /// [`Self::names`] so every registered tool is available immediately.
     pub fn bootstrap_names(&self) -> Vec<String> {
         let mut names = self
             .tools
@@ -78,7 +90,10 @@ impl ToolRegistry {
                 .tools
                 .insert(entry.key().clone(), entry.value().clone());
         }
-        registry
+        Self {
+            tools: registry.tools,
+            confirmation_broker: self.confirmation_broker.clone(),
+        }
     }
 
     pub fn remove(&self, name: &str) -> Option<ToolRef> {
@@ -94,6 +109,58 @@ impl ToolRegistry {
         let tool = self.get(name).ok_or_else(|| ToolError::NotFound {
             tool: name.to_string(),
         })?;
+
+        if tool.requires_confirmation_for(params) {
+            let broker = self
+                .confirmation_broker
+                .as_ref()
+                .ok_or_else(|| ToolError::Execution {
+                    tool: name.to_string(),
+                    message: "confirmation is required but no confirmation broker is configured"
+                        .into(),
+                })?;
+            let events = ctx
+                .agent_event_sink
+                .as_ref()
+                .ok_or_else(|| ToolError::Execution {
+                    tool: name.to_string(),
+                    message: "confirmation is required but no interactive event sink is configured"
+                        .into(),
+                })?;
+            let confirmation_params = redact_confirmation_params(params);
+            let question = broker.request_confirmation(&ctx.session_id, name, &confirmation_params);
+            if events
+                .send(crate::agent::AgentStreamEvent::ToolConfirmationRequested {
+                    session_id: ctx.session_id.clone(),
+                    name: name.to_string(),
+                    input: confirmation_params,
+                    question: question.clone(),
+                })
+                .is_err()
+            {
+                broker.cancel(&ctx.session_id, &question.id);
+                return Err(ToolError::Execution {
+                    tool: name.to_string(),
+                    message: "confirmation UI is unavailable".into(),
+                });
+            }
+            let answer = broker
+                .wait_for_answer(&ctx.session_id, &question.id)
+                .await
+                .unwrap_or_default();
+            let approved = confirmation_approved(&answer);
+            let _ = events.send(crate::agent::AgentStreamEvent::ToolConfirmationResolved {
+                session_id: ctx.session_id.clone(),
+                question_id: question.id,
+                approved,
+            });
+            if !approved {
+                return Ok(ToolResult::error(format!(
+                    "The user denied confirmation for tool '{name}'."
+                ))
+                .with_metadata(json!({ "confirmation": "denied" })));
+            }
+        }
         tool.execute(ctx, params).await
     }
 }
@@ -111,6 +178,8 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     struct EchoTool;
 
@@ -273,5 +342,147 @@ mod tests {
         registry.register(FailingTool);
         let result = registry.execute("failing", &test_ctx(), &json!({})).await;
         assert!(matches!(result, Err(ToolError::InvalidParams { .. })));
+    }
+
+    #[tokio::test]
+    async fn confirmation_blocks_execution_until_approved() {
+        struct ConfirmedTool {
+            executions: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Tool for ConfirmedTool {
+            fn name(&self) -> &str {
+                "confirmed"
+            }
+
+            fn description(&self) -> &str {
+                "Requires approval"
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                json!({"type": "object", "properties": {}})
+            }
+
+            fn requires_confirmation(&self) -> bool {
+                true
+            }
+
+            async fn execute(
+                &self,
+                _ctx: &ToolContext,
+                _params: &serde_json::Value,
+            ) -> Result<ToolResult> {
+                self.executions.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolResult::ok("executed"))
+            }
+        }
+
+        let broker = Arc::new(AskUserBroker::default());
+        let registry = Arc::new(ToolRegistry::with_confirmation_broker(broker.clone()));
+        let executions = Arc::new(AtomicUsize::new(0));
+        registry.register(ConfirmedTool {
+            executions: executions.clone(),
+        });
+        let (events, mut received_events) = tokio::sync::mpsc::unbounded_channel();
+        let mut context = test_ctx();
+        context.agent_event_sink = Some(events);
+        let task = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.execute("confirmed", &context, &json!({})).await }
+        });
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), received_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let question = match event {
+            crate::agent::AgentStreamEvent::ToolConfirmationRequested { question, .. } => question,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(broker.answer("test-session", &question.id, "Allow".into()));
+
+        let result = task.await.unwrap().unwrap();
+        assert!(result.success);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn confirmation_redacts_ui_input_but_preserves_original_tool_params() {
+        struct ConfirmedTool {
+            observed: Arc<Mutex<Option<serde_json::Value>>>,
+        }
+
+        #[async_trait]
+        impl Tool for ConfirmedTool {
+            fn name(&self) -> &str {
+                "confirmed_originals"
+            }
+
+            fn description(&self) -> &str {
+                "Requires approval and observes its input"
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+
+            fn requires_confirmation(&self) -> bool {
+                true
+            }
+
+            async fn execute(
+                &self,
+                _ctx: &ToolContext,
+                params: &serde_json::Value,
+            ) -> Result<ToolResult> {
+                *self.observed.lock().unwrap() = Some(params.clone());
+                Ok(ToolResult::ok("executed"))
+            }
+        }
+
+        let broker = Arc::new(AskUserBroker::default());
+        let registry = Arc::new(ToolRegistry::with_confirmation_broker(broker.clone()));
+        let observed = Arc::new(Mutex::new(None));
+        registry.register(ConfirmedTool {
+            observed: observed.clone(),
+        });
+        let (events, mut received_events) = tokio::sync::mpsc::unbounded_channel();
+        let mut context = test_ctx();
+        context.agent_event_sink = Some(events);
+        let original = json!({
+            "command": "curl -H 'Authorization: Bearer original-secret'"
+        });
+        let task_params = original.clone();
+        let task = tokio::spawn({
+            let registry = registry.clone();
+            async move {
+                registry
+                    .execute("confirmed_originals", &context, &task_params)
+                    .await
+            }
+        });
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), received_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (question, input) = match event {
+            crate::agent::AgentStreamEvent::ToolConfirmationRequested {
+                question, input, ..
+            } => (question, input),
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert!(!input["command"]
+            .as_str()
+            .unwrap()
+            .contains("original-secret"));
+        assert!(observed.lock().unwrap().is_none());
+        assert!(broker.answer("test-session", &question.id, "Allow".into()));
+
+        let result = task.await.unwrap().unwrap();
+        assert!(result.success);
+        assert_eq!(observed.lock().unwrap().as_ref(), Some(&original));
     }
 }

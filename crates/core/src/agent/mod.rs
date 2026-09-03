@@ -36,6 +36,7 @@ const ITERATION_LIMIT_FINAL_CONTEXT: &str = concat!(
     "and do not claim that unverified work succeeded. Respond in the user's language."
 );
 const ITERATION_LIMIT_FALLBACK: &str = "I reached the tool execution safety limit. The work completed so far is preserved; ask me to continue and I will resume from there.";
+const PROJECT_INSTRUCTIONS_CONTEXT: &str = "[Project instructions for the current directory]";
 
 pub(super) fn is_delegation_tool(name: &str) -> bool {
     matches!(name, "list_agents" | "call_agent" | "call_agents")
@@ -48,6 +49,9 @@ pub struct AgentConfig {
     pub name: String,
     pub model: String,
     pub system_prompt: Option<String>,
+    /// Workspace root used to refresh AGENTS.md instructions after a directory
+    /// change. Custom prompts remain untouched when this is not set.
+    pub project_instructions_root: Option<PathBuf>,
     pub tools: Vec<String>,
     /// Maximum number of tool-call rounds before the agent must synthesize a
     /// final response from the work completed so far.
@@ -66,6 +70,7 @@ impl Default for AgentConfig {
             name: "default".into(),
             model: "claude-sonnet-4-20250514".into(),
             system_prompt: None,
+            project_instructions_root: None,
             tools: Vec::new(),
             max_iterations: 50,
             compaction: CompactionConfig::default(),
@@ -115,6 +120,17 @@ pub enum AgentStreamEvent {
         name: String,
         input: serde_json::Value,
     },
+    ToolConfirmationRequested {
+        session_id: String,
+        name: String,
+        input: serde_json::Value,
+        question: crate::tool::builtin::ask_user::UserQuestion,
+    },
+    ToolConfirmationResolved {
+        session_id: String,
+        question_id: String,
+        approved: bool,
+    },
     ToolFinished {
         call_id: Option<String>,
         name: String,
@@ -125,6 +141,10 @@ pub enum AgentStreamEvent {
         /// history as a source entry.
         output: String,
         metadata: Option<serde_json::Value>,
+        /// Provider-ready images from the tool result, such as desktop or
+        /// browser screenshots. The UI can relay them without re-running the
+        /// tool.
+        images: Vec<crate::provider::types::ImageSource>,
     },
     ContextUpdated {
         usage: ContextUsage,
@@ -911,6 +931,23 @@ impl Agent {
         skill_context: Option<String>,
     ) -> ChatRequest {
         let runtime = self.runtime_snapshot();
+        let current_dir = self.tool_activation.current_directory(&self.working_dir);
+        let current_dir_display = current_dir.display().to_string();
+        if let Some(system_prompt) = messages
+            .iter_mut()
+            .find(|message| message.role == Role::System)
+            .and_then(|message| match &mut message.content {
+                MessageContent::Text(text) => Some(text),
+                MessageContent::Parts(_) => None,
+            })
+        {
+            crate::prompt::refresh_system_working_directory(system_prompt, &current_dir_display);
+        }
+        refresh_project_instructions(
+            &mut messages,
+            self.config.project_instructions_root.as_deref(),
+            &current_dir,
+        );
         if let Some(context) = self.understood_context.read().unwrap().clone() {
             insert_understood_context(&mut messages, &context);
         }
@@ -926,6 +963,31 @@ impl Agent {
             reasoning_effort: runtime.reasoning_effort,
         }
     }
+}
+
+fn refresh_project_instructions(
+    messages: &mut Vec<ChatMessage>,
+    workspace_root: Option<&std::path::Path>,
+    working_dir: &std::path::Path,
+) {
+    messages.retain(|message| {
+        !(message.role == Role::System
+            && message_text(message).starts_with(PROJECT_INSTRUCTIONS_CONTEXT))
+    });
+    let Some(workspace_root) = workspace_root else {
+        return;
+    };
+    let instructions = crate::prompt::ProjectInstructions::load(workspace_root, working_dir);
+    if instructions.is_empty() {
+        return;
+    }
+    insert_system_context(
+        messages,
+        format!(
+            "{PROJECT_INSTRUCTIONS_CONTEXT}\n\n{}",
+            instructions.content()
+        ),
+    );
 }
 
 fn insert_system_context(messages: &mut Vec<ChatMessage>, context: String) {

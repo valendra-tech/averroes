@@ -1,11 +1,19 @@
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 use crate::work::WorkDatabase;
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
 pub struct SearchMemoryTool {
     database: Arc<WorkDatabase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchMemoryParams {
+    query: String,
+    limit: Option<usize>,
 }
 
 impl SearchMemoryTool {
@@ -47,20 +55,25 @@ impl Tool for SearchMemoryTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
-        let query = params
-            .get("query")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|query| !query.is_empty())
-            .ok_or_else(|| ToolError::InvalidParams {
+        let params: SearchMemoryParams =
+            serde_json::from_value(params.clone()).map_err(|error| ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: error.to_string(),
+            })?;
+        let query = params.query.trim();
+        if query.is_empty() {
+            return Err(ToolError::InvalidParams {
                 tool: self.name().into(),
                 message: "query is required".into(),
-            })?;
-        let limit = params
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(8)
-            .clamp(1, 20) as usize;
+            });
+        }
+        let limit = params.limit.unwrap_or(8);
+        if !(1..=20).contains(&limit) {
+            return Err(ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: "limit must be between 1 and 20".into(),
+            });
+        }
         let results = if let Some(backend) = ctx.memory_search_backend.as_ref() {
             backend
                 .search(query, limit)

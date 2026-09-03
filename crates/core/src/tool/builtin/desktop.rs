@@ -8,6 +8,8 @@ use std::{collections::HashMap, sync::Arc};
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
 const MAX_CAPTURE_MAPPINGS: usize = 64;
+const MAX_TYPED_TEXT_CHARS: usize = 10_000;
+const MAX_TYPING_DELAY_MS: u64 = 60_000;
 
 pub fn register(registry: &ToolRegistry) {
     let state = Arc::new(DesktopState::default());
@@ -305,6 +307,7 @@ impl Tool for DesktopInputTool {
                 },
                 "text": {
                     "type": "string",
+                    "maxLength": MAX_TYPED_TEXT_CHARS,
                     "description": "Unicode text to type into the focused control"
                 },
                 "key": {
@@ -902,6 +905,7 @@ mod macos {
                     return Err(invalid("text cannot be empty for the type action"));
                 }
                 let interval_ms = params.interval_ms.unwrap_or(0).min(1_000);
+                validate_typing_request(text, interval_ms)?;
                 type_text(&source, text, interval_ms)?;
                 Ok(input_result(
                     "type",
@@ -1165,6 +1169,24 @@ mod macos {
 
     fn bounded_i32(value: f64) -> i32 {
         value.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32
+    }
+
+    fn validate_typing_request(text: &str, interval_ms: u64) -> Result<()> {
+        let character_count = text.chars().count();
+        if character_count > MAX_TYPED_TEXT_CHARS {
+            return Err(invalid(format!(
+                "text cannot exceed {MAX_TYPED_TEXT_CHARS} characters"
+            )));
+        }
+        let delay_ms = u64::try_from(character_count.saturating_sub(1))
+            .unwrap_or(u64::MAX)
+            .saturating_mul(interval_ms);
+        if delay_ms > MAX_TYPING_DELAY_MS {
+            return Err(invalid(format!(
+                "typing delay cannot exceed {MAX_TYPING_DELAY_MS} milliseconds"
+            )));
+        }
+        Ok(())
     }
 
     fn type_text(source: &CGEventSource, text: &str, interval_ms: u64) -> Result<()> {
@@ -1443,6 +1465,16 @@ mod macos {
                 vec!["1234567890123456789", "🙂x"]
             );
             assert_eq!(unicode_chunks("a🙂b", 1), vec!["a", "🙂", "b"]);
+        }
+
+        #[test]
+        fn bounds_typed_text_size_and_accumulated_delay() {
+            assert!(validate_typing_request("x".repeat(MAX_TYPED_TEXT_CHARS).as_str(), 0).is_ok());
+            assert!(
+                validate_typing_request("x".repeat(MAX_TYPED_TEXT_CHARS + 1).as_str(), 0).is_err()
+            );
+            assert!(validate_typing_request("x".repeat(61).as_str(), 1_000).is_ok());
+            assert!(validate_typing_request("x".repeat(62).as_str(), 1_000).is_err());
         }
 
         #[test]

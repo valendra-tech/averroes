@@ -21,12 +21,11 @@ const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INPUT_WAIT: Duration = Duration::from_millis(800);
 const OUTPUT_QUIET_PERIOD: Duration = Duration::from_millis(250);
 const MAX_IDLE: Duration = Duration::from_secs(30 * 60);
+const MAX_SHELL_BUFFER_BYTES: usize = 128 * 1024;
+const OUTPUT_TRUNCATION_MARKER: &[u8] = b"\n...[shell output truncated]...\n";
 
-fn spawn_output_reader<R>(
-    mut reader: R,
-    sender: mpsc::UnboundedSender<Vec<u8>>,
-    stream: &'static str,
-) where
+fn spawn_output_reader<R>(mut reader: R, sender: mpsc::Sender<Vec<u8>>, stream: &'static str)
+where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
@@ -35,7 +34,7 @@ fn spawn_output_reader<R>(
             match reader.read(&mut buffer).await {
                 Ok(0) => break,
                 Ok(bytes) => {
-                    if sender.send(buffer[..bytes].to_vec()).is_err() {
+                    if sender.send(buffer[..bytes].to_vec()).await.is_err() {
                         break;
                     }
                 }
@@ -169,7 +168,7 @@ impl ShellSessionManager {
 
 pub(crate) struct ShellSession {
     writer: AsyncMutex<ChildStdin>,
-    receiver: AsyncMutex<mpsc::UnboundedReceiver<Vec<u8>>>,
+    receiver: AsyncMutex<mpsc::Receiver<Vec<u8>>>,
     pending: AsyncMutex<Vec<u8>>,
     command_lock: AsyncMutex<()>,
     child: Mutex<Child>,
@@ -220,7 +219,7 @@ impl ShellSession {
             .take()
             .context("failed to open shell stderr pipe")?;
 
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(128);
         spawn_output_reader(stdout, sender.clone(), "stdout");
         spawn_output_reader(stderr, sender, "stderr");
 
@@ -364,7 +363,7 @@ impl ShellSession {
                 return Ok(output);
             }
             let chunk = self.next_chunk().await?;
-            self.pending.lock().await.extend_from_slice(&chunk);
+            append_bounded(&mut *self.pending.lock().await, &chunk);
         }
     }
 
@@ -374,7 +373,7 @@ impl ShellSession {
                 return Ok(result);
             }
             let chunk = self.next_chunk().await?;
-            self.pending.lock().await.extend_from_slice(&chunk);
+            append_bounded(&mut *self.pending.lock().await, &chunk);
         }
     }
 
@@ -456,7 +455,7 @@ impl ShellSession {
             match tokio::time::timeout(wait_for, self.receiver.lock().await.recv()).await {
                 Ok(Some(chunk)) => {
                     received_output = true;
-                    output.extend_from_slice(&chunk);
+                    append_bounded(&mut output, &chunk);
                 }
                 Ok(None) => {
                     self.alive.store(false, Ordering::Release);
@@ -489,6 +488,21 @@ impl ShellSession {
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
     }
+}
+
+fn append_bounded(output: &mut Vec<u8>, chunk: &[u8]) {
+    output.extend_from_slice(chunk);
+    if output.len() <= MAX_SHELL_BUFFER_BYTES {
+        return;
+    }
+
+    let tail_bytes = MAX_SHELL_BUFFER_BYTES.saturating_sub(OUTPUT_TRUNCATION_MARKER.len());
+    let head_bytes = tail_bytes / 2;
+    let tail_start = output.len().saturating_sub(tail_bytes - head_bytes);
+    let tail = output[tail_start..].to_vec();
+    output.truncate(head_bytes);
+    output.extend_from_slice(OUTPUT_TRUNCATION_MARKER);
+    output.extend_from_slice(&tail);
 }
 
 impl Drop for ShellSession {
@@ -601,6 +615,17 @@ mod tests {
         }
         assert_eq!(normal, b"pwd\n");
         assert_eq!(b"\x03".to_vec(), vec![0x03]);
+    }
+
+    #[test]
+    fn shell_output_is_bounded_with_a_truncation_marker() {
+        let mut output = Vec::new();
+        append_bounded(&mut output, &vec![b'x'; MAX_SHELL_BUFFER_BYTES + 1]);
+
+        assert_eq!(output.len(), MAX_SHELL_BUFFER_BYTES);
+        assert!(output
+            .windows(OUTPUT_TRUNCATION_MARKER.len())
+            .any(|window| window == OUTPUT_TRUNCATION_MARKER));
     }
 
     #[tokio::test]

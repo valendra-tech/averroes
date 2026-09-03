@@ -776,6 +776,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "oxibrowser-core",
  "parking_lot",
  "pulldown-cmark",
  "reqwest",

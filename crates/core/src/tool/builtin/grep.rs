@@ -1,8 +1,11 @@
+use std::collections::VecDeque;
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::resolve_file_path;
@@ -10,10 +13,22 @@ use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 
 pub struct GrepTool;
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrepParams {
+    pattern: String,
+    path: Option<String>,
+    include: Option<String>,
+    exclude: Option<String>,
+    context: Option<usize>,
+    limit: Option<usize>,
+}
+
 const DEFAULT_MATCH_LIMIT: usize = 100;
 const MAX_MATCH_LIMIT: usize = 1_000;
 const MAX_CONTEXT_LINES: usize = 10;
 const MAX_OUTPUT_BYTES: usize = 64 * 1_024;
+const MAX_CAPTURED_LINE_BYTES: usize = 16 * 1_024;
 
 #[async_trait]
 impl Tool for GrepTool {
@@ -60,7 +75,8 @@ impl Tool for GrepTool {
                     "description": "Maximum number of matching lines"
                 }
             },
-            "required": ["pattern"]
+            "required": ["pattern"],
+            "additionalProperties": false
         })
     }
 
@@ -69,22 +85,40 @@ impl Tool for GrepTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
-        let pattern = required_string(self.name(), params, "pattern")?;
+        let params: GrepParams =
+            serde_json::from_value(params.clone()).map_err(|error| ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: error.to_string(),
+            })?;
+        let pattern = params.pattern.trim();
+        if pattern.is_empty() {
+            return Err(ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: "pattern is required".into(),
+            });
+        }
         let current_dir = ctx.current_dir();
-        let root = optional_string(self.name(), params, "path")?
+        let root = params
+            .path
+            .as_deref()
             .map(|path| resolve_file_path(&current_dir, path))
             .unwrap_or(current_dir);
-        let include = optional_string(self.name(), params, "include")?.map(str::to_owned);
-        let exclude = optional_string(self.name(), params, "exclude")?.map(str::to_owned);
-        let context = integer_param(self.name(), params, "context", 0, 0, MAX_CONTEXT_LINES)?;
-        let limit = integer_param(
-            self.name(),
-            params,
-            "limit",
-            DEFAULT_MATCH_LIMIT,
-            1,
-            MAX_MATCH_LIMIT,
-        )?;
+        let include = params.include;
+        let exclude = params.exclude;
+        let context = params.context.unwrap_or(0);
+        if context > MAX_CONTEXT_LINES {
+            return Err(ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: format!("context must be between 0 and {MAX_CONTEXT_LINES}"),
+            });
+        }
+        let limit = params.limit.unwrap_or(DEFAULT_MATCH_LIMIT);
+        if !(1..=MAX_MATCH_LIMIT).contains(&limit) {
+            return Err(ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: format!("limit must be between 1 and {MAX_MATCH_LIMIT}"),
+            });
+        }
         let regex = Regex::new(pattern).map_err(|error| ToolError::InvalidParams {
             tool: self.name().into(),
             message: format!("Invalid regex pattern: {error}"),
@@ -113,15 +147,24 @@ struct SearchStats {
     files_with_matches: usize,
     skipped_binary: usize,
     skipped_unreadable: usize,
+    truncated_lines: usize,
     matches: usize,
     match_limit_reached: bool,
     output_limit_reached: bool,
 }
 
-struct FileMatches {
-    path: String,
-    lines: Vec<String>,
-    matching_lines: Vec<usize>,
+struct SearchFileResult {
+    binary: bool,
+    output: String,
+    matches: usize,
+    match_limit_reached: bool,
+    output_limit_reached: bool,
+    truncated_lines: usize,
+}
+
+struct SearchWindow {
+    lines: Vec<(usize, String, bool)>,
+    end: usize,
 }
 
 fn search_workspace(
@@ -144,76 +187,65 @@ fn search_workspace(
     } else {
         root
     };
-    let mut paths = if root.is_file() {
-        path_allowed(display_root, root, include, exclude)
-            .then(|| root.to_path_buf())
-            .into_iter()
-            .collect()
+    let (mut paths, walk_errors) = if root.is_file() {
+        (
+            path_allowed(display_root, root, include, exclude)
+                .then(|| root.to_path_buf())
+                .into_iter()
+                .collect(),
+            0,
+        )
     } else {
         collect_paths(root, include, exclude)
     };
     paths.sort_by_key(|path| relative_path(display_root, path));
 
     let mut stats = SearchStats::default();
+    stats.skipped_unreadable = walk_errors;
     let mut output = String::new();
     for path in paths {
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                stats.skipped_unreadable += 1;
-                continue;
-            }
-        };
-        if bytes.contains(&0) {
+        let remaining_limit = limit.saturating_sub(stats.matches);
+        if remaining_limit == 0 {
+            stats.match_limit_reached = true;
+            break;
+        }
+        let file_display_path = relative_path(display_root, &path);
+        let file_result =
+            match search_file(&path, &file_display_path, regex, context, remaining_limit) {
+                Ok(result) => result,
+                Err(_) => {
+                    stats.skipped_unreadable += 1;
+                    continue;
+                }
+            };
+        if file_result.binary {
             stats.skipped_binary += 1;
             continue;
         }
-        let content = match std::str::from_utf8(&bytes) {
-            Ok(content) => content,
-            Err(_) => {
-                stats.skipped_binary += 1;
-                continue;
-            }
-        };
         stats.files_searched += 1;
-
-        let lines = content.lines().map(str::to_owned).collect::<Vec<_>>();
-        let mut matching_lines = Vec::new();
-        let mut stop_after_file = false;
-        for (index, line) in lines.iter().enumerate() {
-            if !regex.is_match(line) {
-                continue;
-            }
-            if stats.matches == limit {
-                stats.match_limit_reached = true;
-                stop_after_file = true;
-                break;
-            }
-            stats.matches += 1;
-            matching_lines.push(index);
-        }
-        if !matching_lines.is_empty() {
+        stats.truncated_lines += file_result.truncated_lines;
+        stats.matches += file_result.matches;
+        if file_result.matches > 0 {
             stats.files_with_matches += 1;
-            let file = FileMatches {
-                path: relative_path(display_root, &path),
-                lines,
-                matching_lines,
-            };
-            if !append_file_matches(&mut output, &file, context) {
+            if !push_bounded(&mut output, &file_result.output) {
                 stats.output_limit_reached = true;
                 break;
             }
         }
-        if stop_after_file {
+        if file_result.output_limit_reached {
+            stats.output_limit_reached = true;
+            break;
+        }
+        if file_result.match_limit_reached {
+            stats.match_limit_reached = true;
             break;
         }
     }
 
-    add_completion_message(&mut output, &stats, limit);
-
     if output.is_empty() {
         output.push_str("No matches found");
     }
+    add_completion_message(&mut output, &stats, limit);
     let truncated = stats.match_limit_reached || stats.output_limit_reached;
     Ok(ToolResult::ok(output).with_metadata(json!({
         "count": stats.matches,
@@ -222,6 +254,7 @@ fn search_workspace(
         "files_with_matches": stats.files_with_matches,
         "skipped_binary": stats.skipped_binary,
         "skipped_unreadable": stats.skipped_unreadable,
+        "truncated_lines": stats.truncated_lines,
         "truncated": truncated,
         "match_limit_reached": stats.match_limit_reached,
         "output_limit_reached": stats.output_limit_reached,
@@ -230,53 +263,231 @@ fn search_workspace(
     })))
 }
 
-fn collect_paths(root: &Path, include: Option<&str>, exclude: Option<&str>) -> Vec<PathBuf> {
-    WalkBuilder::new(root)
-        .standard_filters(true)
-        .follow_links(false)
-        .build()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-        .map(|entry| entry.into_path())
-        .filter(|path| path_allowed(root, path, include, exclude))
-        .collect()
-}
+fn search_file(
+    path: &Path,
+    display_path: &str,
+    regex: &Regex,
+    context: usize,
+    remaining_limit: usize,
+) -> io::Result<SearchFileResult> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut recent = VecDeque::with_capacity(context);
+    let mut window: Option<SearchWindow> = None;
+    let mut output = String::new();
+    let mut matches = 0usize;
+    let mut line_number = 0usize;
+    let mut truncated_lines = 0usize;
+    let mut match_limit_reached = false;
+    let mut output_limit_reached = false;
 
-fn append_file_matches(output: &mut String, file: &FileMatches, context: usize) -> bool {
-    let mut windows: Vec<(usize, usize)> = Vec::new();
-    for &line in &file.matching_lines {
-        let start = line.saturating_sub(context);
-        let end = line.saturating_add(context + 1).min(file.lines.len());
-        if let Some((_, previous_end)) = windows.last_mut() {
-            if start <= *previous_end {
-                *previous_end = (*previous_end).max(end);
-                continue;
+    while let Some(line) = read_line_limited(&mut reader, MAX_CAPTURED_LINE_BYTES)? {
+        if line.contains_nul {
+            return Ok(SearchFileResult {
+                binary: true,
+                output: String::new(),
+                matches: 0,
+                match_limit_reached: false,
+                output_limit_reached: false,
+                truncated_lines: 0,
+            });
+        }
+        let mut text = match String::from_utf8(line.bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                return Ok(SearchFileResult {
+                    binary: true,
+                    output: String::new(),
+                    matches: 0,
+                    match_limit_reached: false,
+                    output_limit_reached: false,
+                    truncated_lines: 0,
+                })
+            }
+        };
+        if text.ends_with('\r') {
+            text.pop();
+        }
+        if line.truncated {
+            truncated_lines = truncated_lines.saturating_add(1);
+            text.push_str("... [line truncated]");
+        }
+
+        let is_match = regex.is_match(&text);
+        if is_match && matches == remaining_limit {
+            match_limit_reached = true;
+            break;
+        }
+
+        let recent_text = text.clone();
+        if let Some(current) = window.as_mut() {
+            if line_number <= current.end {
+                current.lines.push((line_number, text, is_match));
+                if is_match {
+                    matches = matches.saturating_add(1);
+                    current.end = line_number.saturating_add(context);
+                }
+            } else {
+                let current = window.take().expect("search window exists");
+                if !append_search_window(&mut output, &display_path, &current) {
+                    output_limit_reached = true;
+                    break;
+                }
+                if is_match {
+                    matches = matches.saturating_add(1);
+                    window = Some(new_search_window(
+                        line_number,
+                        text,
+                        is_match,
+                        &recent,
+                        context,
+                    ));
+                }
+            }
+        } else if is_match {
+            matches = matches.saturating_add(1);
+            window = Some(new_search_window(
+                line_number,
+                text,
+                is_match,
+                &recent,
+                context,
+            ));
+        }
+
+        if context > 0 {
+            recent.push_back((line_number, recent_text));
+            while recent.len() > context {
+                recent.pop_front();
             }
         }
-        windows.push((start, end));
+        line_number = line_number.saturating_add(1);
     }
 
-    for (window_index, (start, end)) in windows.into_iter().enumerate() {
-        if window_index > 0 && !push_bounded(output, "--\n") {
-            return false;
-        }
-        for line_index in start..end {
-            let matched = file.matching_lines.binary_search(&line_index).is_ok();
-            let separator = if matched { ':' } else { '-' };
-            let line = format!(
-                "{}{}{}{} {}\n",
-                file.path,
-                separator,
-                line_index + 1,
-                separator,
-                file.lines[line_index]
-            );
-            if !push_bounded(output, &line) {
-                return false;
+    if !output_limit_reached {
+        if let Some(current) = window {
+            if !append_search_window(&mut output, &display_path, &current) {
+                output_limit_reached = true;
             }
+        }
+    }
+
+    Ok(SearchFileResult {
+        binary: false,
+        output,
+        matches,
+        match_limit_reached,
+        output_limit_reached,
+        truncated_lines,
+    })
+}
+
+fn new_search_window(
+    line_number: usize,
+    text: String,
+    is_match: bool,
+    recent: &VecDeque<(usize, String)>,
+    context: usize,
+) -> SearchWindow {
+    let mut lines = recent
+        .iter()
+        .map(|(number, text)| (*number, text.clone(), false))
+        .collect::<Vec<_>>();
+    lines.push((line_number, text, is_match));
+    SearchWindow {
+        lines,
+        end: line_number.saturating_add(context),
+    }
+}
+
+struct LimitedLine {
+    bytes: Vec<u8>,
+    truncated: bool,
+    contains_nul: bool,
+}
+
+fn read_line_limited<R>(reader: &mut R, capture_limit: usize) -> io::Result<Option<LimitedLine>>
+where
+    R: BufRead,
+{
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    let mut contains_nul = false;
+    let mut saw_bytes = false;
+
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(saw_bytes.then_some(LimitedLine {
+                bytes,
+                truncated,
+                contains_nul,
+            }));
+        }
+        saw_bytes = true;
+        contains_nul |= buffer.contains(&0);
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(buffer.len());
+        let consumed = newline.map_or(buffer.len(), |position| position + 1);
+        let remaining = capture_limit.saturating_sub(bytes.len());
+        let copied = remaining.min(content_len);
+        bytes.extend_from_slice(&buffer[..copied]);
+        if copied < content_len {
+            truncated = true;
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(LimitedLine {
+                bytes,
+                truncated,
+                contains_nul,
+            }));
+        }
+    }
+}
+
+fn append_search_window(output: &mut String, path: &str, window: &SearchWindow) -> bool {
+    if !output.is_empty() && !push_bounded(output, "--\n") {
+        return false;
+    }
+    for (line_number, line, matched) in &window.lines {
+        let separator = if *matched { ':' } else { '-' };
+        let formatted = format!(
+            "{path}{separator}{}{} {}\n",
+            line_number + 1,
+            separator,
+            line
+        );
+        if !push_bounded(output, &formatted) {
+            return false;
         }
     }
     true
+}
+
+fn collect_paths(
+    root: &Path,
+    include: Option<&str>,
+    exclude: Option<&str>,
+) -> (Vec<PathBuf>, usize) {
+    let mut errors = 0usize;
+    let paths = WalkBuilder::new(root)
+        .standard_filters(true)
+        .follow_links(false)
+        .build()
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(error) => {
+                errors = errors.saturating_add(1);
+                tracing::debug!(root = %root.display(), error = %error, "grep path could not be read");
+                None
+            }
+        })
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+        .map(|entry| entry.into_path())
+        .filter(|path| path_allowed(root, path, include, exclude))
+        .collect();
+    (paths, errors)
 }
 
 fn push_bounded(output: &mut String, value: &str) -> bool {
@@ -288,16 +499,39 @@ fn push_bounded(output: &mut String, value: &str) -> bool {
 }
 
 fn add_completion_message(output: &mut String, stats: &SearchStats, limit: usize) {
-    let notice = if stats.output_limit_reached {
-        "\nOutput truncated at 64 KiB. Narrow the pattern or use include/exclude filters.\n"
-            .to_owned()
+    let mut notices = Vec::new();
+    if stats.output_limit_reached {
+        notices.push(
+            "Output truncated at 64 KiB. Narrow the pattern or use include/exclude filters."
+                .to_owned(),
+        );
     } else if stats.match_limit_reached {
-        format!(
-            "\nSearch stopped after {limit} matches. Narrow the pattern or use include/exclude filters.\n"
-        )
-    } else {
+        notices.push(format!(
+            "Search stopped after {limit} matches. Narrow the pattern or use include/exclude filters."
+        ));
+    }
+    if stats.skipped_binary > 0 {
+        notices.push(format!(
+            "Skipped {} binary or non-UTF-8 file(s).",
+            stats.skipped_binary
+        ));
+    }
+    if stats.skipped_unreadable > 0 {
+        notices.push(format!(
+            "Could not inspect {} path(s); results may be incomplete.",
+            stats.skipped_unreadable
+        ));
+    }
+    if stats.truncated_lines > 0 {
+        notices.push(format!(
+            "{} long line(s) were truncated before matching; results may be incomplete.",
+            stats.truncated_lines
+        ));
+    }
+    if notices.is_empty() {
         return;
-    };
+    }
+    let notice = format!("\n{}\n", notices.join("\n"));
     while output.len().saturating_add(notice.len()) > MAX_OUTPUT_BYTES {
         if output.pop().is_none() {
             break;
@@ -323,57 +557,6 @@ fn relative_path(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
-}
-
-fn required_string<'a>(tool: &str, params: &'a Value, name: &str) -> Result<&'a str> {
-    params
-        .get(name)
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::InvalidParams {
-            tool: tool.into(),
-            message: format!("Missing required parameter: {name}"),
-        })
-}
-
-fn optional_string<'a>(tool: &str, params: &'a Value, name: &str) -> Result<Option<&'a str>> {
-    match params.get(name) {
-        None => Ok(None),
-        Some(value) => value
-            .as_str()
-            .map(Some)
-            .ok_or_else(|| ToolError::InvalidParams {
-                tool: tool.into(),
-                message: format!("{name} must be a string"),
-            }),
-    }
-}
-
-fn integer_param(
-    tool: &str,
-    params: &Value,
-    name: &str,
-    default: usize,
-    minimum: usize,
-    maximum: usize,
-) -> Result<usize> {
-    let Some(value) = params.get(name) else {
-        return Ok(default);
-    };
-    let value = value.as_u64().ok_or_else(|| ToolError::InvalidParams {
-        tool: tool.into(),
-        message: format!("{name} must be an integer between {minimum} and {maximum}"),
-    })?;
-    let value = usize::try_from(value).map_err(|_| ToolError::InvalidParams {
-        tool: tool.into(),
-        message: format!("{name} is too large"),
-    })?;
-    if !(minimum..=maximum).contains(&value) {
-        return Err(ToolError::InvalidParams {
-            tool: tool.into(),
-            message: format!("{name} must be between {minimum} and {maximum}"),
-        });
-    }
-    Ok(value)
 }
 
 #[cfg(test)]
@@ -508,5 +691,58 @@ mod tests {
             .unwrap();
 
         assert!(result.content.contains("outside.txt:1: one needle"));
+    }
+
+    #[tokio::test]
+    async fn reports_long_lines_that_were_truncated_before_matching() {
+        let directory = tempfile::tempdir().unwrap();
+        let long_line = format!(
+            "needle{}\n",
+            "x".repeat(MAX_CAPTURED_LINE_BYTES.saturating_add(100))
+        );
+        std::fs::write(directory.path().join("large.txt"), long_line).unwrap();
+
+        let result = GrepTool
+            .execute(&context(directory.path()), &json!({ "pattern": "needle" }))
+            .await
+            .unwrap();
+        let metadata = result.metadata.as_ref().unwrap();
+
+        assert_eq!(metadata["matches"], 1);
+        assert_eq!(metadata["truncated_lines"], 1);
+        assert!(result.content.contains("[line truncated]"));
+        assert!(result.content.contains("long line(s) were truncated"));
+    }
+
+    #[tokio::test]
+    async fn reports_output_truncation_without_exceeding_the_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let content = (0..1_000)
+            .map(|index| format!("hit {index} {}\n", "x".repeat(120)))
+            .collect::<String>();
+        std::fs::write(directory.path().join("many.txt"), content).unwrap();
+
+        let result = GrepTool
+            .execute(
+                &context(directory.path()),
+                &json!({ "pattern": "hit", "limit": 1_000 }),
+            )
+            .await
+            .unwrap();
+        let metadata = result.metadata.as_ref().unwrap();
+
+        assert_eq!(metadata["output_limit_reached"], true);
+        assert!(result.content.len() <= MAX_OUTPUT_BYTES);
+        assert!(result.content.contains("Output truncated at 64 KiB"));
+    }
+
+    #[test]
+    fn counts_directory_walk_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+
+        let (_, errors) = collect_paths(&missing, None, None);
+
+        assert!(errors > 0);
     }
 }

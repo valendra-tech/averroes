@@ -6,13 +6,16 @@
 
 use anyhow::{anyhow, Context};
 use base64::Engine as _;
+use futures::StreamExt;
+use oxibrowser_core::network::IpFilter;
 use oxibrowser_core::{Browser, BrowserConfig};
+use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, OnceCell};
 use url::Url;
 
@@ -21,6 +24,7 @@ use crate::tool::ToolResult;
 pub const PROJECT_MCP_FILE: &str = "mcp.yaml";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MCP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const MAX_MCP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TOOL_RESULT_IMAGES: usize = 20;
 const MAX_TOOL_RESULT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
@@ -149,11 +153,7 @@ impl ProjectMcpServer {
                 }
             }
             McpTransport::StreamableHttp | McpTransport::Sse | McpTransport::WebMcp => {
-                let parsed = Url::parse(self.url.as_deref().unwrap_or_default().trim())
-                    .context("MCP URL is invalid")?;
-                if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-                    return Err(anyhow!("MCP URL must be an http(s) URL with a host"));
-                }
+                validate_http_url(self.url.as_deref().unwrap_or_default().trim())?;
             }
         }
         if self.auth.kind != McpAuthType::None && self.auth.credential_ref.is_none() {
@@ -253,11 +253,14 @@ impl McpClient {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("could not start MCP server '{}'", self.server_name))?;
         let mut stdin = child.stdin.take().context("MCP stdin unavailable")?;
         let stdout = child.stdout.take().context("MCP stdout unavailable")?;
+        let stderr = child.stderr.take().context("MCP stderr unavailable")?;
         let mut lines = BufReader::new(stdout).lines();
+        let stderr_task = tokio::spawn(drain_stream(stderr));
         write_json_line(
             &mut stdin,
             &json_rpc_request(
@@ -280,6 +283,7 @@ impl McpClient {
         write_json_line(&mut stdin, &json_rpc_request(2, method, params)).await?;
         let result = read_json_response(&mut lines, 2).await;
         let _ = child.kill().await;
+        let _ = stderr_task.await;
         result
     }
 
@@ -314,9 +318,10 @@ impl McpClient {
             .endpoint
             .as_deref()
             .ok_or_else(|| anyhow!("MCP server '{}' has no URL", self.server_name))?;
-        let client = reqwest::Client::new();
+        let endpoint = validate_http_url(endpoint)?;
+        let client = mcp_http_client()?;
         let mut request = client
-            .post(endpoint)
+            .post(&endpoint)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
@@ -337,7 +342,9 @@ impl McpClient {
             *self.session_id.lock().await = Some(session_id.to_str()?.to_owned());
         }
         let status = response.status();
-        let body = response.text().await?;
+        let body = tokio::time::timeout(MCP_REQUEST_TIMEOUT, read_bounded_http_body(response))
+            .await
+            .context("MCP HTTP response timed out")??;
         if !status.is_success() {
             return Err(anyhow!(
                 "MCP server '{}' returned HTTP {}: {}",
@@ -354,9 +361,10 @@ impl McpClient {
             .endpoint
             .as_deref()
             .ok_or_else(|| anyhow!("MCP server '{}' has no URL", self.server_name))?;
-        let client = reqwest::Client::new();
+        let endpoint = validate_http_url(endpoint)?;
+        let client = mcp_http_client()?;
         let mut request = client
-            .post(endpoint)
+            .post(&endpoint)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
@@ -367,7 +375,16 @@ impl McpClient {
         if let Some(token) = self.access_token.as_deref() {
             request = request.bearer_auth(token);
         }
-        let _ = tokio::time::timeout(MCP_REQUEST_TIMEOUT, request.send()).await??;
+        let response = tokio::time::timeout(MCP_REQUEST_TIMEOUT, request.send())
+            .await
+            .context("MCP HTTP notification timed out")??;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "MCP server '{}' returned HTTP {} for notification",
+                self.server_name,
+                response.status()
+            ));
+        }
         Ok(())
     }
 
@@ -385,10 +402,10 @@ impl McpClient {
 
     async fn webmcp_list_tools(&self) -> anyhow::Result<Vec<McpToolDef>> {
         let browser = self.webmcp_browser().await?;
-        let endpoint = self.endpoint.as_deref().unwrap_or_default();
+        let endpoint = validate_http_url(self.endpoint.as_deref().unwrap_or_default())?;
         let session_handle = browser.new_session().await?;
         let mut session = session_handle.write().await;
-        if let Err(error) = session.navigate(endpoint).await {
+        if let Err(error) = session.navigate(&endpoint).await {
             drop(session);
             close_webmcp_session(&browser, &session_handle).await;
             return Err(error.into());
@@ -413,7 +430,7 @@ impl McpClient {
 
     async fn webmcp_call_tool(&self, name: &str, params: Value) -> anyhow::Result<ToolResult> {
         let browser = self.webmcp_browser().await?;
-        let endpoint = self.endpoint.as_deref().unwrap_or_default();
+        let endpoint = validate_http_url(self.endpoint.as_deref().unwrap_or_default())?;
         let session_handle = browser.new_session().await?;
         let name = serde_json::to_string(name)?;
         let params = serde_json::to_string(&params)?;
@@ -421,7 +438,7 @@ impl McpClient {
             "(async function(){{if(!document.modelContext){{throw new Error('WebMCP is not exposed by this page')}}return await document.modelContext.executeTool({name}, {params});}})()"
         );
         let mut session = session_handle.write().await;
-        if let Err(error) = session.navigate(endpoint).await {
+        if let Err(error) = session.navigate(&endpoint).await {
             drop(session);
             close_webmcp_session(&browser, &session_handle).await;
             return Err(error.into());
@@ -435,6 +452,60 @@ impl McpClient {
         }
         parse_tool_result(result.value.unwrap_or(Value::Null))
     }
+}
+
+fn validate_http_url(raw_url: &str) -> anyhow::Result<String> {
+    let url = Url::parse(raw_url).context("MCP URL is invalid")?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(anyhow!("MCP URL must be an http(s) URL with a host"));
+    }
+    if !IpFilter::block_private().is_hostname_allowed(url.host_str().unwrap()) {
+        return Err(anyhow!(
+            "MCP URL host is private, local, or could not be resolved safely"
+        ));
+    }
+    Ok(url.to_string())
+}
+
+fn mcp_http_client() -> anyhow::Result<reqwest::Client> {
+    let redirect_filter = IpFilter::block_private();
+    reqwest::Client::builder()
+        .redirect(Policy::custom(move |attempt| {
+            if redirect_filter.is_hostname_allowed(attempt.url().host_str().unwrap_or_default()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .connect_timeout(MCP_REQUEST_TIMEOUT)
+        .timeout(MCP_REQUEST_TIMEOUT)
+        .build()
+        .context("could not configure MCP HTTP client")
+}
+
+async fn read_bounded_http_body(response: reqwest::Response) -> anyhow::Result<String> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > MAX_MCP_RESPONSE_BYTES {
+            return Err(anyhow!(
+                "MCP response exceeded the {} byte limit",
+                MAX_MCP_RESPONSE_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).context("MCP response was not valid UTF-8")
+}
+
+async fn drain_stream<R>(mut stream: R) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = [0_u8; 8 * 1024];
+    while stream.read(&mut buffer).await? != 0 {}
+    Ok(())
 }
 
 pub struct McpToolDef {
@@ -762,6 +833,17 @@ mcpServers:
             transport: McpTransport::WebMcp,
             ..Default::default()
         };
+        assert!(server.validate().is_err());
+    }
+
+    #[test]
+    fn project_mcp_server_rejects_private_http_hosts() {
+        let server = ProjectMcpServer {
+            transport: McpTransport::StreamableHttp,
+            url: Some("http://127.0.0.1:8080/mcp".into()),
+            ..Default::default()
+        };
+
         assert!(server.validate().is_err());
     }
 

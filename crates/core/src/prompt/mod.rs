@@ -51,6 +51,10 @@ pub(crate) fn refresh_system_environment_time(prompt: &mut String) {
     replace_environment_time(prompt, &EnvironmentTime::now());
 }
 
+pub(crate) fn refresh_system_working_directory(prompt: &mut String, working_dir: &str) {
+    replace_environment_field(prompt, "Working Directory", working_dir);
+}
+
 impl PromptBuilder {
     pub fn new() -> Self {
         let mut env = Environment::new();
@@ -59,11 +63,7 @@ impl PromptBuilder {
         Self { env }
     }
 
-    pub fn build_system(
-        &self,
-        working_dir: &str,
-        project_instructions: Option<&str>,
-    ) -> String {
+    pub fn build_system(&self, working_dir: &str, project_instructions: Option<&str>) -> String {
         let environment_time = EnvironmentTime::now();
         let tmpl = self.env.get_template("system").unwrap();
         tmpl.render(context! {
@@ -87,10 +87,7 @@ mod tests {
     fn renders_project_instructions_when_available() {
         let builder = PromptBuilder::new();
 
-        let prompt = builder.build_system(
-            "/tmp/workspace",
-            Some("Use the workspace conventions."),
-        );
+        let prompt = builder.build_system("/tmp/workspace", Some("Use the workspace conventions."));
 
         assert!(prompt.contains("## Project Instructions"));
         assert!(prompt.contains("Use the workspace conventions."));
@@ -134,23 +131,36 @@ mod tests {
     }
 
     #[test]
+    fn refreshes_working_directory_in_an_existing_prompt() {
+        let builder = PromptBuilder::new();
+        let mut prompt = builder.build_system("/tmp/old", None);
+
+        refresh_system_working_directory(&mut prompt, "/tmp/new");
+
+        assert!(prompt.contains("- **Working Directory**: /tmp/new"));
+        assert!(!prompt.contains("- **Working Directory**: /tmp/old"));
+    }
+
+    #[test]
     fn omits_project_section_without_instructions() {
         let builder = PromptBuilder::new();
 
         let prompt = builder.build_system("/tmp/workspace", None);
 
         assert!(!prompt.contains("## Project Instructions"));
-        assert!(prompt.contains("discover and enable `create_global_memory`"));
+        assert!(prompt.contains("call `create_global_memory` immediately"));
         assert!(prompt.contains("Strict global-memory protocol"));
         assert!(prompt.contains("Detect first, ask second, save third"));
         assert!(prompt.contains("Never claim, imply, or promise"));
         assert!(prompt.contains("search_deep_memory"));
         assert!(prompt.contains("Deep-memory retrieval protocol"));
-        assert!(prompt.contains("call\n`discover_tools`") || prompt.contains("call `discover_tools`"));
-        assert!(prompt.contains("discover `list_agents` and `call_agents`"));
+        assert!(!prompt.contains("discover_tools"));
+        assert!(!prompt.contains("enable_tools"));
+        assert!(!prompt.contains("list_tools"));
+        assert!(prompt.contains("`list_agents` when you need to choose"));
         assert!(prompt.contains("Internet research delegation"));
         assert!(prompt.contains("Use `web_fetch` first"));
-        assert!(prompt.contains("enable `browser` only"));
+        assert!(prompt.contains("Use\n`browser` only"));
         assert!(prompt.contains("one independent delegated agent for the request by default"));
         assert!(prompt.contains("must never launch another subagent"));
         assert!(prompt.contains("Context management is automatic"));

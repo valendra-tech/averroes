@@ -234,6 +234,87 @@ fn char_len(text: &str) -> usize {
     text.chars().count()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteLiveToolStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteLiveToolLine {
+    pub name: String,
+    pub status: RemoteLiveToolStatus,
+    pub summary: String,
+}
+
+/// Markdown body for the in-progress Telegram reply.
+///
+/// Keep this compact: Telegram edits are capped at 4096 characters after HTML
+/// conversion, and reasoning/tool output can grow much faster than that.
+pub fn format_remote_live_markdown(
+    reasoning: &str,
+    tools: &[RemoteLiveToolLine],
+    answer: &str,
+) -> String {
+    let mut out = String::new();
+    let reasoning = reasoning.trim();
+    if !reasoning.is_empty() {
+        out.push_str("**Reasoning**\n");
+        for line in clip_chars(reasoning, 800).lines() {
+            out.push_str("> ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    if !tools.is_empty() {
+        out.push_str("**Tools**\n");
+        let start = tools.len().saturating_sub(12);
+        for tool in &tools[start..] {
+            let status = match tool.status {
+                RemoteLiveToolStatus::Running => "running",
+                RemoteLiveToolStatus::Done => "done",
+                RemoteLiveToolStatus::Failed => "failed",
+            };
+            out.push_str("- `");
+            out.push_str(&tool.name);
+            out.push_str("` (");
+            out.push_str(status);
+            out.push(')');
+            let summary = tool.summary.trim();
+            if !summary.is_empty() {
+                out.push_str(": ");
+                out.push_str(&clip_chars(summary, 120));
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    let answer = answer.trim_end();
+    if !answer.is_empty() {
+        if !out.is_empty() {
+            out.push_str("────────\n\n");
+        }
+        out.push_str(&clip_chars(answer, 1_800));
+    }
+    if out.is_empty() {
+        "Averroes is working…".into()
+    } else {
+        out
+    }
+}
+
+fn clip_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let clipped: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{clipped}…")
+    } else {
+        clipped
+    }
+}
+
 fn split_chars(text: &str, max_chars: usize) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();
@@ -254,7 +335,10 @@ fn split_chars(text: &str, max_chars: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{markdown_to_telegram_html, telegram_html_chunks};
+    use super::{
+        format_remote_live_markdown, markdown_to_telegram_html, telegram_html_chunks,
+        RemoteLiveToolLine, RemoteLiveToolStatus,
+    };
 
     #[test]
     fn converts_common_github_markdown() {
@@ -285,5 +369,25 @@ mod tests {
         let chunks = telegram_html_chunks(markdown, 24);
         assert!(chunks.len() >= 2);
         assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 24));
+    }
+
+    #[test]
+    fn live_markdown_includes_reasoning_tools_and_answer() {
+        let markdown = format_remote_live_markdown(
+            "Check the display first",
+            &[RemoteLiveToolLine {
+                name: "desktop_screenshot".into(),
+                status: RemoteLiveToolStatus::Done,
+                summary: "Captured display 1 as a 1920x1080 PNG.".into(),
+            }],
+            "The window is in the top-left corner.",
+        );
+        assert!(markdown.contains("**Reasoning**"));
+        assert!(markdown.contains("> Check the display first"));
+        assert!(markdown.contains("`desktop_screenshot` (done):"));
+        assert!(markdown.contains("The window is in the top-left corner."));
+        let html = markdown_to_telegram_html(&markdown);
+        assert!(html.contains("<blockquote>"));
+        assert!(html.contains("<code>desktop_screenshot</code>"));
     }
 }

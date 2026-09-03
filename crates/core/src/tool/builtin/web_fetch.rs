@@ -2,8 +2,10 @@
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use oxibrowser_core::network::IpFilter;
 use oxibrowser_core::page::Page;
 use reqwest::redirect::Policy;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 use url::Url;
@@ -20,10 +22,26 @@ pub struct WebFetchTool {
     client: reqwest::Client,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebFetchParams {
+    url: String,
+}
+
 impl Default for WebFetchTool {
     fn default() -> Self {
+        let redirect_filter = IpFilter::block_private();
         let client = reqwest::Client::builder()
-            .redirect(Policy::limited(10))
+            .redirect(Policy::custom(move |attempt| {
+                if redirect_filter.is_hostname_allowed(
+                    attempt.url().host_str().unwrap_or_default(),
+                ) {
+                    attempt.follow()
+                } else {
+                    tracing::warn!(url = %attempt.url(), "Blocked web_fetch redirect to a private or unresolved host");
+                    attempt.stop()
+                }
+            }))
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(format!("Averroes/{}", env!("CARGO_PKG_VERSION")))
             .build()
@@ -61,13 +79,12 @@ impl Tool for WebFetchTool {
     }
 
     async fn execute(&self, _ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
-        let raw_url = params["url"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidParams {
+        let params: WebFetchParams =
+            serde_json::from_value(params.clone()).map_err(|error| ToolError::InvalidParams {
                 tool: self.name().into(),
-                message: "Missing required parameter: url".into(),
+                message: error.to_string(),
             })?;
-        let url = validate_url(self.name(), raw_url)?;
+        let url = validate_url(self.name(), &params.url)?;
 
         tracing::info!(tool = self.name(), url = %url, "fetching URL over direct HTTP");
         tokio::time::timeout(FETCH_TIMEOUT, self.fetch(&url))
@@ -393,6 +410,7 @@ mod tests {
         assert!(validate_url("web_fetch", "http://example.com/path").is_ok());
         assert!(validate_url("web_fetch", "file:///tmp/secrets").is_err());
         assert!(validate_url("web_fetch", "javascript:alert(1)").is_err());
+        assert!(validate_url("web_fetch", "http://127.0.0.1").is_err());
     }
 
     #[test]
@@ -476,10 +494,7 @@ mod tests {
         });
 
         let result = WebFetchTool::default()
-            .execute(
-                &test_context(),
-                &json!({ "url": format!("http://{address}/page") }),
-            )
+            .fetch(&format!("http://{address}/page"))
             .await
             .unwrap();
 

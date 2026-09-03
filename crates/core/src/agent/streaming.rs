@@ -4,6 +4,7 @@ use super::{
 };
 use crate::provider::types::{FunctionCall, MessageContent, Role, ToolCall};
 use crate::provider::{ChatMessage, ChatRequest, ChatResponse, Provider, StreamEvent};
+use crate::tool::builtin::ask_user::redact_confirmation_params;
 use anyhow::Result;
 use futures::StreamExt;
 use std::collections::HashSet;
@@ -105,7 +106,7 @@ impl Agent {
                             let _ = events.send(AgentStreamEvent::ToolPreparing {
                                 call_id: id,
                                 name: tool_call.function.name.clone(),
-                                input,
+                                input: redact_confirmation_params(&input),
                                 inside_reasoning,
                             });
                         }

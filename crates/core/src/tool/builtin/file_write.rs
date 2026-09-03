@@ -1,10 +1,18 @@
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::resolve_file_path;
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 
 pub struct FileWriteTool;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileWriteParams {
+    file_path: String,
+    content: String,
+}
 
 #[async_trait]
 impl Tool for FileWriteTool {
@@ -29,7 +37,8 @@ impl Tool for FileWriteTool {
                     "description": "The content to write to the file"
                 }
             },
-            "required": ["file_path", "content"]
+            "required": ["file_path", "content"],
+            "additionalProperties": false
         })
     }
 
@@ -38,19 +47,13 @@ impl Tool for FileWriteTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
-        let file_path = params["file_path"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidParams {
+        let params: FileWriteParams =
+            serde_json::from_value(params.clone()).map_err(|error| ToolError::InvalidParams {
                 tool: self.name().into(),
-                message: "Missing required parameter: file_path".into(),
+                message: error.to_string(),
             })?;
-
-        let content = params["content"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidParams {
-                tool: self.name().into(),
-                message: "Missing required parameter: content".into(),
-            })?;
+        let file_path = params.file_path.as_str();
+        let content = params.content.as_str();
 
         let full_path = resolve_file_path(&ctx.current_dir(), file_path);
 

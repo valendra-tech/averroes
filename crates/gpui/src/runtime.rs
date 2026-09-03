@@ -1,4 +1,5 @@
 use crate::session::SessionId;
+use anyhow::anyhow;
 use async_trait::async_trait;
 use averroes_core::agent::orchestration::{
     AgentCallRequest, AgentDescriptor, AgentRunner, AgentThreadSnapshot, AgentThreadStatus,
@@ -41,6 +42,7 @@ use averroes_core::work::{
     ConversationSearchResult, EmbeddingConfig, VectorSearchHit, WorkDatabase, WorkDatabaseError,
 };
 use futures::stream::{self, StreamExt};
+use oxibrowser_core::network::IpFilter;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::future::Future;
@@ -191,7 +193,7 @@ fn parse_public_trending_skills(body: &str) -> Vec<MarketplaceSkill> {
 
 #[cfg(test)]
 mod marketplace_skill_tests {
-    use super::{parse_public_trending_skills, MarketplaceSkill};
+    use super::{is_well_known_skill_domain, parse_public_trending_skills, MarketplaceSkill};
     use serde_json::json;
 
     #[test]
@@ -228,6 +230,14 @@ mod marketplace_skill_tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].id, "owner/repo/release");
         assert_eq!(skills[0].installs, 42);
+    }
+
+    #[test]
+    fn accepts_only_dns_like_marketplace_domains() {
+        assert!(is_well_known_skill_domain("skills.example.com"));
+        assert!(!is_well_known_skill_domain("127.0.0.1"));
+        assert!(!is_well_known_skill_domain("localhost"));
+        assert!(!is_well_known_skill_domain("-invalid.example"));
     }
 }
 
@@ -299,6 +309,19 @@ impl AgentThreadRegistry {
         threads.sort_by_key(|thread| std::cmp::Reverse(thread.updated_at));
         threads
     }
+
+    fn interrupt_for_parent(&self, parent_session_id: &str) {
+        let mut threads = self.threads.write();
+        for thread in threads.values_mut() {
+            if thread.parent_session_id == parent_session_id
+                && thread.status == AgentThreadStatus::Running
+            {
+                thread.status = AgentThreadStatus::Interrupted;
+                thread.output = "Delegated agent interrupted.".into();
+                thread.updated_at = averroes_core::work::now();
+            }
+        }
+    }
 }
 
 impl Default for AgentThreadRegistry {
@@ -307,14 +330,51 @@ impl Default for AgentThreadRegistry {
     }
 }
 
+struct DelegatedRunGuard {
+    threads: Arc<AgentThreadRegistry>,
+    snapshot: Option<AgentThreadSnapshot>,
+    abort_handle: Option<tokio::task::AbortHandle>,
+}
+
+impl DelegatedRunGuard {
+    fn new(threads: Arc<AgentThreadRegistry>, snapshot: AgentThreadSnapshot) -> Self {
+        Self {
+            threads,
+            snapshot: Some(snapshot),
+            abort_handle: None,
+        }
+    }
+
+    fn set_abort_handle(&mut self, abort_handle: tokio::task::AbortHandle) {
+        self.abort_handle = Some(abort_handle);
+    }
+
+    fn disarm(&mut self) {
+        self.snapshot = None;
+        self.abort_handle = None;
+    }
+}
+
+impl Drop for DelegatedRunGuard {
+    fn drop(&mut self) {
+        if let Some(abort_handle) = self.abort_handle.take() {
+            abort_handle.abort();
+        }
+        let Some(mut snapshot) = self.snapshot.take() else {
+            return;
+        };
+        snapshot.status = AgentThreadStatus::Interrupted;
+        snapshot.output = "Delegated agent interrupted.".into();
+        snapshot.updated_at = averroes_core::work::now();
+        self.threads.upsert(snapshot);
+    }
+}
+
 fn delegated_agent_tools(
-    existing: Option<&AgentThreadSnapshot>,
-    bootstrap_tools: Vec<String>,
+    _existing: Option<&AgentThreadSnapshot>,
+    all_tools: Vec<String>,
 ) -> Vec<String> {
-    existing
-        .map(|thread| thread.enabled_tools.clone())
-        .filter(|tools| !tools.is_empty())
-        .unwrap_or(bootstrap_tools)
+    all_tools
 }
 
 /// Resolves the explicit connection assigned to a configured delegated
@@ -507,10 +567,7 @@ impl RuntimeAgentRunner {
             .unwrap_or_else(|| self.default_model.clone());
         let title = delegated_agent_title(&request.prompt);
         let now = averroes_core::work::now();
-        let tools = delegated_agent_tools(
-            existing_thread.as_ref(),
-            self.tool_registry.bootstrap_names(),
-        );
+        let tools = delegated_agent_tools(existing_thread.as_ref(), self.tool_registry.names());
         let running = AgentThreadSnapshot {
             id: thread_id.to_owned(),
             thread_id: thread_id.to_owned(),
@@ -526,11 +583,26 @@ impl RuntimeAgentRunner {
             updated_at: now,
         };
         self.threads.upsert(running.clone());
+        let mut run_guard = DelegatedRunGuard::new(self.threads.clone(), running.clone());
 
-        let provider = self
+        let provider = match self
             .provider_resolver
             .provider_for(&connection_id, &model_id)
-            .await?;
+            .await
+        {
+            Ok(provider) => provider,
+            Err(error) => {
+                run_guard.disarm();
+                let failed = AgentThreadSnapshot {
+                    status: AgentThreadStatus::Failed,
+                    output: error.clone(),
+                    updated_at: averroes_core::work::now(),
+                    ..running
+                };
+                self.threads.upsert(failed);
+                return Err(error);
+            }
+        };
         let context = self
             .threads
             .context(thread_id)
@@ -543,19 +615,18 @@ impl RuntimeAgentRunner {
                 request.parent_objective.trim()
             )
         };
-        // A new child starts with the compact discovery bootstrap. Continuing
-        // an existing thread restores only the tools that child activated in
-        // earlier turns, without inheriting every schema from the parent.
         let agent = Arc::new(Agent::new(
             AgentConfig {
-                name: format!("delegated-{}", &thread_id[..thread_id.len().min(8)]),
+                name: format!(
+                    "delegated-{}",
+                    thread_id.chars().take(8).collect::<String>()
+                ),
                 model: model_id,
                 system_prompt: Some(format!(
                     "{}{parent_context}\n\n## Delegation boundary\nYou are a delegated leaf agent. Do not call `list_agents`, `call_agent`, or `call_agents`, and do not start another subagent. Complete the assigned objective yourself and return your result to the parent agent.",
                     self.system_prompt
                 )),
-                // A delegated agent receives the same registry and starts
-                // with only the compact discovery bootstrap tools.
+                project_instructions_root: Some(request.working_dir.clone()),
                 tools,
                 max_iterations: 24,
                 compaction: self.compaction.clone(),
@@ -600,15 +671,17 @@ impl RuntimeAgentRunner {
             let child_task = tokio::spawn(async move {
                 child_agent.run_streaming(&child_prompt, child_sender).await
             });
+            run_guard.set_abort_handle(child_task.abort_handle());
             while let Some(event) = child_events.recv().await {
                 let _ = parent_events.send(AgentStreamEvent::DelegatedAgentEvent {
                     thread_id: thread_id.to_owned(),
                     event: Box::new(event),
                 });
             }
-            child_task
-                .await
-                .map_err(|error| format!("delegated agent task failed: {error}"))?
+            match child_task.await {
+                Ok(result) => result,
+                Err(error) => Err(anyhow!("delegated agent task failed: {error}")),
+            }
         } else {
             agent.run(&request.prompt).await
         };
@@ -627,13 +700,14 @@ impl RuntimeAgentRunner {
             ..running
         };
         self.threads.upsert(finished.clone());
+        run_guard.disarm();
         Ok(finished)
     }
 }
 
 #[cfg(test)]
 mod delegated_agent_tool_tests {
-    use super::{delegated_agent_tools, AgentThreadRegistry};
+    use super::{delegated_agent_tools, AgentThreadRegistry, DelegatedRunGuard};
     use averroes_core::agent::orchestration::{AgentThreadSnapshot, AgentThreadStatus};
 
     fn thread_with_tools(enabled_tools: Vec<String>) -> AgentThreadSnapshot {
@@ -654,27 +728,23 @@ mod delegated_agent_tool_tests {
     }
 
     #[test]
-    fn continuing_a_thread_restores_its_activated_tools() {
-        let existing = thread_with_tools(vec![
-            "discover_tools".into(),
-            "shell".into(),
-            "file_read".into(),
-        ]);
+    fn delegated_threads_use_the_complete_tool_catalog() {
+        let existing = thread_with_tools(vec!["shell".into(), "file_read".into()]);
 
         assert_eq!(
-            delegated_agent_tools(Some(&existing), vec!["discover_tools".into()]),
-            vec!["discover_tools", "shell", "file_read"]
+            delegated_agent_tools(Some(&existing), vec!["patch".into(), "web_fetch".into()]),
+            vec!["patch", "web_fetch"]
         );
     }
 
     #[test]
-    fn a_new_or_legacy_thread_uses_only_bootstrap_tools() {
+    fn legacy_threads_are_upgraded_to_all_tools() {
         let legacy = thread_with_tools(Vec::new());
-        let bootstrap = vec!["discover_tools".into(), "enable_tools".into()];
+        let all_tools = vec!["patch".into(), "web_fetch".into()];
 
         assert_eq!(
-            delegated_agent_tools(Some(&legacy), bootstrap.clone()),
-            bootstrap
+            delegated_agent_tools(Some(&legacy), all_tools.clone()),
+            all_tools
         );
     }
 
@@ -701,6 +771,23 @@ mod delegated_agent_tool_tests {
                 .enabled_tools,
             vec!["shell"]
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_delegated_run_interrupts_the_snapshot_and_aborts_the_child() {
+        let registry = std::sync::Arc::new(AgentThreadRegistry::new());
+        let snapshot = thread_with_tools(Vec::new());
+        registry.upsert(snapshot.clone());
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = task.abort_handle();
+
+        let mut guard = DelegatedRunGuard::new(registry.clone(), snapshot);
+        guard.set_abort_handle(abort_handle);
+        drop(guard);
+
+        let restored = registry.get("thread-1").expect("thread remains registered");
+        assert_eq!(restored.status, AgentThreadStatus::Interrupted);
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 }
 
@@ -981,9 +1068,15 @@ impl AppRuntime {
             tokio::runtime::Runtime::new()
                 .map_err(|error| RuntimeError::Runtime(error.to_string()))?,
         );
-        let tools = Arc::new(ToolRegistry::new());
+        let user_questions = Arc::new(AskUserBroker::default());
+        let tools = Arc::new(ToolRegistry::with_confirmation_broker(
+            user_questions.clone(),
+        ));
         builtin::register_all(&tools);
         let database = WorkDatabase::open(&paths)?;
+        tools.register(builtin::search_memory::SearchMemoryTool::new(
+            database.clone(),
+        ));
         tools.register(builtin::checkpoint::CheckpointTool::new(database.clone()));
         tools.register(builtin::task::TaskListTool::new(database.clone()));
         tools.register(builtin::task::AddTaskTool::new(database.clone()));
@@ -1006,7 +1099,6 @@ impl AppRuntime {
         let provider_hooks = ProviderRegistry::with_builtins();
         provider_hooks.bootstrap(&config.connections, &model_registry);
         let agent_threads = Arc::new(AgentThreadRegistry::default());
-        let user_questions = Arc::new(AskUserBroker::default());
 
         Ok(Self {
             vault,
@@ -1202,24 +1294,16 @@ impl AppRuntime {
         self.agent_threads.for_parent(parent_session_id)
     }
 
-    fn default_agent_tools_for(&self, registry: &ToolRegistry) -> Vec<String> {
-        registry.bootstrap_names()
+    pub fn interrupt_agent_threads_for(&self, parent_session_id: &str) {
+        self.agent_threads.interrupt_for_parent(parent_session_id);
     }
 
-    fn agent_tools(&self, binding: &SessionBinding, registry: &ToolRegistry) -> Vec<String> {
-        let mut enabled = self.default_agent_tools_for(registry);
-        // Bindings created by the discovery flow always contain its bootstrap
-        // root. Older bindings are intentionally not treated as an allow-list:
-        // they may have been written by the former static catalogue.
-        if binding.tools.iter().any(|name| name == "discover_tools") {
-            for name in &binding.tools {
-                if registry.get(name).is_some() && !enabled.iter().any(|item| item == name) {
-                    enabled.push(name.clone());
-                }
-            }
-        }
-        enabled.sort_unstable();
-        enabled
+    fn default_agent_tools_for(&self, registry: &ToolRegistry) -> Vec<String> {
+        registry.names()
+    }
+
+    fn agent_tools(&self, _binding: &SessionBinding, registry: &ToolRegistry) -> Vec<String> {
+        self.default_agent_tools_for(registry)
     }
 
     pub fn save_connection(
@@ -1459,7 +1543,7 @@ impl AppRuntime {
         query: &str,
     ) -> Result<Vec<MarketplaceSkill>, RuntimeError> {
         let query = query.trim();
-        let client = reqwest::Client::new();
+        let client = marketplace_http_client()?;
         if query.is_empty() {
             let response = client
                 .get("https://skills.sh/trending")
@@ -1541,7 +1625,14 @@ impl AppRuntime {
         }
         let source = source.to_owned();
         let slug = slug.to_owned();
-        let client = reqwest::Client::new();
+        if is_well_known_skill_domain(&source)
+            && !IpFilter::block_private().is_hostname_allowed(&source)
+        {
+            return Err(RuntimeError::Runtime(
+                "marketplace skill source resolves to a private or unresolved host".into(),
+            ));
+        }
+        let client = marketplace_http_client()?;
         let files = if source.split('/').count() == 2 && source.split('/').all(valid_segment) {
             fetch_github_skill_files(&client, &source, &slug).await?
         } else if is_well_known_skill_domain(&source) {
@@ -2173,9 +2264,6 @@ impl AppRuntime {
         scoped_tools.register(builtin::ask_user::AskUserTool::new(
             self.user_questions.clone(),
         ));
-        let project_instructions = workspace_root
-            .as_deref()
-            .and_then(|workspace_root| self.workspace_instructions(workspace_root));
         let workspace_skill_index = workspace_root
             .as_deref()
             .and_then(|workspace_root| self.refresh_workspace_skills(workspace_root));
@@ -2266,17 +2354,15 @@ impl AppRuntime {
         } else {
             Vec::new()
         };
-        let system_prompt = self.prompt.build_system(
-            &working_dir.display().to_string(),
-            project_instructions
-                .as_ref()
-                .map(|instructions| instructions.content()),
-        );
+        let system_prompt = self
+            .prompt
+            .build_system(&working_dir.display().to_string(), None);
         let config = self.config();
         let agent_config = AgentConfig {
             name: "averroes".into(),
             model: model.to_owned(),
             system_prompt: Some(system_prompt.clone()),
+            project_instructions_root: workspace_root.clone(),
             tools: tools.clone(),
             max_iterations: 50,
             compaction: compaction_config(&config),
@@ -2614,6 +2700,14 @@ impl AppRuntime {
     ) -> bool {
         self.user_questions
             .answer(session_id.as_str(), question_id, answer)
+    }
+
+    pub fn cancel_user_question(&self, session_id: &SessionId, question_id: Option<&str>) {
+        if let Some(question_id) = question_id {
+            self.user_questions.cancel(session_id.as_str(), question_id);
+        } else {
+            self.user_questions.cancel_session(session_id.as_str());
+        }
     }
 
     pub fn spawn_background<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
@@ -3010,7 +3104,11 @@ fn project_skill_roots(workspace_root: &Path) -> Vec<PathBuf> {
 }
 
 fn is_well_known_skill_domain(source: &str) -> bool {
-    if source.is_empty() || source.len() > 253 || source.split('.').count() < 2 {
+    if source.is_empty()
+        || source.len() > 253
+        || source.parse::<std::net::IpAddr>().is_ok()
+        || source.split('.').count() < 2
+    {
         return false;
     }
     source.split('.').all(|label| {
@@ -3021,6 +3119,26 @@ fn is_well_known_skill_domain(source: &str) -> bool {
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || character == '-')
     })
+}
+
+fn marketplace_http_client() -> Result<reqwest::Client, RuntimeError> {
+    let redirect_filter = IpFilter::block_private();
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if redirect_filter.is_hostname_allowed(attempt.url().host_str().unwrap_or_default()) {
+                attempt.follow()
+            } else {
+                tracing::warn!(
+                    url = %attempt.url(),
+                    "Blocked marketplace redirect to a private or unresolved host"
+                );
+                attempt.stop()
+            }
+        }))
+        .build()
+        .map_err(|error| {
+            RuntimeError::Runtime(format!("could not create marketplace client: {error}"))
+        })
 }
 
 fn project_mcp_credential_ref(workspace_root: &Path, server_name: &str) -> CredentialRef {
