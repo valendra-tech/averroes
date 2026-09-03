@@ -42,6 +42,11 @@ pub fn markdown_to_telegram_html(markdown: &str) -> String {
                 push_escaped(&mut out, &label);
                 out.push(']');
             }
+            Event::InlineMath(math) | Event::DisplayMath(math) => {
+                out.push_str("<code>");
+                push_escaped(&mut out, &math);
+                out.push_str("</code>");
+            }
         }
     }
 
