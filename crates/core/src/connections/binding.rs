@@ -1,4 +1,5 @@
 use super::ConnectionId;
+use crate::tool::ToolApprovalPolicy;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,6 +12,8 @@ pub struct SessionBinding {
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    #[serde(default)]
+    pub approval_policy: ToolApprovalPolicy,
 }
 
 impl SessionBinding {

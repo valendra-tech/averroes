@@ -398,33 +398,9 @@ pub(crate) async fn capture_desktop_screenshot() -> Result<Vec<u8>, String> {
     bytes
 }
 
-fn split_text(text: &str, max_chars: usize) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for character in text.chars() {
-        if current.chars().count() >= max_chars {
-            chunks.push(std::mem::take(&mut current));
-        }
-        current.push(character);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{split_text, TelegramMessage};
-
-    #[test]
-    fn splits_unicode_text_without_breaking_characters() {
-        let chunks = split_text("aé界", 2);
-        assert_eq!(chunks, vec!["aé", "界"]);
-    }
+    use super::TelegramMessage;
 
     #[test]
     fn deserializes_documents_and_captioned_photos() {

@@ -29,6 +29,7 @@ use averroes_core::integrations::mcp::{McpAuth, McpAuthType, McpTransport, Proje
 use averroes_core::models::ManualModel;
 use averroes_core::provider::types::{ChatMessage, ContentPart, ImageSource, MessageContent, Role};
 use averroes_core::provider::{ModelInfo, ModelSource};
+use averroes_core::tool::ToolApprovalPolicy;
 use averroes_core::work::{
     now, CheckpointStatus, ConversationSearchResult, ConversationSummary, EmbeddingConfig,
     EmbeddingIndexStatus, TaskStatus, WorkCheckpoint, WorkConversation, WorkConversationFolder,
@@ -200,7 +201,6 @@ enum Route {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
-    Connections,
     Models,
     Agents,
     RemoteAgent,
@@ -264,17 +264,9 @@ struct ReasoningBlockState {
 
 #[derive(Debug, Clone)]
 struct ToolActivity {
-    /// Provider tool-call ID, when the provider exposes one. This lets the
-    /// streaming preview turn into the real execution row without creating a
-    /// duplicate entry for the same call.
     call_id: Option<String>,
     name: String,
-    /// Byte position in the stream that owns the tool: `reasoning` for an
-    /// inside-reasoning call, otherwise the assistant response text. Stream
-    /// deltas only append, so this preserves temporal ordering cheaply.
     text_offset: usize,
-    /// Calls share a compact group until more text arrives in their owning
-    /// stream. Reasoning and assistant-text groups use separate trackers.
     group_id: Option<usize>,
     input: String,
     summary: String,
@@ -305,6 +297,13 @@ struct ShellMessage {
 #[derive(Clone, Default)]
 struct AgentThreadTranscript {
     messages: Vec<ShellMessage>,
+}
+
+#[derive(Clone)]
+struct PatchHistoryEntry {
+    id: String,
+    activity: ToolActivity,
+    agent_title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,6 +405,30 @@ impl SelectItem for ModelChoice {
         self.info.display_name.to_ascii_lowercase().contains(&query)
             || self.info.id.to_ascii_lowercase().contains(&query)
             || self.connection_name.to_ascii_lowercase().contains(&query)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolApprovalChoice {
+    policy: ToolApprovalPolicy,
+    label: SharedString,
+}
+
+impl ToolApprovalChoice {
+    fn new(policy: ToolApprovalPolicy, label: SharedString) -> Self {
+        Self { policy, label }
+    }
+}
+
+impl SelectItem for ToolApprovalChoice {
+    type Value = ToolApprovalPolicy;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.policy
     }
 }
 
@@ -858,6 +881,74 @@ fn restore_agent_thread_status(status: AgentThreadStatus) -> AgentThreadStatus {
     }
 }
 
+fn collect_patch_history(
+    session: &ShellSession,
+    agent_threads: &[AgentThreadSnapshot],
+) -> Vec<PatchHistoryEntry> {
+    let mut entries = Vec::new();
+    for (message_index, message) in session.messages.iter().enumerate() {
+        for (activity_index, activity) in message.tool_activities.iter().enumerate() {
+            if activity.name != "patch" {
+                continue;
+            }
+            entries.push(PatchHistoryEntry {
+                id: format!("main-{message_index}-{activity_index}"),
+                activity: activity.clone(),
+                agent_title: None,
+            });
+        }
+    }
+
+    let mut thread_ids = Vec::new();
+    let mut seen_thread_ids = HashSet::new();
+    for thread in agent_threads {
+        if session.agent_thread_transcripts.contains_key(&thread.id)
+            && seen_thread_ids.insert(thread.id.clone())
+        {
+            thread_ids.push(thread.id.clone());
+        }
+    }
+    let mut remaining_thread_ids = session
+        .agent_thread_transcripts
+        .keys()
+        .filter(|thread_id| !seen_thread_ids.contains(*thread_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    remaining_thread_ids.sort();
+    thread_ids.extend(remaining_thread_ids);
+
+    for thread_id in thread_ids {
+        let Some(transcript) = session.agent_thread_transcripts.get(&thread_id) else {
+            continue;
+        };
+        let agent_title = agent_threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .map(|thread| {
+                if thread.title.trim().is_empty() {
+                    thread.id.clone()
+                } else {
+                    thread.title.clone()
+                }
+            })
+            .or_else(|| Some(thread_id.clone()));
+        for (message_index, message) in transcript.messages.iter().enumerate() {
+            for (activity_index, activity) in message.tool_activities.iter().enumerate() {
+                if activity.name != "patch" {
+                    continue;
+                }
+                entries.push(PatchHistoryEntry {
+                    id: format!("thread-{thread_id}-{message_index}-{activity_index}"),
+                    activity: activity.clone(),
+                    agent_title: agent_title.clone(),
+                });
+            }
+        }
+    }
+
+    entries
+}
+
 struct ShellSession {
     id: SessionId,
     title: String,
@@ -1050,6 +1141,7 @@ pub struct AverroesApp {
     connection_select: Entity<SelectState<Vec<SharedString>>>,
     model_select: Entity<SelectState<SearchableVec<SelectGroup<ModelChoice>>>>,
     reasoning_select: Entity<SelectState<Vec<SharedString>>>,
+    security_select: Entity<SelectState<Vec<ToolApprovalChoice>>>,
     kind_select: Entity<SelectState<Vec<ConnectionKindChoice>>>,
     connection_labels: Vec<(SharedString, ConnectionId)>,
     model_choices: Vec<ModelChoice>,
@@ -1133,6 +1225,7 @@ pub struct AverroesApp {
     show_sources: bool,
     show_tool_activity: bool,
     show_context: bool,
+    show_patches: bool,
     conversation_list: ListState,
     conversation_list_session: Option<SessionId>,
     selected_agent_thread: Option<String>,
@@ -1189,6 +1282,8 @@ impl AverroesApp {
         });
         let reasoning_select =
             cx.new(|cx| SelectState::new(vec![i18n::text(cx, "reasoning.auto")], None, window, cx));
+        let security_select =
+            cx.new(|cx| SelectState::new(tool_approval_choices(cx), None, window, cx));
         let kind_select = cx.new(|cx| {
             SelectState::new(
                 vec![
@@ -1408,6 +1503,14 @@ impl AverroesApp {
             },
         ));
         subscriptions.push(cx.subscribe_in(
+            &security_select,
+            window,
+            |this, _, event: &SelectEvent<Vec<ToolApprovalChoice>>, window, cx| {
+                let SelectEvent::Confirm(value) = event;
+                this.select_tool_approval_policy(value.as_ref().copied(), window, cx);
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
             &kind_select,
             window,
             |this, _, event: &SelectEvent<Vec<ConnectionKindChoice>>, window, cx| {
@@ -1595,6 +1698,7 @@ impl AverroesApp {
             connection_select,
             model_select,
             reasoning_select,
+            security_select,
             kind_select,
             connection_labels,
             model_choices,
@@ -1679,6 +1783,7 @@ impl AverroesApp {
             show_sources: true,
             show_tool_activity: true,
             show_context: false,
+            show_patches: false,
             conversation_list,
             conversation_list_session: None,
             selected_agent_thread: None,
@@ -7212,6 +7317,40 @@ impl AverroesApp {
         cx.notify();
     }
 
+    fn select_tool_approval_policy(
+        &mut self,
+        policy: Option<ToolApprovalPolicy>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let policy = policy.unwrap_or_default();
+        self.active_mut().binding.approval_policy = policy;
+        if let Some(agent) = self.active().agent.as_ref() {
+            agent.set_tool_approval_policy(policy);
+        }
+        self.notice = None;
+        self.refresh_security_picker(window, cx);
+        let binding = self.active().binding.clone();
+        if binding.is_ready() {
+            match self.runtime.database.remember_binding(&binding) {
+                Ok(()) => {
+                    self.remembered_binding = binding;
+                    self.reconcile_onboarding_steps();
+                }
+                Err(error) => {
+                    self.notice = Some(Notice {
+                        success: false,
+                        text: error.to_string(),
+                    });
+                }
+            }
+        }
+        if self.active().persisted {
+            self.persist_active(cx);
+        }
+        cx.notify();
+    }
+
     fn sync_connection_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected = self.active().binding.connection_id.as_ref().and_then(|id| {
             self.connection_labels
@@ -7298,6 +7437,15 @@ impl AverroesApp {
                 return;
             }
             select.set_selected_value(&selected_label, window, cx);
+        });
+    }
+
+    fn refresh_security_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.active().binding.approval_policy;
+        let items = tool_approval_choices(cx);
+        self.security_select.update(cx, |select, cx| {
+            select.set_items(items, window, cx);
+            select.set_selected_value(&selected, window, cx);
         });
     }
 
@@ -7913,7 +8061,18 @@ impl AverroesApp {
 
     fn toggle_context_sidebar(&mut self, cx: &mut Context<Self>) {
         self.show_context = !self.show_context;
-        if !self.show_context {
+        if self.show_context {
+            self.show_patches = false;
+        } else {
+            self.selected_agent_thread = None;
+        }
+        cx.notify();
+    }
+
+    fn toggle_patch_history_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.show_patches = !self.show_patches;
+        if self.show_patches {
+            self.show_context = false;
             self.selected_agent_thread = None;
         }
         cx.notify();
@@ -7940,6 +8099,7 @@ impl AverroesApp {
         self.agent_thread_view = Some(thread_id);
         self.selected_agent_thread = None;
         self.show_context = false;
+        self.show_patches = false;
         cx.notify();
     }
 
@@ -9093,6 +9253,7 @@ impl AverroesApp {
         let connection_id = self.active().binding.connection_id.clone();
         self.sync_connection_picker(window, cx);
         self.refresh_model_picker(window, cx);
+        self.refresh_security_picker(window, cx);
         let is_codex = connection_id
             .as_ref()
             .and_then(|id| self.runtime.connection(id))
@@ -10414,6 +10575,15 @@ impl AverroesApp {
                                     .placeholder(i18n::text(cx, "composer.effort"))
                                     .search_placeholder(i18n::text(cx, "composer.search_effort"))
                                     .disabled(!has_model),
+                            )
+                            .child(
+                                Select::new(&self.security_select)
+                                    .w(px(108.0))
+                                    .h(px(28.0))
+                                    .small()
+                                    .appearance(false)
+                                    .placeholder(i18n::text(cx, "composer.security"))
+                                    .search_placeholder(i18n::text(cx, "composer.search_security")),
                             ),
                     )
                     .child(div().flex_1())
@@ -11299,6 +11469,8 @@ impl AverroesApp {
                 agent_threads.push(thread);
             }
         }
+        let patch_history = collect_patch_history(session, &agent_threads);
+        let patch_count = patch_history.len().to_string();
 
         if is_empty {
             return div()
@@ -11499,6 +11671,50 @@ impl AverroesApp {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toggle_context_sidebar(cx);
                             })),
+                    )
+                    .child(
+                        div()
+                            .id("patch-history-button")
+                            .ml(px(6.0))
+                            .flex_none()
+                            .h(px(30.0))
+                            .px(px(9.0))
+                            .gap(px(6.0))
+                            .rounded(px(9.0))
+                            .border_1()
+                            .border_color(if self.show_patches {
+                                theme.focus_ring
+                            } else {
+                                theme.border
+                            })
+                            .bg(if self.show_patches {
+                                theme.accent_soft
+                            } else {
+                                theme.surface_subtle
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|style| {
+                                style.bg(theme.accent_soft).border_color(theme.focus_ring)
+                            })
+                            .text_size(px(11.0))
+                            .text_color(theme.muted)
+                            .child(
+                                Icon::new(IconName::File)
+                                    .size(px(13.0))
+                                    .text_color(theme.faint),
+                            )
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(i18n::text(cx, "chat.patches")),
+                            )
+                            .child(patch_count.clone())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_patch_history_sidebar(cx);
+                            })),
                     ),
             )
             .child(
@@ -11574,6 +11790,9 @@ impl AverroesApp {
                             &agent_threads,
                             cx,
                         ))
+                    })
+                    .when(self.show_patches && !self.show_context, |this| {
+                        this.child(self.render_patch_history_sidebar(&patch_history, cx))
                     }),
             )
             .into_any_element()
@@ -11738,6 +11957,206 @@ impl AverroesApp {
                         ),
                     ),
             )
+            .into_any_element()
+    }
+
+    fn render_patch_history_sidebar(
+        &self,
+        entries: &[PatchHistoryEntry],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let rows = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let activity = &entry.activity;
+                let activity_id = format!("patch-history-{}-{index}", entry.id);
+                let state_label = localized_tool_activity_state_label(cx, activity.state);
+                let state_color = tool_activity_state_color(activity.state, theme);
+                let duration = activity
+                    .duration_ms
+                    .map(format_tool_duration)
+                    .unwrap_or_else(|| i18n::text(cx, "tool.running").to_string());
+                let input = tool_input_for_display(&activity.input);
+                let output = if activity.output.is_empty() {
+                    activity.summary.clone()
+                } else {
+                    activity.output.clone()
+                };
+                let summary = activity.summary.clone();
+                let agent_title = entry
+                    .agent_title
+                    .as_ref()
+                    .map(|agent| i18n::format(cx, "chat.patch_agent", &[("agent", agent.clone())]));
+
+                div()
+                    .id(SharedString::from(activity_id.clone()))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .w_full()
+                    .p(px(11.0))
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface_subtle)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .child(tool_icon("patch", 15.0).text_color(theme.muted))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.foreground)
+                                    .child(localized_tool_display_name(cx, "patch")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(state_color)
+                                    .child(state_label),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.faint)
+                                    .child(duration),
+                            ),
+                    )
+                    .when_some(agent_title, |this, agent_title| {
+                        this.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.faint)
+                                .child(agent_title),
+                        )
+                    })
+                    .when(!summary.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.0))
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.faint)
+                                        .child(i18n::text(cx, "chat.patch_summary")),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.muted)
+                                        .child(summary),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.faint)
+                            .child(i18n::text(cx, "tool.arguments")),
+                    )
+                    .child(render_tool_detail(
+                        activity_id.clone(),
+                        input,
+                        ToolDetailSection::Arguments,
+                        theme.muted,
+                        10.0,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.faint)
+                            .child(i18n::text(cx, "tool.result")),
+                    )
+                    .child(render_tool_detail(
+                        activity_id,
+                        if output.is_empty() {
+                            i18n::text(cx, "tool.no_output").to_string()
+                        } else {
+                            output
+                        },
+                        ToolDetailSection::Result,
+                        if activity.state == ToolActivityState::Failed {
+                            theme.destructive
+                        } else {
+                            theme.muted
+                        },
+                        10.0,
+                    ))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let count = i18n::format(
+            cx,
+            "chat.patch_count",
+            &[("count", entries.len().to_string())],
+        );
+
+        div()
+            .flex_none()
+            .w(px(360.0))
+            .min_h(px(0.0))
+            .bg(theme.background)
+            .border_l_1()
+            .border_color(theme.border)
+            .px(px(18.0))
+            .py(px(15.0))
+            .overflow_y_scrollbar()
+            .child(
+                div()
+                    .h(px(30.0))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(
+                                Icon::new(IconName::File)
+                                    .size(px(14.0))
+                                    .text_color(theme.faint),
+                            )
+                            .child(i18n::text(cx, "chat.patch_history")),
+                    )
+                    .child(
+                        Button::new("close-patch-history-sidebar")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Close)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_patch_history_sidebar(cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .mt(px(10.0))
+                    .text_size(px(10.0))
+                    .text_color(theme.faint)
+                    .child(count),
+            )
+            .when(entries.is_empty(), |this| {
+                this.child(
+                    div()
+                        .mt(px(24.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.muted)
+                        .child(i18n::text(cx, "chat.no_patches")),
+                )
+            })
+            .children(rows)
             .into_any_element()
     }
 
@@ -12145,517 +12564,6 @@ impl AverroesApp {
                 .children(thread_rows)
             })
             .when_some(selected_panel, |this, panel| this.child(panel))
-            .into_any_element()
-    }
-
-    fn render_legacy_connections(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = UiTheme::current(cx);
-        let profiles = self.runtime.connections();
-        let codex_account = self.codex_account.clone();
-        let mut cards = Vec::new();
-        for profile in profiles {
-            let id = profile.id.clone();
-            let is_codex = profile.kind == ConnectionKind::Codex;
-            let is_copilot = profile.kind == ConnectionKind::Copilot;
-            let codex_connected = is_codex
-                && codex_account
-                    .as_ref()
-                    .is_some_and(|account| account.authenticated);
-            let copilot_connected = is_copilot && self.runtime.has_connection_credential(&id);
-            let copilot_model_count = if is_copilot {
-                self.runtime
-                    .models_for_connection(&id)
-                    .unwrap_or_default()
-                    .len()
-            } else {
-                0
-            };
-            let needs_sign_in =
-                (is_codex && !codex_connected) || (is_copilot && !copilot_connected);
-            let login_id = id.clone();
-            let subtitle = match profile.kind {
-                ConnectionKind::Codex => codex_account
-                    .as_ref()
-                    .filter(|account| account.authenticated)
-                    .map(|account| {
-                        format!(
-                            "{} · {} plan · direct from Averroes",
-                            account.email.as_deref().unwrap_or("ChatGPT"),
-                            account.plan.as_deref().unwrap_or("unknown")
-                        )
-                    })
-                    .unwrap_or_else(|| "ChatGPT not signed in · no CLI required".to_string()),
-                ConnectionKind::Copilot if copilot_model_count > 0 => format!(
-                    "GitHub Copilot · {copilot_model_count} live models · encrypted GitHub token"
-                ),
-                ConnectionKind::Copilot => {
-                    "GitHub Copilot · encrypted GitHub token · no models loaded".to_string()
-                }
-                ConnectionKind::QDivZero => {
-                    "QDivZero API · live serving catalog · encrypted credential".to_string()
-                }
-                ConnectionKind::OpenAi => "OpenAI API · encrypted credential".to_string(),
-                ConnectionKind::Anthropic => "Anthropic API · encrypted credential".to_string(),
-                ConnectionKind::DeepSeek => "DeepSeek API · encrypted credential".to_string(),
-                ConnectionKind::Groq => "Groq API · encrypted credential".to_string(),
-                ConnectionKind::Ollama => profile
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "http://localhost:11434".into()),
-                ConnectionKind::OllamaCloud => profile
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "https://ollama.com/v1".into()),
-                ConnectionKind::Compatible => profile
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "Compatible API".into()),
-            };
-            cards.push(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.0))
-                    .p(px(14.0))
-                    .rounded(px(12.0))
-                    .bg(theme.surface)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(36.0))
-                            .rounded(px(10.0))
-                            .bg(gpui::rgb(0xf3f4f6))
-                            .child(provider_logo(profile.kind, 19.0)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(profile.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(theme.muted)
-                                    .child(subtitle),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .px(px(9.0))
-                            .py(px(4.0))
-                            .rounded_full()
-                            .bg(if needs_sign_in {
-                                theme.accent_soft
-                            } else {
-                                theme.success_soft
-                            })
-                            .text_color(if needs_sign_in {
-                                theme.accent_hover
-                            } else {
-                                theme.success
-                            })
-                            .text_size(px(10.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(if codex_connected {
-                                "CONNECTED"
-                            } else if copilot_connected {
-                                "CONNECTED"
-                            } else if needs_sign_in {
-                                "SIGN IN"
-                            } else {
-                                "SAVED"
-                            }),
-                    )
-                    .when(is_codex && !codex_connected, |this| {
-                        this.child(
-                            Button::new(format!("login-codex-{}", profile.id))
-                                .secondary()
-                                .small()
-                                .label(i18n::text(cx, "settings.connect"))
-                                .loading(self.codex_busy)
-                                .on_click(cx.listener(|this, _, _, cx| this.start_codex_login(cx))),
-                        )
-                    })
-                    .when(is_copilot, |this| {
-                        this.child(
-                            Button::new(format!("login-copilot-{}", profile.id))
-                                .secondary()
-                                .small()
-                                .icon(IconName::Github)
-                                .label(if copilot_connected {
-                                    "Reconnect"
-                                } else {
-                                    "Sign in with GitHub"
-                                })
-                                .loading(self.copilot_busy)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.start_copilot_login(login_id.clone(), cx)
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new(format!("delete-connection-{}", profile.id))
-                            .ghost()
-                            .small()
-                            .icon(IconName::Delete)
-                            .tooltip(i18n::text(cx, "settings.remove_connection"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.delete_connection(id.clone(), window, cx)
-                            })),
-                    )
-                    .into_any_element(),
-            );
-        }
-
-        let needs_base_url = matches!(
-            self.selected_kind,
-            Some(ConnectionKind::Compatible | ConnectionKind::Ollama | ConnectionKind::OllamaCloud)
-        );
-        let codex = self.selected_kind == Some(ConnectionKind::Codex);
-        let copilot = self.selected_kind == Some(ConnectionKind::Copilot);
-        let ollama_cloud = self.selected_kind == Some(ConnectionKind::OllamaCloud);
-        let needs_key = self
-            .selected_kind
-            .is_some_and(ConnectionKind::requires_api_key)
-            && (!copilot || self.show_manual_copilot_token);
-        let copilot_uses_login = copilot && self.key_input.read(cx).value().trim().is_empty();
-        let notice = self.notice.clone().map(|notice| {
-            div()
-                .px(px(12.0))
-                .py(px(9.0))
-                .rounded(px(9.0))
-                .bg(if notice.success {
-                    theme.success_soft
-                } else {
-                    theme.destructive_soft
-                })
-                .text_color(if notice.success {
-                    theme.success
-                } else {
-                    theme.destructive
-                })
-                .text_size(px(12.0))
-                .child(notice.text)
-                .into_any_element()
-        });
-
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .min_w(px(0.0))
-            .child(
-                div()
-                    .h(px(72.0))
-                    .px(px(32.0))
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(
-                                div()
-                                    .font(UiTheme::display_font())
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(i18n::text(cx, "settings.title")),
-                            )
-                            .child(div().text_size(px(11.0)).text_color(theme.faint).child(
-                                i18n::text(cx, settings_tab_description(self.settings_tab)),
-                            )),
-                    )
-                    .child(
-                        Button::new("back-to-chat")
-                            .secondary()
-                            .icon(IconName::ArrowLeft)
-                            .label(i18n::text(cx, "settings.back_to_work"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.route = Route::Chat;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(self.render_settings_tabs(theme, cx))
-            .when(self.settings_tab == SettingsTab::Connections, |this| {
-                this.child(
-                    div().flex_1().overflow_y_scrollbar().child(
-                        div()
-                            .mx_auto()
-                            .w_full()
-                            .max_w(px(1050.0))
-                            .px(px(32.0))
-                            .py(px(26.0))
-                            .flex()
-                            .gap(px(24.0))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .child(
-                                        div()
-                                            .font(UiTheme::display_font())
-                                            .text_size(px(24.0))
-                                            .font_weight(FontWeight::BOLD)
-                                            .child(i18n::text(cx, "settings.connections_title")),
-                                    )
-                                    .child(
-                                        div()
-                                            .mt(px(6.0))
-                                            .mb(px(18.0))
-                                            .text_color(theme.muted)
-                                            .child(i18n::text(
-                                                cx,
-                                                "settings.connections_description",
-                                            )),
-                                    )
-                                    .when(cards.is_empty(), |this| {
-                                        this.child(
-                                            div()
-                                                .p(px(24.0))
-                                                .rounded(px(14.0))
-                                                .bg(theme.surface_subtle)
-                                                .text_color(theme.muted)
-                                                .child(i18n::text(cx, "settings.no_connections")),
-                                        )
-                                    })
-                                    .child(div().flex().flex_col().gap(px(10.0)).children(cards)),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .w(px(360.0))
-                                    .p(px(20.0))
-                                    .rounded(px(16.0))
-                                    .bg(theme.surface)
-                                    .child(
-                                        div()
-                                            .font(UiTheme::display_font())
-                                            .text_size(px(18.0))
-                                            .font_weight(FontWeight::BOLD)
-                                            .child(i18n::text(cx, "settings.add_connection")),
-                                    )
-                                    .child(
-                                        div()
-                                            .mt(px(4.0))
-                                            .mb(px(18.0))
-                                            .text_size(px(12.0))
-                                            .text_color(theme.muted)
-                                            .child(i18n::text(
-                                                cx,
-                                                "settings.credentials_description",
-                                            )),
-                                    )
-                                    .child(form_label(
-                                        i18n::text(cx, "settings.connection_type"),
-                                        theme,
-                                    ))
-                                    .child(Select::new(&self.kind_select).w_full().placeholder(
-                                        i18n::text(cx, "settings.choose_connection_type"),
-                                    ))
-                                    .child(
-                                        form_label(i18n::text(cx, "settings.name"), theme)
-                                            .mt(px(14.0)),
-                                    )
-                                    .child(Input::new(&self.name_input).w_full())
-                                    .when(needs_base_url, |this| {
-                                        this.child(
-                                            form_label(i18n::text(cx, "settings.base_url"), theme)
-                                                .mt(px(14.0)),
-                                        )
-                                        .child(Input::new(&self.url_input).w_full())
-                                    })
-                                    .when(needs_key, |this| {
-                                        this.child(
-                                            form_label(
-                                                if copilot {
-                                                    "Access token (optional)"
-                                                } else {
-                                                    "API key"
-                                                },
-                                                theme,
-                                            )
-                                            .mt(px(14.0)),
-                                        )
-                                        .child(Input::new(&self.key_input).w_full().mask_toggle())
-                                    })
-                                    .when(codex, |this| {
-                                        this.child(
-                                            div()
-                                                .mt(px(14.0))
-                                                .p(px(11.0))
-                                                .rounded(px(9.0))
-                                                .bg(theme.accent_soft)
-                                                .text_color(theme.accent_hover)
-                                                .text_size(px(12.0))
-                                                .child(i18n::text(
-                                                    cx,
-                                                    "settings.codex_full_description",
-                                                )),
-                                        )
-                                    })
-                                    .when(
-                                        self.selected_kind == Some(ConnectionKind::Copilot),
-                                        |this| {
-                                            this.child(
-                                                div()
-                                                    .mt(px(14.0))
-                                                    .p(px(11.0))
-                                                    .rounded(px(9.0))
-                                                    .bg(theme.accent_soft)
-                                                    .text_color(theme.accent_hover)
-                                                    .text_size(px(12.0))
-                                                    .child(i18n::text(
-                                                        cx,
-                                                        "settings.copilot_full_description",
-                                                    )),
-                                            )
-                                            .child(
-                                                Button::new("toggle-copilot-token")
-                                                    .ghost()
-                                                    .small()
-                                                    .label(if self.show_manual_copilot_token {
-                                                        "Sign in with GitHub instead"
-                                                    } else {
-                                                        "Use an access token instead"
-                                                    })
-                                                    .on_click(cx.listener(
-                                                        |this, _, window, cx| {
-                                                            this.show_manual_copilot_token =
-                                                                !this.show_manual_copilot_token;
-                                                            if !this.show_manual_copilot_token {
-                                                                this.key_input.update(
-                                                                    cx,
-                                                                    |state, cx| {
-                                                                        state.set_value(
-                                                                            "", window, cx,
-                                                                        )
-                                                                    },
-                                                                );
-                                                            }
-                                                            cx.notify();
-                                                        },
-                                                    )),
-                                            )
-                                        },
-                                    )
-                                    .when(
-                                        self.selected_kind == Some(ConnectionKind::Ollama),
-                                        |this| {
-                                            this.child(
-                                                div()
-                                                    .mt(px(14.0))
-                                                    .p(px(11.0))
-                                                    .rounded(px(9.0))
-                                                    .bg(theme.accent_soft)
-                                                    .text_color(theme.accent_hover)
-                                                    .text_size(px(12.0))
-                                                    .child(i18n::text(
-                                                        cx,
-                                                        "settings.ollama_local_description",
-                                                    )),
-                                            )
-                                        },
-                                    )
-                                    .when(ollama_cloud, |this| {
-                                        this.child(
-                                            div()
-                                                .mt(px(14.0))
-                                                .p(px(11.0))
-                                                .rounded(px(9.0))
-                                                .bg(theme.accent_soft)
-                                                .text_color(theme.accent_hover)
-                                                .text_size(px(12.0))
-                                                .child(i18n::text(
-                                                    cx,
-                                                    "settings.ollama_cloud_description",
-                                                )),
-                                        )
-                                    })
-                                    .when_some(notice, |this, notice| {
-                                        this.child(div().mt(px(14.0)).child(notice))
-                                    })
-                                    .child(
-                                        div()
-                                            .mt(px(18.0))
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(9.0))
-                                            .when(codex, |this| {
-                                                this.child(
-                                                    Button::new("connect-chatgpt")
-                                                        .secondary()
-                                                        .icon(IconName::ExternalLink)
-                                                        .label(
-                                                            if self
-                                                                .codex_account
-                                                                .as_ref()
-                                                                .is_some_and(|account| {
-                                                                    account.authenticated
-                                                                })
-                                                            {
-                                                                i18n::text(cx, "settings.reconnect")
-                                                            } else {
-                                                                i18n::text(
-                                                                    cx,
-                                                                    "settings.continue_chatgpt",
-                                                                )
-                                                            },
-                                                        )
-                                                        .loading(self.codex_busy)
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.start_codex_login(cx)
-                                                        })),
-                                                )
-                                            })
-                                            .child(
-                                                Button::new("save-connection")
-                                                    .primary()
-                                                    .icon(if copilot_uses_login {
-                                                        IconName::Github
-                                                    } else {
-                                                        IconName::CircleCheck
-                                                    })
-                                                    .label(if copilot_uses_login {
-                                                        i18n::text(cx, "settings.continue_github")
-                                                    } else {
-                                                        i18n::text(cx, "settings.save_connection")
-                                                    })
-                                                    .disabled(self.selected_kind.is_none())
-                                                    .on_click(cx.listener(
-                                                        |this, _, window, cx| {
-                                                            this.save_connection(window, cx)
-                                                        },
-                                                    )),
-                                            ),
-                                    ),
-                            ),
-                    ),
-                )
-            })
-            .when(self.settings_tab == SettingsTab::Models, |this| {
-                this.child(self.render_settings_models(cx))
-            })
-            .when(self.settings_tab == SettingsTab::Agents, |this| {
-                this.child(self.render_settings_agents(cx))
-            })
-            .when(self.settings_tab == SettingsTab::RemoteAgent, |this| {
-                this.child(self.render_settings_remote_agent(cx))
-            })
-            .when(self.settings_tab == SettingsTab::Diagnostics, |this| {
-                this.child(self.render_settings_diagnostics(cx))
-            })
-            .when(self.settings_tab == SettingsTab::Storage, |this| {
-                this.child(self.render_settings_storage(cx))
-            })
-            .when(self.settings_tab == SettingsTab::About, |this| {
-                this.child(self.render_settings_about(cx))
-            })
-            .child(self.render_status_line(cx))
             .into_any_element()
     }
 
@@ -14887,6 +14795,19 @@ fn preferred_reasoning_effort(model: &ModelInfo) -> Option<String> {
     }
 }
 
+fn tool_approval_choices(cx: &App) -> Vec<ToolApprovalChoice> {
+    vec![
+        ToolApprovalChoice::new(
+            ToolApprovalPolicy::Ask,
+            i18n::text(cx, "security.ask_before_tools"),
+        ),
+        ToolApprovalChoice::new(
+            ToolApprovalPolicy::AllowAll,
+            i18n::text(cx, "security.allow_all_tools"),
+        ),
+    ]
+}
+
 fn localized_reasoning_effort_label(cx: &App, effort: &str) -> SharedString {
     let key = match effort.to_ascii_lowercase().as_str() {
         "none" => "reasoning.none",
@@ -15603,10 +15524,6 @@ fn tool_activity_groups_for_location(
         }
     }
     groups
-}
-
-fn tool_activity_groups(activities: &[ToolActivity]) -> Vec<(usize, Vec<usize>)> {
-    tool_activity_groups_for_location(activities, false)
 }
 
 fn reasoning_tool_activity_groups(activities: &[ToolActivity]) -> Vec<(usize, Vec<usize>)> {
@@ -16476,178 +16393,15 @@ fn render_agent_thread_reasoning(
     .unwrap_or_else(|| div().into_any_element())
 }
 
-fn render_all_agent_thread_reasoning(
-    thread_id: &str,
-    message_index: usize,
-    message: &ShellMessage,
-    streaming: bool,
-    theme: UiTheme,
-    cx: &mut Context<AverroesApp>,
-) -> AnyElement {
-    let ranges = reasoning_block_ranges_for_message(message);
-    let states = reasoning_blocks_for_message(message);
-    let block_count = ranges.len().max(states.len());
-    let panels = (0..block_count)
-        .filter_map(|block_index| {
-            let (start, end) = ranges.get(block_index).copied().unwrap_or_else(|| {
-                let end = message.reasoning.len();
-                (end, end)
-            });
-            let state = states.get(block_index).copied().unwrap_or(ReasoningBlockState {
-                complete: message.reasoning_complete,
-                expanded: message.reasoning_expanded,
-            });
-            let block_text = message.reasoning.get(start..end)?;
-            let reasoning_groups = reasoning_tool_activity_groups_for_block(
-                &message.reasoning,
-                &message.tool_activities,
-                &ranges,
-                block_index,
-            );
-            let active_reasoning_group_id = streaming
-                .then(|| message.active_reasoning_tool_group())
-                .flatten();
-            let reasoning_content = if state.expanded {
-                tool_group_stream_blocks(
-                    block_text,
-                    reasoning_groups,
-                    &message.tool_activities,
-                    start,
-                )
-                .into_iter()
-                .filter_map(|block| match block {
-                    ToolStreamBlock::Text { start, end } => {
-                        block_text.get(start..end).map(|segment| {
-                            render_reasoning_text_segment(
-                                format!(
-                                    "agent-thread-reasoning-text-{thread_id}-{message_index}-{block_index}-{start}"
-                                ),
-                                segment,
-                                streaming && !state.complete && end == block_text.len(),
-                                theme,
-                            )
-                        })
-                    }
-                    ToolStreamBlock::Group {
-                        group_id,
-                        activity_indices,
-                    } => Some(render_agent_thread_tool_group(
-                        thread_id,
-                        message_index,
-                        group_id,
-                        &activity_indices,
-                        &message.tool_activities,
-                        active_reasoning_group_id,
-                        message.is_tool_group_expanded(group_id),
-                        theme,
-                        cx,
-                    )),
-                })
-                .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            let toggle_thread_id = thread_id.to_owned();
-            let reasoning_label = if block_count > 1 {
-                format!("{} {}", i18n::text(cx, "chat.reasoning"), block_index + 1)
-            } else {
-                i18n::text(cx, "chat.reasoning").to_string()
-            };
-            let reasoning_complete = state.complete || (!streaming && message.reasoning_complete);
-            Some(
-                div()
-                    .id(SharedString::from(format!(
-                        "agent-thread-reasoning-{thread_id}-{message_index}-{block_index}"
-                    )))
-                    .w_full()
-                    .px(px(12.0))
-                    .py(px(9.0))
-                    .rounded(px(10.0))
-                    .bg(theme.surface_subtle)
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.0))
-                            .child(
-                                Button::new(format!(
-                                    "agent-thread-toggle-reasoning-{thread_id}-{message_index}-{block_index}"
-                                ))
-                                .ghost()
-                                .small()
-                                .icon(if state.expanded {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                })
-                                .label(reasoning_label)
-                                .on_click(cx.listener(move |app, _, _, cx| {
-                                    app.toggle_agent_thread_reasoning(
-                                        &toggle_thread_id,
-                                        message_index,
-                                        block_index,
-                                        cx,
-                                    );
-                                })),
-                            )
-                            .child(div().flex_1())
-                            .child(if reasoning_complete {
-                                Icon::new(IconName::Check)
-                                    .size(px(12.0))
-                                    .text_color(theme.success)
-                                    .into_any_element()
-                            } else {
-                                render_activity_indicator(
-                                    format!(
-                                        "agent-thread-reasoning-{thread_id}-{message_index}-{block_index}"
-                                    ),
-                                    theme,
-                                    3.0,
-                                )
-                            }),
-                    )
-                    .when(state.expanded, |this| {
-                        this.child(
-                            div()
-                                .mt(px(7.0))
-                                .pt(px(7.0))
-                                .border_t_1()
-                                .border_color(theme.border)
-                                .text_size(px(12.0))
-                                .text_color(theme.muted)
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(7.0))
-                                        .children(reasoning_content),
-                                ),
-                        )
-                    })
-                    .into_any_element(),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(7.0))
-        .children(panels)
-        .into_any_element()
-}
-
 #[cfg(test)]
 mod agent_thread_render_tests {
     use super::{
         agent_thread_blocks, reasoning_block_ranges, reasoning_block_ranges_for_message,
-        reasoning_block_states, reasoning_is_complete_for_display, reasoning_text_is_streaming,
-        reasoning_tool_activity_groups, reasoning_tool_activity_groups_for_block,
-        tool_activity_groups, tool_group_stream_blocks, AgentThreadBlock, ReasoningBlockState,
-        ShellMessage, ToolActivity, ToolActivityState, ToolStreamBlock,
-        LEGACY_REASONING_TOOL_GROUP_ID, REASONING_BLOCK_SEPARATOR,
+        reasoning_block_states, reasoning_tool_activity_groups,
+        reasoning_tool_activity_groups_for_block, tool_activity_groups_for_location,
+        tool_group_stream_blocks, AgentThreadBlock, ReasoningBlockState, ShellMessage,
+        ToolActivity, ToolActivityState, ToolStreamBlock, LEGACY_REASONING_TOOL_GROUP_ID,
+        REASONING_BLOCK_SEPARATOR,
     };
     use std::time::Instant;
 
@@ -16712,17 +16466,6 @@ mod agent_thread_render_tests {
     }
 
     #[test]
-    fn reasoning_stays_active_until_the_whole_turn_finishes() {
-        let mut message = ShellMessage::assistant();
-        message.reasoning = "Calling a tool".into();
-        message.reasoning_complete = true;
-
-        assert!(!reasoning_is_complete_for_display(&message, true));
-        assert!(reasoning_is_complete_for_display(&message, false));
-        assert!(!reasoning_text_is_streaming(&message, true));
-    }
-
-    #[test]
     fn reasoning_and_inline_tools_have_exclusive_compact_groups() {
         let activity = ToolActivity {
             call_id: Some("outside-1".into()),
@@ -16748,7 +16491,10 @@ mod agent_thread_render_tests {
         outside_two.call_id = Some("outside-2".into());
         let activities = vec![activity, reasoning_one, reasoning_two, outside_two];
 
-        assert_eq!(tool_activity_groups(&activities), vec![(4, vec![0, 3])]);
+        assert_eq!(
+            tool_activity_groups_for_location(&activities, false),
+            vec![(4, vec![0, 3])]
+        );
         assert_eq!(
             reasoning_tool_activity_groups(&activities),
             vec![(LEGACY_REASONING_TOOL_GROUP_ID, vec![1, 2])]
@@ -16778,7 +16524,7 @@ mod agent_thread_render_tests {
         legacy_reasoning.inside_reasoning = true;
         let activities = vec![legacy_outer, legacy_reasoning];
 
-        assert!(tool_activity_groups(&activities).is_empty());
+        assert!(tool_activity_groups_for_location(&activities, false).is_empty());
         assert_eq!(
             reasoning_tool_activity_groups(&activities),
             vec![(LEGACY_REASONING_TOOL_GROUP_ID, vec![0, 1])]
@@ -17635,18 +17381,6 @@ fn render_image_attachments(
         .collect()
 }
 
-fn reasoning_is_complete_for_display(message: &ShellMessage, streaming: bool) -> bool {
-    // `ReasoningFinished` closes one provider response, not necessarily the
-    // whole agent turn. Tool calls can run after that response and trigger a
-    // new reasoning phase, so the disclosure stays active until the turn's
-    // stream itself has settled.
-    message.reasoning_complete && !streaming
-}
-
-fn reasoning_text_is_streaming(message: &ShellMessage, streaming: bool) -> bool {
-    streaming && !message.reasoning_complete
-}
-
 fn render_ordered_message_content(
     session_id: &SessionId,
     message_index: usize,
@@ -17945,7 +17679,6 @@ fn settings_page_title(
 
 fn settings_tab_description(tab: SettingsTab) -> &'static str {
     match tab {
-        SettingsTab::Connections => "settings.global_connections",
         SettingsTab::Models => "settings.provider_catalogs",
         SettingsTab::Agents => "settings.delegated_agents_description",
         SettingsTab::RemoteAgent => "settings.remote_agent_description",
@@ -18228,6 +17961,65 @@ mod workspace_grouping_tests {
         );
     }
 
+    fn patch_activity(input: &str) -> ToolActivity {
+        ToolActivity {
+            call_id: None,
+            name: "patch".into(),
+            text_offset: 0,
+            group_id: None,
+            input: input.into(),
+            summary: "Applied patch".into(),
+            output: "Patch applied".into(),
+            state: ToolActivityState::Completed,
+            started_at: std::time::Instant::now(),
+            duration_ms: Some(10),
+            expanded: false,
+            inside_reasoning: false,
+        }
+    }
+
+    #[test]
+    fn patch_history_includes_main_and_delegated_activities() {
+        let mut session = ShellSession::new(None, SessionBinding::default());
+        let mut main_message = ShellMessage::assistant();
+        main_message
+            .tool_activities
+            .push(patch_activity("{\"patch\":\"main\"}"));
+        session.messages.push(main_message);
+
+        let thread = AgentThreadSnapshot {
+            id: "thread-1".into(),
+            thread_id: "thread-1".into(),
+            agent_id: "worker".into(),
+            parent_session_id: session.id.to_string(),
+            title: "Worker".into(),
+            model_id: "model-1".into(),
+            status: AgentThreadStatus::Completed,
+            enabled_tools: Vec::new(),
+            prompt: "Apply the change".into(),
+            output: "Done".into(),
+            created_at: 1,
+            updated_at: 1,
+        };
+        let mut delegated_message = ShellMessage::assistant();
+        delegated_message
+            .tool_activities
+            .push(patch_activity("{\"patch\":\"delegated\"}"));
+        session.agent_thread_transcripts.insert(
+            thread.id.clone(),
+            AgentThreadTranscript {
+                messages: vec![delegated_message],
+            },
+        );
+
+        let entries = collect_patch_history(&session, &[thread]);
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].agent_title.is_none());
+        assert_eq!(entries[1].agent_title.as_deref(), Some("Worker"));
+        assert_eq!(entries[1].activity.input, "{\"patch\":\"delegated\"}");
+    }
+
     #[test]
     fn new_conversations_inherit_the_active_model_and_all_tools() {
         let active = SessionBinding {
@@ -18235,12 +18027,14 @@ mod workspace_grouping_tests {
             model_id: Some("active-model".into()),
             reasoning_effort: Some("high".into()),
             tools: vec!["grep".into(), "checkpoint".into()],
+            approval_policy: ToolApprovalPolicy::AllowAll,
         };
         let remembered = SessionBinding {
             connection_id: Some(ConnectionId("remembered".into())),
             model_id: Some("remembered-model".into()),
             reasoning_effort: Some("low".into()),
             tools: vec!["web_fetch".into()],
+            approval_policy: ToolApprovalPolicy::Ask,
         };
 
         let inherited =
@@ -18249,6 +18043,7 @@ mod workspace_grouping_tests {
         assert_eq!(inherited.connection_id, active.connection_id);
         assert_eq!(inherited.model_id, active.model_id);
         assert_eq!(inherited.reasoning_effort, active.reasoning_effort);
+        assert_eq!(inherited.approval_policy, active.approval_policy);
         assert_eq!(inherited.tools, vec!["bash", "file_read"]);
     }
 
@@ -18256,6 +18051,7 @@ mod workspace_grouping_tests {
     fn tool_bindings_are_normalized_to_the_current_catalog() {
         let mut binding = SessionBinding {
             tools: vec!["discover_tools".into()],
+            approval_policy: ToolApprovalPolicy::AllowAll,
             ..Default::default()
         };
 
@@ -18277,6 +18073,7 @@ mod workspace_grouping_tests {
             model_id: Some("remembered-model".into()),
             reasoning_effort: None,
             tools: Vec::new(),
+            approval_policy: ToolApprovalPolicy::AllowAll,
         };
 
         let inherited = inherited_session_binding(
@@ -18287,6 +18084,7 @@ mod workspace_grouping_tests {
 
         assert_eq!(inherited.connection_id, remembered.connection_id);
         assert_eq!(inherited.model_id, remembered.model_id);
+        assert_eq!(inherited.approval_policy, remembered.approval_policy);
         assert_eq!(inherited.tools, vec!["bash", "file_read"]);
     }
 

@@ -14,6 +14,7 @@ pub use profile::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::ToolApprovalPolicy;
 
     #[test]
     fn a_new_session_has_no_implicit_connection_or_model() {
@@ -24,6 +25,7 @@ mod tests {
                 model_id: None,
                 reasoning_effort: None,
                 tools: Vec::new(),
+                approval_policy: ToolApprovalPolicy::default(),
             }
         );
         assert!(!SessionBinding::default().is_ready());

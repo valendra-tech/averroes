@@ -149,6 +149,7 @@ impl Tool for CallAgentsTool {
             model_id,
             working_dir: ctx.current_dir(),
             context: reduced_context(&ctx.conversation_context),
+            tool_approval_policy: ctx.tool_activation.approval_policy(),
         };
         let mut snapshot = if let Some(events) = ctx.agent_event_sink.clone() {
             runner.call_agent_streaming(request, events).await

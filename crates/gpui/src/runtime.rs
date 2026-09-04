@@ -62,7 +62,6 @@ struct MarketplaceSkillFile {
     path: PathBuf,
     contents: Vec<u8>,
 }
-
 /// Provider-neutral application services.
 ///
 /// A provider is created only after a conversation explicitly selects both a
@@ -95,7 +94,6 @@ pub struct MarketplaceSkill {
     pub source: String,
     pub slug: String,
     pub installs: u64,
-    pub install_url: Option<String>,
     pub url: Option<String>,
 }
 
@@ -138,10 +136,6 @@ impl MarketplaceSkill {
                 .get("installs")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or_default(),
-            install_url: value
-                .get("installUrl")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
             url: value
                 .get("url")
                 .and_then(serde_json::Value::as_str)
@@ -631,6 +625,7 @@ impl RuntimeAgentRunner {
                 max_iterations: 24,
                 compaction: self.compaction.clone(),
                 reasoning_effort: self.reasoning_effort.clone(),
+                tool_approval_policy: request.tool_approval_policy,
                 allow_delegation: false,
                 ..Default::default()
             },
@@ -1044,7 +1039,6 @@ impl SkillMarketplaceBackend for AppRuntime {
             source: skill.source.clone(),
             slug: skill.slug.clone(),
             installs: skill.installs,
-            install_url: None,
             url: skill.url.clone(),
         };
         self.install_skill_from_marketplace(workspace_root, &skill)
@@ -2354,9 +2348,11 @@ impl AppRuntime {
         } else {
             Vec::new()
         };
-        let system_prompt = self
-            .prompt
-            .build_system(&working_dir.display().to_string(), None);
+        let system_prompt = self.prompt.build_system_with_approval_policy(
+            &working_dir.display().to_string(),
+            None,
+            binding.approval_policy,
+        );
         let config = self.config();
         let agent_config = AgentConfig {
             name: "averroes".into(),
@@ -2366,6 +2362,7 @@ impl AppRuntime {
             tools: tools.clone(),
             max_iterations: 50,
             compaction: compaction_config(&config),
+            tool_approval_policy: binding.approval_policy,
             ..Default::default()
         };
         let agent_compaction = agent_config.compaction.clone();
@@ -2482,23 +2479,6 @@ impl AppRuntime {
         self.workspace_instructions
             .write()
             .insert(workspace_root.to_path_buf(), Arc::new(instructions));
-    }
-
-    fn workspace_instructions(&self, workspace_root: &Path) -> Option<Arc<ProjectInstructions>> {
-        if let Some(instructions) = self
-            .workspace_instructions
-            .read()
-            .get(workspace_root)
-            .cloned()
-        {
-            return (!instructions.is_empty()).then_some(instructions);
-        }
-        self.load_workspace_instructions(workspace_root);
-        self.workspace_instructions
-            .read()
-            .get(workspace_root)
-            .cloned()
-            .filter(|instructions| !instructions.is_empty())
     }
 
     fn workspace_skill_index(&self, workspace_root: &Path) -> Option<Arc<SkillIndex>> {
@@ -3228,6 +3208,3 @@ fn compaction_config(config: &AppConfig) -> CompactionConfig {
         ..Default::default()
     }
 }
-
-// Transitional alias for peripheral views that are not compiled by the new shell.
-pub type AgentFactory = AppRuntime;
