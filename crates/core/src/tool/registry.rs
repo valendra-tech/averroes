@@ -110,7 +110,9 @@ impl ToolRegistry {
             tool: name.to_string(),
         })?;
 
-        if tool.requires_confirmation_for(params) {
+        if tool.requires_confirmation_for(params)
+            && !ctx.tool_activation.approval_policy().allows_all()
+        {
             let broker = self
                 .confirmation_broker
                 .as_ref()
@@ -404,6 +406,59 @@ mod tests {
         assert!(broker.answer("test-session", &question.id, "Allow".into()));
 
         let result = task.await.unwrap().unwrap();
+        assert!(result.success);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn allow_all_skips_confirmation_for_non_shell_tools() {
+        struct ConfirmedPatch {
+            executions: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Tool for ConfirmedPatch {
+            fn name(&self) -> &str {
+                "patch"
+            }
+
+            fn description(&self) -> &str {
+                "Requires approval to change files"
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+
+            fn requires_confirmation(&self) -> bool {
+                true
+            }
+
+            async fn execute(
+                &self,
+                _ctx: &ToolContext,
+                _params: &serde_json::Value,
+            ) -> Result<ToolResult> {
+                self.executions.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolResult::ok("patched"))
+            }
+        }
+
+        let registry = ToolRegistry::new();
+        let executions = Arc::new(AtomicUsize::new(0));
+        registry.register(ConfirmedPatch {
+            executions: executions.clone(),
+        });
+        let context = test_ctx();
+        context
+            .tool_activation
+            .set_approval_policy(crate::tool::ToolApprovalPolicy::AllowAll);
+
+        let result = registry
+            .execute("patch", &context, &json!({}))
+            .await
+            .unwrap();
+
         assert!(result.success);
         assert_eq!(executions.load(Ordering::SeqCst), 1);
     }

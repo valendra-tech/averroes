@@ -53,6 +53,20 @@ pub trait SkillMarketplaceBackend: Send + Sync {
     ) -> std::result::Result<String, String>;
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalPolicy {
+    #[default]
+    Ask,
+    AllowAll,
+}
+
+impl ToolApprovalPolicy {
+    pub fn allows_all(self) -> bool {
+        matches!(self, Self::AllowAll)
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolContext {
     pub working_dir: PathBuf,
@@ -121,6 +135,7 @@ impl std::fmt::Debug for ToolContext {
 pub struct ToolActivation {
     names: RwLock<BTreeSet<String>>,
     current_directory: RwLock<Option<PathBuf>>,
+    approval_policy: RwLock<ToolApprovalPolicy>,
 }
 
 impl ToolActivation {
@@ -137,6 +152,14 @@ impl ToolActivation {
 
     pub fn names(&self) -> Vec<String> {
         self.names.read().unwrap().iter().cloned().collect()
+    }
+
+    pub fn approval_policy(&self) -> ToolApprovalPolicy {
+        *self.approval_policy.read().unwrap()
+    }
+
+    pub fn set_approval_policy(&self, policy: ToolApprovalPolicy) {
+        *self.approval_policy.write().unwrap() = policy;
     }
 
     pub(crate) fn current_directory(&self, fallback: &Path) -> PathBuf {

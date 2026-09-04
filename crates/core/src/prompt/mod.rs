@@ -1,6 +1,8 @@
 use chrono::{DateTime, Local};
 use minijinja::{context, Environment};
 
+use crate::tool::ToolApprovalPolicy;
+
 pub mod instructions;
 
 pub use instructions::ProjectInstructions;
@@ -64,6 +66,19 @@ impl PromptBuilder {
     }
 
     pub fn build_system(&self, working_dir: &str, project_instructions: Option<&str>) -> String {
+        self.build_system_with_approval_policy(
+            working_dir,
+            project_instructions,
+            ToolApprovalPolicy::default(),
+        )
+    }
+
+    pub fn build_system_with_approval_policy(
+        &self,
+        working_dir: &str,
+        project_instructions: Option<&str>,
+        approval_policy: ToolApprovalPolicy,
+    ) -> String {
         let environment_time = EnvironmentTime::now();
         let tmpl = self.env.get_template("system").unwrap();
         tmpl.render(context! {
@@ -74,6 +89,7 @@ impl PromptBuilder {
             current_time => environment_time.time,
             time_zone => environment_time.time_zone,
             project_instructions => project_instructions.unwrap_or_default(),
+            allow_all_tools => approval_policy.allows_all(),
         })
         .unwrap_or_else(|e| format!("System prompt error: {e}"))
     }
@@ -165,5 +181,19 @@ mod tests {
         assert!(prompt.contains("must never launch another subagent"));
         assert!(prompt.contains("Context management is automatic"));
         assert!(!prompt.contains("compact_conversation"));
+    }
+
+    #[test]
+    fn explains_when_tool_approval_is_already_authorized() {
+        let builder = PromptBuilder::new();
+
+        let prompt = builder.build_system_with_approval_policy(
+            "/tmp/workspace",
+            None,
+            ToolApprovalPolicy::AllowAll,
+        );
+
+        assert!(prompt.contains("selected a security level"));
+        assert!(!prompt.contains("request their own approval through the runtime"));
     }
 }

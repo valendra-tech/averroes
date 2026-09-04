@@ -325,6 +325,7 @@ mod tests {
             model_id: Some("model-1".into()),
             reasoning_effort: Some("high".into()),
             tools: vec!["file_read".into(), "grep".into()],
+            approval_policy: Default::default(),
         };
         store.save("bound", &[], None, None, &binding).unwrap();
         assert_eq!(store.load_snapshot("bound").unwrap().binding, binding);

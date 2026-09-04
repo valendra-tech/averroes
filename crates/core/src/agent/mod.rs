@@ -16,7 +16,7 @@ use crate::provider::types::{MessageContent, Role};
 use crate::provider::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolDefinition};
 use crate::runtime::ResourceGovernor;
 use crate::skill::SkillIndex;
-use crate::tool::{ToolActivation, ToolRegistry};
+use crate::tool::{ToolActivation, ToolApprovalPolicy, ToolRegistry};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -59,6 +59,7 @@ pub struct AgentConfig {
     pub compaction: CompactionConfig,
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<String>,
+    pub tool_approval_policy: ToolApprovalPolicy,
     /// Child agents are deliberately leaf workers and cannot start another
     /// delegation chain.
     pub allow_delegation: bool,
@@ -76,6 +77,7 @@ impl Default for AgentConfig {
             compaction: CompactionConfig::default(),
             temperature: None,
             reasoning_effort: None,
+            tool_approval_policy: ToolApprovalPolicy::default(),
             allow_delegation: true,
         }
     }
@@ -225,6 +227,7 @@ impl Agent {
         };
         let reasoning_effort = config.reasoning_effort.clone();
         let tool_activation = Arc::new(ToolActivation::new(config.tools.iter().cloned()));
+        tool_activation.set_approval_policy(config.tool_approval_policy);
 
         Self {
             config,
@@ -380,6 +383,10 @@ impl Agent {
     pub fn set_reasoning_effort(&self, effort: Option<String>) {
         let mut runtime = self.runtime.write().unwrap();
         runtime.reasoning_effort = effort;
+    }
+
+    pub fn set_tool_approval_policy(&self, policy: ToolApprovalPolicy) {
+        self.tool_activation.set_approval_policy(policy);
     }
 
     /// Installs the workspace skill index on this agent and refreshes the

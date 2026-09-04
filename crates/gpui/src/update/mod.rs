@@ -29,10 +29,6 @@ pub(crate) enum UpdateState {
 }
 
 impl UpdateState {
-    pub(crate) fn available(info: UpdateInfo) -> Self {
-        Self::Available(info)
-    }
-
     pub(crate) fn begin_download(self) -> Option<(Self, UpdateInfo)> {
         match self {
             Self::Available(info)
@@ -118,6 +114,7 @@ pub(crate) enum UpdateError {
     #[error("unsafe update asset name {name:?}")]
     UnsafeAssetName { name: String },
 
+    #[cfg(not(target_os = "macos"))]
     #[error("installer is unsupported on this platform")]
     UnsupportedPlatform,
 
@@ -181,7 +178,7 @@ mod tests {
     fn available_begins_download_with_update_info() {
         let info = sample_update_info();
 
-        let (state, returned_info) = UpdateState::available(info.clone())
+        let (state, returned_info) = UpdateState::Available(info.clone())
             .begin_download()
             .expect("available update should begin downloading");
 

@@ -1218,6 +1218,7 @@ mod tests {
                 model_id: Some("model-1".into()),
                 reasoning_effort: Some("high".into()),
                 tools: vec!["discover_tools".into(), "web_search_intrernal".into()],
+                approval_policy: Default::default(),
             },
             context_summary: Some(
                 "Objective: ship the interface.\nNext action: verify the release.".into(),
@@ -1407,6 +1408,7 @@ mod tests {
             model_id: Some("gpt-5.2-codex".into()),
             reasoning_effort: None,
             tools: vec!["file_read".into(), "grep".into()],
+            approval_policy: Default::default(),
         };
         database.remember_binding(&binding).unwrap();
         drop(database);
@@ -1808,6 +1810,7 @@ mod tests {
             model_id: Some("gpt-5.2".into()),
             reasoning_effort: None,
             tools: vec!["bash".into()],
+            approval_policy: Default::default(),
         };
         database.remember_binding(&complete).unwrap();
         database
@@ -1816,6 +1819,7 @@ mod tests {
                 model_id: None,
                 reasoning_effort: None,
                 tools: vec!["web_fetch".into()],
+                approval_policy: Default::default(),
             })
             .unwrap();
         assert_eq!(database.last_binding().unwrap(), Some(complete));
@@ -1831,6 +1835,7 @@ mod tests {
                 model_id: Some("model".into()),
                 reasoning_effort: None,
                 tools: vec!["file_read".into()],
+                approval_policy: Default::default(),
             })
             .unwrap();
         database

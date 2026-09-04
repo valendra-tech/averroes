@@ -1,5 +1,6 @@
 use crate::agent::AgentStreamEvent;
 use crate::provider::ChatMessage;
+use crate::tool::ToolApprovalPolicy;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -44,6 +45,7 @@ pub struct AgentCallRequest {
     pub model_id: Option<String>,
     pub working_dir: PathBuf,
     pub context: Vec<ChatMessage>,
+    pub tool_approval_policy: ToolApprovalPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
