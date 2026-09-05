@@ -87,6 +87,24 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS tasks_conversation_updated
             ON tasks(conversation_id, status, updated_at, task_id);
+        CREATE TABLE IF NOT EXISTS scheduled_tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            workspace_root TEXT NOT NULL,
+            project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+            binding_json TEXT NOT NULL,
+            schedule_json TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            last_run_at INTEGER,
+            last_run_success INTEGER,
+            last_error TEXT,
+            last_conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS scheduled_tasks_workspace
+            ON scheduled_tasks(workspace_root, enabled, updated_at DESC);
         CREATE TABLE IF NOT EXISTS sources (
             conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
             source_key TEXT NOT NULL,
@@ -255,7 +273,7 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX conversation_embeddings_model
              ON conversation_embeddings(connection_id, model_id, conversation_id);",
     )?;
-    connection.pragma_update(None, "user_version", 15)?;
+    connection.pragma_update(None, "user_version", 16)?;
     Ok(())
 }
 

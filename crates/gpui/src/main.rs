@@ -40,6 +40,107 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use ui::UiTheme;
 
+fn scheduled_task_id() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--run-scheduled-task" {
+            return args.next().filter(|id| !id.trim().is_empty());
+        }
+    }
+    None
+}
+
+fn scheduled_task_key_provider() -> Arc<dyn averroes_core::credentials::VaultKeyProvider> {
+    Arc::new(MacKeychainKeyProvider)
+}
+
+fn run_scheduled_task(task_id: &str) -> anyhow::Result<()> {
+    let paths = ConfigPaths::discover().map_err(anyhow::Error::from)?;
+    let database = WorkDatabase::open(&paths).map_err(anyhow::Error::from)?;
+    let task = database
+        .scheduled_task(task_id)
+        .map_err(anyhow::Error::from)?
+        .ok_or_else(|| anyhow::anyhow!("scheduled task '{task_id}' does not exist"))?;
+    if !task.enabled {
+        return Ok(());
+    }
+    let runtime = Arc::new(
+        AppRuntime::load_from(paths, scheduled_task_key_provider()).map_err(anyhow::Error::from)?,
+    );
+    runtime
+        .validate_binding(&task.binding)
+        .map_err(anyhow::Error::from)?;
+    let conversation_id = uuid::Uuid::new_v4().to_string();
+    let conversation = averroes_core::work::WorkConversation {
+        id: conversation_id.clone(),
+        title: task.title.clone(),
+        project_id: task.project_id.clone(),
+        pinned: false,
+        unread: false,
+        created_at: averroes_core::work::now(),
+        updated_at: averroes_core::work::now(),
+        binding: task.binding.clone(),
+        context_summary: None,
+        context_usage: averroes_core::agent::ContextUsage::default(),
+        messages: vec![averroes_core::work::WorkMessage {
+            role: averroes_core::work::WorkMessageRole::User,
+            text: task.prompt.clone(),
+            reasoning: String::new(),
+            reasoning_complete: true,
+            reasoning_expanded: false,
+            tool_activities: Vec::new(),
+            expanded_tool_groups: Vec::new(),
+        }],
+        checkpoints: Vec::new(),
+        tasks: Vec::new(),
+        sources: Vec::new(),
+        agent_threads: Vec::new(),
+        agent_thread_transcripts: std::collections::HashMap::new(),
+    };
+    runtime.database.save_conversation(&conversation)?;
+    let agent = runtime
+        .runtime
+        .block_on(runtime.new_agent(
+            &session::SessionId(conversation_id.clone()),
+            &task.binding,
+            Some(&task.workspace_root),
+        ))
+        .map_err(anyhow::Error::from)?;
+    let result = runtime.runtime.block_on(agent.run(&task.prompt));
+    match result {
+        Ok(output) => {
+            let mut completed = conversation;
+            completed.messages.push(averroes_core::work::WorkMessage {
+                role: averroes_core::work::WorkMessageRole::Assistant,
+                text: output,
+                reasoning: String::new(),
+                reasoning_complete: true,
+                reasoning_expanded: false,
+                tool_activities: Vec::new(),
+                expanded_tool_groups: Vec::new(),
+            });
+            runtime.database.save_conversation(&completed)?;
+            runtime
+                .scheduled_tasks
+                .record_run(task_id, Some(&conversation_id), true, None)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            Ok(())
+        }
+        Err(error) => {
+            runtime
+                .scheduled_tasks
+                .record_run(
+                    task_id,
+                    Some(&conversation_id),
+                    false,
+                    Some(&error.to_string()),
+                )
+                .map_err(|record_error| anyhow::anyhow!(record_error.to_string()))?;
+            Err(error)
+        }
+    }
+}
+
 pub(crate) static APP_QUITTING: AtomicBool = AtomicBool::new(false);
 
 fn application_quit_mode() -> gpui::QuitMode {
@@ -287,6 +388,14 @@ fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
+
+    if let Some(task_id) = scheduled_task_id() {
+        if let Err(error) = run_scheduled_task(&task_id) {
+            tracing::error!(%error, task_id = %task_id, "scheduled task failed");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // GPUI uses its application HttpClient for remote image assets. Without
     // this, source favicons are sent to the default NullHttpClient and every

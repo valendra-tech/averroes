@@ -1,6 +1,8 @@
+pub mod environment;
 pub mod governor;
 pub mod pool;
 
+pub use environment::SystemEnvironment;
 pub use governor::{CallPermit, ResourceGovernor, TokenReservation};
 use pool::ProviderConnectionPool;
 use std::sync::Arc;

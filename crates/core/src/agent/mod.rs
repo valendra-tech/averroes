@@ -19,6 +19,7 @@ use crate::skill::SkillIndex;
 use crate::tool::{ToolActivation, ToolApprovalPolicy, ToolRegistry};
 use anyhow::Result;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -63,6 +64,8 @@ pub struct AgentConfig {
     /// Child agents are deliberately leaf workers and cannot start another
     /// delegation chain.
     pub allow_delegation: bool,
+    /// Whether the agent may wait for a human answer through `ask_user`.
+    pub allow_user_questions: bool,
     /// Parent conversation used when a delegated agent emits a checkpoint.
     pub work_conversation_id: Option<String>,
     /// Namespace used to keep checkpoint IDs from different delegated
@@ -84,6 +87,7 @@ impl Default for AgentConfig {
             reasoning_effort: None,
             tool_approval_policy: ToolApprovalPolicy::default(),
             allow_delegation: true,
+            allow_user_questions: true,
             work_conversation_id: None,
             work_id_prefix: None,
         }
@@ -196,6 +200,7 @@ pub struct Agent {
     memory_search_backend:
         Arc<std::sync::RwLock<Option<Arc<dyn crate::tool::MemorySearchBackend>>>>,
     agent_runner: Arc<Mutex<Option<Arc<dyn AgentRunner>>>>,
+    user_questions_allowed: Arc<AtomicBool>,
     agent_id: String,
     session_id: String,
     working_dir: PathBuf,
@@ -233,6 +238,7 @@ impl Agent {
             Arc::new(tokio::sync::Mutex::new(msgs))
         };
         let reasoning_effort = config.reasoning_effort.clone();
+        let allow_user_questions = config.allow_user_questions;
         let tool_activation = Arc::new(ToolActivation::new(config.tools.iter().cloned()));
         tool_activation.set_approval_policy(config.tool_approval_policy);
         if let Some(conversation_id) = config.work_conversation_id.clone() {
@@ -261,6 +267,7 @@ impl Agent {
             skill_index: Arc::new(std::sync::RwLock::new(None)),
             memory_search_backend: Arc::new(std::sync::RwLock::new(None)),
             agent_runner: Arc::new(Mutex::new(None)),
+            user_questions_allowed: Arc::new(AtomicBool::new(allow_user_questions)),
             agent_id,
             session_id,
             working_dir,
@@ -400,6 +407,15 @@ impl Agent {
 
     pub fn set_tool_approval_policy(&self, policy: ToolApprovalPolicy) {
         self.tool_activation.set_approval_policy(policy);
+    }
+
+    pub fn set_user_questions_allowed(&self, allowed: bool) {
+        self.user_questions_allowed
+            .store(allowed, Ordering::Release);
+    }
+
+    pub(crate) fn user_questions_allowed(&self) -> bool {
+        self.user_questions_allowed.load(Ordering::Acquire)
     }
 
     /// Installs the workspace skill index on this agent and refreshes the

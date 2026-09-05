@@ -10,7 +10,9 @@ use crate::shortcuts::{CloseSession, FocusInput, NewSession, Quit, SendMessage, 
 use crate::telegram_markdown::{
     format_remote_live_markdown, RemoteLiveToolLine, RemoteLiveToolStatus,
 };
-use crate::tool_details::{render_tool_detail, ToolDetailSection};
+use crate::tool_details::{
+    patch_content_for_display, render_patch_diff, render_tool_detail, ToolDetailSection,
+};
 use crate::tool_groups::{
     summarize_tool_names, ToolGroupEvent, ToolGroupRenderMode, ToolGroupTracker,
 };
@@ -34,6 +36,7 @@ use averroes_core::integrations::mcp::{McpAuth, McpAuthType, McpTransport, Proje
 use averroes_core::models::ManualModel;
 use averroes_core::provider::types::{ChatMessage, ContentPart, ImageSource, MessageContent, Role};
 use averroes_core::provider::{ModelInfo, ModelSource};
+use averroes_core::task::scheduled::{ScheduledTask, ScheduledTaskSchedule};
 use averroes_core::tool::ToolApprovalPolicy;
 use averroes_core::work::{
     now, CheckpointStatus, ConversationSearchResult, ConversationSummary, EmbeddingConfig,
@@ -201,6 +204,7 @@ enum Route {
     Home,
     Chat,
     Connections,
+    ScheduledTasks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1225,6 +1229,10 @@ pub struct AverroesApp {
     codex_busy: bool,
     copilot_busy: bool,
     projects: Vec<WorkProject>,
+    scheduled_tasks: Vec<ScheduledTask>,
+    scheduled_title_input: Entity<InputState>,
+    scheduled_prompt_input: Entity<InputState>,
+    scheduled_interval_input: Entity<InputState>,
     conversations: Vec<ConversationSummary>,
     onboarding_steps: HashMap<String, bool>,
     conversation_folders: Vec<WorkConversationFolder>,
@@ -1265,6 +1273,221 @@ pub struct AverroesApp {
 }
 
 impl AverroesApp {
+    fn refresh_scheduled_tasks(&mut self) {
+        let workspace = self
+            .active_workspace_id
+            .as_ref()
+            .and_then(|id| self.projects.iter().find(|project| &project.id == id))
+            .map(|project| project.root.clone());
+        self.scheduled_tasks = self
+            .runtime
+            .scheduled_tasks_for(workspace.as_deref())
+            .unwrap_or_default();
+    }
+
+    fn render_scheduled_tasks(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let tasks = self.scheduled_tasks.clone();
+        let active_workspace = self.active_workspace_id.clone();
+        let can_create = active_workspace.is_some() && self.remembered_binding.is_ready();
+        let rows = tasks
+            .into_iter()
+            .map(|task| {
+                let task_id = task.id.clone();
+                let toggle_id = task.id.clone();
+                let title = task.title.clone();
+                let schedule = task.schedule.summary();
+                div()
+                    .id(SharedString::from(format!("scheduled-task-{task_id}")))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .p(px(14.0))
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(px(UiTheme::RADIUS))
+                    .child(
+                        Icon::new(if task.enabled {
+                            IconName::CircleCheck
+                        } else {
+                            IconName::Ellipsis
+                        })
+                        .size(px(16.0))
+                        .text_color(if task.enabled {
+                            theme.success
+                        } else {
+                            theme.faint
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.muted)
+                                    .child(schedule),
+                            ),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("toggle-scheduled-{toggle_id}")))
+                            .small()
+                            .label(if task.enabled { "Disable" } else { "Enable" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Ok(current) = this.runtime.scheduled_tasks.get(&toggle_id) {
+                                    if let Err(error) = this
+                                        .runtime
+                                        .scheduled_tasks
+                                        .set_enabled(&toggle_id, !current.enabled)
+                                    {
+                                        this.show_error(error.to_string(), cx);
+                                    } else {
+                                        this.refresh_scheduled_tasks();
+                                        cx.notify();
+                                    }
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("delete-scheduled-{task_id}")))
+                            .danger()
+                            .small()
+                            .label(i18n::text(cx, "dialog.delete"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Err(error) = this.runtime.delete_scheduled_task(&task_id) {
+                                    this.show_error(error.to_string(), cx);
+                                } else {
+                                    this.refresh_scheduled_tasks();
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .p(px(40.0))
+            .gap(px(18.0))
+            .overflow_y_scrollbar()
+            .bg(theme.background)
+            .child(
+                div()
+                    .text_2xl()
+                    .font_weight(FontWeight::BOLD)
+                    .child(i18n::text(cx, "scheduled.title")),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted)
+                    .child(i18n::text(cx, "scheduled.description")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .p(px(16.0))
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(px(UiTheme::RADIUS))
+                    .child(Input::new(&self.scheduled_title_input).w_full())
+                    .child(Input::new(&self.scheduled_prompt_input).w_full())
+                    .child(Input::new(&self.scheduled_interval_input).w_full())
+                    .child(
+                        Button::new("add-scheduled-task")
+                            .primary()
+                            .label(i18n::text(cx, "scheduled.add"))
+                            .disabled(!can_create)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let title = this
+                                    .scheduled_title_input
+                                    .read(cx)
+                                    .value()
+                                    .trim()
+                                    .to_owned();
+                                let prompt = this
+                                    .scheduled_prompt_input
+                                    .read(cx)
+                                    .value()
+                                    .trim()
+                                    .to_owned();
+                                let seconds = this
+                                    .scheduled_interval_input
+                                    .read(cx)
+                                    .value()
+                                    .trim()
+                                    .parse::<u64>()
+                                    .unwrap_or(3600);
+                                let Some(project_id) = this.active_workspace_id.clone() else {
+                                    return;
+                                };
+                                let Some(project) = this
+                                    .projects
+                                    .iter()
+                                    .find(|project| project.id == project_id)
+                                else {
+                                    return;
+                                };
+                                if title.is_empty() || prompt.is_empty() {
+                                    this.show_error(i18n::text(cx, "scheduled.required"), cx);
+                                    return;
+                                }
+                                let task = ScheduledTask::new(
+                                    title,
+                                    prompt,
+                                    project.root.clone(),
+                                    Some(project.id.clone()),
+                                    this.remembered_binding.clone(),
+                                    ScheduledTaskSchedule::Interval { seconds },
+                                );
+                                match this.runtime.save_scheduled_task(task) {
+                                    Ok(_) => {
+                                        this.scheduled_title_input.update(cx, |input, cx| {
+                                            input.set_value("", window, cx)
+                                        });
+                                        this.scheduled_prompt_input.update(cx, |input, cx| {
+                                            input.set_value("", window, cx)
+                                        });
+                                        this.scheduled_interval_input.update(cx, |input, cx| {
+                                            input.set_value("", window, cx)
+                                        });
+                                        this.refresh_scheduled_tasks();
+                                        cx.notify();
+                                    }
+                                    Err(error) => this.show_error(error.to_string(), cx),
+                                }
+                            })),
+                    ),
+            )
+            .when(active_workspace.is_none(), |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.warning)
+                        .child(i18n::text(cx, "scheduled.workspace_required")),
+                )
+            })
+            .when(rows.is_empty(), |this| {
+                this.child(
+                    div()
+                        .p(px(20.0))
+                        .bg(theme.surface)
+                        .rounded(px(UiTheme::RADIUS))
+                        .child(i18n::text(cx, "scheduled.empty")),
+                )
+            })
+            .children(rows)
+            .into_any_element()
+    }
+
     pub fn new(
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1286,6 +1509,7 @@ impl AverroesApp {
             .map(|(label, _)| label.clone())
             .collect::<Vec<_>>();
         let projects = runtime.database.projects().unwrap_or_default();
+        let scheduled_tasks = runtime.scheduled_tasks_for(None).unwrap_or_default();
         let stored_binding = runtime.database.last_binding().ok().flatten();
         let mut remembered_binding = stored_binding
             .filter(|binding| {
@@ -1487,6 +1711,16 @@ impl AverroesApp {
         });
         let manual_model_reasoning_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(i18n::text(cx, "placeholder.reasoning_levels"))
+        });
+        let scheduled_title_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::text(cx, "scheduled.title_placeholder"))
+        });
+        let scheduled_prompt_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::text(cx, "scheduled.prompt_placeholder"))
+        });
+        let scheduled_interval_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(i18n::text(cx, "scheduled.interval_placeholder"))
         });
 
         let mut subscriptions = Vec::new();
@@ -1785,6 +2019,10 @@ impl AverroesApp {
             codex_busy: false,
             copilot_busy: false,
             projects,
+            scheduled_tasks,
+            scheduled_title_input,
+            scheduled_prompt_input,
+            scheduled_interval_input,
             conversations,
             onboarding_steps,
             conversation_folders: Vec::new(),
@@ -10328,6 +10566,36 @@ impl AverroesApp {
                 ),
             )
             .child(
+                div().flex_none().px(px(SIDEBAR_GUTTER)).pb(px(12.0)).child(
+                    div()
+                        .id("open-scheduled-tasks-nav")
+                        .h(px(SIDEBAR_NAV_HEIGHT))
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .rounded(px(SIDEBAR_RADIUS))
+                        .cursor_pointer()
+                        .text_size(px(14.5))
+                        .when(self.route == Route::ScheduledTasks, |this| {
+                            this.bg(theme.surface_hover).font_weight(FontWeight::MEDIUM)
+                        })
+                        .hover(|style| style.bg(theme.surface_hover))
+                        .child(
+                            Icon::new(IconName::Calendar)
+                                .size(px(16.0))
+                                .text_color(theme.muted),
+                        )
+                        .child(i18n::text(cx, "sidebar.scheduled_tasks"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.project_settings_open = false;
+                            this.refresh_scheduled_tasks();
+                            this.route = Route::ScheduledTasks;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .child(
                 div()
                     .flex_1()
                     .min_h(px(0.0))
@@ -12227,11 +12495,11 @@ impl AverroesApp {
                             .text_color(theme.faint)
                             .child(i18n::text(cx, "tool.arguments")),
                     )
-                    .child(render_tool_detail(
+                    .child(render_tool_arguments(
                         activity_id.clone(),
-                        input,
-                        ToolDetailSection::Arguments,
-                        theme.muted,
+                        &activity.name,
+                        &input,
+                        theme,
                         10.0,
                     ))
                     .child(
@@ -14606,6 +14874,7 @@ impl Render for AverroesApp {
                 }
             }
             Route::Connections => self.render_connections(cx),
+            Route::ScheduledTasks => self.render_scheduled_tasks(cx),
         };
         let sheet_layer = ComponentRoot::render_sheet_layer(window, cx);
         let dialog_layer = ComponentRoot::render_dialog_layer(window, cx);
@@ -15173,6 +15442,28 @@ fn tool_input_for_display(input: &str) -> String {
     } else {
         input.into()
     }
+}
+
+fn render_tool_arguments(
+    id_prefix: impl Into<String>,
+    name: &str,
+    input: &str,
+    theme: UiTheme,
+    text_size: f32,
+) -> AnyElement {
+    let id_prefix = id_prefix.into();
+    if name == "patch" {
+        if let Some(patch) = patch_content_for_display(input) {
+            return render_patch_diff(id_prefix, &patch, theme, text_size);
+        }
+    }
+    render_tool_detail(
+        id_prefix,
+        input.to_owned(),
+        ToolDetailSection::Arguments,
+        theme.muted,
+        text_size,
+    )
 }
 
 fn tool_display_name(name: &str) -> String {
@@ -16002,11 +16293,11 @@ fn render_tool_activity(
                                 .text_color(theme.faint)
                                 .child(i18n::text(cx, "tool.arguments")),
                         )
-                        .child(render_tool_detail(
+                        .child(render_tool_arguments(
                             activity_id.clone(),
-                            input,
-                            ToolDetailSection::Arguments,
-                            theme.muted,
+                            &activity.name,
+                            &input,
+                            theme,
                             11.0,
                         ))
                         .child(
@@ -17164,11 +17455,11 @@ fn render_agent_thread_tool_activity(
                     .text_color(theme.faint)
                     .child(i18n::text(cx, "tool.arguments")),
             )
-            .child(render_tool_detail(
+            .child(render_tool_arguments(
                 activity_id.clone(),
-                tool_input_for_display(&activity.input),
-                ToolDetailSection::Arguments,
-                theme.faint,
+                &activity.name,
+                &tool_input_for_display(&activity.input),
+                theme,
                 10.0,
             ))
             .child(
