@@ -1,3 +1,4 @@
+pub mod animation;
 pub mod markdown;
 pub mod provider;
 pub mod theme;
