@@ -76,6 +76,10 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
             task_id TEXT NOT NULL,
             title TEXT NOT NULL,
+            description TEXT,
+            parent_task_id TEXT,
+            depends_on_json TEXT NOT NULL DEFAULT '[]',
+            priority TEXT NOT NULL DEFAULT 'normal',
             status TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
@@ -222,6 +226,24 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    if !table_has_column(connection, "tasks", "description")? {
+        connection.execute("ALTER TABLE tasks ADD COLUMN description TEXT", [])?;
+    }
+    if !table_has_column(connection, "tasks", "parent_task_id")? {
+        connection.execute("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT", [])?;
+    }
+    if !table_has_column(connection, "tasks", "depends_on_json")? {
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN depends_on_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+    if !table_has_column(connection, "tasks", "priority")? {
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'",
+            [],
+        )?;
+    }
     if !table_has_column(connection, "sources", "url")? {
         connection.execute("ALTER TABLE sources ADD COLUMN url TEXT", [])?;
     }
@@ -233,7 +255,7 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX conversation_embeddings_model
              ON conversation_embeddings(connection_id, model_id, conversation_id);",
     )?;
-    connection.pragma_update(None, "user_version", 14)?;
+    connection.pragma_update(None, "user_version", 15)?;
     Ok(())
 }
 

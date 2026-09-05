@@ -180,21 +180,62 @@ pub struct WorkCheckpoint {
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
+    InProgress,
     Done,
+    Blocked,
+    Cancelled,
 }
 
 impl TaskStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::InProgress => "in_progress",
             Self::Done => "done",
+            Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
         }
     }
 
     pub(super) fn parse(value: &str) -> Self {
         match value {
+            "in_progress" => Self::InProgress,
             "done" => Self::Done,
+            "blocked" => Self::Blocked,
+            "cancelled" => Self::Cancelled,
             _ => Self::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPriority {
+    Low,
+    Normal,
+    High,
+}
+
+impl Default for TaskPriority {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl TaskPriority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::High => "high",
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Self {
+        match value {
+            "low" => Self::Low,
+            "high" => Self::High,
+            _ => Self::Normal,
         }
     }
 }
@@ -203,6 +244,14 @@ impl TaskStatus {
 pub struct WorkTask {
     pub id: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub priority: TaskPriority,
     pub status: TaskStatus,
     pub created_at: i64,
     pub updated_at: i64,

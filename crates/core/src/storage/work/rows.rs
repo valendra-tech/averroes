@@ -1,4 +1,4 @@
-use super::types::{CheckpointStatus, TaskStatus, WorkMessage, WorkMessageRole};
+use super::types::{CheckpointStatus, TaskPriority, TaskStatus, WorkMessage, WorkMessageRole};
 use super::{WorkCheckpoint, WorkConversation, WorkDatabaseError, WorkSource, WorkTask};
 use rusqlite::{params, types::Type, Connection, OptionalExtension, Transaction};
 use serde::de::DeserializeOwned;
@@ -227,16 +227,25 @@ pub(super) fn upsert_task_connection(
 ) -> Result<(), WorkDatabaseError> {
     connection.execute(
         "INSERT INTO tasks
-            (conversation_id, task_id, title, status, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            (conversation_id, task_id, title, description, parent_task_id, depends_on_json,
+             priority, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(conversation_id, task_id) DO UPDATE SET
             title = excluded.title,
+            description = excluded.description,
+            parent_task_id = excluded.parent_task_id,
+            depends_on_json = excluded.depends_on_json,
+            priority = excluded.priority,
             status = excluded.status,
             updated_at = excluded.updated_at",
         params![
             conversation_id,
             task.id,
             task.title,
+            task.description,
+            task.parent_task_id,
+            serde_json::to_string(&task.depends_on)?,
+            task.priority.as_str(),
             task.status.as_str(),
             task.created_at,
             task.updated_at,
@@ -258,17 +267,31 @@ pub(super) fn load_tasks(
     conversation_id: &str,
 ) -> Result<Vec<WorkTask>, WorkDatabaseError> {
     let mut statement = connection.prepare(
-        "SELECT task_id, title, status, created_at, updated_at FROM tasks
+        "SELECT task_id, title, description, parent_task_id, depends_on_json, priority,
+                status, created_at, updated_at
+         FROM tasks
          WHERE conversation_id = ?1
-         ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, created_at, task_id",
+         ORDER BY CASE status
+                    WHEN 'in_progress' THEN 0
+                    WHEN 'pending' THEN 1
+                    WHEN 'blocked' THEN 2
+                    WHEN 'done' THEN 3
+                    ELSE 4
+                  END,
+                  CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
+                  created_at, task_id",
     )?;
     let rows = statement.query_map(params![conversation_id], |row| {
         Ok(WorkTask {
             id: row.get(0)?,
             title: row.get(1)?,
-            status: TaskStatus::parse(&row.get::<_, String>(2)?),
-            created_at: row.get(3)?,
-            updated_at: row.get(4)?,
+            description: row.get(2)?,
+            parent_task_id: row.get(3)?,
+            depends_on: json_column(row, 4)?,
+            priority: TaskPriority::parse(&row.get::<_, String>(5)?),
+            status: TaskStatus::parse(&row.get::<_, String>(6)?),
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

@@ -627,6 +627,8 @@ impl RuntimeAgentRunner {
                 reasoning_effort: self.reasoning_effort.clone(),
                 tool_approval_policy: request.tool_approval_policy,
                 allow_delegation: false,
+                work_conversation_id: Some(request.parent_session_id.clone()),
+                work_id_prefix: Some(format!("agent:{}:", thread_id)),
                 ..Default::default()
             },
             provider,
@@ -1074,6 +1076,7 @@ impl AppRuntime {
         tools.register(builtin::checkpoint::CheckpointTool::new(database.clone()));
         tools.register(builtin::task::TaskListTool::new(database.clone()));
         tools.register(builtin::task::AddTaskTool::new(database.clone()));
+        tools.register(builtin::task::UpdateTaskTool::new(database.clone()));
         tools.register(builtin::task::MarkTaskAsDoneTool::new(database.clone()));
         tools.register(builtin::global_memory::CreateGlobalMemoryTool::new(
             database.clone(),

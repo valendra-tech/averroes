@@ -8,8 +8,8 @@ use super::openai::{
 use super::qdivzero::parse_serving_endpoints;
 use super::{
     log_debug_request, model_uses_reasoning_api, parse_openai_embeddings, parse_provider_models,
-    ChatRequest, ChatResponse, ChatStream, EmbeddingRequest, EmbeddingResponse, Provider,
-    ProviderError, ProviderModel, Result,
+    send_with_retry, ChatRequest, ChatResponse, ChatStream, EmbeddingRequest, EmbeddingResponse,
+    Provider, ProviderError, ProviderModel, Result,
 };
 use crate::connection::ConnectionKind;
 use crate::provider::hooks::{ModelDiscovery, ProviderRegistry, StandardProviderHook};
@@ -218,15 +218,17 @@ impl Provider for GenericProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         log_debug_request(&request, "Generic");
         let body = self.build_body(&request, false);
-        let response = self
-            .authenticated(
+        let response = send_with_retry(|| async {
+            self.authenticated(
                 self.client
                     .post(format!("{}/chat/completions", self.base_url)),
             )
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
-            .await?;
+            .await
+        })
+        .await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -315,15 +317,17 @@ impl Provider for GenericProvider {
     async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
         log_debug_request(&request, "Generic");
         let body = self.build_body(&request, true);
-        let response = self
-            .authenticated(
+        let response = send_with_retry(|| async {
+            self.authenticated(
                 self.client
                     .post(format!("{}/chat/completions", self.base_url)),
             )
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
-            .await?;
+            .await
+        })
+        .await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -339,10 +343,12 @@ impl Provider for GenericProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModel>> {
-        let response = self
-            .authenticated(self.client.get(&self.models_url))
-            .send()
-            .await?;
+        let response = send_with_retry(|| async {
+            self.authenticated(self.client.get(&self.models_url))
+                .send()
+                .await
+        })
+        .await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -361,15 +367,18 @@ impl Provider for GenericProvider {
     }
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
-        let response = self
-            .authenticated(self.client.post(&self.embedding_url))
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "model": request.model,
-                "input": request.input,
-            }))
-            .send()
-            .await?;
+        let body = serde_json::json!({
+            "model": request.model,
+            "input": request.input,
+        });
+        let response = send_with_retry(|| async {
+            self.authenticated(self.client.post(&self.embedding_url))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+        })
+        .await?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
             return Err(ProviderError::Api {

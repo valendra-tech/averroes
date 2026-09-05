@@ -326,6 +326,7 @@
   "tool.checkpoint": "Checkpoint",
   "tool.list_tasks": "List tasks",
   "tool.add_task": "Add task",
+  "tool.update_task": "Update task",
   "tool.complete_task": "Complete task",
   "tool.ask_user": "Ask user",
   "tool.list_tools": "List tools",

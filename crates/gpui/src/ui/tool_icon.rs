@@ -22,7 +22,7 @@ fn tool_icon_path(tool_name: &str) -> &'static str {
         "grep" | "search" => "tools/search.svg",
         "web_fetch" | "web_search_intrernal" | "browser" => "tools/globe.svg",
         "checkpoint" => "tools/checkpoint.svg",
-        "task_list" | "add_task" | "mark_task_as_done" => "tools/task.svg",
+        "task_list" | "add_task" | "update_task" | "mark_task_as_done" => "tools/task.svg",
         "ask_user" => "tools/ask-user.svg",
         "list_tools" => "tools/tool.svg",
         "list_skills" | "search_skills" => "tools/skills.svg",
@@ -49,6 +49,7 @@ mod tests {
         assert_eq!(tool_icon_path("web_fetch"), "tools/globe.svg");
         assert_eq!(tool_icon_path("browser"), "tools/globe.svg");
         assert_eq!(tool_icon_path("add_task"), "tools/task.svg");
+        assert_eq!(tool_icon_path("update_task"), "tools/task.svg");
         assert_eq!(tool_icon_path("ask_user"), "tools/ask-user.svg");
         assert_eq!(tool_icon_path("search_skills"), "tools/skills.svg");
         assert_eq!(tool_icon_path("install_skill"), "tools/skill.svg");

@@ -13,7 +13,109 @@ use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::future::Future;
+use std::time::Duration;
 use types::TokenUsage;
+
+const HTTP_REQUEST_MAX_RETRIES: usize = 3;
+const HTTP_REQUEST_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const HTTP_REQUEST_MAX_BACKOFF: Duration = Duration::from_secs(4);
+
+pub(crate) async fn send_with_retry<F, Fut>(request: F) -> Result<reqwest::Response>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<reqwest::Response, reqwest::Error>>,
+{
+    send_with_retry_with_policy(
+        request,
+        HTTP_REQUEST_MAX_RETRIES,
+        HTTP_REQUEST_INITIAL_BACKOFF,
+        HTTP_REQUEST_MAX_BACKOFF,
+    )
+    .await
+}
+
+async fn send_with_retry_with_policy<F, Fut>(
+    mut request: F,
+    max_retries: usize,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+) -> Result<reqwest::Response>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<reqwest::Response, reqwest::Error>>,
+{
+    for attempt in 0..=max_retries {
+        match request().await {
+            Ok(response)
+                if attempt < max_retries && is_retryable_http_status(response.status()) =>
+            {
+                drop(response);
+                sleep_before_retry(attempt, max_retries, initial_backoff, max_backoff).await;
+            }
+            Ok(response) => return Ok(response),
+            Err(error) if attempt < max_retries && is_retryable_http_error(&error) => {
+                sleep_before_retry(attempt, max_retries, initial_backoff, max_backoff).await;
+            }
+            Err(error) => return Err(ProviderError::Http(error)),
+        }
+    }
+
+    unreachable!("HTTP retry loop always returns")
+}
+
+fn is_retryable_http_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout() || error.is_request()
+}
+
+fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::TOO_EARLY
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+pub(crate) fn retry_backoff(
+    attempt: usize,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+) -> Duration {
+    let shift = attempt.min(127) as u32;
+    let multiplier = 1u128.checked_shl(shift).unwrap_or(u128::MAX);
+    let millis = initial_backoff
+        .as_millis()
+        .saturating_mul(multiplier)
+        .min(max_backoff.as_millis());
+    Duration::from_millis(millis.min(u64::MAX as u128) as u64)
+}
+
+async fn sleep_before_retry(
+    attempt: usize,
+    max_retries: usize,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+) {
+    let delay = retry_backoff(attempt, initial_backoff, max_backoff);
+    crate::observability::diagnostics::record(
+        crate::observability::diagnostics::DiagnosticLevel::Warning,
+        "provider.http",
+        format!(
+            "Transient provider request failure; retrying in {} ms ({}/{})",
+            delay.as_millis(),
+            attempt + 1,
+            max_retries
+        ),
+    );
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+}
 
 pub use crate::provider::types::ChatMessage;
 pub use hooks::{ModelDiscovery, ProviderHook, ProviderRegistry, StandardProviderHook};
@@ -169,4 +271,96 @@ pub(crate) fn parse_openai_embeddings(value: &Value) -> Result<EmbeddingResponse
             .map(|(_, embedding)| embedding)
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::send_with_retry_with_policy;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn retries_transient_http_statuses_with_exponential_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request).await.unwrap();
+                let status = if attempt < 2 { 503 } else { 200 };
+                let body = "ok";
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{body}"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let response = send_with_retry_with_policy(
+            || client.get(format!("http://{address}/responses")).send(),
+            3,
+            Duration::from_millis(1),
+            Duration::from_millis(4),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_transient_transport_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request).await.unwrap();
+                if attempt == 0 {
+                    drop(stream);
+                    continue;
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let response = send_with_retry_with_policy(
+            || client.get(format!("http://{address}/responses")).send(),
+            3,
+            Duration::from_millis(1),
+            Duration::from_millis(4),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn retry_backoff_is_exponential_and_capped() {
+        assert_eq!(
+            super::retry_backoff(0, Duration::from_millis(100), Duration::from_secs(2)),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            super::retry_backoff(1, Duration::from_millis(100), Duration::from_secs(2)),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            super::retry_backoff(8, Duration::from_millis(100), Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+    }
 }

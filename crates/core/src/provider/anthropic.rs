@@ -18,8 +18,8 @@ pub(crate) fn register_provider_hook(registry: &mut ProviderRegistry) {
     ));
 }
 use crate::provider::{
-    log_debug_request, parse_provider_models, ChatRequest, ChatResponse, ChatStream, Provider,
-    ProviderError, ProviderModel, Result, ToolDefinition,
+    log_debug_request, parse_provider_models, send_with_retry, ChatRequest, ChatResponse,
+    ChatStream, Provider, ProviderError, ProviderModel, Result, ToolDefinition,
 };
 
 pub struct AnthropicProvider {
@@ -348,12 +348,14 @@ impl Provider for AnthropicProvider {
         let body = self.build_body(&request, false);
         let url = format!("{}/messages", self.base_url);
 
-        let response = self
-            .authenticated(self.client.post(&url))
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        let response = send_with_retry(|| async {
+            self.authenticated(self.client.post(&url))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+        })
+        .await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -392,12 +394,14 @@ impl Provider for AnthropicProvider {
         let body = self.build_body(&request, true);
         let url = format!("{}/messages", self.base_url);
 
-        let response = self
-            .authenticated(self.client.post(&url))
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        let response = send_with_retry(|| async {
+            self.authenticated(self.client.post(&url))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+        })
+        .await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -413,10 +417,12 @@ impl Provider for AnthropicProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModel>> {
-        let response = self
-            .authenticated(self.client.get(format!("{}/models", self.base_url)))
-            .send()
-            .await?;
+        let response = send_with_retry(|| async {
+            self.authenticated(self.client.get(format!("{}/models", self.base_url)))
+                .send()
+                .await
+        })
+        .await?;
 
         let status = response.status();
         if !status.is_success() {

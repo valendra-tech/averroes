@@ -136,6 +136,8 @@ pub struct ToolActivation {
     names: RwLock<BTreeSet<String>>,
     current_directory: RwLock<Option<PathBuf>>,
     approval_policy: RwLock<ToolApprovalPolicy>,
+    work_conversation_id: RwLock<Option<String>>,
+    work_id_prefix: RwLock<Option<String>>,
 }
 
 impl ToolActivation {
@@ -160,6 +162,40 @@ impl ToolActivation {
 
     pub fn set_approval_policy(&self, policy: ToolApprovalPolicy) {
         *self.approval_policy.write().unwrap() = policy;
+    }
+
+    pub(crate) fn set_work_scope(
+        &self,
+        conversation_id: impl Into<String>,
+        work_id_prefix: impl Into<String>,
+    ) {
+        *self.work_conversation_id.write().unwrap() = Some(conversation_id.into());
+        *self.work_id_prefix.write().unwrap() = Some(work_id_prefix.into());
+    }
+
+    pub(crate) fn work_scope(
+        &self,
+        fallback_conversation_id: &str,
+        work_id: &str,
+    ) -> (String, String) {
+        let conversation_id = self
+            .work_conversation_id
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| fallback_conversation_id.to_owned());
+        let id_prefix = self
+            .work_id_prefix
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        let scoped_id = if id_prefix.is_empty() || work_id.starts_with(&id_prefix) {
+            work_id.to_owned()
+        } else {
+            format!("{id_prefix}{work_id}")
+        };
+        (conversation_id, scoped_id)
     }
 
     pub(crate) fn current_directory(&self, fallback: &Path) -> PathBuf {
