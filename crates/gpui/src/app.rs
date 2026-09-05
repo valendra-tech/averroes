@@ -3,6 +3,7 @@ use crate::remote_agent::{
     capture_desktop_screenshot, TelegramCallbackQuery, TelegramClient, TelegramMessage,
     TelegramUpdate, TelegramUser,
 };
+use crate::response_rate::ResponseRate;
 use crate::runtime::{AppRuntime, MarketplaceSkill};
 use crate::session::SessionId;
 use crate::shortcuts::{CloseSession, FocusInput, NewSession, Quit, SendMessage, ToggleSettings};
@@ -972,6 +973,7 @@ struct ShellSession {
     pending_user_question: Option<averroes_core::tool::builtin::ask_user::UserQuestion>,
     pending_user_question_session_id: Option<String>,
     context_usage: ContextUsage,
+    response_rate: ResponseRate,
     agent_threads: Vec<AgentThreadSnapshot>,
     agent_thread_transcripts: HashMap<String, AgentThreadTranscript>,
     context_busy: bool,
@@ -1003,6 +1005,7 @@ impl ShellSession {
             pending_user_question: None,
             pending_user_question_session_id: None,
             context_usage: ContextUsage::unknown(0),
+            response_rate: ResponseRate::default(),
             agent_threads: Vec::new(),
             agent_thread_transcripts: HashMap::new(),
             context_busy: false,
@@ -1044,6 +1047,7 @@ impl ShellSession {
             pending_user_question: None,
             pending_user_question_session_id: None,
             context_usage: conversation.context_usage,
+            response_rate: ResponseRate::default(),
             agent_threads: conversation
                 .agent_threads
                 .into_iter()
@@ -6833,6 +6837,7 @@ impl AverroesApp {
                 else {
                     return;
                 };
+                session.response_rate.record_delta(&text, Instant::now());
                 if let Some(message) = session.messages.last_mut() {
                     if !text.is_empty() {
                         message.append_text(&text);
@@ -6848,6 +6853,7 @@ impl AverroesApp {
                 else {
                     return;
                 };
+                session.response_rate.record_delta(&text, Instant::now());
                 if let Some(message) = session.messages.last_mut() {
                     message.append_reasoning(&text);
                 }
@@ -7072,6 +7078,9 @@ impl AverroesApp {
                     .iter_mut()
                     .find(|session| &session.id == session_id)
                 {
+                    session
+                        .response_rate
+                        .finalize(usage.output_tokens, Instant::now());
                     session.context_usage = usage;
                 }
             }
@@ -8412,6 +8421,7 @@ impl AverroesApp {
         self.sessions[session_index]
             .messages
             .push(ShellMessage::assistant());
+        self.sessions[session_index].response_rate.reset();
         self.sessions[session_index].processing = true;
         self.sessions[session_index].unread = false;
         if self.active().id == session_id {
@@ -10396,6 +10406,39 @@ impl AverroesApp {
         let session = self.active();
         let has_connection = session.binding.connection_id.is_some();
         let has_model = session.binding.model_id.is_some();
+        let token_rate_indicator = session
+            .response_rate
+            .display_rate(Instant::now())
+            .map(|rate| {
+                let rate_label = i18n::format(
+                    cx,
+                    "composer.tokens_per_second",
+                    &[("rate", rate.tokens_per_second.to_string())],
+                );
+                let kind_key = if rate.exact {
+                    "composer.tokens_per_second_exact"
+                } else {
+                    "composer.tokens_per_second_estimated"
+                };
+                let tooltip = i18n::format(
+                    cx,
+                    "composer.tokens_per_second_tooltip",
+                    &[
+                        ("kind", i18n::text(cx, kind_key).to_string()),
+                        ("rate", rate.tokens_per_second.to_string()),
+                    ],
+                );
+                Button::new(SharedString::from(format!(
+                    "composer-tokens-per-second-{}",
+                    session.id.as_str()
+                )))
+                .ghost()
+                .small()
+                .label(rate_label)
+                .tooltip(tooltip)
+                .text_color(theme.faint)
+                .into_any_element()
+            });
         let attachment_chips = self
             .attachments
             .iter()
@@ -10607,6 +10650,9 @@ impl AverroesApp {
                             ),
                     )
                     .child(div().flex_1())
+                    .when_some(token_rate_indicator, |footer, indicator| {
+                        footer.child(indicator)
+                    })
                     .child(send_button),
             )
             .into_any_element()
