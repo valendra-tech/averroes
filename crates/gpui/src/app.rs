@@ -17398,11 +17398,12 @@ fn render_assistant_text_segment(
     message_index: usize,
     segment_index: usize,
     text: &str,
+    stream_animation_id: &str,
     streaming: bool,
     theme: UiTheme,
 ) -> AnyElement {
     if streaming {
-        render_streaming_markdown(theme, text)
+        render_streaming_markdown(theme, text, stream_animation_id)
             .text_size(px(14.0))
             .into_any_element()
     } else {
@@ -17426,7 +17427,7 @@ fn render_reasoning_text_segment(
 ) -> AnyElement {
     let text = normalize_reasoning_for_display(text);
     if streaming {
-        render_streaming_markdown(theme, text.as_ref())
+        render_streaming_markdown(theme, text.as_ref(), &id)
             .text_size(px(12.0))
             .into_any_element()
     } else {
@@ -17509,11 +17510,16 @@ fn render_ordered_message_content(
             }
             AgentThreadBlock::Text { start, end } => {
                 if let Some(text) = message.text.get(start..end).filter(|text| !text.is_empty()) {
+                    let stream_animation_id = format!(
+                        "stream-message-{}-{message_index}-segment-{text_segment_index}",
+                        session_id.as_str()
+                    );
                     elements.push(render_assistant_text_segment(
                         session_id,
                         message_index,
                         text_segment_index,
                         text,
+                        &stream_animation_id,
                         streaming && end == message.text.len(),
                         theme,
                     ));
@@ -17636,8 +17642,18 @@ fn render_message(
             4.0,
         )]
     } else {
+        let stream_animation_id = format!(
+            "stream-message-{}-{index}-segment-0",
+            session_id.as_str()
+        );
         vec![render_assistant_text_segment(
-            session_id, index, 0, &body, streaming, theme,
+            session_id,
+            index,
+            0,
+            &body,
+            &stream_animation_id,
+            streaming,
+            theme,
         )]
     };
     let user_question_element = if assistant {
