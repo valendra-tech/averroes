@@ -10522,16 +10522,12 @@ impl AverroesApp {
                 )
                 .into_any_element()
         } else {
-            send_button
-                .child(Icon::new(IconName::ArrowUp).with_animation(
-                    format!("composer-send-icon-{}-idle", session.id.as_str()),
-                    Animation::new(STATE_FADE_DURATION).with_easing(gpui::ease_out_quint()),
-                    |icon, delta| {
-                        let scale = 0.92 + delta.clamp(0.0, 1.0) * 0.08;
-                        icon.transform(gpui::Transformation::scale(gpui::size(scale, scale)))
-                    },
-                ))
-                .into_any_element()
+            fade_in(
+                send_button.icon(IconName::ArrowUp),
+                format!("composer-send-button-{}-idle", session.id.as_str()),
+                STATE_FADE_DURATION,
+            )
+            .into_any_element()
         };
         div()
             .w_full()
