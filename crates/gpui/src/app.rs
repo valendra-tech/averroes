@@ -289,6 +289,8 @@ struct ShellMessage {
     reasoning_complete: bool,
     reasoning_expanded: bool,
     animate_in: bool,
+    stream_text_batch_start: usize,
+    stream_text_batch: u64,
     tool_activities: Vec<ToolActivity>,
     stream_blocks: Vec<AgentThreadBlock>,
     tool_groups: ToolGroupTracker,
@@ -472,6 +474,8 @@ impl ShellMessage {
             reasoning_complete: true,
             reasoning_expanded: false,
             animate_in: false,
+            stream_text_batch_start: 0,
+            stream_text_batch: 0,
             tool_activities: Vec::new(),
             stream_blocks: Vec::new(),
             tool_groups: ToolGroupTracker::default(),
@@ -489,6 +493,8 @@ impl ShellMessage {
             reasoning_complete: false,
             reasoning_expanded: false,
             animate_in: true,
+            stream_text_batch_start: 0,
+            stream_text_batch: 0,
             tool_activities: Vec::new(),
             stream_blocks: Vec::new(),
             tool_groups: ToolGroupTracker::default(),
@@ -506,6 +512,8 @@ impl ShellMessage {
             reasoning_complete: true,
             reasoning_expanded: false,
             animate_in: false,
+            stream_text_batch_start: 0,
+            stream_text_batch: 0,
             tool_activities: Vec::new(),
             stream_blocks: Vec::new(),
             tool_groups: ToolGroupTracker::default(),
@@ -520,6 +528,11 @@ impl ShellMessage {
 
     fn assistant_text_arrived(&mut self) {
         self.tool_groups.close_on_assistant_text();
+    }
+
+    fn begin_stream_text_batch(&mut self) {
+        self.stream_text_batch_start = self.text.len();
+        self.stream_text_batch = self.stream_text_batch.wrapping_add(1);
     }
 
     fn append_text(&mut self, text: &str) {
@@ -844,6 +857,8 @@ fn shell_message_from_work(message: WorkMessage) -> ShellMessage {
         reasoning_complete: message.reasoning_complete,
         reasoning_expanded: message.reasoning_expanded,
         animate_in: false,
+        stream_text_batch_start: 0,
+        stream_text_batch: 0,
         tool_activities: message
             .tool_activities
             .into_iter()
@@ -6774,6 +6789,18 @@ impl AverroesApp {
         }
     }
 
+    fn begin_stream_text_batch(&mut self, session_id: &SessionId) {
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| &session.id == session_id)
+        {
+            if let Some(message) = session.messages.last_mut() {
+                message.begin_stream_text_batch();
+            }
+        }
+    }
+
     fn apply_agent_stream_event(
         &mut self,
         session_id: &SessionId,
@@ -8659,6 +8686,15 @@ impl AverroesApp {
                 _ = this.update(cx, |app, cx| {
                     let force_recovery_checkpoint =
                         events.iter().any(stream_event_requires_immediate_flush);
+                    let has_text_delta = events.iter().any(|event| {
+                        matches!(
+                            event,
+                            AgentStreamEvent::TextDelta { text } if !text.is_empty()
+                        )
+                    });
+                    if has_text_delta {
+                        app.begin_stream_text_batch(&stream_session_id);
+                    }
                     for event in events {
                         app.apply_agent_stream_event(&stream_session_id, event, cx);
                     }
@@ -16835,6 +16871,20 @@ mod agent_thread_render_tests {
             Vec::new()
         );
     }
+
+    #[test]
+    fn stream_text_batches_start_at_the_current_text_end() {
+        let mut message = ShellMessage::assistant();
+        message.append_text("old");
+        message.begin_stream_text_batch();
+        assert_eq!(message.stream_text_batch_start, 3);
+        assert_eq!(message.stream_text_batch, 1);
+
+        message.append_text("new");
+        message.begin_stream_text_batch();
+        assert_eq!(message.stream_text_batch_start, 6);
+        assert_eq!(message.stream_text_batch, 2);
+    }
 }
 
 fn render_agent_thread_tool_group(
@@ -17554,20 +17604,66 @@ fn render_ordered_message_content(
             }
             AgentThreadBlock::Text { start, end } => {
                 if let Some(text) = message.text.get(start..end).filter(|text| !text.is_empty()) {
-                    let stream_animation_id = format!(
-                        "stream-message-{}-{message_index}-segment-{text_segment_index}",
-                        session_id.as_str()
-                    );
-                    elements.push(render_assistant_text_segment(
-                        session_id,
-                        message_index,
-                        text_segment_index,
-                        text,
-                        &stream_animation_id,
-                        streaming && end == message.text.len(),
-                        theme,
-                    ));
-                    text_segment_index += 1;
+                    let is_streaming_tail = streaming && end == message.text.len();
+                    let batch_start = message.stream_text_batch_start.clamp(start, end);
+                    if is_streaming_tail && batch_start < end {
+                        if batch_start > start {
+                            let previous_text = message
+                                .text
+                                .get(start..batch_start)
+                                .expect("stream batch start stays on a UTF-8 boundary");
+                            let previous_animation_id = format!(
+                                "stream-message-{}-{message_index}-segment-{start}-prefix",
+                                session_id.as_str()
+                            );
+                            elements.push(render_assistant_text_segment(
+                                session_id,
+                                message_index,
+                                text_segment_index,
+                                previous_text,
+                                &previous_animation_id,
+                                true,
+                                theme,
+                            ));
+                            text_segment_index += 1;
+                        }
+
+                        let new_text = message
+                            .text
+                            .get(batch_start..end)
+                            .expect("stream batch end stays on a UTF-8 boundary");
+                        let stream_animation_id = format!(
+                            "stream-message-{}-{message_index}-batch-{}-{}",
+                            session_id.as_str(),
+                            message.stream_text_batch,
+                            batch_start
+                        );
+                        elements.push(render_assistant_text_segment(
+                            session_id,
+                            message_index,
+                            text_segment_index,
+                            new_text,
+                            &stream_animation_id,
+                            true,
+                            theme,
+                        ));
+                        text_segment_index += 1;
+                    } else {
+                        let stream_animation_id = format!(
+                            "stream-message-{}-{message_index}-segment-{text_segment_index}",
+                            session_id.as_str()
+                        );
+                        elements.push(render_assistant_text_segment(
+                            session_id,
+                            message_index,
+                            text_segment_index,
+                            text,
+                            &stream_animation_id,
+                            is_streaming_tail,
+                            theme,
+                        ));
+                        text_segment_index += 1;
+                    }
                 }
             }
             AgentThreadBlock::Tool { activity_index } => {
