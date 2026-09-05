@@ -326,6 +326,7 @@
   "tool.checkpoint": "Punto de control",
   "tool.list_tasks": "Listar tareas",
   "tool.add_task": "Añadir tarea",
+  "tool.update_task": "Actualizar tarea",
   "tool.complete_task": "Completar tarea",
   "tool.ask_user": "Preguntar al usuario",
   "tool.list_tools": "Listar herramientas",

@@ -182,6 +182,14 @@ async fn open_stream_with_first_event(
             Ok(Err(error)) => return Err(error),
             Ok(Ok(None)) | Err(_) if attempt < max_retries => {
                 record_silent_retry(attempt + 1, max_retries, timeout);
+                let delay = crate::provider::retry_backoff(
+                    attempt,
+                    Duration::from_millis(250),
+                    Duration::from_secs(4),
+                );
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
             }
             Ok(Ok(None)) | Err(_) => {
                 return Err(silent_provider_timeout(timeout, max_retries));

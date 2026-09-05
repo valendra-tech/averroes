@@ -828,21 +828,10 @@ impl WorkDatabase {
         if changed == 0 {
             return Ok(None);
         }
-        let task = connection.query_row(
-            "SELECT task_id, title, status, created_at, updated_at FROM tasks
-             WHERE conversation_id = ?1 AND task_id = ?2",
-            params![session_id, task_id],
-            |row| {
-                Ok(WorkTask {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    status: TaskStatus::parse(&row.get::<_, String>(2)?),
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
-                })
-            },
-        )?;
-        Ok(Some(task))
+        let task = rows::load_tasks(&connection, session_id)?
+            .into_iter()
+            .find(|task| task.id == task_id);
+        Ok(task)
     }
 
     pub fn record_source(
@@ -1251,6 +1240,10 @@ mod tests {
             tasks: vec![WorkTask {
                 id: "task-release".into(),
                 title: "Verify the release".into(),
+                description: None,
+                parent_task_id: None,
+                depends_on: Vec::new(),
+                priority: Default::default(),
                 status: TaskStatus::Pending,
                 created_at: timestamp,
                 updated_at: timestamp,

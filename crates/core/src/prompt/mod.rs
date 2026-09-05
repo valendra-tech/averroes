@@ -196,4 +196,34 @@ mod tests {
         assert!(prompt.contains("selected a security level"));
         assert!(!prompt.contains("request their own approval through the runtime"));
     }
+
+    #[test]
+    fn explains_checkpoint_lifecycle_and_delegated_scope() {
+        let builder = PromptBuilder::new();
+
+        let prompt = builder.build_system("/tmp/workspace", None);
+
+        assert!(prompt.contains("reuse the same stable id when updating it"));
+        assert!(prompt.contains("in_progress"));
+        assert!(prompt.contains("loading state"));
+        assert!(prompt.contains("`completed` or `blocked`"));
+        assert!(prompt.contains("delegated agents"));
+        assert!(prompt.contains("parent conversation"));
+        assert!(prompt.contains("Do not leave a checkpoint in_progress"));
+    }
+
+    #[test]
+    fn explains_task_decomposition_and_lifecycle() {
+        let builder = PromptBuilder::new();
+
+        let prompt = builder.build_system("/tmp/workspace", None);
+
+        assert!(prompt.contains("parent_task_id"));
+        assert!(prompt.contains("description"));
+        assert!(prompt.contains("priority"));
+        assert!(prompt.contains("depends_on"));
+        assert!(prompt.contains("update_task"));
+        assert!(prompt.contains("in_progress"));
+        assert!(prompt.contains("`blocked` or `cancelled`"));
+    }
 }

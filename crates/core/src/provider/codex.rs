@@ -1,9 +1,9 @@
 use super::openai::{spawn_responses_stream_producer, OpenAiProvider, OpenAiStream};
 use super::types::{ChatMessage, FunctionCall, MessageContent, Role, ToolCall};
 use super::{
-    log_debug_request, parse_openai_embeddings, ChatRequest, ChatResponse, ChatStream,
-    EmbeddingRequest, EmbeddingResponse, Provider, ProviderError, ProviderModel, Result,
-    StreamEvent,
+    log_debug_request, parse_openai_embeddings, send_with_retry, ChatRequest, ChatResponse,
+    ChatStream, EmbeddingRequest, EmbeddingResponse, Provider, ProviderError, ProviderModel,
+    Result, StreamEvent,
 };
 use crate::codex::{CodexClient, CODEX_API_BASE, CODEX_CLIENT_VERSION, CODEX_ORIGINATOR};
 use async_trait::async_trait;
@@ -76,16 +76,18 @@ impl ChatGptCodexProvider {
             .credentials()
             .await
             .map_err(|error| ProviderError::Other(error.to_string()))?;
-        Ok(self
-            .http
-            .post(format!("{CODEX_API_BASE}/responses"))
-            .bearer_auth(credentials.access_token)
-            .header("ChatGPT-Account-ID", credentials.account_id)
-            .header("originator", CODEX_ORIGINATOR)
-            .header("Accept", "text/event-stream")
-            .json(body)
-            .send()
-            .await?)
+        send_with_retry(|| async {
+            self.http
+                .post(format!("{CODEX_API_BASE}/responses"))
+                .bearer_auth(&credentials.access_token)
+                .header("ChatGPT-Account-ID", &credentials.account_id)
+                .header("originator", CODEX_ORIGINATOR)
+                .header("Accept", "text/event-stream")
+                .json(body)
+                .send()
+                .await
+        })
+        .await
     }
 
     async fn send_embeddings(&self, body: &Value) -> Result<reqwest::Response> {
@@ -106,16 +108,18 @@ impl ChatGptCodexProvider {
             .credentials()
             .await
             .map_err(|error| ProviderError::Other(error.to_string()))?;
-        Ok(self
-            .http
-            .post(format!("{CODEX_API_BASE}/embeddings"))
-            .bearer_auth(credentials.access_token)
-            .header("ChatGPT-Account-ID", credentials.account_id)
-            .header("originator", CODEX_ORIGINATOR)
-            .header("Content-Type", "application/json")
-            .json(body)
-            .send()
-            .await?)
+        send_with_retry(|| async {
+            self.http
+                .post(format!("{CODEX_API_BASE}/embeddings"))
+                .bearer_auth(&credentials.access_token)
+                .header("ChatGPT-Account-ID", &credentials.account_id)
+                .header("originator", CODEX_ORIGINATOR)
+                .header("Content-Type", "application/json")
+                .json(body)
+                .send()
+                .await
+        })
+        .await
     }
 }
 

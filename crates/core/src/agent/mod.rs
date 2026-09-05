@@ -63,6 +63,11 @@ pub struct AgentConfig {
     /// Child agents are deliberately leaf workers and cannot start another
     /// delegation chain.
     pub allow_delegation: bool,
+    /// Parent conversation used when a delegated agent emits a checkpoint.
+    pub work_conversation_id: Option<String>,
+    /// Namespace used to keep checkpoint IDs from different delegated
+    /// threads independent in the parent conversation.
+    pub work_id_prefix: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -79,6 +84,8 @@ impl Default for AgentConfig {
             reasoning_effort: None,
             tool_approval_policy: ToolApprovalPolicy::default(),
             allow_delegation: true,
+            work_conversation_id: None,
+            work_id_prefix: None,
         }
     }
 }
@@ -228,6 +235,12 @@ impl Agent {
         let reasoning_effort = config.reasoning_effort.clone();
         let tool_activation = Arc::new(ToolActivation::new(config.tools.iter().cloned()));
         tool_activation.set_approval_policy(config.tool_approval_policy);
+        if let Some(conversation_id) = config.work_conversation_id.clone() {
+            tool_activation.set_work_scope(
+                conversation_id,
+                config.work_id_prefix.clone().unwrap_or_default(),
+            );
+        }
 
         Self {
             config,
@@ -1729,6 +1742,29 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         assert!(!agent.id().is_empty());
+    }
+
+    #[test]
+    fn delegated_agent_config_scopes_checkpoints_to_parent() {
+        let agent = Agent::new(
+            AgentConfig {
+                work_conversation_id: Some("parent-session".into()),
+                work_id_prefix: Some("agent:research:".into()),
+                ..test_agent_config()
+            },
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "agent-thread:research".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        assert_eq!(
+            agent
+                .tool_activation
+                .work_scope("agent-thread:research", "checkpoint"),
+            ("parent-session".into(), "agent:research:checkpoint".into())
+        );
     }
 
     #[tokio::test]

@@ -54,6 +54,14 @@ impl GovernedProvider {
                             max_retries
                         ),
                     );
+                    let delay = crate::provider::retry_backoff(
+                        attempt,
+                        std::time::Duration::from_millis(250),
+                        std::time::Duration::from_secs(4),
+                    );
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                 }
                 Err(_) => {
                     return Err(ProviderError::Other(format!(

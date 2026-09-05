@@ -12,8 +12,8 @@ pub(crate) use stream::{
 
 use super::{
     log_debug_request, model_uses_responses_api, parse_openai_embeddings, parse_provider_models,
-    ChatRequest, ChatResponse, ChatStream, EmbeddingRequest, EmbeddingResponse, Provider,
-    ProviderError, ProviderModel, Result, StreamEvent,
+    send_with_retry, ChatRequest, ChatResponse, ChatStream, EmbeddingRequest, EmbeddingResponse,
+    Provider, ProviderError, ProviderModel, Result, StreamEvent,
 };
 use crate::connection::ConnectionKind;
 use crate::provider::hooks::{ModelDiscovery, ProviderRegistry, StandardProviderHook};
@@ -210,12 +210,14 @@ impl OpenAiProvider {
     async fn responses_chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         log_debug_request(&request, "OpenAI Responses");
         let body = Self::build_responses_request(&request, false);
-        let response = self
-            .authenticated(self.client.post(format!("{}/responses", self.base_url)))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        let response = send_with_retry(|| async {
+            self.authenticated(self.client.post(format!("{}/responses", self.base_url)))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+        })
+        .await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -248,12 +250,14 @@ impl OpenAiProvider {
     async fn responses_chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
         log_debug_request(&request, "OpenAI Responses");
         let body = Self::build_responses_request(&request, true);
-        let response = self
-            .authenticated(self.client.post(format!("{}/responses", self.base_url)))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        let response = send_with_retry(|| async {
+            self.authenticated(self.client.post(format!("{}/responses", self.base_url)))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+        })
+        .await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -278,15 +282,17 @@ impl Provider for OpenAiProvider {
 
         log_debug_request(&request, "OpenAI");
         let body = self.build_body(&request, false);
-        let response = self
-            .authenticated(
+        let response = send_with_retry(|| async {
+            self.authenticated(
                 self.client
                     .post(format!("{}/chat/completions", self.base_url)),
             )
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
-            .await?;
+            .await
+        })
+        .await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -379,15 +385,17 @@ impl Provider for OpenAiProvider {
 
         log_debug_request(&request, "OpenAI");
         let body = self.build_body(&request, true);
-        let response = self
-            .authenticated(
+        let response = send_with_retry(|| async {
+            self.authenticated(
                 self.client
                     .post(format!("{}/chat/completions", self.base_url)),
             )
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
-            .await?;
+            .await
+        })
+        .await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -403,10 +411,12 @@ impl Provider for OpenAiProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModel>> {
-        let response = self
-            .authenticated(self.client.get(format!("{}/models", self.base_url)))
-            .send()
-            .await?;
+        let response = send_with_retry(|| async {
+            self.authenticated(self.client.get(format!("{}/models", self.base_url)))
+                .send()
+                .await
+        })
+        .await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -420,15 +430,18 @@ impl Provider for OpenAiProvider {
     }
 
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
-        let response = self
-            .authenticated(self.client.post(format!("{}/embeddings", self.base_url)))
-            .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "model": request.model,
-                "input": request.input,
-            }))
-            .send()
-            .await?;
+        let body = serde_json::json!({
+            "model": request.model,
+            "input": request.input,
+        });
+        let response = send_with_retry(|| async {
+            self.authenticated(self.client.post(format!("{}/embeddings", self.base_url)))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+        })
+        .await?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
             return Err(ProviderError::Api {

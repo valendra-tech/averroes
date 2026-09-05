@@ -6652,6 +6652,7 @@ impl AverroesApp {
                         success,
                         summary,
                         output,
+                        metadata,
                         ..
                     } => {
                         let existing = call_id.as_deref().and_then(|call_id| {
@@ -6697,6 +6698,22 @@ impl AverroesApp {
                                 expanded: false,
                                 inside_reasoning,
                             });
+                        }
+                        if let Some(checkpoint) = metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.get("checkpoint").cloned())
+                            .and_then(|checkpoint| {
+                                serde_json::from_value::<WorkCheckpoint>(checkpoint).ok()
+                            })
+                        {
+                            self.update_checkpoint(session_id, checkpoint);
+                        }
+                        if let Some(task) = metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.get("task").cloned())
+                            .and_then(|task| serde_json::from_value::<WorkTask>(task).ok())
+                        {
+                            self.update_task(session_id, task);
                         }
                     }
                     AgentStreamEvent::ToolConfirmationRequested { .. }
@@ -7138,11 +7155,14 @@ impl AverroesApp {
             session.tasks.push(task);
         }
         session.tasks.sort_by_key(|task| {
-            (
-                matches!(task.status, TaskStatus::Done),
-                task.created_at,
-                task.id.clone(),
-            )
+            let status_rank = match task.status {
+                TaskStatus::InProgress => 0,
+                TaskStatus::Pending => 1,
+                TaskStatus::Blocked => 2,
+                TaskStatus::Done => 3,
+                TaskStatus::Cancelled => 4,
+            };
+            (status_rank, task.created_at, task.id.clone())
         });
     }
 
@@ -11508,47 +11528,73 @@ impl AverroesApp {
         let work_rail_markers = checkpoints
             .iter()
             .map(|checkpoint| {
+                let checkpoint_id = checkpoint.id.clone();
                 let (icon, color) = match checkpoint.status {
                     CheckpointStatus::Completed => (IconName::CircleCheck, theme.success),
                     CheckpointStatus::InProgress => (IconName::Loader, theme.warning),
                     CheckpointStatus::Blocked => (IconName::CircleX, theme.destructive),
                     CheckpointStatus::Pending => (IconName::Ellipsis, theme.faint),
                 };
-                let checkpoint_id = checkpoint.id.clone();
                 let message_position = checkpoint.message_position;
                 let tooltip = checkpoint.title.clone();
-                Button::new(SharedString::from(format!(
+                let marker = Button::new(SharedString::from(format!(
                     "checkpoint-marker-{}-{checkpoint_id}",
                     session_id.as_str()
                 )))
                 .ghost()
                 .small()
-                .icon(icon)
-                .text_color(color)
-                .tooltip(tooltip)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.scroll_to_checkpoint(message_position, cx);
-                }))
-                .into_any_element()
+                .text_color(color);
+                let marker = if checkpoint.status == CheckpointStatus::InProgress {
+                    marker.child(Icon::new(icon).with_animation(
+                        format!("checkpoint-spinner-{}-{checkpoint_id}", session_id.as_str()),
+                        Animation::new(Duration::from_millis(800)).repeat(),
+                        |icon, delta| {
+                            icon.transform(Transformation::rotate(gpui::percentage(delta)))
+                        },
+                    ))
+                } else {
+                    marker.icon(icon)
+                };
+                marker
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.scroll_to_checkpoint(message_position, cx);
+                    }))
+                    .into_any_element()
             })
             .chain(tasks.iter().map(|task| {
                 let task_id = task.id.clone();
-                let done = task.status == TaskStatus::Done;
-                let tooltip = task.title.clone();
-                Button::new(SharedString::from(format!(
+                let (icon, color) = match task.status {
+                    TaskStatus::Done => (IconName::CircleCheck, theme.success),
+                    TaskStatus::InProgress => (IconName::Loader, theme.warning),
+                    TaskStatus::Blocked => (IconName::CircleX, theme.destructive),
+                    TaskStatus::Cancelled => (IconName::CircleX, theme.faint),
+                    TaskStatus::Pending => (IconName::Ellipsis, theme.faint),
+                };
+                let mut tooltip = format!("{} [{}]", task.title, task.priority.as_str());
+                if let Some(description) = &task.description {
+                    tooltip.push('\n');
+                    tooltip.push_str(description);
+                }
+                let marker = Button::new(SharedString::from(format!(
                     "task-marker-{}-{task_id}",
                     session_id.as_str()
                 )))
                 .ghost()
                 .small()
-                .icon(if done {
-                    IconName::CircleCheck
+                .text_color(color);
+                let marker = if task.status == TaskStatus::InProgress {
+                    marker.child(Icon::new(icon).with_animation(
+                        format!("task-spinner-{}-{task_id}", session_id.as_str()),
+                        Animation::new(Duration::from_millis(800)).repeat(),
+                        |icon, delta| {
+                            icon.transform(Transformation::rotate(gpui::percentage(delta)))
+                        },
+                    ))
                 } else {
-                    IconName::Ellipsis
-                })
-                .text_color(if done { theme.success } else { theme.faint })
-                .tooltip(tooltip)
-                .into_any_element()
+                    marker.icon(icon)
+                };
+                marker.tooltip(tooltip).into_any_element()
             }))
             .collect::<Vec<_>>();
         let has_work_markers = !work_rail_markers.is_empty();
@@ -15024,6 +15070,7 @@ fn tool_display_name(name: &str) -> String {
         "checkpoint" => "Checkpoint".into(),
         "task_list" => "List tasks".into(),
         "add_task" => "Add task".into(),
+        "update_task" => "Update task".into(),
         "mark_task_as_done" => "Complete task".into(),
         "ask_user" => "Ask user".into(),
         "list_tools" => "List tools".into(),
@@ -15064,6 +15111,7 @@ fn localized_tool_display_name(cx: &App, name: &str) -> SharedString {
         "checkpoint" => Some("tool.checkpoint"),
         "task_list" => Some("tool.list_tasks"),
         "add_task" => Some("tool.add_task"),
+        "update_task" => Some("tool.update_task"),
         "mark_task_as_done" => Some("tool.complete_task"),
         "ask_user" => Some("tool.ask_user"),
         "list_tools" => Some("tool.list_tools"),
@@ -15166,6 +15214,7 @@ fn tool_activity_argument(name: &str, input: &str, summary: &str) -> Option<Stri
         "glob" | "find_files" => string_value("pattern"),
         "grep" => string_value("pattern").or_else(|| string_value("path")),
         "checkpoint" | "add_task" => string_value("title"),
+        "update_task" => string_value("title").or_else(|| string_value("task_id")),
         "ask_user" => string_value("question"),
         "list_skills" | "search_skills" | "search_memory" | "search_deep_memory" => {
             string_value("query")
