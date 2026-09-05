@@ -170,6 +170,7 @@
   "sidebar.search": "Search conversations",
   "sidebar.new_work": "New conversation",
   "sidebar.complements": "Add-ons",
+  "sidebar.scheduled_tasks": "Scheduled tasks",
   "sidebar.open_workspace": "Open project",
   "sidebar.pinned": "Pinned",
   "sidebar.recents": "Recent",
@@ -516,4 +517,13 @@
   "about.version": "Version",
   "about.philosopher": "Ibn Rushd (Averroes), born in Córdoba in al-Andalus, was an Andalusian philosopher, physician, and jurist. His influential commentaries on Aristotle helped carry classical Greek thought into medieval Europe and shaped European philosophy, theology, and science.",
   "about.attribution": "Developed by Valendra.tech with love 💙"
+  ,"scheduled.title": "Scheduled tasks"
+  ,"scheduled.description": "Recurring agent runs managed by macOS launchd. They run without the desktop open and cannot answer interactive questions."
+  ,"scheduled.workspace_required": "Open a workspace to create or manage workspace-specific schedules."
+  ,"scheduled.empty": "No scheduled tasks for this workspace yet."
+  ,"scheduled.add": "Add scheduled task"
+  ,"scheduled.required": "Enter a title and prompt first."
+  ,"scheduled.title_placeholder": "Task name"
+  ,"scheduled.prompt_placeholder": "Prompt to run each time"
+  ,"scheduled.interval_placeholder": "Interval in seconds (minimum 60)"
 }

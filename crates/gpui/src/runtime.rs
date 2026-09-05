@@ -33,6 +33,8 @@ use averroes_core::provider::{
 };
 use averroes_core::runtime::ResourceGovernor;
 use averroes_core::skill::{SkillIndex, SkillLoader};
+use averroes_core::task::launchd::LaunchdManager;
+use averroes_core::task::scheduled::{ScheduledTask, ScheduledTaskService};
 use averroes_core::tool::builtin::ask_user::{AskUserBroker, AskUserParams, UserQuestion};
 use averroes_core::tool::dynamic::{DynamicTool, DynamicToolConfig, DynamicToolHandler};
 use averroes_core::tool::{
@@ -74,6 +76,7 @@ pub struct AppRuntime {
     pub governor: Arc<ResourceGovernor>,
     pub runtime: Arc<tokio::runtime::Runtime>,
     pub database: Arc<WorkDatabase>,
+    pub scheduled_tasks: Arc<ScheduledTaskService>,
     pub model_registry: Arc<ModelRegistry>,
     prompt: PromptBuilder,
     codex: Arc<tokio::sync::Mutex<Option<Arc<CodexClient>>>>,
@@ -627,6 +630,7 @@ impl RuntimeAgentRunner {
                 reasoning_effort: self.reasoning_effort.clone(),
                 tool_approval_policy: request.tool_approval_policy,
                 allow_delegation: false,
+                allow_user_questions: false,
                 work_conversation_id: Some(request.parent_session_id.clone()),
                 work_id_prefix: Some(format!("agent:{}:", thread_id)),
                 ..Default::default()
@@ -1070,6 +1074,10 @@ impl AppRuntime {
         ));
         builtin::register_all(&tools);
         let database = WorkDatabase::open(&paths)?;
+        let launchd =
+            LaunchdManager::discover().map_err(|error| RuntimeError::Runtime(error.to_string()))?;
+        let scheduled_tasks = Arc::new(ScheduledTaskService::new(database.clone(), launchd));
+        builtin::register_scheduled_task_tools(&tools, scheduled_tasks.clone());
         tools.register(builtin::search_memory::SearchMemoryTool::new(
             database.clone(),
         ));
@@ -1108,6 +1116,7 @@ impl AppRuntime {
             )),
             runtime,
             database,
+            scheduled_tasks,
             model_registry,
             prompt: PromptBuilder::new(),
             codex: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1123,6 +1132,27 @@ impl AppRuntime {
 
     pub fn config(&self) -> AppConfig {
         self.config.read().clone()
+    }
+
+    pub fn scheduled_tasks_for(
+        &self,
+        workspace_root: Option<&Path>,
+    ) -> Result<Vec<ScheduledTask>, RuntimeError> {
+        self.scheduled_tasks
+            .list(workspace_root)
+            .map_err(|error| RuntimeError::Runtime(error.to_string()))
+    }
+
+    pub fn save_scheduled_task(&self, task: ScheduledTask) -> Result<ScheduledTask, RuntimeError> {
+        self.scheduled_tasks
+            .save(task)
+            .map_err(|error| RuntimeError::Runtime(error.to_string()))
+    }
+
+    pub fn delete_scheduled_task(&self, id: &str) -> Result<bool, RuntimeError> {
+        self.scheduled_tasks
+            .delete(id)
+            .map_err(|error| RuntimeError::Runtime(error.to_string()))
     }
 
     pub fn ensure_secure_storage_access(&self) -> Result<(), RuntimeError> {
@@ -2366,6 +2396,7 @@ impl AppRuntime {
             max_iterations: 50,
             compaction: compaction_config(&config),
             tool_approval_policy: binding.approval_policy,
+            allow_user_questions: true,
             ..Default::default()
         };
         let agent_compaction = agent_config.compaction.clone();

@@ -94,13 +94,18 @@ impl Agent {
     ) -> ToolCallExecution {
         let delegation_blocked =
             !self.config.allow_delegation && super::is_delegation_tool(&tool_call.function.name);
+        let user_question_blocked =
+            !self.user_questions_allowed() && tool_call.function.name == "ask_user";
         if delegation_blocked
+            || user_question_blocked
             || !ctx
                 .enabled_tools
                 .iter()
                 .any(|tool| tool.name == tool_call.function.name)
         {
-            let message = if delegation_blocked {
+            let message = if user_question_blocked {
+                "Tool 'ask_user' is unavailable in a non-interactive scheduled run.".to_owned()
+            } else if delegation_blocked {
                 format!(
                     "Tool '{}' is unavailable: delegated agents are leaf workers and cannot launch subagents.",
                     tool_call.function.name

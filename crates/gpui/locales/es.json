@@ -170,6 +170,7 @@
   "sidebar.search": "Buscar conversaciones",
   "sidebar.new_work": "Nueva conversación",
   "sidebar.complements": "Complementos",
+  "sidebar.scheduled_tasks": "Tareas programadas",
   "sidebar.open_workspace": "Abrir proyecto",
   "sidebar.pinned": "Fijadas",
   "sidebar.recents": "Recientes",
@@ -515,5 +516,14 @@
   "about.title": "Acerca de Averroes",
   "about.version": "Versión",
   "about.philosopher": "Ibn Rushd (Averroes), nacido en Córdoba, en Al-Ándalus, fue un filósofo, médico y jurista andalusí. Sus influyentes comentarios sobre Aristóteles ayudaron a transmitir el pensamiento clásico a la Europa medieval y marcaron profundamente la filosofía, la teología y la ciencia europeas.",
-  "about.attribution": "Desarrollado por Valendra.tech con cariño 💙"
+  "about.attribution": "Desarrollado por Valendra.tech con cariño 💙",
+  "scheduled.title": "Tareas programadas",
+  "scheduled.description": "Ejecuciones recurrentes del agente gestionadas por macOS launchd. Funcionan sin abrir el escritorio y no pueden responder preguntas interactivas.",
+  "scheduled.workspace_required": "Abre un workspace para gestionar sus tareas programadas.",
+  "scheduled.empty": "Todavía no hay tareas programadas en este workspace.",
+  "scheduled.add": "Añadir tarea programada",
+  "scheduled.required": "Introduce primero un nombre y un prompt.",
+  "scheduled.title_placeholder": "Nombre de la tarea",
+  "scheduled.prompt_placeholder": "Prompt que se ejecutará cada vez",
+  "scheduled.interval_placeholder": "Intervalo en segundos (mínimo 60)"
 }

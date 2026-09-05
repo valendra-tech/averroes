@@ -1,5 +1,16 @@
-use gpui::{div, px, AnyElement, IntoElement, ParentElement, Rgba, SharedString, Styled};
+use crate::ui::UiTheme;
+use gpui::{
+    div, px, AnyElement, InteractiveElement, IntoElement, ParentElement, Rgba, SharedString, Styled,
+};
 use gpui_component::scroll::ScrollableElement;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PatchLineKind {
+    Context,
+    Added,
+    Removed,
+    Header,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolDetailSection {
@@ -67,9 +78,88 @@ pub(crate) fn render_tool_detail(
         .into_any_element()
 }
 
+pub(crate) fn patch_content_for_display(input: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(input) {
+        if let Some(patch) = value.get("patch").and_then(serde_json::Value::as_str) {
+            if !patch.trim().is_empty() {
+                return Some(patch.to_owned());
+            }
+        }
+    }
+
+    let input = input.trim();
+    (input.starts_with("*** Begin Patch") || input.starts_with("diff ")).then(|| input.to_owned())
+}
+
+pub(crate) fn classify_patch_line(line: &str) -> PatchLineKind {
+    if line.starts_with("@@")
+        || line.starts_with("***")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("diff ")
+        || line.starts_with("index ")
+    {
+        PatchLineKind::Header
+    } else if line.starts_with('+') {
+        PatchLineKind::Added
+    } else if line.starts_with('-') {
+        PatchLineKind::Removed
+    } else {
+        PatchLineKind::Context
+    }
+}
+
+pub(crate) fn render_patch_diff(
+    id_prefix: impl Into<String>,
+    patch: &str,
+    theme: UiTheme,
+    text_size: f32,
+) -> AnyElement {
+    let id_prefix = id_prefix.into();
+    let height = tool_detail_viewport_height(patch, ToolDetailSection::Arguments, text_size);
+    let rows = patch.lines().enumerate().map(|(index, line)| {
+        let (background, color) = match classify_patch_line(line) {
+            PatchLineKind::Added => (theme.success_soft, theme.success),
+            PatchLineKind::Removed => (theme.destructive_soft, theme.destructive),
+            PatchLineKind::Header => (theme.surface_hover, theme.faint),
+            PatchLineKind::Context => (theme.surface, theme.muted),
+        };
+        div()
+            .id(SharedString::from(format!("{id_prefix}-line-{index}")))
+            .w_full()
+            .min_w(px(0.0))
+            .px(px(6.0))
+            .bg(background)
+            .text_color(color)
+            .whitespace_normal()
+            .child(if line.is_empty() {
+                " ".to_owned()
+            } else {
+                line.to_owned()
+            })
+            .into_any_element()
+    });
+
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex_none()
+        .h(px(height))
+        .max_h(px(tool_detail_max_height(ToolDetailSection::Arguments)))
+        .font(UiTheme::mono_font())
+        .text_size(px(text_size))
+        .overflow_y_scrollbar()
+        .id(format!("{id_prefix}-diff"))
+        .children(rows)
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{tool_detail_max_height, tool_detail_viewport_height, ToolDetailSection};
+    use super::{
+        classify_patch_line, patch_content_for_display, tool_detail_max_height,
+        tool_detail_viewport_height, PatchLineKind, ToolDetailSection,
+    };
 
     #[test]
     fn result_viewport_is_larger_but_both_sections_are_bounded() {
@@ -97,5 +187,25 @@ mod tests {
 
         assert!(short >= 18.0);
         assert!(long <= tool_detail_max_height(ToolDetailSection::Result));
+    }
+
+    #[test]
+    fn extracts_patch_text_from_tool_arguments() {
+        assert_eq!(
+            patch_content_for_display(r#"{"patch":"*** Begin Patch\n+added\n*** End Patch"}"#),
+            Some("*** Begin Patch\n+added\n*** End Patch".into())
+        );
+    }
+
+    #[test]
+    fn classifies_patch_lines_for_github_style_colors() {
+        assert_eq!(classify_patch_line("+added"), PatchLineKind::Added);
+        assert_eq!(classify_patch_line("-removed"), PatchLineKind::Removed);
+        assert_eq!(classify_patch_line("@@ -1 +1 @@"), PatchLineKind::Header);
+        assert_eq!(
+            classify_patch_line("*** Update File: src/main.rs"),
+            PatchLineKind::Header
+        );
+        assert_eq!(classify_patch_line(" unchanged"), PatchLineKind::Context);
     }
 }

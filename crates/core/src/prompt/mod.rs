@@ -1,6 +1,7 @@
 use chrono::{DateTime, Local};
 use minijinja::{context, Environment};
 
+use crate::runtime::SystemEnvironment;
 use crate::tool::ToolApprovalPolicy;
 
 pub mod instructions;
@@ -80,11 +81,12 @@ impl PromptBuilder {
         approval_policy: ToolApprovalPolicy,
     ) -> String {
         let environment_time = EnvironmentTime::now();
+        let system_environment = SystemEnvironment::detect();
         let tmpl = self.env.get_template("system").unwrap();
         tmpl.render(context! {
             working_dir => working_dir,
             os => std::env::consts::OS,
-            shell => "sh",
+            shell => system_environment.shell.display().to_string(),
             current_date => environment_time.date,
             current_time => environment_time.time,
             time_zone => environment_time.time_zone,
@@ -121,6 +123,14 @@ mod tests {
         assert!(!prompt.contains("{{ current_date }}"));
         assert!(!prompt.contains("{{ current_time }}"));
         assert!(!prompt.contains("{{ time_zone }}"));
+    }
+
+    #[test]
+    fn renders_the_detected_system_shell() {
+        let builder = PromptBuilder::new();
+        let prompt = builder.build_system("/tmp/workspace", None);
+        let shell = crate::runtime::SystemEnvironment::detect().shell;
+        assert!(prompt.contains(&shell.display().to_string()));
     }
 
     #[test]
@@ -225,5 +235,14 @@ mod tests {
         assert!(prompt.contains("update_task"));
         assert!(prompt.contains("in_progress"));
         assert!(prompt.contains("`blocked` or `cancelled`"));
+    }
+
+    #[test]
+    fn explains_scheduled_task_constraints() {
+        let builder = PromptBuilder::new();
+        let prompt = builder.build_system("/tmp/workspace", None);
+        assert!(prompt.contains("scheduled_task_list"));
+        assert!(prompt.contains("non-interactive"));
+        assert!(prompt.contains("at least 60 seconds"));
     }
 }

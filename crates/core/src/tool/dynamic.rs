@@ -1,4 +1,5 @@
 use crate::integrations::mcp::McpClient;
+use crate::runtime::SystemEnvironment;
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -217,10 +218,13 @@ async fn run_shell_command(
     current_dir: &std::path::Path,
     tool: &str,
 ) -> Result<ShellOutput> {
-    let mut child = tokio::process::Command::new("bash")
+    let environment = SystemEnvironment::detect();
+    let mut child = tokio::process::Command::new(&environment.shell)
         .arg("-c")
         .arg(command)
         .current_dir(current_dir)
+        .env_clear()
+        .envs(&environment.variables)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)

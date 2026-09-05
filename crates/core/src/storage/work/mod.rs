@@ -813,6 +813,127 @@ impl WorkDatabase {
         rows::upsert_task_connection(&connection, session_id, task)
     }
 
+    pub fn scheduled_tasks(
+        &self,
+        workspace_root: Option<&Path>,
+    ) -> Result<Vec<WorkScheduledTask>, WorkDatabaseError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT id, title, prompt, workspace_root, project_id, binding_json,
+                    schedule_json, enabled, created_at, updated_at, last_run_at,
+                    last_run_success, last_error, last_conversation_id
+             FROM scheduled_tasks
+             WHERE (?1 IS NULL OR workspace_root = ?1)
+             ORDER BY enabled DESC, updated_at DESC, id",
+        )?;
+        let workspace_root = workspace_root.map(|path| path.to_string_lossy().to_string());
+        let rows = statement.query_map(params![workspace_root], |row| {
+            Ok(WorkScheduledTask {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                prompt: row.get(2)?,
+                workspace_root: PathBuf::from(row.get::<_, String>(3)?),
+                project_id: row.get(4)?,
+                binding: serde_json::from_str(&row.get::<_, String>(5)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                schedule: serde_json::from_str(&row.get::<_, String>(6)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                enabled: row.get::<_, i64>(7)? != 0,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+                last_run_at: row.get(10)?,
+                last_run_success: row.get::<_, Option<i64>>(11)?.map(|value| value != 0),
+                last_error: row.get(12)?,
+                last_conversation_id: row.get(13)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn scheduled_task(&self, id: &str) -> Result<Option<WorkScheduledTask>, WorkDatabaseError> {
+        Ok(self
+            .scheduled_tasks(None)?
+            .into_iter()
+            .find(|task| task.id == id))
+    }
+
+    pub fn save_scheduled_task(&self, task: &WorkScheduledTask) -> Result<(), WorkDatabaseError> {
+        let binding = serde_json::to_string(&task.binding)?;
+        let schedule = serde_json::to_string(&task.schedule)?;
+        self.connection.lock().execute(
+            "INSERT INTO scheduled_tasks
+                (id, title, prompt, workspace_root, project_id, binding_json,
+                 schedule_json, enabled, created_at, updated_at, last_run_at,
+                 last_run_success, last_error, last_conversation_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                prompt = excluded.prompt,
+                workspace_root = excluded.workspace_root,
+                project_id = excluded.project_id,
+                binding_json = excluded.binding_json,
+                schedule_json = excluded.schedule_json,
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at,
+                last_run_at = excluded.last_run_at,
+                last_run_success = excluded.last_run_success,
+                last_error = excluded.last_error,
+                last_conversation_id = excluded.last_conversation_id",
+            params![
+                task.id,
+                task.title,
+                task.prompt,
+                task.workspace_root.to_string_lossy().to_string(),
+                task.project_id,
+                binding,
+                schedule,
+                task.enabled as i64,
+                task.created_at,
+                task.updated_at,
+                task.last_run_at,
+                task.last_run_success.map(|value| value as i64),
+                task.last_error,
+                task.last_conversation_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_scheduled_task(&self, id: &str) -> Result<bool, WorkDatabaseError> {
+        Ok(self
+            .connection
+            .lock()
+            .execute("DELETE FROM scheduled_tasks WHERE id = ?1", params![id])?
+            > 0)
+    }
+
+    pub fn record_scheduled_task_run(
+        &self,
+        id: &str,
+        run_at: i64,
+        conversation_id: Option<&str>,
+        success: bool,
+        error: Option<&str>,
+    ) -> Result<bool, WorkDatabaseError> {
+        Ok(self.connection.lock().execute(
+            "UPDATE scheduled_tasks
+             SET last_run_at = ?2, last_run_success = ?3, last_error = ?4,
+                 last_conversation_id = ?5, updated_at = ?2
+             WHERE id = ?1",
+            params![id, run_at, success as i64, error, conversation_id],
+        )? > 0)
+    }
+
     pub fn mark_task_as_done(
         &self,
         session_id: &str,

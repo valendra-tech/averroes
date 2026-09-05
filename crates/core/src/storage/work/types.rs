@@ -258,6 +258,24 @@ pub struct WorkTask {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkScheduledTask {
+    pub id: String,
+    pub title: String,
+    pub prompt: String,
+    pub workspace_root: PathBuf,
+    pub project_id: Option<String>,
+    pub binding: SessionBinding,
+    pub schedule: crate::task::scheduled::ScheduledTaskSchedule,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_run_at: Option<i64>,
+    pub last_run_success: Option<bool>,
+    pub last_error: Option<String>,
+    pub last_conversation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkSource {
     pub key: String,
     pub kind: String,

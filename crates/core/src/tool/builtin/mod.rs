@@ -19,6 +19,7 @@ pub mod list_skills;
 pub mod list_tools;
 pub mod load_skill;
 pub mod patch;
+pub mod scheduled;
 pub mod search_memory;
 pub mod search_skills;
 mod shell_session;
@@ -61,6 +62,16 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(web_search_intrernal::WebSearchTool);
     registry.register(list_agents::ListAgentsTool);
     registry.register(call_agents::CallAgentsTool);
+}
+
+pub fn register_scheduled_task_tools(
+    registry: &ToolRegistry,
+    service: Arc<crate::task::scheduled::ScheduledTaskService>,
+) {
+    registry.register(scheduled::ScheduledTaskListTool::new(service.clone()));
+    registry.register(scheduled::AddScheduledTaskTool::new(service.clone()));
+    registry.register(scheduled::UpdateScheduledTaskTool::new(service.clone()));
+    registry.register(scheduled::DeleteScheduledTaskTool::new(service));
 }
 
 pub fn register_skill_tools(registry: &ToolRegistry, index: Arc<SkillIndex>) {

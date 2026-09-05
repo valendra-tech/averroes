@@ -340,8 +340,8 @@ impl Tool for AddTaskTool {
                     "description": "Concrete scope or acceptance criteria for the task."
                 },
                 "parent_task_id": {
-                    "type": "string",
-                    "description": "Exact id of the parent task when this is a subtask."
+                    "type": ["string", "null"],
+                    "description": "Exact id of the parent task when this is a subtask. Omit or set to null for a root task."
                 },
                 "depends_on": {
                     "type": "array",
@@ -383,6 +383,8 @@ impl Tool for AddTaskTool {
         let parent_task_id = params
             .parent_task_id
             .as_deref()
+            .map(str::trim)
+            .filter(|parent_task_id| !parent_task_id.is_empty())
             .map(|parent_task_id| {
                 scope_reference(
                     ctx,
@@ -606,6 +608,8 @@ impl Tool for UpdateTaskTool {
         if let Some(parent_task_id) = params.parent_task_id {
             task.parent_task_id = parent_task_id
                 .as_deref()
+                .map(str::trim)
+                .filter(|parent_task_id| !parent_task_id.is_empty())
                 .map(|parent_task_id| {
                     scope_reference(
                         ctx,
@@ -736,6 +740,156 @@ mod tests {
         assert_eq!(
             database.tasks("session").unwrap()[0].status,
             TaskStatus::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_parent_task_id_creates_a_root_task() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("averroes.db")).unwrap();
+        let timestamp = now();
+        database
+            .save_conversation(&WorkConversation {
+                id: "session".into(),
+                title: "Test".into(),
+                project_id: None,
+                pinned: false,
+                unread: false,
+                created_at: timestamp,
+                updated_at: timestamp,
+                binding: SessionBinding::default(),
+                context_summary: None,
+                context_usage: crate::agent::ContextUsage::default(),
+                messages: Vec::new(),
+                checkpoints: Vec::new(),
+                tasks: Vec::new(),
+                sources: Vec::new(),
+                agent_threads: Vec::new(),
+                agent_thread_transcripts: std::collections::HashMap::new(),
+            })
+            .unwrap();
+
+        let task = AddTaskTool::new(database.clone())
+            .execute(
+                &context(),
+                &json!({ "title": "Root task", "parent_task_id": "" }),
+            )
+            .await
+            .unwrap()
+            .metadata
+            .unwrap()["task"]
+            .clone();
+
+        let task_id = task["id"].as_str().unwrap();
+        assert_eq!(database.tasks("session").unwrap().len(), 1);
+        assert_eq!(database.tasks("session").unwrap()[0].id, task_id);
+        assert_eq!(database.tasks("session").unwrap()[0].parent_task_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_null_parent_task_id_creates_a_root_task() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("averroes.db")).unwrap();
+        let timestamp = now();
+        database
+            .save_conversation(&WorkConversation {
+                id: "session".into(),
+                title: "Test".into(),
+                project_id: None,
+                pinned: false,
+                unread: false,
+                created_at: timestamp,
+                updated_at: timestamp,
+                binding: SessionBinding::default(),
+                context_summary: None,
+                context_usage: crate::agent::ContextUsage::default(),
+                messages: Vec::new(),
+                checkpoints: Vec::new(),
+                tasks: Vec::new(),
+                sources: Vec::new(),
+                agent_threads: Vec::new(),
+                agent_thread_transcripts: std::collections::HashMap::new(),
+            })
+            .unwrap();
+
+        AddTaskTool::new(database.clone())
+            .execute(
+                &context(),
+                &json!({ "title": "Another root task", "parent_task_id": null }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(database.tasks("session").unwrap().len(), 1);
+        assert_eq!(database.tasks("session").unwrap()[0].parent_task_id, None);
+    }
+
+    #[tokio::test]
+    async fn updating_a_task_with_an_empty_parent_task_id_makes_it_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("averroes.db")).unwrap();
+        let timestamp = now();
+        database
+            .save_conversation(&WorkConversation {
+                id: "session".into(),
+                title: "Test".into(),
+                project_id: None,
+                pinned: false,
+                unread: false,
+                created_at: timestamp,
+                updated_at: timestamp,
+                binding: SessionBinding::default(),
+                context_summary: None,
+                context_usage: crate::agent::ContextUsage::default(),
+                messages: Vec::new(),
+                checkpoints: Vec::new(),
+                tasks: Vec::new(),
+                sources: Vec::new(),
+                agent_threads: Vec::new(),
+                agent_thread_transcripts: std::collections::HashMap::new(),
+            })
+            .unwrap();
+
+        let add = AddTaskTool::new(database.clone());
+        let parent = add
+            .execute(&context(), &json!({ "title": "Parent" }))
+            .await
+            .unwrap()
+            .metadata
+            .unwrap()["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let child = add
+            .execute(
+                &context(),
+                &json!({ "title": "Child", "parent_task_id": parent }),
+            )
+            .await
+            .unwrap()
+            .metadata
+            .unwrap()["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        UpdateTaskTool::new(database.clone())
+            .execute(
+                &context(),
+                &json!({ "task_id": child, "parent_task_id": "  " }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            database
+                .tasks("session")
+                .unwrap()
+                .into_iter()
+                .find(|task| task.id == child)
+                .unwrap()
+                .parent_task_id,
+            None
         );
     }
 

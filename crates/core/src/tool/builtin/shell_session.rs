@@ -6,6 +6,7 @@
 //! The process lives only for the lifetime of Averroes and is cleaned up when
 //! it has been idle for a while or when its session is explicitly closed.
 
+use crate::runtime::SystemEnvironment;
 use anyhow::{anyhow, Context as _};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -180,14 +181,15 @@ pub(crate) struct ShellSession {
 
 impl ShellSession {
     fn spawn(working_dir: &Path) -> anyhow::Result<Self> {
-        let mut command = Command::new("bash");
-        command.arg("--noprofile");
-        command.arg("--norc");
-        // `-s` keeps bash reading commands from stdin while preserving shell
+        let environment = SystemEnvironment::detect();
+        let mut command = Command::new(&environment.shell);
+        // `-s` keeps POSIX-compatible shells reading commands from stdin while preserving shell
         // state between calls. Pipes deliberately prevent child processes
         // from believing they have a terminal.
         command.arg("-s");
         command.current_dir(working_dir);
+        command.env_clear();
+        command.envs(&environment.variables);
         // Keep agent output deterministic and prevent CLI programs from
         // opening a pager or asking an interactive prompt on the pipe.
         command.env("TERM", "dumb");
@@ -203,9 +205,12 @@ impl ShellSession {
         command.stderr(Stdio::piped());
         command.kill_on_drop(true);
 
-        let mut child = command
-            .spawn()
-            .context("failed to start non-interactive bash session")?;
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to start non-interactive {} session",
+                environment.shell.display()
+            )
+        })?;
         let writer = child
             .stdin
             .take()

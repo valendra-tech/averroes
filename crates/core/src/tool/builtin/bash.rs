@@ -41,7 +41,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Run commands in a persistent non-interactive bash session backed by pipes. New sessions start in the conversation's current directory; shell-local state such as cd and exports is retained between calls. Commands may access paths outside the active workspace. Terminal-dependent programs, pagers, SSH shells, and interactive REPLs are not supported. Use detach:true only for commands that can run without a terminal."
+        "Run commands in a persistent non-interactive session using the operating system user's shell and environment. New sessions start in the conversation's current directory; shell-local state such as cd and exports is retained between calls. Commands may access paths outside the active workspace. Terminal-dependent programs, pagers, SSH shells, and interactive REPLs are not supported. Use detach:true only for commands that can run without a terminal."
     }
 
     fn parameters(&self) -> Value {
