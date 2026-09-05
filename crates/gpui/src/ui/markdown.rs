@@ -1,5 +1,5 @@
-use super::theme::UiTheme;
 use super::animation::{fade_in, STREAM_LINE_FADE_DURATION};
+use super::theme::UiTheme;
 use gpui::*;
 use std::borrow::Cow;
 
@@ -68,7 +68,9 @@ fn last_non_empty_line_index(content: &str) -> Option<usize> {
         .split('\n')
         .enumerate()
         .fold(None, |last_index, (index, line)| {
-            (!line.trim_end_matches('\r').trim().is_empty()).then_some(index).or(last_index)
+            (!line.trim_end_matches('\r').trim().is_empty())
+                .then_some(index)
+                .or(last_index)
         })
 }
 

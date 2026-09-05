@@ -1,4 +1,6 @@
-use gpui::{ease_out_quint, Animation, AnimationElement, AnimationExt, Div, ElementId, Styled};
+use gpui::{
+    ease_out_quint, Animation, AnimationElement, AnimationExt, ElementId, IntoElement, Styled,
+};
 use std::time::Duration;
 
 pub const MESSAGE_FADE_DURATION: Duration = Duration::from_millis(220);
@@ -10,11 +12,10 @@ pub fn fade_opacity(delta: f32) -> f32 {
     delta.clamp(0.0, 1.0)
 }
 
-pub fn fade_in(
-    element: Div,
-    id: impl Into<ElementId>,
-    duration: Duration,
-) -> AnimationElement<Div> {
+pub fn fade_in<E>(element: E, id: impl Into<ElementId>, duration: Duration) -> AnimationElement<E>
+where
+    E: IntoElement + Styled + 'static,
+{
     element.with_animation(
         id,
         Animation::new(duration).with_easing(ease_out_quint()),

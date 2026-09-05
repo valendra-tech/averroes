@@ -15,6 +15,7 @@ use crate::tool_groups::{
     summarize_tool_names, ToolGroupEvent, ToolGroupRenderMode, ToolGroupTracker,
 };
 use crate::ui::{
+    animation::{fade_in, ATTACHMENT_FADE_DURATION, MESSAGE_FADE_DURATION, STATE_FADE_DURATION},
     markdown::{normalize_reasoning_for_display, render_streaming_markdown},
     provider_logo, tool_icon, UiTheme,
 };
@@ -76,7 +77,6 @@ use std::time::{Duration, Instant};
 const STREAM_UI_BATCH_WINDOW: Duration = Duration::from_millis(32);
 const STREAM_UI_MAX_EVENTS: usize = 64;
 const STREAM_RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
-const STREAM_MESSAGE_FADE_DURATION: Duration = Duration::from_millis(260);
 const REMOTE_LIVE_EDIT_INTERVAL: Duration = Duration::from_millis(750);
 const REMOTE_QUESTION_CALLBACK_PREFIX: &str = "ask-answer";
 const CONVERSATION_SEARCH_DEBOUNCE: Duration = Duration::from_millis(280);
@@ -10445,7 +10445,9 @@ impl AverroesApp {
             .enumerate()
             .map(|(index, attachment)| {
                 let name = composer_attachment_name(&attachment.path);
-                div()
+                let animation_id =
+                    format!("composer-attachment-{}", attachment.path.to_string_lossy());
+                let chip = div()
                     .id(SharedString::from(format!("attachment-{index}")))
                     .max_w(px(220.0))
                     .h(px(27.0))
@@ -10467,8 +10469,8 @@ impl AverroesApp {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.remove_attachment(index, cx);
                             })),
-                    )
-                    .into_any_element()
+                    );
+                fade_in(chip, animation_id, ATTACHMENT_FADE_DURATION).into_any_element()
             })
             .collect::<Vec<_>>();
         let has_attachments = !attachment_chips.is_empty();
@@ -10520,7 +10522,16 @@ impl AverroesApp {
                 )
                 .into_any_element()
         } else {
-            send_button.icon(IconName::ArrowUp).into_any_element()
+            send_button
+                .child(Icon::new(IconName::ArrowUp).with_animation(
+                    format!("composer-send-icon-{}-idle", session.id.as_str()),
+                    Animation::new(STATE_FADE_DURATION).with_easing(gpui::ease_out_quint()),
+                    |icon, delta| {
+                        let scale = 0.92 + delta.clamp(0.0, 1.0) * 0.08;
+                        icon.transform(gpui::Transformation::scale(gpui::size(scale, scale)))
+                    },
+                ))
+                .into_any_element()
         };
         div()
             .w_full()
@@ -11599,7 +11610,23 @@ impl AverroesApp {
                         },
                     ))
                 } else {
-                    marker.icon(icon)
+                    marker.child(
+                        fade_in(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(color)
+                                .child(Icon::new(icon)),
+                            format!(
+                                "checkpoint-state-{}-{checkpoint_id}-{:?}",
+                                session_id.as_str(),
+                                checkpoint.status
+                            ),
+                            STATE_FADE_DURATION,
+                        )
+                        .into_any_element(),
+                    )
                 };
                 marker
                     .tooltip(tooltip)
@@ -11638,7 +11665,23 @@ impl AverroesApp {
                         },
                     ))
                 } else {
-                    marker.icon(icon)
+                    marker.child(
+                        fade_in(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(color)
+                                .child(Icon::new(icon)),
+                            format!(
+                                "task-state-{}-{task_id}-{:?}",
+                                session_id.as_str(),
+                                task.status
+                            ),
+                            STATE_FADE_DURATION,
+                        )
+                        .into_any_element(),
+                    )
                 };
                 marker.tooltip(tooltip).into_any_element()
             }))
@@ -17452,7 +17495,7 @@ fn render_image_attachments(
         .enumerate()
         .map(|(index, path)| {
             let fallback_name = composer_attachment_name(path);
-            div()
+            let image = div()
                 .id(SharedString::from(format!("{message_id}-image-{index}")))
                 .max_w(px(460.0))
                 .max_h(px(360.0))
@@ -17471,8 +17514,13 @@ fn render_image_attachments(
                                 .child(fallback_name.clone())
                                 .into_any_element()
                         }),
-                )
-                .into_any_element()
+                );
+            fade_in(
+                image,
+                format!("{message_id}-image-{index}"),
+                ATTACHMENT_FADE_DURATION,
+            )
+            .into_any_element()
         })
         .collect()
 }
@@ -17642,10 +17690,8 @@ fn render_message(
             4.0,
         )]
     } else {
-        let stream_animation_id = format!(
-            "stream-message-{}-{index}-segment-0",
-            session_id.as_str()
-        );
+        let stream_animation_id =
+            format!("stream-message-{}-{index}-segment-0", session_id.as_str());
         vec![render_assistant_text_segment(
             session_id,
             index,
@@ -17744,7 +17790,7 @@ fn render_message(
         message_element
             .with_animation(
                 format!("stream-message-fade-{}-{index}", session_id.as_str()),
-                Animation::new(STREAM_MESSAGE_FADE_DURATION).with_easing(gpui::ease_out_quint()),
+                Animation::new(MESSAGE_FADE_DURATION).with_easing(gpui::ease_out_quint()),
                 |element, delta| element.opacity(delta),
             )
             .into_any_element()
