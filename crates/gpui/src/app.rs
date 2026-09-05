@@ -390,6 +390,7 @@ struct PendingRemoteAccessRequest {
 struct ModelChoice {
     connection_id: ConnectionId,
     connection_name: SharedString,
+    connection_kind: ConnectionKind,
     info: ModelInfo,
 }
 
@@ -398,6 +399,28 @@ impl SelectItem for ModelChoice {
 
     fn title(&self) -> SharedString {
         self.info.display_name.clone().into()
+    }
+
+    fn display_title(&self) -> Option<AnyElement> {
+        Some(
+            div()
+                .flex()
+                .w_full()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .items_center()
+                .gap(px(6.0))
+                .child(provider_logo(self.connection_kind, 14.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .truncate()
+                        .child(self.title()),
+                )
+                .into_any_element(),
+        )
     }
 
     fn value(&self) -> &Self::Value {
@@ -7495,14 +7518,19 @@ impl AverroesApp {
         {
             return;
         }
-        let connection_name = self
-            .runtime
-            .connection(&connection_id)
-            .map(|profile| profile.name)
+        let connection = self.runtime.connection(&connection_id);
+        let connection_name = connection
+            .as_ref()
+            .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "Connection".into());
+        let connection_kind = connection
+            .as_ref()
+            .map(|profile| profile.kind)
+            .unwrap_or(ConnectionKind::Compatible);
         self.model_choices.push(ModelChoice {
             connection_id,
             connection_name: connection_name.into(),
+            connection_kind,
             info: ModelInfo {
                 id: model_id.clone(),
                 display_name: model_id,
@@ -7755,15 +7783,16 @@ impl AverroesApp {
     }
 
     fn replace_model_choices(&mut self, connection_id: &ConnectionId, models: Vec<ModelInfo>) {
-        let connection_name = self
-            .runtime
-            .connection(connection_id)
-            .map(|profile| profile.name)
+        let connection = self.runtime.connection(connection_id);
+        let connection_name = connection
+            .as_ref()
+            .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "Connection".into());
-        let is_copilot = self
-            .runtime
-            .connection(connection_id)
-            .is_some_and(|profile| profile.kind == ConnectionKind::Copilot);
+        let connection_kind = connection
+            .as_ref()
+            .map(|profile| profile.kind)
+            .unwrap_or(ConnectionKind::Compatible);
+        let is_copilot = connection_kind == ConnectionKind::Copilot;
         let selected_model_is_unavailable = is_copilot
             && self.active().binding.connection_id.as_ref() == Some(connection_id)
             && self
@@ -7792,6 +7821,7 @@ impl AverroesApp {
                 .map(|info| ModelChoice {
                     connection_id: connection_id.clone(),
                     connection_name: connection_name.clone().into(),
+                    connection_kind,
                     info,
                 }),
         );
@@ -14839,6 +14869,7 @@ fn initial_model_choices(runtime: &AppRuntime) -> Vec<ModelChoice> {
         .flat_map(|profile| {
             let connection_id = profile.id.clone();
             let connection_name: SharedString = profile.name.clone().into();
+            let connection_kind = profile.kind;
             runtime
                 .models_for_connection(&profile.id)
                 .unwrap_or_default()
@@ -14847,6 +14878,7 @@ fn initial_model_choices(runtime: &AppRuntime) -> Vec<ModelChoice> {
                 .map(move |info| ModelChoice {
                     connection_id: connection_id.clone(),
                     connection_name: connection_name.clone(),
+                    connection_kind,
                     info,
                 })
         })
