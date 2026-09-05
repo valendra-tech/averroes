@@ -5,7 +5,7 @@ use std::time::Duration;
 
 pub const MESSAGE_FADE_DURATION: Duration = Duration::from_millis(220);
 pub const ATTACHMENT_FADE_DURATION: Duration = Duration::from_millis(180);
-pub const STREAM_LINE_FADE_DURATION: Duration = Duration::from_millis(140);
+pub const STREAM_TEXT_FADE_DURATION: Duration = Duration::from_millis(140);
 pub const STATE_FADE_DURATION: Duration = Duration::from_millis(160);
 
 pub fn fade_opacity(delta: f32) -> f32 {
@@ -25,13 +25,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{fade_opacity, ATTACHMENT_FADE_DURATION, STREAM_LINE_FADE_DURATION};
+    use super::{fade_opacity, ATTACHMENT_FADE_DURATION, STREAM_TEXT_FADE_DURATION};
     use std::time::Duration;
 
     #[test]
     fn uses_short_durations_for_subtle_content_motion() {
         assert_eq!(ATTACHMENT_FADE_DURATION, Duration::from_millis(180));
-        assert_eq!(STREAM_LINE_FADE_DURATION, Duration::from_millis(140));
+        assert_eq!(STREAM_TEXT_FADE_DURATION, Duration::from_millis(140));
     }
 
     #[test]

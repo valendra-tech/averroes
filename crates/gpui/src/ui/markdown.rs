@@ -1,4 +1,3 @@
-use super::animation::{fade_in, STREAM_LINE_FADE_DURATION};
 use super::theme::UiTheme;
 use gpui::*;
 use std::borrow::Cow;
@@ -60,49 +59,28 @@ fn strip_unpaired_strong_delimiters(content: &str) -> String {
 
 /// Renders a response while it is still arriving from a provider.
 ///
-/// Keep the live path deliberately cheap. Once the provider closes the block,
-/// the keyed Markdown TextView takes over and retains its parsed document
-/// between frames.
-fn last_non_empty_line_index(content: &str) -> Option<usize> {
-    content
-        .split('\n')
-        .enumerate()
-        .fold(None, |last_index, (index, line)| {
-            (!line.trim_end_matches('\r').trim().is_empty())
-                .then_some(index)
-                .or(last_index)
-        })
-}
-
-pub fn render_streaming_markdown(theme: UiTheme, content: &str, animation_id: &str) -> Div {
-    let last_line_index = last_non_empty_line_index(content);
+/// Keep the live path deliberately cheap. The caller owns the single stable
+/// fade wrapper; this element only renders the changing text. Keeping the
+/// animation outside the line list prevents a newline or remeasurement from
+/// making an already visible line blink.
+pub fn render_streaming_markdown(theme: UiTheme, content: &str) -> Div {
     div()
         .w_full()
         .min_w(px(0.0))
         .text_sm()
         .text_color(theme.foreground)
-        .children(content.split('\n').enumerate().map(|(line_index, line)| {
-            let line_element = div()
+        .children(content.split('\n').map(|line| {
+            div()
                 .w_full()
                 .min_w(px(0.0))
                 .whitespace_normal()
-                .child(line.trim_end_matches('\r').to_string());
-            if Some(line_index) == last_line_index {
-                fade_in(
-                    line_element,
-                    format!("{animation_id}-line-{line_index}"),
-                    STREAM_LINE_FADE_DURATION,
-                )
-                .into_any_element()
-            } else {
-                line_element.into_any_element()
-            }
+                .child(line.trim_end_matches('\r').to_string())
         }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{last_non_empty_line_index, normalize_reasoning_for_display};
+    use super::normalize_reasoning_for_display;
     use std::borrow::Cow;
 
     #[test]
@@ -133,12 +111,5 @@ mod tests {
     fn reasoning_display_keeps_well_formed_strong_markdown() {
         let content = "**Checkpoint complete**";
         assert_eq!(normalize_reasoning_for_display(content), content);
-    }
-
-    #[test]
-    fn streaming_animation_targets_only_the_last_non_empty_line() {
-        assert_eq!(last_non_empty_line_index("one\ntwo"), Some(1));
-        assert_eq!(last_non_empty_line_index("one\ntwo\n"), Some(1));
-        assert_eq!(last_non_empty_line_index("\n\n"), None);
     }
 }
