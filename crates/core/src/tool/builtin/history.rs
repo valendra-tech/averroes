@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 50;
-const MAX_SEARCH_CANDIDATES: usize = 512;
 const MAX_SEARCH_OFFSET: usize = 100_000;
 const READ_PAGE_CHARS: usize = 4_096;
 const MAX_EXCERPT_CHARS: usize = 512;
@@ -101,23 +100,21 @@ impl HistoryTool {
             return Err(self.invalid(format!("offset must be at most {MAX_SEARCH_OFFSET}")));
         }
 
+        let scope_conversation = self.scope_conversation(ctx)?;
         let mut entries = if params.all {
             self.database
-                .search_history_workspace(
-                    &canonical_workspace_root(ctx),
-                    query,
-                    MAX_SEARCH_CANDIDATES,
-                    0,
-                )
+                .history_entries_for_workspace(&canonical_workspace_root(ctx))
                 .map_err(|error| self.storage_error(error))?
         } else {
             self.database
-                .search_history(&ctx.session_id, query, MAX_SEARCH_CANDIDATES, 0)
+                .history_entries(&scope_conversation)
                 .map_err(|error| self.storage_error(error))?
                 .into_iter()
-                .map(|entry| (ctx.session_id.clone(), entry))
+                .map(|entry| (scope_conversation.clone(), entry))
                 .collect()
         };
+        let query = query.to_lowercase();
+        entries.retain(|(_, entry)| entry.text.to_lowercase().contains(&query));
 
         entries.sort_by(|(left_conversation, left), (right_conversation, right)| {
             derived_rank(left)
@@ -130,13 +127,14 @@ impl HistoryTool {
 
         let mut seen = HashSet::new();
         entries.retain(|(_, entry)| seen.insert(entry.entry_id.clone()));
+        let total = entries.len();
         let page = entries
             .iter()
             .skip(offset)
             .take(limit)
             .map(|(conversation_id, entry)| format_search_entry(conversation_id, entry))
             .collect::<Vec<_>>();
-        let has_more = entries.len() > offset.saturating_add(page.len());
+        let has_more = total > offset.saturating_add(page.len());
         let next_offset = has_more.then_some(offset.saturating_add(page.len()));
         let content = if page.is_empty() {
             "No history entries matched the query.".into()
@@ -146,6 +144,7 @@ impl HistoryTool {
         Ok(ToolResult::ok(content).with_metadata(json!({
             "offset": offset,
             "limit": limit,
+            "total": total,
             "result_count": page.len(),
             "has_more": has_more,
             "next_offset": next_offset,
@@ -162,14 +161,20 @@ impl HistoryTool {
         }
         let offset = params.offset.unwrap_or(0);
         let workspace_root = canonical_workspace_root(ctx);
+        let scope_conversation = self.scope_conversation(ctx)?;
         let (_, entry) = self
             .database
-            .history_entry_in_scope(&ctx.session_id, &workspace_root, id)
+            .history_entry_in_scope(&scope_conversation, &workspace_root, id)
             .map_err(|error| self.storage_error(error))?
             .ok_or_else(|| self.invalid(format!("history entry '{id}' was not found")))?;
 
         let total = entry.text.chars().count();
-        let start = offset.min(total);
+        if offset > total {
+            return Err(self.invalid(format!(
+                "offset {offset} exceeds history entry length {total}"
+            )));
+        }
+        let start = offset;
         let end = (start + READ_PAGE_CHARS).min(total);
         let content = entry
             .text
@@ -200,6 +205,15 @@ impl HistoryTool {
             tool: self.name().into(),
             message: error.to_string(),
         }
+    }
+
+    fn scope_conversation(&self, ctx: &ToolContext) -> Result<String> {
+        let workspace_root = canonical_workspace_root(ctx);
+        self.database
+            .resolve_history_conversation(&ctx.session_id, &workspace_root)
+            .map_err(|error| self.storage_error(error))?
+            .or_else(|| Some(ctx.session_id.clone()))
+            .ok_or_else(|| self.invalid("conversation scope could not be resolved"))
     }
 }
 
@@ -347,13 +361,14 @@ fn format_search_entry(conversation_id: &str, entry: &WorkHistoryEntry) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::orchestration::{AgentThreadSnapshot, AgentThreadStatus};
     use crate::agent::{ContextBudget, ContextController};
     use crate::connection::SessionBinding;
     use crate::provider::types::ImageSource;
     use crate::storage::work::{
         now, WorkConversation, WorkDatabase, WorkHistoryEntry, WorkHistoryKind,
     };
-    use crate::tool::{Tool, ToolActivation, ToolContext, ToolError};
+    use crate::tool::{Tool, ToolActivation, ToolContext, ToolError, ToolRegistry};
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::path::Path;
@@ -576,6 +591,183 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.content.matches("same-entry").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn delegated_session_resolves_parent_scope_and_keeps_workspace_isolation() {
+        let root = tempfile::tempdir().unwrap();
+        let isolated_root = tempfile::tempdir().unwrap();
+        let mut parent = conversation("parent", None);
+        parent.agent_threads = vec![AgentThreadSnapshot {
+            id: "thread-1".into(),
+            thread_id: "thread-1".into(),
+            agent_id: "researcher".into(),
+            parent_session_id: "parent".into(),
+            title: "Research".into(),
+            model_id: "model-1".into(),
+            status: AgentThreadStatus::Completed,
+            enabled_tools: vec!["history".into()],
+            prompt: "Find it".into(),
+            output: "Done".into(),
+            created_at: 1,
+            updated_at: 2,
+        }];
+        let (_directory, database) = database_with_workspace(root.path(), &[parent]);
+        database
+            .append_history_entries(
+                "parent",
+                &[
+                    entry(
+                        "parent-entry",
+                        1,
+                        WorkHistoryKind::User,
+                        "parent delegated needle",
+                    ),
+                    {
+                        let mut delegated = entry(
+                            "delegated-entry",
+                            2,
+                            WorkHistoryKind::Assistant,
+                            "delegated needle",
+                        );
+                        delegated.thread_id = Some("thread-1".into());
+                        delegated
+                    },
+                ],
+            )
+            .unwrap();
+        let isolated_project = database.open_project(isolated_root.path()).unwrap();
+        let isolated = conversation("isolated", Some(isolated_project.id));
+        database.save_conversation(&isolated).unwrap();
+        database
+            .append_history_entries(
+                "isolated",
+                &[entry(
+                    "isolated-entry",
+                    1,
+                    WorkHistoryKind::User,
+                    "delegated needle",
+                )],
+            )
+            .unwrap();
+
+        let tool = HistoryTool::new(database.clone());
+        let delegated_context = context("agent-thread:thread-1", root.path());
+        let search = tool
+            .execute(
+                &delegated_context,
+                &json!({"operation": "search", "query": "delegated"}),
+            )
+            .await
+            .unwrap();
+        assert!(search.content.contains("parent-entry"));
+        assert!(search.content.contains("delegated-entry"));
+
+        let all = tool
+            .execute(
+                &delegated_context,
+                &json!({"operation": "search", "query": "needle", "all": true}),
+            )
+            .await
+            .unwrap();
+        assert!(!all.content.contains("isolated-entry"));
+
+        let registry = ToolRegistry::new();
+        crate::tool::builtin::register_work_tools(&registry, database);
+        assert!(registry.get("history").is_some());
+        assert!(registry.fork().get("history").is_some());
+    }
+
+    #[tokio::test]
+    async fn search_pagination_reports_total_and_consistent_offsets() {
+        let root = tempfile::tempdir().unwrap();
+        let current = conversation("current", None);
+        let (_directory, database) = database_with_workspace(root.path(), &[current]);
+        database
+            .append_history_entries(
+                "current",
+                &[
+                    entry("page-1", 1, WorkHistoryKind::User, "page needle one"),
+                    entry("page-2", 2, WorkHistoryKind::User, "page needle two"),
+                    entry("page-3", 3, WorkHistoryKind::User, "page needle three"),
+                ],
+            )
+            .unwrap();
+        let result = HistoryTool::new(database)
+            .execute(
+                &context("current", root.path()),
+                &json!({"operation": "search", "query": "needle", "limit": 1, "offset": 1}),
+            )
+            .await
+            .unwrap();
+        let metadata = result.metadata.as_ref().unwrap();
+        assert_eq!(metadata["total"], 3);
+        assert_eq!(metadata["offset"], 1);
+        assert_eq!(metadata["result_count"], 1);
+        assert_eq!(metadata["has_more"], true);
+        assert_eq!(metadata["next_offset"], 2);
+        assert!(result.content.contains("page-2"));
+    }
+
+    #[tokio::test]
+    async fn read_rejects_offsets_beyond_unicode_total() {
+        let root = tempfile::tempdir().unwrap();
+        let current = conversation("current", None);
+        let (_directory, database) = database_with_workspace(root.path(), &[current]);
+        database
+            .append_history_entries(
+                "current",
+                &[entry("short", 1, WorkHistoryKind::Assistant, "é🙂")],
+            )
+            .unwrap();
+        let error = HistoryTool::new(database)
+            .execute(
+                &context("current", root.path()),
+                &json!({"operation": "read", "id": "short", "offset": 3}),
+            )
+            .await
+            .unwrap_err();
+        match error {
+            ToolError::InvalidParams { message, .. } => {
+                assert!(message.contains("offset"));
+                assert!(message.contains("2"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_does_not_discard_originals_after_candidate_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let current = conversation("current", None);
+        let (_directory, database) = database_with_workspace(root.path(), &[current]);
+        let mut entries = (0..512)
+            .map(|sequence| {
+                entry(
+                    &format!("context-{sequence}"),
+                    sequence,
+                    WorkHistoryKind::ContextWindow,
+                    "boundary needle",
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.push(entry(
+            "original",
+            1_000,
+            WorkHistoryKind::User,
+            "boundary needle original",
+        ));
+        database
+            .append_history_entries("current", &entries)
+            .unwrap();
+        let result = HistoryTool::new(database)
+            .execute(
+                &context("current", root.path()),
+                &json!({"operation": "search", "query": "boundary", "limit": 1}),
+            )
+            .await
+            .unwrap();
+        assert!(result.content.contains("original"));
     }
 
     #[tokio::test]

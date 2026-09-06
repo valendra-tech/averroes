@@ -153,6 +153,75 @@ pub(super) fn load_history_entries(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+pub(super) fn resolve_history_conversation(
+    connection: &Connection,
+    session_id: &str,
+    workspace_root: &str,
+) -> Result<Option<String>, WorkDatabaseError> {
+    let direct = connection
+        .query_row(
+            "SELECT c.id
+             FROM conversations c
+             LEFT JOIN projects p ON p.id = c.project_id
+             WHERE c.id = ?1
+               AND (c.project_id IS NULL OR p.root = ?2)
+             LIMIT 1",
+            params![session_id, workspace_root],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if direct.is_some() {
+        return Ok(direct);
+    }
+
+    let Some(thread_id) = session_id.strip_prefix("agent-thread:") else {
+        return Ok(None);
+    };
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return Ok(None);
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT c.id, c.agent_threads_json
+         FROM conversations c
+         JOIN projects p ON p.id = c.project_id
+         WHERE p.root = ?1
+         ORDER BY c.updated_at DESC, c.id",
+    )?;
+    let mut rows = statement.query(params![workspace_root])?;
+    while let Some(row) = rows.next()? {
+        let conversation_id = row.get::<_, String>(0)?;
+        let serialized_threads = row.get::<_, String>(1)?;
+        let threads =
+            serde_json::from_str::<Vec<crate::agent::orchestration::AgentThreadSnapshot>>(
+                &serialized_threads,
+            )
+            .unwrap_or_default();
+        if threads.iter().any(|thread| {
+            thread.parent_session_id == conversation_id
+                && (thread.thread_id == thread_id || thread.id == thread_id)
+        }) {
+            return Ok(Some(conversation_id));
+        }
+    }
+
+    connection
+        .query_row(
+            "SELECT h.conversation_id
+             FROM conversation_history h
+             JOIN conversations c ON c.id = h.conversation_id
+             JOIN projects p ON p.id = c.project_id
+             WHERE p.root = ?1 AND h.thread_id = ?2
+             ORDER BY h.sequence, h.conversation_id
+             LIMIT 1",
+            params![workspace_root, thread_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
 pub(super) fn search_history(
     connection: &Connection,
     conversation_id: &str,

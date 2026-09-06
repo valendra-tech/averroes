@@ -997,6 +997,14 @@ impl WorkDatabase {
         rows::load_history_entries(&self.connection.lock(), conversation_id)
     }
 
+    pub fn resolve_history_conversation(
+        &self,
+        session_id: &str,
+        workspace_root: &str,
+    ) -> Result<Option<String>, WorkDatabaseError> {
+        rows::resolve_history_conversation(&self.connection.lock(), session_id, workspace_root)
+    }
+
     pub fn search_history(
         &self,
         conversation_id: &str,
