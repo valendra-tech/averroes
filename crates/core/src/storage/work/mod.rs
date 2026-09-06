@@ -1049,6 +1049,71 @@ impl WorkDatabase {
         Ok(stored)
     }
 
+    /// Atomically records a context-window transition and, for root agents,
+    /// advances the durable provider-facing snapshot to the new window.
+    /// Repeating the same entry id with the same payload is idempotent.
+    pub fn commit_context_rollover(
+        &self,
+        conversation_id: &str,
+        entry: &WorkHistoryEntry,
+        active_context: Option<(&[crate::provider::ChatMessage], &str)>,
+    ) -> Result<WorkHistoryEntry, WorkDatabaseError> {
+        let active_context = active_context
+            .map(|(messages, window_id)| {
+                Ok::<_, WorkDatabaseError>((serde_json::to_string(messages)?, window_id.to_owned()))
+            })
+            .transpose()?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let stored = if let Some(existing) =
+            rows::load_history_entry(&transaction, conversation_id, &entry.entry_id)?
+        {
+            if history_entry_payload_equal(&existing, entry) {
+                existing
+            } else {
+                return Err(WorkDatabaseError::HistoryConflict {
+                    conversation_id: conversation_id.into(),
+                    sequence: entry.sequence,
+                    entry_id: entry.entry_id.clone(),
+                    existing_entry_id: existing.entry_id,
+                });
+            }
+        } else {
+            let mut stored = entry.clone();
+            if stored.sequence <= 0 {
+                stored.sequence = transaction.query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1
+                     FROM conversation_history WHERE conversation_id = ?1",
+                    params![conversation_id],
+                    |row| row.get(0),
+                )?;
+            }
+            if stored.timestamp <= 0 {
+                stored.timestamp = now();
+            }
+            rows::append_history_entries(&transaction, conversation_id, &[stored.clone()])?;
+            stored
+        };
+
+        if let Some((active_context, active_window_id)) = active_context {
+            let rows_affected = transaction.execute(
+                "UPDATE conversations
+                 SET active_context_json = ?2, active_window_id = ?3, updated_at = ?4
+                 WHERE id = ?1",
+                params![conversation_id, active_context, active_window_id, now()],
+            )?;
+            if rows_affected == 0 {
+                return Err(WorkDatabaseError::ConversationNotFound {
+                    conversation_id: conversation_id.into(),
+                });
+            }
+        }
+
+        transaction.commit()?;
+        Ok(stored)
+    }
+
     /// Updates only the provider-facing active context. The visible transcript
     /// remains owned by the normal conversation snapshot/save path.
     pub fn save_active_context(
@@ -1658,6 +1723,45 @@ mod tests {
             database.history_entries("history-collision").unwrap(),
             vec![first]
         );
+    }
+
+    #[test]
+    fn context_rollover_commit_is_atomic_and_idempotent() {
+        let (_directory, database) = database();
+        let conversation_id = "context-rollover-commit";
+        database
+            .save_conversation(&test_conversation(conversation_id))
+            .unwrap();
+        let active_context = vec![crate::provider::ChatMessage::user("saved handoff")];
+        let entry = WorkHistoryEntry {
+            entry_id: "context-rollover-entry".into(),
+            parent_id: None,
+            thread_id: None,
+            window_id: "initial".into(),
+            sequence: 0,
+            timestamp: 0,
+            kind: WorkHistoryKind::ContextWindow,
+            text: "Context window rollover: initial -> window-2".into(),
+            payload: serde_json::json!({
+                "old_window_id": "initial",
+                "new_window_id": "window-2",
+                "handoff": "saved handoff",
+            }),
+            images: Vec::new(),
+        };
+
+        let stored = database
+            .commit_context_rollover(conversation_id, &entry, Some((&active_context, "window-2")))
+            .unwrap();
+        let repeated = database
+            .commit_context_rollover(conversation_id, &entry, Some((&active_context, "window-2")))
+            .unwrap();
+
+        assert_eq!(stored, repeated);
+        let restored = database.conversation(conversation_id).unwrap().unwrap();
+        assert_eq!(restored.active_window_id, "window-2");
+        assert_eq!(restored.active_context, active_context);
+        assert_eq!(restored.history_entries, vec![stored]);
     }
 
     #[test]

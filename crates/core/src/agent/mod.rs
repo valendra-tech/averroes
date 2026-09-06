@@ -450,6 +450,15 @@ impl Agent {
             return Ok(());
         }
         let entry = self.persist_history_entry(entry)?;
+        self.emit_history_entry_event(entry, events);
+        Ok(())
+    }
+
+    fn emit_history_entry_event(
+        &self,
+        entry: WorkHistoryEntry,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+    ) {
         if self
             .emitted_history_ids
             .lock()
@@ -460,7 +469,118 @@ impl Agent {
                 let _ = events.send(AgentStreamEvent::HistoryEntryAppended { entry });
             }
         }
-        Ok(())
+    }
+
+    async fn commit_context_rollover(
+        &self,
+        tool_execution: &tools::ToolExecution,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+        run_state: &mut RunStateGuard,
+    ) -> Result<bool> {
+        if tool_execution.had_failure {
+            return Ok(false);
+        }
+        let Some(context_action) = tool_execution.context_action.clone() else {
+            return Ok(false);
+        };
+
+        if let Err(error) = self
+            .context_controller
+            .request_context(context_action.handoff.clone())
+        {
+            self.context_controller.clear_pending_request();
+            self.set_state(AgentState::Errored);
+            run_state.finish();
+            return Err(anyhow::Error::msg(error));
+        }
+
+        let Some(request) = self.context_controller.take_pending_request() else {
+            self.set_state(AgentState::Errored);
+            run_state.finish();
+            return Err(anyhow::anyhow!(
+                "new_context action completed without a pending context request"
+            ));
+        };
+        let previous_window_id = self.context_controller.window_id();
+        let window_id = uuid::Uuid::new_v4().to_string();
+        let messages = self.fresh_context_messages(request.handoff.as_deref());
+        let history_entry = self.new_history_entry(
+            WorkHistoryKind::ContextWindow,
+            format!("Context window rollover: {previous_window_id} -> {window_id}"),
+            json!({
+                "old_window_id": previous_window_id,
+                "new_window_id": window_id,
+                "handoff": request.handoff,
+                "reason": "explicit_new_context",
+            }),
+            Vec::new(),
+        );
+
+        let active_snapshot = self
+            .config
+            .work_id_prefix
+            .is_none()
+            .then_some((messages.as_slice(), window_id.as_str()));
+        let stored_entry = match (
+            self.history_database.as_ref(),
+            self.history_conversation_id.as_deref(),
+        ) {
+            (Some(database), Some(conversation_id)) => database
+                .commit_context_rollover(conversation_id, &history_entry, active_snapshot)
+                .map_err(anyhow::Error::from),
+            _ => self.persist_history_entry(history_entry),
+        };
+        let stored_entry = match stored_entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                self.context_controller.clear_pending_request();
+                self.set_state(AgentState::Errored);
+                run_state.finish();
+                return Err(error);
+            }
+        };
+
+        let previous_window_id = self.context_controller.begin_window(window_id.clone());
+        *self.messages.lock().await = messages.clone();
+        self.emit_history_entry_event(stored_entry, events);
+        self.emit_context_window_started(
+            events,
+            previous_window_id,
+            "explicit new_context tool",
+            request.handoff,
+            false,
+        );
+        if let Some(events) = events {
+            let _ = events.send(AgentStreamEvent::ContextSnapshot {
+                window_id,
+                messages,
+            });
+        }
+        Ok(true)
+    }
+
+    fn fresh_context_messages(&self, handoff: Option<&str>) -> Vec<ChatMessage> {
+        let mut messages = self
+            .config
+            .system_prompt
+            .as_ref()
+            .map(|prompt| ChatMessage {
+                role: Role::System,
+                content: MessageContent::Text(prompt.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(handoff) = handoff {
+            messages.push(ChatMessage {
+                role: Role::System,
+                content: MessageContent::Text(format!("[Context handoff]\n\n{handoff}")),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+        messages
     }
 
     /// Emits and persists the current provider context at a lifecycle
@@ -1032,25 +1152,20 @@ impl Agent {
                     }
                 }
                 let had_failure = tool_execution.had_failure;
-                let context_action = tool_execution.context_action;
-                let messages = tool_execution.messages;
                 if had_failure {
                     self.context_controller.clear_pending_request();
-                } else if let Some(context_action) = context_action {
-                    if let Err(error) = self
-                        .context_controller
-                        .request_context(context_action.handoff)
-                    {
-                        self.context_controller.clear_pending_request();
-                        return Err(self
-                            .finish_errored_after_snapshot(
-                                stream_events.as_ref(),
-                                &mut run_state,
-                                anyhow::Error::msg(error),
-                            )
-                            .await);
-                    }
                 }
+                if self
+                    .commit_context_rollover(
+                        &tool_execution,
+                        stream_events.as_ref(),
+                        &mut run_state,
+                    )
+                    .await?
+                {
+                    continue;
+                }
+                let messages = tool_execution.messages;
                 {
                     let mut msgs = self.messages.lock().await;
                     msgs.push(response.message.clone());
@@ -4226,21 +4341,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_tool_batch_recommits_the_context_action() {
+    async fn successful_new_context_rolls_over_before_the_next_provider_request() {
         let provider = Arc::new(TestProvider::new(vec![
-            tool_response(vec![
-                function_tool_call(
-                    "new-context",
-                    "new_context",
-                    r#"{"handoff":"saved handoff"}"#,
-                ),
-                function_tool_call("overwrite", "overwrite_pending", "{}"),
-            ]),
+            tool_response(vec![function_tool_call(
+                "new-context",
+                "new_context",
+                r#"{"handoff":"saved handoff"}"#,
+            )]),
             assistant_response("continued", 10),
         ]));
+        let provider_ref = provider.clone();
         let agent = Agent::new(
             AgentConfig {
-                tools: vec!["new_context".into(), "overwrite_pending".into()],
+                system_prompt: Some("You are a test agent.".into()),
+                tools: vec!["new_context".into()],
                 ..Default::default()
             },
             provider,
@@ -4250,20 +4364,169 @@ mod tests {
             PathBuf::from("/tmp"),
         );
 
-        assert_eq!(agent.run("continue").await.unwrap(), "continued");
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         assert_eq!(
-            agent
-                .context_controller()
-                .pending_request()
-                .unwrap()
-                .handoff
-                .as_deref(),
-            Some("saved handoff")
+            agent.run_streaming("continue", sender).await.unwrap(),
+            "continued"
         );
+
+        let requests = provider_ref.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]
+            .messages
+            .iter()
+            .any(|message| message.role == ProviderRole::System
+                && message_text(message).contains("saved handoff")));
+        assert!(requests[1]
+            .messages
+            .iter()
+            .all(|message| !message_text(message).contains("continue")));
+        assert!(requests[1]
+            .messages
+            .iter()
+            .all(|message| !message_text(message).contains("A new context window is pending")));
+        assert!(requests[1]
+            .messages
+            .iter()
+            .all(|message| message.tool_calls.is_none()));
+
+        let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::HistoryEntryAppended { entry }
+                if entry.kind == WorkHistoryKind::User && entry.text == "continue"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::HistoryEntryAppended { entry }
+                if entry.kind == WorkHistoryKind::ToolResult
+                    && entry.text.contains("new context window is pending")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::ContextWindowStarted {
+                previous_window_id,
+                handoff: Some(handoff),
+                automatic: false,
+                ..
+            } if previous_window_id == "initial" && handoff == "saved handoff"
+        )));
+
+        let active_context = agent.active_context_snapshot().await;
+        assert_eq!(active_context[0].role, ProviderRole::System);
+        assert!(message_text(&active_context[0]).contains("You are a test agent."));
+        assert_eq!(active_context[1].role, ProviderRole::System);
+        assert!(message_text(&active_context[1]).contains("saved handoff"));
+        assert!(active_context
+            .iter()
+            .all(|message| !message_text(message).contains("A new context window is pending")));
+        assert_eq!(agent.context_controller().pending_request(), None);
     }
 
     #[tokio::test]
-    async fn failed_sibling_clears_the_pending_context_action() {
+    async fn successful_new_context_persists_history_and_active_snapshot_without_touching_transcript(
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("history.db")).unwrap();
+        let conversation_id = "context-rollover-durable";
+        database
+            .save_conversation(&history_conversation(conversation_id))
+            .unwrap();
+
+        let provider = Arc::new(TestProvider::new(vec![
+            tool_response(vec![function_tool_call(
+                "new-context",
+                "new_context",
+                r#"{"handoff":"saved handoff"}"#,
+            )]),
+            assistant_response("continued", 10),
+        ]));
+        let registry = ToolRegistry::new();
+        registry.register(crate::tool::builtin::context_window::NewContextTool);
+        registry.set_work_database(database.clone());
+        let agent = Agent::new(
+            AgentConfig {
+                system_prompt: Some("You are a test agent.".into()),
+                tools: vec!["new_context".into()],
+                work_conversation_id: Some(conversation_id.into()),
+                ..Default::default()
+            },
+            provider,
+            Arc::new(registry),
+            test_governor(),
+            conversation_id.into(),
+            PathBuf::from("/tmp"),
+        );
+
+        assert_eq!(agent.run("continue").await.unwrap(), "continued");
+
+        let stored = database.conversation(conversation_id).unwrap().unwrap();
+        assert!(stored.messages.is_empty());
+        assert_ne!(stored.active_window_id, "initial");
+        assert!(stored
+            .active_context
+            .iter()
+            .any(|message| message_text(message).contains("saved handoff")));
+        let rollover = stored
+            .history_entries
+            .iter()
+            .find(|entry| entry.kind == WorkHistoryKind::ContextWindow)
+            .expect("context rollover history");
+        assert_eq!(rollover.payload["old_window_id"], "initial");
+        assert_eq!(rollover.payload["new_window_id"], stored.active_window_id);
+        assert_eq!(rollover.payload["handoff"], "saved handoff");
+    }
+
+    #[tokio::test]
+    async fn rollover_persistence_failure_preserves_old_context_and_clears_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("history.db")).unwrap();
+        let registry = ToolRegistry::new();
+        registry.set_work_database(database);
+        let agent = Agent::new(
+            AgentConfig {
+                system_prompt: Some("configured".into()),
+                work_conversation_id: Some("missing-conversation".into()),
+                ..Default::default()
+            },
+            Arc::new(TestProvider::new(Vec::new())),
+            Arc::new(registry),
+            test_governor(),
+            "missing-conversation".into(),
+            PathBuf::from("/tmp"),
+        );
+        let old_context = vec![
+            ChatMessage {
+                role: ProviderRole::System,
+                content: MessageContent::Text("configured".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage::user("old context"),
+        ];
+        *agent.messages.lock().await = old_context.clone();
+        let execution = tools::ToolExecution {
+            messages: Vec::new(),
+            history_entries: Vec::new(),
+            context_action: Some(ContextRequest {
+                handoff: Some("saved handoff".into()),
+            }),
+            had_failure: false,
+        };
+        let mut run_state = RunStateGuard::new(agent.state.clone());
+
+        assert!(agent
+            .commit_context_rollover(&execution, None, &mut run_state)
+            .await
+            .is_err());
+        assert_eq!(agent.state().await, AgentState::Errored);
+        assert_eq!(agent.context_controller().window_id(), "initial");
+        assert!(agent.context_controller().pending_request().is_none());
+        assert_eq!(agent.active_context_snapshot().await, old_context);
+    }
+
+    #[tokio::test]
+    async fn failed_sibling_keeps_the_original_context_without_rollover() {
         let provider = Arc::new(TestProvider::new(vec![
             tool_response(vec![
                 function_tool_call(
@@ -4275,6 +4538,7 @@ mod tests {
             ]),
             assistant_response("continued", 10),
         ]));
+        let provider_ref = provider.clone();
         let agent = Agent::new(
             AgentConfig {
                 tools: vec!["new_context".into(), "failing_context_sibling".into()],
@@ -4287,8 +4551,30 @@ mod tests {
             PathBuf::from("/tmp"),
         );
 
-        assert_eq!(agent.run("continue").await.unwrap(), "continued");
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            agent.run_streaming("continue", sender).await.unwrap(),
+            "continued"
+        );
         assert!(agent.context_controller().pending_request().is_none());
+        assert_eq!(agent.context_controller().window_id(), "initial");
+
+        let requests = provider_ref.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]
+            .messages
+            .iter()
+            .any(|message| message_text(message) == "continue"));
+        assert!(requests[1]
+            .messages
+            .iter()
+            .any(|message| message_text(message).contains("A new context window is pending")));
+        assert!(requests[1]
+            .messages
+            .iter()
+            .any(|message| message_text(message).contains("sibling failed")));
+        assert!(!std::iter::from_fn(|| receiver.try_recv().ok())
+            .any(|event| matches!(event, AgentStreamEvent::ContextWindowStarted { .. })));
     }
 
     #[tokio::test]
@@ -4339,9 +4625,15 @@ mod tests {
             PathBuf::from("/tmp"),
         );
 
+        let old_context = agent.active_context_snapshot().await;
         assert!(agent.run("continue").await.is_err());
         assert_eq!(agent.state().await, AgentState::Errored);
         assert!(agent.context_controller().pending_request().is_none());
+        assert_eq!(agent.context_controller().window_id(), "initial");
+        assert_eq!(
+            agent.active_context_snapshot().await.len(),
+            old_context.len() + 1
+        );
     }
 
     #[tokio::test]

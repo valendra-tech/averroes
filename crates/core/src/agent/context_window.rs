@@ -221,6 +221,10 @@ impl ContextController {
         *self.pending.lock() = None;
     }
 
+    pub(crate) fn take_pending_request(&self) -> Option<ContextRequest> {
+        self.pending.lock().take()
+    }
+
     pub(crate) fn restore_pending_request(&self, request: Option<ContextRequest>) {
         *self.pending.lock() = request;
     }
