@@ -22,7 +22,7 @@ use crate::tool::{ToolActivation, ToolApprovalPolicy, ToolRegistry};
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -252,6 +252,7 @@ pub struct Agent {
     history_conversation_id: Option<String>,
     history_sequence: AtomicI64,
     emitted_history_ids: Mutex<HashSet<String>>,
+    tool_outcomes: Mutex<HashMap<String, bool>>,
 }
 
 #[derive(Clone)]
@@ -357,6 +358,7 @@ impl Agent {
             history_conversation_id,
             history_sequence: AtomicI64::new(0),
             emitted_history_ids: Mutex::new(HashSet::new()),
+            tool_outcomes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -708,7 +710,7 @@ impl Agent {
                 Role::Tool => {
                     let mut payload = json!({
                         "call_id": message.tool_call_id,
-                        "success": true,
+                        "success": self.recorded_tool_outcome(message.tool_call_id.as_deref()),
                     });
                     if let Some(call_id) = message.tool_call_id.as_deref() {
                         if let Some(name) = tool_names.get(call_id) {
@@ -858,6 +860,19 @@ impl Agent {
             payload,
             images,
         }
+    }
+
+    pub(super) fn record_tool_outcome(&self, call_id: &str, success: bool) {
+        self.tool_outcomes
+            .lock()
+            .unwrap()
+            .insert(call_id.to_owned(), success);
+    }
+
+    fn recorded_tool_outcome(&self, call_id: Option<&str>) -> bool {
+        call_id
+            .and_then(|call_id| self.tool_outcomes.lock().unwrap().get(call_id).copied())
+            .unwrap_or(true)
     }
 
     fn persist_history_entry(&self, entry: WorkHistoryEntry) -> Result<WorkHistoryEntry> {
@@ -4939,6 +4954,39 @@ mod tests {
         let handoff = build_auto_handoff_for_window(&entries, "initial", 20_000).unwrap();
         assert!(handoff.contains("[Latest successful ask_user answer]"));
         assert!(handoff.contains("production"));
+    }
+
+    #[tokio::test]
+    async fn in_memory_failed_ask_user_is_not_selected_as_successful_answer() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "ask-user-failure-recovery".into(),
+            PathBuf::from("/tmp"),
+        );
+        let response = tool_response(vec![function_tool_call(
+            "failed-ask-call",
+            "ask_user",
+            r#"{"question":"Which environment?"}"#,
+        )]);
+        let execution = agent.execute_tools(&response, None).await.unwrap();
+        *agent.messages.lock().await = vec![ChatMessage::user("continue the task")];
+        agent.messages.lock().await.extend([
+            response.message,
+            execution.messages.into_iter().next().unwrap(),
+        ]);
+
+        let entries = agent.recovery_history_entries().await.unwrap();
+        let answer = entries
+            .iter()
+            .find(|entry| entry.kind == WorkHistoryKind::ToolResult)
+            .expect("in-memory failed ask_user result");
+        assert_eq!(answer.payload["name"], "ask_user");
+        assert_eq!(answer.payload["success"], false);
+        let handoff = build_auto_handoff_for_window(&entries, "initial", 20_000).unwrap();
+        assert!(!handoff.contains("[Latest successful ask_user answer]"));
     }
 
     #[tokio::test]

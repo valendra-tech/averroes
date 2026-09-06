@@ -206,6 +206,7 @@ impl Agent {
                     images: Vec::new(),
                 });
             }
+            self.record_tool_outcome(&tool_call.id, false);
             return ToolCallExecution {
                 message: ChatMessage {
                     role: Role::Tool,
@@ -247,6 +248,7 @@ impl Agent {
                         images: Vec::new(),
                     });
                 }
+                self.record_tool_outcome(&tool_call.id, false);
                 return ToolCallExecution {
                     message: ChatMessage {
                         role: Role::Tool,
@@ -286,6 +288,7 @@ impl Agent {
             Ok(result) => result,
             Err(error) => ToolResult::error(error.to_string()),
         };
+        self.record_tool_outcome(&tool_call.id, result.success);
 
         let context_action = if result.success && tool_call.function.name == "new_context" {
             result.metadata.as_ref().and_then(|metadata| {

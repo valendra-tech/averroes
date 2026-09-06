@@ -116,7 +116,7 @@ pub struct ContextController {
     generation: RwLock<u64>,
     usage: RwLock<Option<ContextUsage>>,
     pending: Mutex<Option<ContextRequest>>,
-    reminder_fingerprint: RwLock<Option<String>>,
+    reminder_fingerprints: RwLock<std::collections::HashSet<String>>,
     request_overhead: RwLock<RequestOverhead>,
 }
 
@@ -128,7 +128,7 @@ impl ContextController {
             generation: RwLock::new(0),
             usage: RwLock::new(None),
             pending: Mutex::new(None),
-            reminder_fingerprint: RwLock::new(None),
+            reminder_fingerprints: RwLock::new(std::collections::HashSet::new()),
             request_overhead: RwLock::new(RequestOverhead::default()),
         }
     }
@@ -186,7 +186,7 @@ impl ContextController {
         *self.budget.write() = budget;
         self.clear_usage();
         *self.pending.lock() = None;
-        *self.reminder_fingerprint.write() = None;
+        self.reminder_fingerprints.write().clear();
         *self.request_overhead.write() = RequestOverhead::default();
     }
 
@@ -342,11 +342,15 @@ impl ContextController {
     }
 
     pub fn mark_reminder(&self, fingerprint: impl Into<String>) {
-        *self.reminder_fingerprint.write() = Some(fingerprint.into());
+        self.reminder_fingerprints
+            .write()
+            .insert(fingerprint.into());
     }
 
     pub fn reminder_matches(&self, fingerprint: impl AsRef<str>) -> bool {
-        self.reminder_fingerprint.read().as_deref() == Some(fingerprint.as_ref())
+        self.reminder_fingerprints
+            .read()
+            .contains(fingerprint.as_ref())
     }
 
     /// Atomically claims the one automatic reminder allowed for this window
@@ -362,11 +366,11 @@ impl ContextController {
         }
 
         let fingerprint = self.reminder_fingerprint(model);
-        let mut claimed = self.reminder_fingerprint.write();
-        if claimed.as_deref() == Some(fingerprint.as_str()) {
+        let mut claimed = self.reminder_fingerprints.write();
+        if claimed.contains(&fingerprint) {
             return None;
         }
-        *claimed = Some(fingerprint.clone());
+        claimed.insert(fingerprint.clone());
         Some(ReminderClaim {
             fingerprint,
             remaining_tokens: budget.rollover_at.saturating_sub(input_tokens),
@@ -375,10 +379,9 @@ impl ContextController {
     }
 
     pub fn clear_reminder(&self, fingerprint: impl AsRef<str>) {
-        let mut claimed = self.reminder_fingerprint.write();
-        if claimed.as_deref() == Some(fingerprint.as_ref()) {
-            *claimed = None;
-        }
+        self.reminder_fingerprints
+            .write()
+            .remove(fingerprint.as_ref());
     }
 
     /// Starts a new provider context and clears state that belongs only to the
@@ -389,7 +392,7 @@ impl ContextController {
         let previous = std::mem::replace(&mut *self.window_id.write(), window_id.into());
         *self.usage.write() = None;
         *self.pending.lock() = None;
-        *self.reminder_fingerprint.write() = None;
+        self.reminder_fingerprints.write().clear();
         *self.request_overhead.write() = RequestOverhead::default();
         previous
     }
@@ -884,8 +887,10 @@ mod tests {
         let first = controller.claim_automatic_reminder("model-a").unwrap();
         assert!(controller.claim_automatic_reminder("model-a").is_none());
         let second = controller.claim_automatic_reminder("model-b");
+        let third = controller.claim_automatic_reminder("model-a");
 
         assert!(second.is_some());
+        assert!(third.is_none());
         assert_ne!(first.fingerprint, second.unwrap().fingerprint);
         assert!(first.fingerprint.contains("model-a"));
     }
