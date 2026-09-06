@@ -46,10 +46,15 @@ impl Tool for GetContextRemainingTool {
         let budget = ctx.context_controller.budget();
         let usage = ctx.context_controller.usage();
         let Some(input_tokens) = usage.and_then(|usage| usage.input_tokens) else {
-            return Ok(ToolResult::ok(format!(
+            let mut content = format!(
                 "Context usage is not known yet because the provider has not reported token usage.\nHard limit: {} tokens total; remaining capacity is unknown.",
                 format_tokens(budget.context_window),
-            )));
+            );
+            if let Some(status) = automatic_status_line(budget, None) {
+                content.push('\n');
+                content.push_str(&status);
+            }
+            return Ok(ToolResult::ok(content));
         };
 
         let hard_remaining = budget.context_window.saturating_sub(input_tokens);
@@ -60,18 +65,9 @@ impl Tool for GetContextRemainingTool {
             format_tokens(budget.context_window),
         );
 
-        if budget.automatic_enabled() {
-            let rollover_remaining = budget.rollover_at.saturating_sub(input_tokens);
-            content.push_str(&format!(
-                "\nAutomatic rollover: {} tokens remaining, at {} input tokens.",
-                format_tokens(rollover_remaining),
-                format_tokens(budget.rollover_at),
-            ));
-        } else {
-            content.push_str(&format!(
-                "\nAutomatic behavior is off; automatic rollover is disabled because {}.",
-                automatic_off_reason(budget),
-            ));
+        if let Some(status) = automatic_status_line(budget, Some(input_tokens)) {
+            content.push('\n');
+            content.push_str(&status);
         }
 
         Ok(ToolResult::ok(content).with_metadata(json!({
@@ -87,6 +83,26 @@ impl Tool for GetContextRemainingTool {
 
     fn is_read_only(&self) -> bool {
         true
+    }
+}
+
+fn automatic_status_line(
+    budget: crate::agent::ContextBudget,
+    input_tokens: Option<u64>,
+) -> Option<String> {
+    if budget.automatic_enabled() {
+        let input_tokens = input_tokens?;
+        let rollover_remaining = budget.rollover_at.saturating_sub(input_tokens);
+        Some(format!(
+            "Automatic rollover: {} tokens remaining, at {} input tokens.",
+            format_tokens(rollover_remaining),
+            format_tokens(budget.rollover_at),
+        ))
+    } else {
+        Some(format!(
+            "Automatic behavior is off; automatic rollover is disabled because {}.",
+            automatic_off_reason(budget),
+        ))
     }
 }
 
@@ -286,6 +302,38 @@ mod tests {
             .unwrap();
 
         assert!(result.content.contains("usage is not known"));
+    }
+
+    #[tokio::test]
+    async fn context_remaining_reports_unknown_usage_and_disabled_reason() {
+        let controller = Arc::new(ContextController::new(ContextBudget::new(
+            100_000, 16_384, false,
+        )));
+        let result = GetContextRemainingTool
+            .execute(&test_context(controller), &json!({}))
+            .await
+            .unwrap();
+
+        assert!(result.content.contains("usage is not known"));
+        assert!(result.content.contains("Automatic behavior is off"));
+        assert!(result.content.contains("the context budget is disabled"));
+    }
+
+    #[tokio::test]
+    async fn context_remaining_reports_unknown_usage_and_unsupported_reason() {
+        let controller = Arc::new(ContextController::new(ContextBudget::new(
+            32_000, 24_000, true,
+        )));
+        let result = GetContextRemainingTool
+            .execute(&test_context(controller), &json!({}))
+            .await
+            .unwrap();
+
+        assert!(result.content.contains("usage is not known"));
+        assert!(result.content.contains("Automatic behavior is off"));
+        assert!(result
+            .content
+            .contains("the context budget is unsupported for this window size"));
     }
 
     #[tokio::test]
