@@ -1235,11 +1235,15 @@ fn is_context_error(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::SessionBinding;
     use crate::provider::types::{FunctionCall, Role as ProviderRole, TokenUsage, ToolCall};
     use crate::provider::{ProviderError, StreamEvent};
+    use crate::storage::work::{now, WorkConversation, WorkDatabase, WorkHistoryKind};
     use crate::tool::{Tool, ToolContext, ToolResult};
     use async_trait::async_trait;
     use futures::{Stream, StreamExt};
+    use serde_json::json;
+    use std::collections::HashMap;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1374,9 +1378,30 @@ mod tests {
 
         async fn chat_stream(
             &self,
-            _r: ChatRequest,
+            request: ChatRequest,
         ) -> crate::provider::Result<crate::provider::ChatStream> {
-            unimplemented!()
+            let response = self.chat(request).await?;
+            let mut events = Vec::new();
+            let text = message_text(&response.message);
+            if !text.is_empty() {
+                events.push(Ok(StreamEvent::TextDelta { text }));
+            }
+            if let Some(tool_calls) = response.message.tool_calls.as_ref() {
+                for tool_call in tool_calls {
+                    events.push(Ok(StreamEvent::ToolCallDelta {
+                        id: tool_call.id.clone(),
+                        name: tool_call.function.name.clone(),
+                        arguments_delta: tool_call.function.arguments.clone(),
+                    }));
+                    events.push(Ok(StreamEvent::ToolCallEnd {
+                        id: tool_call.id.clone(),
+                    }));
+                }
+            }
+            events.push(Ok(StreamEvent::MessageEnd {
+                usage: response.usage,
+            }));
+            Ok(Box::new(futures::stream::iter(events)))
         }
 
         fn context_window(&self, _m: &str) -> usize {
@@ -1775,6 +1800,37 @@ mod tests {
         Arc::new(registry)
     }
 
+    struct ImageTool;
+
+    #[async_trait]
+    impl Tool for ImageTool {
+        fn name(&self) -> &str {
+            "image_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Returns a provider image"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: &serde_json::Value,
+        ) -> crate::tool::Result<ToolResult> {
+            Ok(ToolResult::ok("image result").with_image("image/png", "base64-image-data"))
+        }
+    }
+
+    fn image_tool_registry() -> Arc<ToolRegistry> {
+        let registry = ToolRegistry::new();
+        registry.register(ImageTool);
+        Arc::new(registry)
+    }
+
     struct OverwritePendingContextTool;
 
     #[async_trait]
@@ -1887,7 +1943,7 @@ mod tests {
         }
     }
 
-    fn assistant_response(content: &str) -> ChatResponse {
+    fn assistant_response(content: &str, input_tokens: u64) -> ChatResponse {
         ChatResponse {
             message: ChatMessage {
                 role: ProviderRole::Assistant,
@@ -1895,10 +1951,46 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
             },
-            usage: None,
+            usage: Some(TokenUsage {
+                input_tokens,
+                output_tokens: 0,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+                reasoning_output_tokens: None,
+            }),
             reasoning: None,
             stop_reason: None,
         }
+    }
+
+    fn history_conversation(id: &str) -> WorkConversation {
+        WorkConversation {
+            id: id.into(),
+            title: id.into(),
+            project_id: None,
+            pinned: false,
+            unread: false,
+            created_at: now(),
+            updated_at: now(),
+            binding: SessionBinding::default(),
+            context_summary: None,
+            context_usage: ContextUsage::default(),
+            messages: Vec::new(),
+            checkpoints: Vec::new(),
+            tasks: Vec::new(),
+            sources: Vec::new(),
+            agent_threads: Vec::new(),
+            agent_thread_transcripts: HashMap::new(),
+            active_context: Vec::new(),
+            active_window_id: "initial".into(),
+            history_entries: Vec::new(),
+        }
+    }
+
+    fn history_registry(database: Arc<WorkDatabase>) -> Arc<ToolRegistry> {
+        let registry = ToolRegistry::new();
+        crate::tool::builtin::register_work_tools(&registry, database);
+        Arc::new(registry)
     }
 
     fn function_tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
@@ -3229,7 +3321,7 @@ mod tests {
                 ),
                 function_tool_call("overwrite", "overwrite_pending", "{}"),
             ]),
-            assistant_response("continued"),
+            assistant_response("continued", 10),
         ]));
         let agent = Agent::new(
             AgentConfig {
@@ -3266,7 +3358,7 @@ mod tests {
                 ),
                 function_tool_call("failure", "failing_context_sibling", "{}"),
             ]),
-            assistant_response("continued"),
+            assistant_response("continued", 10),
         ]));
         let agent = Agent::new(
             AgentConfig {
@@ -3291,7 +3383,7 @@ mod tests {
                 function_tool_call("first-context", "new_context", r#"{"handoff":"first"}"#),
                 function_tool_call("second-context", "new_context", r#"{"handoff":"second"}"#),
             ]),
-            assistant_response("continued"),
+            assistant_response("continued", 10),
         ]));
         let agent = Agent::new(
             AgentConfig {
