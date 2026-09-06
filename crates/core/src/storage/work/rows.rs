@@ -169,12 +169,46 @@ pub(super) fn load_recovery_history_entries(
     thread_id: Option<&str>,
 ) -> Result<Vec<WorkHistoryEntry>, WorkDatabaseError> {
     let mut statement = connection.prepare(
-        "SELECT entry_id, parent_id, thread_id, window_id, sequence, timestamp,
+        "WITH current_window AS (
+             SELECT entry_id, parent_id, thread_id, window_id, sequence, timestamp,
+                    kind, text, payload_json, images_json
+             FROM conversation_history
+             WHERE conversation_id = ?1
+               AND window_id = ?2
+               AND ((?3 IS NULL AND thread_id IS NULL) OR thread_id = ?3)
+         ),
+         latest_user AS (
+             SELECT entry_id, parent_id, thread_id, window_id, sequence, timestamp,
+                    kind, text, payload_json, images_json
+             FROM conversation_history
+             WHERE conversation_id = ?1
+               AND kind = 'user'
+               AND ((?3 IS NULL AND thread_id IS NULL) OR thread_id = ?3)
+             ORDER BY sequence DESC, entry_id DESC
+             LIMIT 1
+         ),
+         latest_checkpoint AS (
+             SELECT entry_id, parent_id, thread_id, window_id, sequence, timestamp,
+                    kind, text, payload_json, images_json
+             FROM conversation_history
+             WHERE conversation_id = ?1
+               AND kind = 'context_window'
+               AND ((?3 IS NULL AND thread_id IS NULL) OR thread_id = ?3)
+               AND json_extract(payload_json, '$.handoff') IS NOT NULL
+               AND trim(CAST(json_extract(payload_json, '$.handoff') AS TEXT)) <> ''
+             ORDER BY sequence DESC, entry_id DESC
+             LIMIT 1
+         ),
+         recovery AS (
+             SELECT * FROM current_window
+             UNION
+             SELECT * FROM latest_user
+             UNION
+             SELECT * FROM latest_checkpoint
+         )
+         SELECT entry_id, parent_id, thread_id, window_id, sequence, timestamp,
                 kind, text, payload_json, images_json
-         FROM conversation_history
-         WHERE conversation_id = ?1
-           AND window_id = ?2
-           AND ((?3 IS NULL AND thread_id IS NULL) OR thread_id = ?3)
+         FROM recovery
          ORDER BY sequence, entry_id",
     )?;
     let rows = statement.query_map(

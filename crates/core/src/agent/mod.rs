@@ -22,7 +22,7 @@ use crate::tool::{ToolActivation, ToolApprovalPolicy, ToolRegistry};
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -253,7 +253,7 @@ pub struct Agent {
     history_conversation_id: Option<String>,
     history_sequence: AtomicI64,
     emitted_history_ids: Mutex<HashSet<String>>,
-    tool_outcomes: Mutex<HashMap<String, ToolOutcome>>,
+    tool_outcomes: Mutex<VecDeque<ToolOutcome>>,
 }
 
 #[derive(Clone)]
@@ -266,6 +266,7 @@ struct AgentRuntime {
 
 #[derive(Debug, Clone)]
 struct ToolOutcome {
+    call_id: String,
     window_id: String,
     success: bool,
 }
@@ -365,7 +366,7 @@ impl Agent {
             history_conversation_id,
             history_sequence: AtomicI64::new(0),
             emitted_history_ids: Mutex::new(HashSet::new()),
-            tool_outcomes: Mutex::new(HashMap::new()),
+            tool_outcomes: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -704,6 +705,51 @@ impl Agent {
             .flatten()
             .map(|tool_call| (tool_call.id.clone(), tool_call.function.name.clone()))
             .collect::<std::collections::HashMap<_, _>>();
+        let current_window_id = self.context_controller.window_id();
+        let recorded_outcomes = self
+            .tool_outcomes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|outcome| outcome.window_id == current_window_id)
+            .fold(
+                HashMap::<String, Vec<bool>>::new(),
+                |mut outcomes, outcome| {
+                    outcomes
+                        .entry(outcome.call_id.clone())
+                        .or_default()
+                        .push(outcome.success);
+                    outcomes
+                },
+            );
+        let tool_message_counts = messages
+            .iter()
+            .filter_map(|message| {
+                (message.role == Role::Tool)
+                    .then_some(message.tool_call_id.as_deref())
+                    .flatten()
+            })
+            .fold(HashMap::<String, usize>::new(), |mut counts, call_id| {
+                *counts.entry(call_id.to_owned()).or_default() += 1;
+                counts
+            });
+        let outcome_by_occurrence = tool_message_counts
+            .into_iter()
+            .map(|(call_id, message_count)| {
+                let recorded = recorded_outcomes.get(&call_id).cloned().unwrap_or_default();
+                let outcomes = if recorded.len() == message_count {
+                    recorded
+                } else if recorded.len() < message_count {
+                    let mut outcomes = vec![false; message_count - recorded.len()];
+                    outcomes.extend(recorded);
+                    outcomes
+                } else {
+                    vec![false; message_count]
+                };
+                (call_id, outcomes)
+            })
+            .collect::<HashMap<_, _>>();
+        let mut tool_occurrences = HashMap::<String, usize>::new();
         let mut entries = Vec::new();
         for message in &messages {
             match message.role {
@@ -717,9 +763,24 @@ impl Agent {
                     entries.extend(self.history_entries_for_provider_message(message))
                 }
                 Role::Tool => {
+                    let success = message
+                        .tool_call_id
+                        .as_deref()
+                        .and_then(|call_id| {
+                            let occurrence =
+                                tool_occurrences.entry(call_id.to_owned()).or_default();
+                            let success = outcome_by_occurrence
+                                .get(call_id)
+                                .and_then(|outcomes| outcomes.get(*occurrence))
+                                .copied()
+                                .unwrap_or(false);
+                            *occurrence += 1;
+                            Some(success)
+                        })
+                        .unwrap_or(false);
                     let mut payload = json!({
                         "call_id": message.tool_call_id,
-                        "success": self.recorded_tool_outcome(message.tool_call_id.as_deref()),
+                        "success": success,
                     });
                     if let Some(call_id) = message.tool_call_id.as_deref() {
                         if let Some(name) = tool_names.get(call_id) {
@@ -874,26 +935,14 @@ impl Agent {
     pub(super) fn record_tool_outcome(&self, call_id: &str, success: bool) {
         let window_id = self.context_controller.window_id();
         let mut outcomes = self.tool_outcomes.lock().unwrap();
-        if !outcomes.contains_key(call_id) && outcomes.len() >= MAX_TOOL_OUTCOMES {
-            if let Some(oldest_call_id) = outcomes.keys().next().cloned() {
-                outcomes.remove(&oldest_call_id);
-            }
+        if outcomes.len() >= MAX_TOOL_OUTCOMES {
+            outcomes.pop_front();
         }
-        outcomes.insert(call_id.to_owned(), ToolOutcome { window_id, success });
-    }
-
-    fn recorded_tool_outcome(&self, call_id: Option<&str>) -> bool {
-        let window_id = self.context_controller.window_id();
-        call_id
-            .and_then(|call_id| {
-                self.tool_outcomes
-                    .lock()
-                    .unwrap()
-                    .get(call_id)
-                    .filter(|outcome| outcome.window_id == window_id)
-                    .map(|outcome| outcome.success)
-            })
-            .unwrap_or(true)
+        outcomes.push_back(ToolOutcome {
+            call_id: call_id.to_owned(),
+            window_id,
+            success,
+        });
     }
 
     fn clear_tool_outcomes(&self) {
@@ -4951,14 +5000,14 @@ mod tests {
         let entries = agent.recovery_history_entries().await.unwrap();
         let handoff = build_auto_handoff_for_window(&entries, "shared-window", 20_000).unwrap();
 
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2);
         assert!(handoff.contains("root objective"));
         assert!(!handoff.contains("delegated sibling objective"));
-        assert!(!handoff.contains("old window objective"));
+        assert!(handoff.contains("old window objective"));
     }
 
     #[test]
-    fn tool_outcomes_are_bounded_and_scoped_to_the_active_window() {
+    fn tool_outcomes_are_bounded_and_cleared_when_the_window_changes() {
         let agent = Agent::new(
             test_agent_config(),
             Arc::new(TestProvider::new(vec![])),
@@ -4969,14 +5018,106 @@ mod tests {
         );
 
         agent.record_tool_outcome("reused-call", false);
-        assert!(!agent.recorded_tool_outcome(Some("reused-call")));
         agent.set_active_window_id("next-window");
-        assert!(agent.recorded_tool_outcome(Some("reused-call")));
+        assert!(agent.tool_outcomes.lock().unwrap().is_empty());
 
         for index in 0..300 {
             agent.record_tool_outcome(&format!("call-{index}"), index % 2 == 0);
         }
         assert!(agent.tool_outcomes.lock().unwrap().len() <= 256);
+    }
+
+    #[tokio::test]
+    async fn in_memory_recovery_keeps_repeated_call_id_outcomes_in_occurrence_order() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "repeated-call-outcomes".into(),
+            PathBuf::from("/tmp"),
+        );
+        agent.record_tool_outcome("duplicate-call", false);
+        agent.record_tool_outcome("duplicate-call", true);
+        *agent.messages.lock().await = vec![
+            ChatMessage::user("continue the task"),
+            ChatMessage {
+                role: ProviderRole::Assistant,
+                content: MessageContent::Text(String::new()),
+                tool_call_id: None,
+                tool_calls: Some(vec![
+                    function_tool_call("duplicate-call", "ask_user", "{}"),
+                    function_tool_call("duplicate-call", "ask_user", "{}"),
+                ]),
+            },
+            ChatMessage {
+                role: ProviderRole::Tool,
+                content: MessageContent::Text("first result".into()),
+                tool_call_id: Some("duplicate-call".into()),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ProviderRole::Tool,
+                content: MessageContent::Text("second result".into()),
+                tool_call_id: Some("duplicate-call".into()),
+                tool_calls: None,
+            },
+        ];
+
+        let entries = agent.recovery_history_entries().await.unwrap();
+        let results = entries
+            .iter()
+            .filter(|entry| entry.kind == WorkHistoryKind::ToolResult)
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].payload["success"], false);
+        assert_eq!(results[1].payload["success"], true);
+    }
+
+    #[tokio::test]
+    async fn in_memory_recovery_treats_evicted_outcomes_as_unknown_failure() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "evicted-tool-outcome".into(),
+            PathBuf::from("/tmp"),
+        );
+        agent.record_tool_outcome("ask-call", false);
+        for _ in 0..MAX_TOOL_OUTCOMES {
+            agent.record_tool_outcome("ask-call", true);
+        }
+        assert!(agent.tool_outcomes.lock().unwrap().len() <= MAX_TOOL_OUTCOMES);
+        *agent.messages.lock().await = vec![
+            ChatMessage::user("continue the task"),
+            ChatMessage {
+                role: ProviderRole::Assistant,
+                content: MessageContent::Text(String::new()),
+                tool_call_id: None,
+                tool_calls: Some(vec![function_tool_call(
+                    "ask-call",
+                    "ask_user",
+                    r#"{"question":"Which environment?"}"#,
+                )]),
+            },
+            ChatMessage {
+                role: ProviderRole::Tool,
+                content: MessageContent::Text("stale answer".into()),
+                tool_call_id: Some("ask-call".into()),
+                tool_calls: None,
+            },
+        ];
+
+        let entries = agent.recovery_history_entries().await.unwrap();
+        let answer = entries
+            .iter()
+            .find(|entry| entry.kind == WorkHistoryKind::ToolResult)
+            .expect("in-memory ask_user result");
+        assert_eq!(answer.payload["name"], "ask_user");
+        assert_eq!(answer.payload["success"], false);
+        let handoff = build_auto_handoff_for_window(&entries, "initial", 20_000).unwrap();
+        assert!(!handoff.contains("[Latest successful ask_user answer]"));
     }
 
     #[tokio::test]
@@ -5008,6 +5149,7 @@ mod tests {
                 tool_calls: None,
             },
         ];
+        agent.record_tool_outcome("ask-call", true);
 
         let entries = agent.recovery_history_entries().await.unwrap();
         let answer = entries
@@ -5052,6 +5194,78 @@ mod tests {
         assert_eq!(answer.payload["success"], false);
         let handoff = build_auto_handoff_for_window(&entries, "initial", 20_000).unwrap();
         assert!(!handoff.contains("[Latest successful ask_user answer]"));
+    }
+
+    #[tokio::test]
+    async fn recovery_after_rollover_includes_prior_owner_and_checkpoint_for_the_active_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("history.db")).unwrap();
+        database
+            .save_conversation(&history_conversation("recovery-anchors"))
+            .unwrap();
+        database
+            .append_history_entries(
+                "recovery-anchors",
+                &[
+                    WorkHistoryEntry {
+                        entry_id: "owner-before-rollover".into(),
+                        parent_id: None,
+                        thread_id: None,
+                        window_id: "old-window".into(),
+                        sequence: 1,
+                        timestamp: 1,
+                        kind: WorkHistoryKind::User,
+                        text: "owner objective before rollover".into(),
+                        payload: json!({}),
+                        images: Vec::new(),
+                    },
+                    WorkHistoryEntry {
+                        entry_id: "checkpoint-before-rollover".into(),
+                        parent_id: None,
+                        thread_id: None,
+                        window_id: "old-window".into(),
+                        sequence: 2,
+                        timestamp: 2,
+                        kind: WorkHistoryKind::ContextWindow,
+                        text: "saved checkpoint".into(),
+                        payload: json!({"handoff": "resume the owner objective"}),
+                        images: Vec::new(),
+                    },
+                    WorkHistoryEntry {
+                        entry_id: "sibling-owner".into(),
+                        parent_id: None,
+                        thread_id: Some("agent:sibling:".into()),
+                        window_id: "old-window".into(),
+                        sequence: 3,
+                        timestamp: 3,
+                        kind: WorkHistoryKind::User,
+                        text: "sibling objective must stay out".into(),
+                        payload: json!({}),
+                        images: Vec::new(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let agent = Agent::new(
+            AgentConfig {
+                work_conversation_id: Some("recovery-anchors".into()),
+                ..test_agent_config()
+            },
+            Arc::new(TestProvider::new(vec![])),
+            history_registry(database),
+            test_governor(),
+            "recovery-anchors".into(),
+            PathBuf::from("/tmp"),
+        );
+        agent.set_active_window_id("new-window");
+
+        let entries = agent.recovery_history_entries().await.unwrap();
+        let handoff = build_auto_handoff_for_window(&entries, "new-window", 20_000).unwrap();
+
+        assert!(handoff.contains("owner objective before rollover"));
+        assert!(handoff.contains("resume the owner objective"));
+        assert!(!handoff.contains("sibling objective must stay out"));
     }
 
     #[tokio::test]
