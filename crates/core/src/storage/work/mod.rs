@@ -1013,6 +1013,43 @@ impl WorkDatabase {
         )
     }
 
+    pub fn history_entries_for_workspace(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Vec<(String, WorkHistoryEntry)>, WorkDatabaseError> {
+        rows::list_history_workspace(&self.connection.lock(), workspace_root)
+    }
+
+    pub fn search_history_workspace(
+        &self,
+        workspace_root: &str,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(String, WorkHistoryEntry)>, WorkDatabaseError> {
+        rows::search_history_workspace(
+            &self.connection.lock(),
+            workspace_root,
+            query,
+            limit,
+            offset,
+        )
+    }
+
+    pub fn history_entry_in_scope(
+        &self,
+        conversation_id: &str,
+        workspace_root: &str,
+        entry_id: &str,
+    ) -> Result<Option<(String, WorkHistoryEntry)>, WorkDatabaseError> {
+        rows::load_history_entry_in_scope(
+            &self.connection.lock(),
+            conversation_id,
+            workspace_root,
+            entry_id,
+        )
+    }
+
     pub fn history_entry(
         &self,
         conversation_id: &str,

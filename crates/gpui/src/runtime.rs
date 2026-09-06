@@ -1075,6 +1075,7 @@ impl AppRuntime {
         ));
         builtin::register_all(&tools);
         let database = WorkDatabase::open(&paths)?;
+        builtin::register_work_tools(&tools, database.clone());
         let launchd =
             LaunchdManager::discover().map_err(|error| RuntimeError::Runtime(error.to_string()))?;
         let scheduled_tasks = Arc::new(ScheduledTaskService::new(database.clone(), launchd));

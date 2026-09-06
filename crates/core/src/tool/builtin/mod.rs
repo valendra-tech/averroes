@@ -14,6 +14,7 @@ pub mod file_write;
 pub mod glob;
 pub mod global_memory;
 pub mod grep;
+pub mod history;
 pub mod install_skill;
 pub mod list_agents;
 pub mod list_skills;
@@ -66,6 +67,10 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(web_search_intrernal::WebSearchTool);
     registry.register(list_agents::ListAgentsTool);
     registry.register(call_agents::CallAgentsTool);
+}
+
+pub fn register_work_tools(registry: &ToolRegistry, database: Arc<crate::work::WorkDatabase>) {
+    registry.register(history::HistoryTool::new(database));
 }
 
 pub fn register_scheduled_task_tools(

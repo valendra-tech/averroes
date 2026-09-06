@@ -14,18 +14,31 @@ fn json_column<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> ru
 }
 
 fn history_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkHistoryEntry> {
+    history_entry_from_row_at(row, 0)
+}
+
+fn history_entry_from_row_at(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<WorkHistoryEntry> {
     Ok(WorkHistoryEntry {
-        entry_id: row.get(0)?,
-        parent_id: row.get(1)?,
-        thread_id: row.get(2)?,
-        window_id: row.get(3)?,
-        sequence: row.get(4)?,
-        timestamp: row.get(5)?,
-        kind: WorkHistoryKind::parse(&row.get::<_, String>(6)?),
-        text: row.get(7)?,
-        payload: json_column(row, 8)?,
-        images: json_column(row, 9)?,
+        entry_id: row.get(offset)?,
+        parent_id: row.get(offset + 1)?,
+        thread_id: row.get(offset + 2)?,
+        window_id: row.get(offset + 3)?,
+        sequence: row.get(offset + 4)?,
+        timestamp: row.get(offset + 5)?,
+        kind: WorkHistoryKind::parse(&row.get::<_, String>(offset + 6)?),
+        text: row.get(offset + 7)?,
+        payload: json_column(row, offset + 8)?,
+        images: json_column(row, offset + 9)?,
     })
+}
+
+fn history_entry_with_conversation_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(String, WorkHistoryEntry)> {
+    Ok((row.get(0)?, history_entry_from_row_at(row, 1)?))
 }
 
 pub(super) fn append_history_entries(
@@ -165,6 +178,80 @@ pub(super) fn search_history(
         history_entry_from_row,
     )?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub(super) fn list_history_workspace(
+    connection: &Connection,
+    workspace_root: &str,
+) -> Result<Vec<(String, WorkHistoryEntry)>, WorkDatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT h.conversation_id, h.entry_id, h.parent_id, h.thread_id, h.window_id,
+                h.sequence, h.timestamp, h.kind, h.text, h.payload_json, h.images_json
+         FROM conversation_history h
+         JOIN conversations c ON c.id = h.conversation_id
+         JOIN projects p ON p.id = c.project_id
+         WHERE p.root = ?1
+         ORDER BY h.sequence, h.entry_id, h.conversation_id",
+    )?;
+    let rows = statement.query_map(
+        params![workspace_root],
+        history_entry_with_conversation_from_row,
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub(super) fn search_history_workspace(
+    connection: &Connection,
+    workspace_root: &str,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<(String, WorkHistoryEntry)>, WorkDatabaseError> {
+    if query.trim().is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let pattern = format!("%{}%", escape_like_pattern(query.trim()));
+    let mut statement = connection.prepare(
+        "SELECT h.conversation_id, h.entry_id, h.parent_id, h.thread_id, h.window_id,
+                h.sequence, h.timestamp, h.kind, h.text, h.payload_json, h.images_json
+         FROM conversation_history h
+         JOIN conversations c ON c.id = h.conversation_id
+         JOIN projects p ON p.id = c.project_id
+         WHERE p.root = ?1
+           AND h.text LIKE ?2 COLLATE NOCASE ESCAPE '\\'
+         ORDER BY h.sequence, h.entry_id, h.conversation_id
+         LIMIT ?3 OFFSET ?4",
+    )?;
+    let rows = statement.query_map(
+        params![workspace_root, pattern, limit as i64, offset as i64],
+        history_entry_with_conversation_from_row,
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub(super) fn load_history_entry_in_scope(
+    connection: &Connection,
+    conversation_id: &str,
+    workspace_root: &str,
+    entry_id: &str,
+) -> Result<Option<(String, WorkHistoryEntry)>, WorkDatabaseError> {
+    connection
+        .query_row(
+            "SELECT h.conversation_id, h.entry_id, h.parent_id, h.thread_id, h.window_id,
+                    h.sequence, h.timestamp, h.kind, h.text, h.payload_json, h.images_json
+             FROM conversation_history h
+             LEFT JOIN conversations c ON c.id = h.conversation_id
+             LEFT JOIN projects p ON p.id = c.project_id
+             WHERE h.entry_id = ?3
+               AND (h.conversation_id = ?1 OR p.root = ?2)
+             ORDER BY CASE WHEN h.conversation_id = ?1 THEN 0 ELSE 1 END,
+                      h.sequence, h.conversation_id
+             LIMIT 1",
+            params![conversation_id, workspace_root, entry_id],
+            history_entry_with_conversation_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn escape_like_pattern(value: &str) -> String {
