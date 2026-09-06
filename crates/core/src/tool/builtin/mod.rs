@@ -52,6 +52,7 @@ pub(crate) fn resolve_file_path(current_dir: &Path, requested: &str) -> PathBuf 
 pub fn register_all(registry: &ToolRegistry) {
     registry.register(bash::BashTool::default());
     registry.register(change_directory::ChangeDirectoryTool);
+    registry.register(context_window::GetContextRemainingTool);
     registry.register(context_window::NewContextTool);
     registry.register(file_read::FileReadTool);
     registry.register(file_write::FileWriteTool);

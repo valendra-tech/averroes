@@ -295,6 +295,11 @@ impl Agent {
         self.context_controller.clone()
     }
 
+    /// Returns the current context budget used by the shared controller.
+    pub fn context_budget(&self) -> ContextBudget {
+        self.context_controller.budget()
+    }
+
     pub async fn state(&self) -> AgentState {
         *self.state.lock().unwrap()
     }
