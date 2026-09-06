@@ -646,11 +646,11 @@ impl Agent {
                 }
             }
 
-            let runtime = self.runtime_snapshot();
+            let (generation, runtime) =
+                capture_generation_before(&self.context_controller, || self.runtime_snapshot());
             let messages = self.messages.lock().await.clone();
-            let (generation, request) = capture_generation_before(&self.context_controller, || {
-                self.build_request(messages, runtime.model.clone(), skill_context.clone())
-            });
+            let request =
+                self.build_request(messages, runtime.model.clone(), skill_context.clone());
 
             self.set_state(AgentState::Thinking);
 
@@ -750,14 +750,13 @@ impl Agent {
             }
         }
 
-        let runtime = self.runtime_snapshot();
-        let messages = self.messages.lock().await.clone();
         // The final synthesis does not need the per-turn skill catalogue. In
         // addition to saving context, omitting it avoids instructions that
         // may encourage another tool call when tools are deliberately off.
-        let (generation, mut request) = capture_generation_before(&self.context_controller, || {
-            self.build_request(messages, runtime.model.clone(), None)
-        });
+        let (generation, runtime) =
+            capture_generation_before(&self.context_controller, || self.runtime_snapshot());
+        let messages = self.messages.lock().await.clone();
+        let mut request = self.build_request(messages, runtime.model.clone(), None);
         request.tools.clear();
         insert_system_context(
             &mut request.messages,
@@ -1059,10 +1058,10 @@ impl Agent {
 
 fn capture_generation_before<T>(
     controller: &ContextController,
-    build_request: impl FnOnce() -> T,
+    operation: impl FnOnce() -> T,
 ) -> (u64, T) {
     let generation = controller.current_generation();
-    (generation, build_request())
+    (generation, operation())
 }
 
 /// Conservatively estimates request tokens from UTF-8 bytes. ASCII uses the
@@ -2060,7 +2059,7 @@ mod tests {
     }
 
     #[test]
-    fn context_generation_is_captured_before_request_building() {
+    fn context_generation_is_captured_before_runtime_and_request_building() {
         let controller = Arc::new(ContextController::for_test(100_000, 1_000));
         let previous_generation = controller.current_generation();
 
