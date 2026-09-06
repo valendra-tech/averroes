@@ -36,7 +36,7 @@ const MAX_AUTO_SKILL_CONTEXT_BYTES: usize = 32 * 1024;
 const MAX_SKILL_CATALOG_BYTES: usize = 8 * 1024;
 const PROVIDER_INITIAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_SILENT_PROVIDER_RETRIES: usize = 1;
-const APPROX_CHARS_PER_TOKEN: usize = 4;
+const ASCII_BYTES_PER_TOKEN: usize = 4;
 const ITERATION_LIMIT_FINAL_CONTEXT: &str = concat!(
     "[Tool execution budget reached]\n\n",
     "Tool use is disabled for this response. Use the results already available in the conversation ",
@@ -819,6 +819,10 @@ impl Agent {
     }
 
     async fn should_compact_with_runtime(&self, runtime: &AgentRuntime) -> bool {
+        // This is the legacy provider-usage compaction threshold. It is
+        // intentionally separate from ContextBudget's automatic rollover
+        // budget; reminder and automatic rollover wiring belongs to the later
+        // rollover task and must not change existing compaction semantics.
         let context_limit = runtime.provider.context_window(&runtime.model);
         let message_count = self.messages.lock().await.len();
         let usage_pressure = self
@@ -1052,11 +1056,17 @@ impl Agent {
     }
 }
 
-/// Conservatively estimates request tokens from serialized character length.
-/// This deliberately avoids provider-specific wire serialization and leaves
-/// room for framing and tokenizer differences.
+/// Conservatively estimates request tokens from UTF-8 bytes. ASCII uses the
+/// existing four-bytes-per-token approximation; each non-ASCII UTF-8 byte is
+/// counted as one token, which covers byte-fallback tokenizers for CJK and
+/// emoji. This deliberately avoids provider-specific wire serialization and
+/// leaves room for framing and tokenizer differences.
 fn estimate_tokens(value: &str) -> usize {
-    value.len().saturating_add(APPROX_CHARS_PER_TOKEN - 1) / APPROX_CHARS_PER_TOKEN
+    let ascii_bytes = value.bytes().filter(|byte| byte.is_ascii()).count();
+    let non_ascii_bytes = value.len().saturating_sub(ascii_bytes);
+    let ascii_tokens =
+        ascii_bytes.saturating_add(ASCII_BYTES_PER_TOKEN - 1) / ASCII_BYTES_PER_TOKEN;
+    ascii_tokens.saturating_add(non_ascii_bytes)
 }
 
 fn estimate_content_tokens(content: &MessageContent) -> usize {
@@ -2022,12 +2032,19 @@ mod tests {
             "reconfigure-session".into(),
             PathBuf::from("/tmp"),
         );
+        let controller = agent.context_controller();
+        let previous_generation = controller.current_generation();
+        controller.record_usage(ContextUsage::from_usage(9, 1, 10));
 
         agent.reconfigure_provider(provider, "new-model".into(), new_governor.clone());
 
         let runtime = agent.runtime_snapshot();
         assert_eq!(runtime.model, "new-model");
         assert!(Arc::ptr_eq(&runtime.governor, &new_governor));
+        assert_eq!(controller.current_generation(), previous_generation + 1);
+        assert!(controller.usage().is_none());
+        assert!(!controller
+            .record_usage_for_generation(previous_generation, ContextUsage::from_usage(9, 1, 10),));
 
         assert_eq!(agent.run("hello").await.unwrap(), "reconfigured response");
         assert_eq!(new_governor.tokens_available(), 100);
@@ -2371,6 +2388,13 @@ mod tests {
         let exposed = observed.lock().unwrap().clone().unwrap();
         let controller = agent.context_controller();
         assert!(Arc::ptr_eq(&controller, &exposed));
+    }
+
+    #[test]
+    fn token_estimator_accounts_conservatively_for_unicode() {
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("界"), 3);
+        assert_eq!(estimate_tokens("🙂"), 4);
     }
 
     fn stream_request() -> ChatRequest {

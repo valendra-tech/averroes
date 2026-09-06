@@ -16,7 +16,9 @@ pub const REMINDER_BUFFER_TOKENS: usize = 32_000;
 /// Tokens kept free from the provider window for agent rollover safety.
 pub const CONTEXT_RESERVE_TOKENS: usize = 1_000;
 
-const APPROX_CHARS_PER_TOKEN: u64 = 4;
+/// Worst-case UTF-8 width used when converting a token budget to a character
+/// budget without seeing the page contents.
+const MAX_UTF8_BYTES_PER_CHAR: u64 = 4;
 const IMAGE_ALLOWANCE_TOKENS: u64 = 1_024;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -147,6 +149,8 @@ impl ContextController {
     }
 
     pub fn replace_budget(&self, budget: ContextBudget) {
+        let mut generation = self.generation.write();
+        *generation = generation.saturating_add(1);
         *self.budget.write() = budget;
         self.clear_usage();
         *self.pending.lock() = None;
@@ -248,7 +252,7 @@ impl ContextController {
             None => fresh_capacity / 2,
         };
         available_tokens
-            .saturating_mul(APPROX_CHARS_PER_TOKEN)
+            .saturating_div(MAX_UTF8_BYTES_PER_CHAR)
             .min(usize::MAX as u64) as usize
     }
 
@@ -273,8 +277,8 @@ impl ContextController {
     /// previous window. Returns the previous window id for lifecycle events.
     pub fn begin_window(&self, window_id: impl Into<String>) -> String {
         let mut generation = self.generation.write();
-        let previous = std::mem::replace(&mut *self.window_id.write(), window_id.into());
         *generation = generation.saturating_add(1);
+        let previous = std::mem::replace(&mut *self.window_id.write(), window_id.into());
         *self.usage.write() = None;
         *self.pending.lock() = None;
         *self.reminder_fingerprint.write() = None;
@@ -345,8 +349,34 @@ mod tests {
 
         assert_eq!(
             controller.safe_page_chars(0, 0, 0, 0, 0).unwrap(),
-            (20_000 - PAGE_MARGIN_TOKENS) * 4
+            (20_000 - PAGE_MARGIN_TOKENS) / 4
         );
+    }
+
+    #[test]
+    fn replacing_budget_fences_late_usage_from_the_previous_generation() {
+        let controller = ContextController::for_test(100_000, 16_384);
+        let previous_generation = controller.current_generation();
+        controller.record_usage(ContextUsage::from_usage(50_000, 1, 100_000));
+
+        controller.replace_budget(ContextBudget::new(200_000, 16_384, true));
+
+        assert_eq!(controller.current_generation(), previous_generation + 1);
+        assert!(controller.usage().is_none());
+        assert!(!controller.record_usage_for_generation(
+            previous_generation,
+            ContextUsage::from_usage(75_000, 1, 100_000),
+        ));
+        assert!(controller.usage().is_none());
+    }
+
+    #[test]
+    fn safe_page_chars_reserves_worst_case_utf8_bytes_per_character() {
+        let controller = ContextController::for_test(100_000, 16_384);
+        let page = controller.safe_page_chars(0, 0, 0, 0, 0).unwrap();
+        let available_tokens = (100_000 - 16_384 - PAGE_MARGIN_TOKENS) / 2;
+
+        assert_eq!(page, available_tokens / 4);
     }
 
     #[test]
@@ -368,7 +398,7 @@ mod tests {
         let fresh_handoff = controller.handoff_limit();
 
         let loaded_page = controller
-            .safe_page_chars(0, 25_000, 25_000, 25_000, 0)
+            .safe_page_chars(0, 10_000, 10_000, 10_000, 0)
             .unwrap();
         let loaded_handoff = controller.handoff_limit();
 
@@ -386,12 +416,18 @@ mod tests {
         assert!(controller.handoff_limit() < MAX_HANDOFF_CHARS);
 
         controller.replace_budget(ContextBudget::new(100_000, 16_384, true));
-        assert_eq!(controller.handoff_limit(), MAX_HANDOFF_CHARS);
+        assert_eq!(
+            controller.handoff_limit(),
+            ContextController::for_test(100_000, 16_384).handoff_limit()
+        );
         assert!(controller.pending_request().is_none());
 
         controller.set_request_overhead(25_000, 25_000, 25_000, 0);
         controller.begin_window("window-2");
-        assert_eq!(controller.handoff_limit(), MAX_HANDOFF_CHARS);
+        assert_eq!(
+            controller.handoff_limit(),
+            ContextController::for_test(100_000, 16_384).handoff_limit()
+        );
     }
 
     #[test]
