@@ -311,55 +311,64 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
     if !table_has_column(connection, "sources", "title")? {
         connection.execute("ALTER TABLE sources ADD COLUMN title TEXT", [])?;
     }
-    let mut notes_search_keys_added = false;
-    if !table_has_column(connection, "notes", "path_search")? {
-        connection.execute(
-            "ALTER TABLE notes ADD COLUMN path_search TEXT NOT NULL DEFAULT ''",
-            [],
-        )?;
-        notes_search_keys_added = true;
-    }
-    if !table_has_column(connection, "notes", "content_search")? {
-        connection.execute(
-            "ALTER TABLE notes ADD COLUMN content_search TEXT NOT NULL DEFAULT ''",
-            [],
-        )?;
-        notes_search_keys_added = true;
-    }
-    if notes_search_keys_added {
-        let mut statement =
-            connection.prepare("SELECT workspace_root, path, content FROM notes")?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        let notes = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
-        for (workspace_root, path, content) in notes {
-            connection.execute(
-                "UPDATE notes
-                 SET path_search = ?3, content_search = ?4
-                 WHERE workspace_root = ?1 AND path = ?2",
-                rusqlite::params![
-                    workspace_root,
-                    path,
-                    note_search_key(&path),
-                    note_search_key(&content),
-                ],
-            )?;
-        }
-    }
     connection.execute_batch(
         "DROP INDEX IF EXISTS conversation_history_sequence;
          DROP INDEX IF EXISTS conversation_embeddings_model;
          CREATE INDEX conversation_embeddings_model
              ON conversation_embeddings(connection_id, model_id, conversation_id);",
     )?;
-    connection.pragma_update(None, "user_version", 18)?;
+    migrate_note_search_keys(connection)?;
     Ok(())
+}
+
+/// Add and backfill Unicode search keys as one retryable migration unit.
+///
+/// SQLite rolls back transactional DDL, so a process dying after either
+/// ALTER TABLE cannot leave a half-migrated schema. Rows with incomplete keys
+/// are selected on every run, making recovery safe even for databases created
+/// by the earlier non-transactional migration.
+fn migrate_note_search_keys(connection: &Connection) -> rusqlite::Result<()> {
+    let path_search_exists = table_has_column(connection, "notes", "path_search")?;
+    let content_search_exists = table_has_column(connection, "notes", "content_search")?;
+    let transaction = connection.unchecked_transaction()?;
+    if !path_search_exists {
+        transaction.execute(
+            "ALTER TABLE notes ADD COLUMN path_search TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !content_search_exists {
+        transaction.execute(
+            "ALTER TABLE notes ADD COLUMN content_search TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+
+    let mut statement = transaction.prepare(
+        "SELECT workspace_root, path, content FROM notes
+         WHERE path_search = '' OR (content_search = '' AND content <> '')",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let notes = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (workspace_root, path, content) in notes {
+        let path_search = note_search_key(&path);
+        let content_search = note_search_key(&content);
+        transaction.execute(
+            "UPDATE notes
+             SET path_search = ?3, content_search = ?4
+             WHERE workspace_root = ?1 AND path = ?2",
+            rusqlite::params![workspace_root, path, path_search, content_search],
+        )?;
+    }
+    transaction.execute_batch("PRAGMA user_version = 18")?;
+    transaction.commit()
 }
 
 fn conversation_has_column(connection: &Connection, column: &str) -> rusqlite::Result<bool> {

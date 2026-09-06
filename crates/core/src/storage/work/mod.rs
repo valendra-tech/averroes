@@ -1638,6 +1638,41 @@ mod tests {
     }
 
     #[test]
+    fn note_search_key_migration_repairs_incomplete_rows_on_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = rusqlite::Connection::open(directory.path().join("legacy.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE notes (
+                    workspace_root TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    path_search TEXT NOT NULL DEFAULT '',
+                    content_search TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (workspace_root, path)
+                );
+                INSERT INTO notes
+                    (workspace_root, path, content, created_at, updated_at)
+                VALUES ('/workspace', 'cafe.md', 'CAFÉ', 1, 1);",
+            )
+            .unwrap();
+
+        schema::migrate(&connection).unwrap();
+
+        let keys = connection
+            .query_row(
+                "SELECT path_search, content_search FROM notes
+                 WHERE workspace_root = '/workspace' AND path = 'cafe.md'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(keys, ("cafe.md".to_owned(), "café".to_owned()));
+    }
+
+    #[test]
     fn migration_corrects_the_legacy_gpt_5_6_context_limit() {
         let (_directory, database) = database();
         {

@@ -337,13 +337,27 @@ impl Tool for NotesTool {
                 let page_size = ctx
                     .safe_page_chars(offset)
                     .map_err(|message| invalid(self.name(), message))?;
-                let end = offset.saturating_add(page_size).min(total);
+                let mut end = offset.saturating_add(page_size).min(total);
+                let header = loop {
+                    let has_more = end < total;
+                    let continuation = has_more
+                        .then(|| format!("; continue with offset {end}"))
+                        .unwrap_or_default();
+                    let header = format!("[chars {offset}-{end} of {total}{continuation}]");
+                    let output_chars = header.chars().count() + 1 + end - offset;
+                    if output_chars <= page_size {
+                        break header;
+                    }
+                    if end == offset {
+                        return Err(invalid(
+                            self.name(),
+                            format!("safe page at offset {offset} cannot fit its paging header"),
+                        ));
+                    }
+                    end = end.saturating_sub((output_chars - page_size).max(1));
+                };
                 let page = char_slice(&note, offset, end);
                 let has_more = end < total;
-                let continuation = has_more
-                    .then(|| format!("; continue with offset {end}"))
-                    .unwrap_or_default();
-                let header = format!("[chars {offset}-{end} of {total}{continuation}]");
                 let content = format!("{header}\n{page}");
                 Ok(ToolResult::ok(content).with_metadata(json!({
                     "op": "read",
@@ -742,33 +756,35 @@ mod tests {
             .await
             .unwrap();
         let first_metadata = first.metadata.as_ref().unwrap();
+        assert!(first.content.chars().count() <= page_size);
+        let first_end = first_metadata["end"].as_u64().unwrap() as usize;
         let first_header = format!(
-            "[chars 0-{page_size} of {}; continue with offset {page_size}]",
-            page_size * 2 + 3
+            "[chars 0-{first_end} of {}; continue with offset {first_end}]",
+            page_size * 2 + 3,
         );
         assert_eq!(first_metadata["header"], first_header);
-        assert_eq!(first_metadata["page"], "x".repeat(page_size));
+        assert_eq!(first_metadata["page"], "x".repeat(first_end));
         assert!(first.content.starts_with(&format!("{first_header}\n")));
-        assert_eq!(first_metadata["next_offset"], page_size);
+        assert_eq!(first_metadata["next_offset"], first_end);
 
         let second = tool
             .execute(
                 &ctx,
-                &json!({"op": "read", "path": "large.md", "offset": page_size}),
+                &json!({"op": "read", "path": "large.md", "offset": first_end}),
             )
             .await
             .unwrap();
         let second_metadata = second.metadata.as_ref().unwrap();
+        let second_end = second_metadata["end"].as_u64().unwrap() as usize;
         let second_header = format!(
-            "[chars {page_size}-{} of {}; continue with offset {}]",
-            page_size * 2,
+            "[chars {first_end}-{second_end} of {}; continue with offset {second_end}]",
             page_size * 2 + 3,
-            page_size * 2
         );
         assert_eq!(second_metadata["header"], second_header);
-        assert_eq!(second_metadata["page"], "x".repeat(page_size));
+        assert_eq!(second_metadata["page"], "x".repeat(second_end - first_end));
         assert!(second.content.starts_with(&format!("{second_header}\n")));
-        assert_eq!(second_metadata["offset"], page_size);
+        assert_eq!(second_metadata["offset"], first_end);
+        assert!(second.content.chars().count() <= page_size);
     }
 
     #[tokio::test]
