@@ -162,6 +162,28 @@ pub(super) fn load_history_entries(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+pub(super) fn load_recovery_history_entries(
+    connection: &Connection,
+    conversation_id: &str,
+    window_id: &str,
+    thread_id: Option<&str>,
+) -> Result<Vec<WorkHistoryEntry>, WorkDatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT entry_id, parent_id, thread_id, window_id, sequence, timestamp,
+                kind, text, payload_json, images_json
+         FROM conversation_history
+         WHERE conversation_id = ?1
+           AND window_id = ?2
+           AND ((?3 IS NULL AND thread_id IS NULL) OR thread_id = ?3)
+         ORDER BY sequence, entry_id",
+    )?;
+    let rows = statement.query_map(
+        params![conversation_id, window_id, thread_id],
+        history_entry_from_row,
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 pub(super) fn resolve_history_conversation(
     connection: &Connection,
     session_id: &str,

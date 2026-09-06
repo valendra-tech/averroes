@@ -1144,6 +1144,20 @@ impl WorkDatabase {
         rows::load_history_entries(&self.connection.lock(), conversation_id)
     }
 
+    pub fn recovery_history_entries(
+        &self,
+        conversation_id: &str,
+        window_id: &str,
+        thread_id: Option<&str>,
+    ) -> Result<Vec<WorkHistoryEntry>, WorkDatabaseError> {
+        rows::load_recovery_history_entries(
+            &self.connection.lock(),
+            conversation_id,
+            window_id,
+            thread_id,
+        )
+    }
+
     pub fn resolve_history_conversation(
         &self,
         session_id: &str,

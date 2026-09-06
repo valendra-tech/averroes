@@ -49,6 +49,7 @@ const MAX_SKILL_CATALOG_BYTES: usize = 8 * 1024;
 const PROVIDER_INITIAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_SILENT_PROVIDER_RETRIES: usize = 1;
 const ASCII_BYTES_PER_TOKEN: usize = 4;
+const MAX_TOOL_OUTCOMES: usize = 256;
 const ITERATION_LIMIT_FINAL_CONTEXT: &str = concat!(
     "[Tool execution budget reached]\n\n",
     "Tool use is disabled for this response. Use the results already available in the conversation ",
@@ -252,7 +253,7 @@ pub struct Agent {
     history_conversation_id: Option<String>,
     history_sequence: AtomicI64,
     emitted_history_ids: Mutex<HashSet<String>>,
-    tool_outcomes: Mutex<HashMap<String, bool>>,
+    tool_outcomes: Mutex<HashMap<String, ToolOutcome>>,
 }
 
 #[derive(Clone)]
@@ -261,6 +262,12 @@ struct AgentRuntime {
     model: String,
     governor: Arc<ResourceGovernor>,
     reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolOutcome {
+    window_id: String,
+    success: bool,
 }
 
 impl Agent {
@@ -418,6 +425,7 @@ impl Agent {
     /// Restores the identity of the active provider window without changing
     /// the current messages or provider usage snapshot.
     pub fn set_active_window_id(&self, window_id: impl Into<String>) {
+        self.clear_tool_outcomes();
         self.context_controller.set_window_id(window_id);
     }
 
@@ -581,6 +589,7 @@ impl Agent {
         };
 
         let previous_window_id = self.context_controller.begin_window(window_id.clone());
+        self.clear_tool_outcomes();
         *active_messages = messages.clone();
         drop(active_messages);
         self.emit_history_entry_event(stored_entry, events);
@@ -676,13 +685,13 @@ impl Agent {
             self.history_database.as_ref(),
             self.history_conversation_id.as_deref(),
         ) {
-            let mut entries = database
-                .history_entries(conversation_id)
-                .map_err(anyhow::Error::from)?;
-            entries.retain(|entry| {
-                entry.thread_id.as_deref() == self.config.work_id_prefix.as_deref()
-            });
-            return Ok(entries);
+            return database
+                .recovery_history_entries(
+                    conversation_id,
+                    &self.context_controller.window_id(),
+                    self.config.work_id_prefix.as_deref(),
+                )
+                .map_err(anyhow::Error::from);
         }
 
         let messages = self.messages.lock().await.clone();
@@ -863,16 +872,32 @@ impl Agent {
     }
 
     pub(super) fn record_tool_outcome(&self, call_id: &str, success: bool) {
-        self.tool_outcomes
-            .lock()
-            .unwrap()
-            .insert(call_id.to_owned(), success);
+        let window_id = self.context_controller.window_id();
+        let mut outcomes = self.tool_outcomes.lock().unwrap();
+        if !outcomes.contains_key(call_id) && outcomes.len() >= MAX_TOOL_OUTCOMES {
+            if let Some(oldest_call_id) = outcomes.keys().next().cloned() {
+                outcomes.remove(&oldest_call_id);
+            }
+        }
+        outcomes.insert(call_id.to_owned(), ToolOutcome { window_id, success });
     }
 
     fn recorded_tool_outcome(&self, call_id: Option<&str>) -> bool {
+        let window_id = self.context_controller.window_id();
         call_id
-            .and_then(|call_id| self.tool_outcomes.lock().unwrap().get(call_id).copied())
+            .and_then(|call_id| {
+                self.tool_outcomes
+                    .lock()
+                    .unwrap()
+                    .get(call_id)
+                    .filter(|outcome| outcome.window_id == window_id)
+                    .map(|outcome| outcome.success)
+            })
             .unwrap_or(true)
+    }
+
+    fn clear_tool_outcomes(&self) {
+        self.tool_outcomes.lock().unwrap().clear();
     }
 
     fn persist_history_entry(&self, entry: WorkHistoryEntry) -> Result<WorkHistoryEntry> {
@@ -4891,8 +4916,23 @@ mod tests {
             payload: json!({}),
             images: Vec::new(),
         };
+        let old_window_entry = WorkHistoryEntry {
+            entry_id: "old-window-user".into(),
+            parent_id: None,
+            thread_id: None,
+            window_id: "old-window".into(),
+            sequence: 3,
+            timestamp: 3,
+            kind: WorkHistoryKind::User,
+            text: "old window objective".into(),
+            payload: json!({}),
+            images: Vec::new(),
+        };
         database
-            .append_history_entries("root-scope", &[root_entry, delegated_entry])
+            .append_history_entries(
+                "root-scope",
+                &[root_entry, delegated_entry, old_window_entry],
+            )
             .unwrap();
 
         let agent = Agent::new(
@@ -4906,12 +4946,37 @@ mod tests {
             "root-scope".into(),
             PathBuf::from("/tmp"),
         );
+        agent.set_active_window_id("shared-window");
 
         let entries = agent.recovery_history_entries().await.unwrap();
         let handoff = build_auto_handoff_for_window(&entries, "shared-window", 20_000).unwrap();
 
+        assert_eq!(entries.len(), 1);
         assert!(handoff.contains("root objective"));
         assert!(!handoff.contains("delegated sibling objective"));
+        assert!(!handoff.contains("old window objective"));
+    }
+
+    #[test]
+    fn tool_outcomes_are_bounded_and_scoped_to_the_active_window() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "tool-outcome-scope".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        agent.record_tool_outcome("reused-call", false);
+        assert!(!agent.recorded_tool_outcome(Some("reused-call")));
+        agent.set_active_window_id("next-window");
+        assert!(agent.recorded_tool_outcome(Some("reused-call")));
+
+        for index in 0..300 {
+            agent.record_tool_outcome(&format!("call-{index}"), index % 2 == 0);
+        }
+        assert!(agent.tool_outcomes.lock().unwrap().len() <= 256);
     }
 
     #[tokio::test]
