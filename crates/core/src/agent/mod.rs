@@ -572,14 +572,14 @@ impl Agent {
             })
             .into_iter()
             .collect::<Vec<_>>();
-        if let Some(handoff) = handoff {
-            messages.push(ChatMessage {
-                role: Role::System,
-                content: MessageContent::Text(format!("[Context handoff]\n\n{handoff}")),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-        }
+        let handoff = handoff
+            .unwrap_or("No handoff was provided. Continue the current task by consulting history.");
+        messages.push(ChatMessage {
+            role: Role::System,
+            content: MessageContent::Text(format!("[Context handoff]\n\n{handoff}")),
+            tool_call_id: None,
+            tool_calls: None,
+        });
         messages
     }
 
@@ -4421,6 +4421,44 @@ mod tests {
             .iter()
             .all(|message| !message_text(message).contains("A new context window is pending")));
         assert_eq!(agent.context_controller().pending_request(), None);
+    }
+
+    #[tokio::test]
+    async fn new_context_without_handoff_adds_a_history_recovery_marker() {
+        let provider = Arc::new(TestProvider::new(vec![
+            tool_response(vec![function_tool_call(
+                "new-context",
+                "new_context",
+                r#"{"handoff":null}"#,
+            )]),
+            assistant_response("continued from history", 10),
+        ]));
+        let provider_ref = provider.clone();
+        let agent = Agent::new(
+            AgentConfig {
+                system_prompt: Some("You are a test agent.".into()),
+                tools: vec!["new_context".into()],
+                ..Default::default()
+            },
+            provider,
+            context_action_registry(false),
+            test_governor(),
+            "context-marker-action".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        assert_eq!(
+            agent.run("continue the current task").await.unwrap(),
+            "continued from history"
+        );
+
+        let requests = provider_ref.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].messages.iter().any(|message| {
+            message.role == ProviderRole::System
+                && message_text(message)
+                    == "[Context handoff]\n\nNo handoff was provided. Continue the current task by consulting history."
+        }));
     }
 
     #[tokio::test]
