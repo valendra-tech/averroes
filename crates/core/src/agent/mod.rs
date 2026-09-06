@@ -718,9 +718,15 @@ impl Agent {
                 if had_failure {
                     self.context_controller.clear_pending_request();
                 } else if let Some(context_action) = context_action {
-                    self.context_controller
+                    if let Err(error) = self
+                        .context_controller
                         .request_context(context_action.handoff)
-                        .map_err(anyhow::Error::msg)?;
+                    {
+                        self.context_controller.clear_pending_request();
+                        self.set_state(AgentState::Errored);
+                        run_state.finish();
+                        return Err(anyhow::Error::msg(error));
+                    }
                 }
                 {
                     let mut msgs = self.messages.lock().await;
@@ -1795,6 +1801,33 @@ mod tests {
         }
     }
 
+    struct ShrinkContextCapacityTool;
+
+    #[async_trait]
+    impl Tool for ShrinkContextCapacityTool {
+        fn name(&self) -> &str {
+            "shrink_context_capacity"
+        }
+
+        fn description(&self) -> &str {
+            "Shrinks the context handoff capacity for commit failure tests"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            ctx: &ToolContext,
+            _params: &serde_json::Value,
+        ) -> crate::tool::Result<ToolResult> {
+            ctx.context_controller
+                .set_request_overhead(180_000, 0, 0, 0);
+            Ok(ToolResult::ok("capacity shrunk"))
+        }
+    }
+
     fn context_action_registry(include_failure: bool) -> Arc<ToolRegistry> {
         let registry = ToolRegistry::new();
         registry.register(crate::tool::builtin::context_window::NewContextTool);
@@ -1803,6 +1836,13 @@ mod tests {
         } else {
             registry.register(OverwritePendingContextTool);
         }
+        Arc::new(registry)
+    }
+
+    fn shrinking_context_action_registry() -> Arc<ToolRegistry> {
+        let registry = ToolRegistry::new();
+        registry.register(crate::tool::builtin::context_window::NewContextTool);
+        registry.register(ShrinkContextCapacityTool);
         Arc::new(registry)
     }
 
@@ -1877,6 +1917,7 @@ mod tests {
         }
 
         let registry = ToolRegistry::new();
+        registry.register(crate::tool::builtin::context_window::NewContextTool);
         registry.register(BlockingTool { started });
         Arc::new(registry)
     }
@@ -3207,6 +3248,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn second_new_context_in_a_batch_fails_and_clears_pending_action() {
+        let provider = Arc::new(TestProvider::new(vec![
+            tool_response(vec![
+                function_tool_call("first-context", "new_context", r#"{"handoff":"first"}"#),
+                function_tool_call("second-context", "new_context", r#"{"handoff":"second"}"#),
+            ]),
+            assistant_response("continued"),
+        ]));
+        let agent = Agent::new(
+            AgentConfig {
+                tools: vec!["new_context".into()],
+                ..Default::default()
+            },
+            provider,
+            context_action_registry(false),
+            test_governor(),
+            "duplicate-context-action".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        assert_eq!(agent.run("continue").await.unwrap(), "continued");
+        assert!(agent.context_controller().pending_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn context_action_commit_failure_is_errored_and_clears_pending() {
+        let handoff = "x".repeat(15_000);
+        let provider = Arc::new(TestProvider::new(vec![tool_response(vec![
+            function_tool_call(
+                "new-context",
+                "new_context",
+                &serde_json::json!({"handoff": handoff}).to_string(),
+            ),
+            function_tool_call("shrink", "shrink_context_capacity", "{}"),
+        ])]));
+        let agent = Agent::new(
+            AgentConfig {
+                tools: vec!["new_context".into(), "shrink_context_capacity".into()],
+                ..Default::default()
+            },
+            provider,
+            shrinking_context_action_registry(),
+            test_governor(),
+            "context-action-commit-error".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        assert!(agent.run("continue").await.is_err());
+        assert_eq!(agent.state().await, AgentState::Errored);
+        assert!(agent.context_controller().pending_request().is_none());
+    }
+
+    #[tokio::test]
     async fn canceled_tool_execution_does_not_append_partial_history() {
         let started = Arc::new(tokio::sync::Notify::new());
         let provider = Arc::new(TestProvider::new(vec![ChatResponse {
@@ -3252,6 +3346,39 @@ mod tests {
         let messages = agent.messages.lock().await;
         assert_eq!(messages.len(), 1);
         assert!(matches!(messages[0].role, ProviderRole::User));
+    }
+
+    #[tokio::test]
+    async fn canceled_context_tool_batch_does_not_leave_a_pending_action() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(TestProvider::new(vec![tool_response(vec![
+            function_tool_call(
+                "new-context",
+                "new_context",
+                r#"{"handoff":"discard on cancel"}"#,
+            ),
+            function_tool_call("block", "block", "{}"),
+        ])]));
+        let agent = Arc::new(Agent::new(
+            AgentConfig {
+                tools: vec!["new_context".into(), "block".into()],
+                max_iterations: 1,
+                ..Default::default()
+            },
+            provider,
+            blocking_tool_registry(started.clone()),
+            test_governor(),
+            "context-action-cancel".into(),
+            PathBuf::from("/tmp"),
+        ));
+
+        let task_agent = agent.clone();
+        let task = tokio::spawn(async move { task_agent.run("run the tools").await });
+        started.notified().await;
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(agent.context_controller().pending_request().is_none());
     }
 
     #[tokio::test]

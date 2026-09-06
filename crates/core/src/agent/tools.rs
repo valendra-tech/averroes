@@ -6,6 +6,7 @@ use crate::tool::{EnabledTool, ToolContext, ToolResult};
 use anyhow::Result;
 use futures::future::join_all;
 use serde_json::Value;
+use std::sync::Arc;
 
 pub(super) struct ToolExecution {
     pub messages: Vec<ChatMessage>,
@@ -17,6 +18,41 @@ struct ToolCallExecution {
     message: ChatMessage,
     context_action: Option<ContextRequest>,
     had_failure: bool,
+}
+
+struct PendingContextGuard {
+    controller: Arc<super::ContextController>,
+    previous: Option<ContextRequest>,
+    armed: bool,
+}
+
+impl PendingContextGuard {
+    fn new(controller: Arc<super::ContextController>) -> Self {
+        let previous = controller.pending_request();
+        Self {
+            controller,
+            previous,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+
+    fn clear_and_disarm(mut self) {
+        self.controller.clear_pending_request();
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingContextGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.controller
+                .restore_pending_request(self.previous.take());
+        }
+    }
 }
 
 impl Agent {
@@ -35,6 +71,8 @@ impl Agent {
                 })
             }
         };
+
+        let pending_context_guard = PendingContextGuard::new(self.context_controller.clone());
 
         let available_tools = self
             .tool_registry
@@ -99,6 +137,12 @@ impl Agent {
             .into_iter()
             .map(|execution| execution.message)
             .collect();
+
+        if had_failure {
+            pending_context_guard.clear_and_disarm();
+        } else {
+            pending_context_guard.disarm();
+        }
 
         Ok(ToolExecution {
             messages,

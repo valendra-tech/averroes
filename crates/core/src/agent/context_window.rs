@@ -204,6 +204,10 @@ impl ContextController {
         *self.pending.lock() = None;
     }
 
+    pub(crate) fn restore_pending_request(&self, request: Option<ContextRequest>) {
+        *self.pending.lock() = request;
+    }
+
     pub fn handoff_limit(&self) -> usize {
         let overhead = *self.request_overhead.read();
         MAX_HANDOFF_CHARS.min(self.page_capacity_chars(overhead))

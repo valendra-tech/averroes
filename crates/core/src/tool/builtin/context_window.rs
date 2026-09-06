@@ -42,6 +42,13 @@ impl Tool for NewContextTool {
                 message: error.to_string(),
             })?;
 
+        if ctx.context_controller.pending_request().is_some() {
+            return Err(ToolError::InvalidParams {
+                tool: self.name().into(),
+                message: "a context action is already pending".into(),
+            });
+        }
+
         ctx.context_controller
             .request_context(params.handoff)
             .map_err(|message| ToolError::InvalidParams {
@@ -129,5 +136,26 @@ mod tests {
 
         assert!(error.to_string().contains("handoff exceeds"));
         assert!(controller.pending_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn new_context_rejects_a_second_pending_action() {
+        let controller = Arc::new(ContextController::for_test(100_000, 16_384));
+        let ctx = test_context(controller.clone());
+
+        NewContextTool
+            .execute(&ctx, &json!({"handoff":"first"}))
+            .await
+            .unwrap();
+        let error = NewContextTool
+            .execute(&ctx, &json!({"handoff":"second"}))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already pending"));
+        assert_eq!(
+            controller.pending_request().unwrap().handoff.as_deref(),
+            Some("first")
+        );
     }
 }
