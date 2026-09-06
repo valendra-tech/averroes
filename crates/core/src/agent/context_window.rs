@@ -162,6 +162,13 @@ impl ContextController {
         self.window_id.read().clone()
     }
 
+    /// Restores a persisted window identity without resetting usage or
+    /// pending context actions. A caller restoring a full snapshot may apply
+    /// the provider usage separately after this identity is restored.
+    pub fn set_window_id(&self, window_id: impl Into<String>) {
+        *self.window_id.write() = window_id.into();
+    }
+
     pub fn set_request_overhead(
         &self,
         system_prompt_tokens: usize,

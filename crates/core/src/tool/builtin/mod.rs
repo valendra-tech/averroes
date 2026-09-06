@@ -70,6 +70,7 @@ pub fn register_all(registry: &ToolRegistry) {
 }
 
 pub fn register_work_tools(registry: &ToolRegistry, database: Arc<crate::work::WorkDatabase>) {
+    registry.set_work_database(database.clone());
     registry.register(history::HistoryTool::new(database));
 }
 

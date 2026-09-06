@@ -990,6 +990,66 @@ impl WorkDatabase {
         Ok(())
     }
 
+    /// Appends one agent-owned history entry, allocating a sequence when the
+    /// caller does not have a durable sequence yet. Repeating the same entry
+    /// id with the same payload is idempotent and returns the stored row.
+    pub fn append_history_entry(
+        &self,
+        conversation_id: &str,
+        entry: &WorkHistoryEntry,
+    ) -> Result<WorkHistoryEntry, WorkDatabaseError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) =
+            rows::load_history_entry(&transaction, conversation_id, &entry.entry_id)?
+        {
+            if history_entry_payload_equal(&existing, entry) {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(WorkDatabaseError::HistoryConflict {
+                conversation_id: conversation_id.into(),
+                sequence: entry.sequence,
+                entry_id: entry.entry_id.clone(),
+                existing_entry_id: existing.entry_id,
+            });
+        }
+
+        let mut stored = entry.clone();
+        if stored.sequence <= 0 {
+            stored.sequence = transaction.query_row(
+                "SELECT COALESCE(MAX(sequence), 0) + 1
+                 FROM conversation_history WHERE conversation_id = ?1",
+                params![conversation_id],
+                |row| row.get(0),
+            )?;
+        }
+        if stored.timestamp <= 0 {
+            stored.timestamp = now();
+        }
+        rows::append_history_entries(&transaction, conversation_id, &[stored.clone()])?;
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    /// Updates only the provider-facing active context. The visible transcript
+    /// remains owned by the normal conversation snapshot/save path.
+    pub fn save_active_context(
+        &self,
+        conversation_id: &str,
+        active_context: &[crate::provider::ChatMessage],
+        active_window_id: &str,
+    ) -> Result<(), WorkDatabaseError> {
+        let active_context = serde_json::to_string(active_context)?;
+        self.connection.lock().execute(
+            "UPDATE conversations
+             SET active_context_json = ?2, active_window_id = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![conversation_id, active_context, active_window_id, now()],
+        )?;
+        Ok(())
+    }
+
     pub fn history_entries(
         &self,
         conversation_id: &str,
@@ -1304,6 +1364,17 @@ impl WorkDatabase {
         }
         Ok(())
     }
+}
+
+fn history_entry_payload_equal(left: &WorkHistoryEntry, right: &WorkHistoryEntry) -> bool {
+    left.entry_id == right.entry_id
+        && left.parent_id == right.parent_id
+        && left.thread_id == right.thread_id
+        && left.window_id == right.window_id
+        && left.kind == right.kind
+        && left.text == right.text
+        && left.payload == right.payload
+        && left.images == right.images
 }
 
 fn load_global_memories(connection: &Connection) -> Result<Vec<GlobalMemory>, WorkDatabaseError> {

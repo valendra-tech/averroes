@@ -7034,6 +7034,10 @@ impl AverroesApp {
                         }
                     }
                     AgentStreamEvent::ContextUpdated { .. } => {}
+                    AgentStreamEvent::ContextReminder { .. }
+                    | AgentStreamEvent::ContextWindowStarted { .. }
+                    | AgentStreamEvent::ContextSnapshot { .. }
+                    | AgentStreamEvent::HistoryEntryAppended { .. } => {}
                     AgentStreamEvent::DelegatedAgentStarted { .. }
                     | AgentStreamEvent::DelegatedAgentEvent { .. } => unreachable!(),
                 }
@@ -7386,6 +7390,10 @@ impl AverroesApp {
                 }
                 self.refresh_remote_live_reply(session_id, true, cx);
             }
+            AgentStreamEvent::ContextReminder { .. }
+            | AgentStreamEvent::ContextWindowStarted { .. }
+            | AgentStreamEvent::ContextSnapshot { .. }
+            | AgentStreamEvent::HistoryEntryAppended { .. } => {}
         }
         self.remeasure_active_conversation_tail(session_id);
     }

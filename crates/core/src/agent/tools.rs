@@ -1,6 +1,7 @@
 use super::{Agent, AgentStreamEvent, ContextRequest};
 use crate::provider::types::{ContentPart, MessageContent, Role, ToolCall};
 use crate::provider::{ChatMessage, ChatResponse};
+use crate::storage::work::{WorkHistoryEntry, WorkHistoryKind};
 use crate::tool::builtin::ask_user::redact_confirmation_params;
 use crate::tool::{EnabledTool, ToolContext, ToolResult};
 use anyhow::Result;
@@ -10,12 +11,14 @@ use std::sync::Arc;
 
 pub(super) struct ToolExecution {
     pub messages: Vec<ChatMessage>,
+    pub history_entries: Vec<WorkHistoryEntry>,
     pub context_action: Option<ContextRequest>,
     pub had_failure: bool,
 }
 
 struct ToolCallExecution {
     message: ChatMessage,
+    history_entry: WorkHistoryEntry,
     context_action: Option<ContextRequest>,
     had_failure: bool,
 }
@@ -66,6 +69,7 @@ impl Agent {
             None => {
                 return Ok(ToolExecution {
                     messages: Vec::new(),
+                    history_entries: Vec::new(),
                     context_action: None,
                     had_failure: false,
                 })
@@ -133,10 +137,14 @@ impl Agent {
                 .iter()
                 .find_map(|execution| execution.context_action.clone())
         };
+        let history_entries = executions
+            .iter()
+            .map(|execution| execution.history_entry.clone())
+            .collect();
         let messages = executions
             .into_iter()
             .map(|execution| execution.message)
-            .collect();
+            .collect::<Vec<_>>();
 
         if had_failure {
             pending_context_guard.clear_and_disarm();
@@ -146,6 +154,7 @@ impl Agent {
 
         Ok(ToolExecution {
             messages,
+            history_entries,
             context_action,
             had_failure,
         })
@@ -200,10 +209,20 @@ impl Agent {
             return ToolCallExecution {
                 message: ChatMessage {
                     role: Role::Tool,
-                    content: MessageContent::Text(message),
+                    content: MessageContent::Text(message.clone()),
                     tool_call_id: Some(tool_call.id.clone()),
                     tool_calls: None,
                 },
+                history_entry: self.new_history_entry(
+                    WorkHistoryKind::ToolResult,
+                    &message,
+                    serde_json::json!({
+                        "call_id": tool_call.id,
+                        "name": tool_call.function.name,
+                        "success": false,
+                    }),
+                    Vec::new(),
+                ),
                 context_action: None,
                 had_failure: true,
             };
@@ -235,6 +254,16 @@ impl Agent {
                         tool_call_id: Some(tool_call.id.clone()),
                         tool_calls: None,
                     },
+                    history_entry: self.new_history_entry(
+                        WorkHistoryKind::ToolResult,
+                        format!("invalid arguments: {error}"),
+                        serde_json::json!({
+                            "call_id": tool_call.id,
+                            "name": tool_call.function.name,
+                            "success": false,
+                        }),
+                        Vec::new(),
+                    ),
                     context_action: None,
                     had_failure: true,
                 };
@@ -307,6 +336,27 @@ impl Agent {
             });
         }
 
+        let result_text = if result.success {
+            result.content.clone()
+        } else {
+            result
+                .error
+                .clone()
+                .unwrap_or_else(|| "unknown error".into())
+        };
+        let history_entry = self.new_history_entry(
+            WorkHistoryKind::ToolResult,
+            result_text,
+            serde_json::json!({
+                "call_id": tool_call.id,
+                "name": tool_call.function.name,
+                "arguments": params,
+                "success": result.success,
+                "metadata": result.metadata,
+            }),
+            result.images.clone(),
+        );
+
         ToolCallExecution {
             message: ChatMessage {
                 role: Role::Tool,
@@ -314,6 +364,7 @@ impl Agent {
                 tool_call_id: Some(tool_call.id.clone()),
                 tool_calls: None,
             },
+            history_entry,
             context_action,
             had_failure,
         }

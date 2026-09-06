@@ -17,10 +17,14 @@ use crate::provider::types::{ContentPart, MessageContent, Role};
 use crate::provider::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolDefinition};
 use crate::runtime::ResourceGovernor;
 use crate::skill::SkillIndex;
+use crate::storage::work::{WorkHistoryEntry, WorkHistoryKind};
 use crate::tool::{ToolActivation, ToolApprovalPolicy, ToolRegistry};
 use anyhow::Result;
+use serde::Serialize;
+use serde_json::json;
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -113,7 +117,7 @@ pub enum AgentState {
     Cancelled,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum AgentStreamEvent {
     TextDelta {
         text: String,
@@ -169,6 +173,30 @@ pub enum AgentStreamEvent {
     ContextUpdated {
         usage: ContextUsage,
     },
+    /// The current context entered its bounded reminder band.
+    ContextReminder {
+        window_id: String,
+        fingerprint: String,
+        remaining_tokens: Option<u64>,
+        rollover_at: u64,
+    },
+    /// A provider-facing context window was restored or started.
+    ContextWindowStarted {
+        previous_window_id: String,
+        window_id: String,
+        reason: String,
+        handoff: Option<String>,
+        automatic: bool,
+    },
+    /// The complete active provider context at a lifecycle boundary.
+    ContextSnapshot {
+        window_id: String,
+        messages: Vec<ChatMessage>,
+    },
+    /// One normalized history item accepted by the durable history pipeline.
+    HistoryEntryAppended {
+        entry: WorkHistoryEntry,
+    },
     CompactionStarted {
         reason: String,
     },
@@ -212,6 +240,10 @@ pub struct Agent {
     session_id: String,
     workspace_root: PathBuf,
     working_dir: PathBuf,
+    history_database: Option<Arc<crate::storage::work::WorkDatabase>>,
+    history_conversation_id: Option<String>,
+    history_sequence: AtomicI64,
+    emitted_history_ids: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -273,6 +305,13 @@ impl Agent {
         };
         let reasoning_effort = config.reasoning_effort.clone();
         let allow_user_questions = config.allow_user_questions;
+        let history_database = tool_registry.work_database();
+        let history_conversation_id = history_database.as_ref().map(|_| {
+            config
+                .work_conversation_id
+                .clone()
+                .unwrap_or_else(|| session_id.clone())
+        });
         let tool_activation = Arc::new(ToolActivation::new(config.tools.iter().cloned()));
         tool_activation.set_approval_policy(config.tool_approval_policy);
         if let Some(conversation_id) = config.work_conversation_id.clone() {
@@ -306,6 +345,10 @@ impl Agent {
             session_id,
             workspace_root,
             working_dir,
+            history_database,
+            history_conversation_id,
+            history_sequence: AtomicI64::new(0),
+            emitted_history_ids: Mutex::new(HashSet::new()),
         }
     }
 
@@ -330,6 +373,209 @@ impl Agent {
     /// token usage is intentionally unknown.
     pub async fn context_usage(&self) -> ContextUsage {
         self.context_controller.context_usage()
+    }
+
+    /// Returns the provider-facing context for the current window.
+    pub async fn active_context_snapshot(&self) -> Vec<ChatMessage> {
+        self.messages.lock().await.clone()
+    }
+
+    /// Restores a persisted provider snapshot while keeping the configured
+    /// system prompt trusted. Incomplete assistant tool turns and orphan tool
+    /// messages are discarded before the context becomes active.
+    pub async fn restore_active_context(&self, snapshot: Vec<ChatMessage>) {
+        let _run_lock = self.run_lock.lock().await;
+        let configured_system = self
+            .messages
+            .lock()
+            .await
+            .iter()
+            .find(|message| message.role == Role::System)
+            .cloned();
+        let sanitized = sanitize_tool_history(snapshot);
+        let mut restored = Vec::with_capacity(sanitized.len() + 1);
+        if let Some(system) = configured_system {
+            restored.push(system);
+        }
+        restored.extend(
+            sanitized.into_iter().filter(|message| {
+                matches!(message.role, Role::User | Role::Assistant | Role::Tool)
+            }),
+        );
+        *self.messages.lock().await = restored;
+    }
+
+    /// Restores the identity of the active provider window without changing
+    /// the current messages or provider usage snapshot.
+    pub fn set_active_window_id(&self, window_id: impl Into<String>) {
+        self.context_controller.set_window_id(window_id);
+    }
+
+    /// Emits a context-window lifecycle event when a stream is available.
+    /// Non-streaming agents intentionally treat this as a no-op.
+    pub fn emit_context_window_started(
+        &self,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+        previous_window_id: impl Into<String>,
+        reason: impl Into<String>,
+        handoff: Option<String>,
+        automatic: bool,
+    ) {
+        let Some(events) = events else {
+            return;
+        };
+        let _ = events.send(AgentStreamEvent::ContextWindowStarted {
+            previous_window_id: previous_window_id.into(),
+            window_id: self.context_controller.window_id(),
+            reason: reason.into(),
+            handoff,
+            automatic,
+        });
+    }
+
+    /// Persists and/or emits one normalized history entry. The database path
+    /// is idempotent by entry id; the in-memory guard prevents duplicate stream
+    /// events if a lifecycle hook is retried.
+    pub fn emit_history_entry(
+        &self,
+        entry: WorkHistoryEntry,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+    ) {
+        let should_emit = self
+            .emitted_history_ids
+            .lock()
+            .unwrap()
+            .insert(entry.entry_id.clone());
+        if !should_emit {
+            return;
+        }
+        let entry = self.persist_history_entry(entry);
+        if let Some(events) = events {
+            let _ = events.send(AgentStreamEvent::HistoryEntryAppended { entry });
+        }
+    }
+
+    /// Emits and persists the current provider context at a lifecycle
+    /// boundary. Persistence intentionally still happens for legacy
+    /// non-streaming runs; only the stream event is optional.
+    pub async fn emit_snapshot(
+        &self,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+    ) {
+        let messages = self.messages.lock().await.clone();
+        let window_id = self.context_controller.window_id();
+        if let (Some(database), Some(conversation_id)) = (
+            self.history_database.as_ref(),
+            self.history_conversation_id.as_deref(),
+        ) {
+            if let Err(error) = database.save_active_context(conversation_id, &messages, &window_id)
+            {
+                crate::observability::diagnostics::record(
+                    crate::observability::diagnostics::DiagnosticLevel::Warning,
+                    "agent.history",
+                    format!("Could not persist active context snapshot: {error}"),
+                );
+            }
+        }
+        if let Some(events) = events {
+            let _ = events.send(AgentStreamEvent::ContextSnapshot {
+                window_id,
+                messages,
+            });
+        }
+    }
+
+    fn new_history_entry(
+        &self,
+        kind: WorkHistoryKind,
+        text: impl Into<String>,
+        payload: serde_json::Value,
+        images: Vec<crate::provider::types::ImageSource>,
+    ) -> WorkHistoryEntry {
+        let sequence = if self.history_database.is_some() {
+            0
+        } else {
+            self.history_sequence.fetch_add(1, Ordering::Relaxed) + 1
+        };
+        WorkHistoryEntry {
+            entry_id: format!("{}:{}", self.agent_id, uuid::Uuid::new_v4()),
+            parent_id: None,
+            thread_id: self.config.work_id_prefix.clone(),
+            window_id: self.context_controller.window_id(),
+            sequence,
+            timestamp: crate::storage::work::now(),
+            kind,
+            text: text.into(),
+            payload,
+            images,
+        }
+    }
+
+    fn persist_history_entry(&self, entry: WorkHistoryEntry) -> WorkHistoryEntry {
+        let (Some(database), Some(conversation_id)) = (
+            self.history_database.as_ref(),
+            self.history_conversation_id.as_deref(),
+        ) else {
+            return entry;
+        };
+        match database.append_history_entry(conversation_id, &entry) {
+            Ok(stored) => stored,
+            Err(error) => {
+                crate::observability::diagnostics::record(
+                    crate::observability::diagnostics::DiagnosticLevel::Warning,
+                    "agent.history",
+                    format!(
+                        "Could not persist history entry {}: {error}",
+                        entry.entry_id
+                    ),
+                );
+                entry
+            }
+        }
+    }
+
+    fn history_entry_for_message(
+        &self,
+        kind: WorkHistoryKind,
+        message: &ChatMessage,
+        payload: serde_json::Value,
+    ) -> WorkHistoryEntry {
+        self.new_history_entry(
+            kind,
+            message_text(message),
+            payload,
+            message_images(message),
+        )
+    }
+
+    fn history_entries_for_provider_message(&self, message: &ChatMessage) -> Vec<WorkHistoryEntry> {
+        let mut entries = Vec::new();
+        let images = message_images(message);
+        let text = message_text(message);
+        let tool_calls = message.tool_calls.as_deref().unwrap_or_default();
+        if !text.is_empty() || tool_calls.is_empty() {
+            entries.push(self.history_entry_for_message(
+                WorkHistoryKind::Assistant,
+                message,
+                json!({"role": "assistant"}),
+            ));
+        }
+        for tool_call in tool_calls {
+            entries.push(self.new_history_entry(
+                WorkHistoryKind::ToolCall,
+                format!(
+                    "{}({})",
+                    tool_call.function.name, tool_call.function.arguments
+                ),
+                json!({
+                    "call_id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.function.arguments,
+                }),
+                images.clone(),
+            ));
+        }
+        entries
     }
 
     /// Generates a short conversation title with the selected provider.
@@ -637,6 +883,12 @@ impl Agent {
         let mut run_state = RunStateGuard::new(self.state.clone());
         let skill_context = self.resolve_skill_context(user_input).await;
 
+        let user_message = ChatMessage {
+            role: Role::User,
+            content: user_content.unwrap_or_else(|| MessageContent::Text(user_input.to_string())),
+            tool_call_id: None,
+            tool_calls: None,
+        };
         {
             let mut msgs = self.messages.lock().await;
             if let Some(system_prompt) = msgs
@@ -649,14 +901,16 @@ impl Agent {
             {
                 crate::prompt::refresh_system_environment_time(system_prompt);
             }
-            msgs.push(ChatMessage {
-                role: Role::User,
-                content: user_content
-                    .unwrap_or_else(|| MessageContent::Text(user_input.to_string())),
-                tool_call_id: None,
-                tool_calls: None,
-            });
+            msgs.push(user_message.clone());
         }
+        self.emit_history_entry(
+            self.history_entry_for_message(
+                WorkHistoryKind::User,
+                &user_message,
+                json!({"role": "user"}),
+            ),
+            stream_events.as_ref(),
+        );
 
         let mut context_retries = 0;
         let mut tool_iterations = 0;
@@ -720,6 +974,9 @@ impl Agent {
                 stream_events.as_ref(),
                 generation,
             );
+            for entry in self.history_entries_for_provider_message(&response.message) {
+                self.emit_history_entry(entry, stream_events.as_ref());
+            }
 
             if response
                 .message
@@ -739,6 +996,9 @@ impl Agent {
                             return Err(error);
                         }
                     };
+                for entry in tool_execution.history_entries.iter().cloned() {
+                    self.emit_history_entry(entry, stream_events.as_ref());
+                }
                 let had_failure = tool_execution.had_failure;
                 let context_action = tool_execution.context_action;
                 let messages = tool_execution.messages;
@@ -768,6 +1028,7 @@ impl Agent {
                 let mut messages = self.messages.lock().await;
                 messages.push(response.message.clone());
             }
+            self.emit_snapshot(stream_events.as_ref()).await;
             self.set_state(AgentState::Completed);
             run_state.finish();
             return Ok(message_text(&response.message));
@@ -829,6 +1090,9 @@ impl Agent {
             stream_events.as_ref(),
             generation,
         );
+        for entry in self.history_entries_for_provider_message(&response.message) {
+            self.emit_history_entry(entry, stream_events.as_ref());
+        }
 
         let mut final_message = response.message;
         final_message.tool_calls = None;
@@ -843,6 +1107,7 @@ impl Agent {
             }
         }
         self.messages.lock().await.push(final_message);
+        self.emit_snapshot(stream_events.as_ref()).await;
         self.set_state(AgentState::Completed);
         run_state.finish();
         Ok(final_text)
@@ -982,6 +1247,7 @@ impl Agent {
                 understood_context,
             });
         }
+        self.emit_snapshot(events).await;
         Ok(())
     }
 
@@ -1156,6 +1422,19 @@ fn count_images(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
+fn message_images(message: &ChatMessage) -> Vec<crate::provider::types::ImageSource> {
+    match &message.content {
+        MessageContent::Text(_) => Vec::new(),
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Image { source } => Some(source.clone()),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
 fn refresh_project_instructions(
     messages: &mut Vec<ChatMessage>,
     workspace_root: Option<&std::path::Path>,
@@ -1238,7 +1517,9 @@ mod tests {
     use crate::connection::SessionBinding;
     use crate::provider::types::{FunctionCall, Role as ProviderRole, TokenUsage, ToolCall};
     use crate::provider::{ProviderError, StreamEvent};
-    use crate::storage::work::{now, WorkConversation, WorkDatabase, WorkHistoryKind};
+    use crate::storage::work::{
+        now, WorkConversation, WorkDatabase, WorkHistoryEntry, WorkHistoryKind,
+    };
     use crate::tool::{Tool, ToolContext, ToolResult};
     use async_trait::async_trait;
     use futures::{Stream, StreamExt};
@@ -2237,6 +2518,272 @@ mod tests {
             message.role == ProviderRole::Assistant
                 && message.content == MessageContent::Text("remember me".into())
         }));
+    }
+
+    #[tokio::test]
+    async fn completed_run_emits_history_entries_and_final_snapshot() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![assistant_response("done", 10)])),
+            test_tool_registry(),
+            test_governor(),
+            "event-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        agent.run_streaming("ship it", sender).await.unwrap();
+
+        let mut history = Vec::new();
+        let mut snapshots = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                AgentStreamEvent::HistoryEntryAppended { entry } => history.push(entry),
+                AgentStreamEvent::ContextSnapshot { messages, .. } => snapshots.push(messages),
+                _ => {}
+            }
+        }
+        assert!(history
+            .iter()
+            .any(|entry| { entry.kind == WorkHistoryKind::User && entry.text == "ship it" }));
+        assert!(history
+            .iter()
+            .any(|entry| { entry.kind == WorkHistoryKind::Assistant && entry.text == "done" }));
+        assert_eq!(snapshots.len(), 1);
+        assert!(snapshots[0]
+            .iter()
+            .any(|message| message.content == MessageContent::Text("done".into())));
+    }
+
+    #[tokio::test]
+    async fn scoped_run_persists_user_and_assistant_history_idempotently() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("history.db")).unwrap();
+        database
+            .save_conversation(&history_conversation("persisted-session"))
+            .unwrap();
+        let agent = Agent::new(
+            AgentConfig {
+                work_conversation_id: Some("persisted-session".into()),
+                ..test_agent_config()
+            },
+            Arc::new(TestProvider::new(vec![assistant_response("done", 10)])),
+            history_registry(database.clone()),
+            test_governor(),
+            "persisted-session".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        agent.run("persist this").await.unwrap();
+        let entries = database.history_entries("persisted-session").unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|entry| { entry.kind == WorkHistoryKind::User && entry.text == "persist this" }));
+        assert!(entries
+            .iter()
+            .any(|entry| { entry.kind == WorkHistoryKind::Assistant && entry.text == "done" }));
+        assert!(entries.iter().all(|entry| entry.sequence > 0));
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.entry_id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            entries.len()
+        );
+
+        agent.run("persist this again").await.unwrap();
+        let repeated = database.history_entries("persisted-session").unwrap();
+        assert_eq!(repeated.len(), 4);
+        assert_eq!(
+            repeated
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            repeated.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_and_result_history_preserve_provider_images() {
+        let agent = Agent::new(
+            AgentConfig {
+                tools: vec!["image_tool".into()],
+                ..test_agent_config()
+            },
+            Arc::new(TestProvider::new(vec![
+                tool_response(vec![function_tool_call("call-image", "image_tool", "{}")]),
+                assistant_response("finished", 10),
+            ])),
+            image_tool_registry(),
+            test_governor(),
+            "image-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        agent.run_streaming("inspect", sender).await.unwrap();
+
+        let entries = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|event| match event {
+                AgentStreamEvent::HistoryEntryAppended { entry } => Some(entry),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let tool_call = entries
+            .iter()
+            .find(|entry| entry.kind == WorkHistoryKind::ToolCall)
+            .expect("tool call history entry");
+        assert_eq!(tool_call.payload["call_id"], "call-image");
+        let tool_result = entries
+            .iter()
+            .find(|entry| entry.kind == WorkHistoryKind::ToolResult)
+            .expect("tool result history entry");
+        assert_eq!(tool_result.text, "image result");
+        assert_eq!(tool_result.images.len(), 1);
+        assert_eq!(tool_result.images[0].media_type, "image/png");
+        assert_eq!(tool_result.images[0].data, "base64-image-data");
+    }
+
+    #[tokio::test]
+    async fn context_snapshot_and_window_events_have_serializable_payloads() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "window-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        agent.set_active_window_id("window-2");
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        agent.emit_context_window_started(
+            Some(&sender),
+            "initial",
+            "manual restore",
+            Some("continue from checkpoint".into()),
+            false,
+        );
+        agent.emit_snapshot(Some(&sender)).await;
+        let reminder = AgentStreamEvent::ContextReminder {
+            window_id: "window-2".into(),
+            fingerprint: "window-2:200000:1000".into(),
+            remaining_tokens: Some(10_000),
+            rollover_at: 190_001,
+        };
+
+        let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::ContextWindowStarted {
+                previous_window_id,
+                window_id,
+                automatic: false,
+                handoff: Some(handoff),
+                ..
+            } if previous_window_id == "initial"
+                && window_id == "window-2"
+                && handoff == "continue from checkpoint"
+        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentStreamEvent::ContextSnapshot { .. })));
+        assert!(serde_json::to_value(&reminder).is_ok());
+        assert!(events
+            .iter()
+            .all(|event| serde_json::to_value(event).is_ok()));
+    }
+
+    #[tokio::test]
+    async fn restore_active_context_preserves_system_and_sanitizes_incomplete_tools() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "restore-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        agent.set_active_window_id("window-restore");
+        agent
+            .restore_active_context(vec![
+                ChatMessage {
+                    role: ProviderRole::System,
+                    content: MessageContent::Text("provider system must not replace config".into()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                ChatMessage {
+                    role: ProviderRole::User,
+                    content: MessageContent::Text("keep this".into()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                ChatMessage {
+                    role: ProviderRole::Assistant,
+                    content: MessageContent::Text("complete tool turn".into()),
+                    tool_call_id: None,
+                    tool_calls: Some(vec![function_tool_call("complete", "echo", "{}")]),
+                },
+                ChatMessage {
+                    role: ProviderRole::Tool,
+                    content: MessageContent::Text("completed".into()),
+                    tool_call_id: Some("complete".into()),
+                    tool_calls: None,
+                },
+                ChatMessage {
+                    role: ProviderRole::Assistant,
+                    content: MessageContent::Text("incomplete tool turn".into()),
+                    tool_call_id: None,
+                    tool_calls: Some(vec![function_tool_call("incomplete", "echo", "{}")]),
+                },
+                ChatMessage {
+                    role: ProviderRole::Tool,
+                    content: MessageContent::Text("orphan".into()),
+                    tool_call_id: Some("orphan".into()),
+                    tool_calls: None,
+                },
+            ])
+            .await;
+
+        let restored = agent.active_context_snapshot().await;
+        assert_eq!(agent.context_controller().window_id(), "window-restore");
+        assert_eq!(
+            restored[0].content,
+            MessageContent::Text("You are a test agent.".into())
+        );
+        assert!(restored
+            .iter()
+            .any(|message| message.content == MessageContent::Text("completed".into())));
+        assert!(!restored.iter().any(|message| {
+            message.content == MessageContent::Text("incomplete tool turn".into())
+                || message.content == MessageContent::Text("orphan".into())
+        }));
+    }
+
+    #[tokio::test]
+    async fn no_stream_history_helpers_are_noops_without_panicking() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![assistant_response("done", 10)])),
+            test_tool_registry(),
+            test_governor(),
+            "no-stream-session".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        agent.emit_history_entry(
+            WorkHistoryEntry::user("initial", "entry-1", "not streamed"),
+            None,
+        );
+        agent.emit_snapshot(None).await;
+        agent.emit_context_window_started(None, "initial", "test", None, true);
+
+        assert_eq!(agent.run("hello").await.unwrap(), "done");
     }
 
     #[tokio::test]

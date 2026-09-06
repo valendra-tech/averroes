@@ -9,6 +9,7 @@ use std::sync::Arc;
 pub struct ToolRegistry {
     tools: DashMap<String, ToolRef>,
     confirmation_broker: Option<Arc<AskUserBroker>>,
+    work_database: std::sync::RwLock<Option<Arc<crate::work::WorkDatabase>>>,
 }
 
 impl ToolRegistry {
@@ -16,6 +17,7 @@ impl ToolRegistry {
         Self {
             tools: DashMap::new(),
             confirmation_broker: None,
+            work_database: std::sync::RwLock::new(None),
         }
     }
 
@@ -23,6 +25,7 @@ impl ToolRegistry {
         Self {
             tools: DashMap::new(),
             confirmation_broker: Some(broker),
+            work_database: std::sync::RwLock::new(None),
         }
     }
 
@@ -93,7 +96,16 @@ impl ToolRegistry {
         Self {
             tools: registry.tools,
             confirmation_broker: self.confirmation_broker.clone(),
+            work_database: std::sync::RwLock::new(self.work_database()),
         }
+    }
+
+    pub fn set_work_database(&self, database: Arc<crate::work::WorkDatabase>) {
+        *self.work_database.write().unwrap() = Some(database);
+    }
+
+    pub fn work_database(&self) -> Option<Arc<crate::work::WorkDatabase>> {
+        self.work_database.read().unwrap().clone()
     }
 
     pub fn remove(&self, name: &str) -> Option<ToolRef> {

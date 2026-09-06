@@ -864,6 +864,7 @@ impl ChatView {
                             cx.notify();
                         });
                     }
+                    _ => {}
                 }
             }
 
