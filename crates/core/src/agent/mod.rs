@@ -2362,7 +2362,7 @@ mod tests {
                 ctx: &ToolContext,
                 _params: &serde_json::Value,
             ) -> crate::tool::Result<ToolResult> {
-                *self.observed.lock().unwrap() = ctx.context_controller.clone();
+                *self.observed.lock().unwrap() = Some(ctx.context_controller.clone());
                 Ok(ToolResult::ok("captured"))
             }
         }

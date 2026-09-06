@@ -982,12 +982,15 @@ mod tests {
         tokio::fs::write(&file, "before\n").await.unwrap();
         let context = ToolContext {
             working_dir: directory.path().to_path_buf(),
+            workspace_root: directory.path().to_path_buf(),
             session_id: "test".into(),
             agent_id: "test".into(),
             enabled_tools: Vec::new(),
             available_tools: Vec::new(),
             tool_activation: Arc::new(crate::tool::ToolActivation::default()),
-            context_controller: None,
+            context_controller: Arc::new(crate::agent::ContextController::for_test(
+                100_000, 16_384,
+            )),
             conversation_context: Vec::new(),
             agent_runner: None,
             memory_search_backend: None,
@@ -1011,12 +1014,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let context = ToolContext {
             working_dir: directory.path().to_path_buf(),
+            workspace_root: directory.path().to_path_buf(),
             session_id: "test".into(),
             agent_id: "test".into(),
             enabled_tools: Vec::new(),
             available_tools: Vec::new(),
             tool_activation: Arc::new(crate::tool::ToolActivation::default()),
-            context_controller: None,
+            context_controller: Arc::new(crate::agent::ContextController::for_test(
+                100_000, 16_384,
+            )),
             conversation_context: Vec::new(),
             agent_runner: None,
             memory_search_backend: None,
@@ -1089,12 +1095,15 @@ mod tests {
         tokio::fs::write(&file, "original\n").await.unwrap();
         let context = ToolContext {
             working_dir: directory.path().to_path_buf(),
+            workspace_root: directory.path().to_path_buf(),
             session_id: "test".into(),
             agent_id: "test".into(),
             enabled_tools: Vec::new(),
             available_tools: Vec::new(),
             tool_activation: Arc::new(crate::tool::ToolActivation::default()),
-            context_controller: None,
+            context_controller: Arc::new(crate::agent::ContextController::for_test(
+                100_000, 16_384,
+            )),
             conversation_context: Vec::new(),
             agent_runner: None,
             memory_search_backend: None,
@@ -1125,13 +1134,16 @@ mod tests {
             .unwrap();
         tokio::fs::write(&external, "before\n").await.unwrap();
         let context = ToolContext {
+            workspace_root: workspace.clone(),
             working_dir: workspace,
             session_id: "test".into(),
             agent_id: "test".into(),
             enabled_tools: Vec::new(),
             available_tools: Vec::new(),
             tool_activation: Arc::new(crate::tool::ToolActivation::default()),
-            context_controller: None,
+            context_controller: Arc::new(crate::agent::ContextController::for_test(
+                100_000, 16_384,
+            )),
             conversation_context: Vec::new(),
             agent_runner: None,
             memory_search_backend: None,

@@ -91,6 +91,7 @@ mod tests {
     fn context() -> ToolContext {
         ToolContext {
             working_dir: PathBuf::from("/tmp"),
+            workspace_root: PathBuf::from("/tmp"),
             session_id: "session".into(),
             agent_id: "agent".into(),
             enabled_tools: vec![
@@ -105,7 +106,9 @@ mod tests {
             ],
             available_tools: Vec::new(),
             tool_activation: Arc::new(ToolActivation::default()),
-            context_controller: None,
+            context_controller: Arc::new(crate::agent::ContextController::for_test(
+                100_000, 16_384,
+            )),
             conversation_context: Vec::new(),
             agent_runner: None,
             memory_search_backend: None,

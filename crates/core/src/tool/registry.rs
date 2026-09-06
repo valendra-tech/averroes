@@ -221,12 +221,15 @@ mod tests {
     fn test_ctx() -> ToolContext {
         ToolContext {
             working_dir: PathBuf::from("/tmp"),
+            workspace_root: PathBuf::from("/tmp"),
             session_id: "test-session".into(),
             agent_id: "test-agent".into(),
             enabled_tools: Vec::new(),
             available_tools: Vec::new(),
             tool_activation: Arc::new(super::super::ToolActivation::default()),
-            context_controller: None,
+            context_controller: Arc::new(crate::agent::ContextController::for_test(
+                100_000, 16_384,
+            )),
             conversation_context: Vec::new(),
             agent_runner: None,
             memory_search_backend: None,

@@ -508,12 +508,15 @@ mod tests {
     fn test_context() -> ToolContext {
         ToolContext {
             working_dir: std::path::PathBuf::from("/tmp"),
+            workspace_root: std::path::PathBuf::from("/tmp"),
             session_id: "session".into(),
             agent_id: "agent".into(),
             enabled_tools: Vec::new(),
             available_tools: Vec::new(),
             tool_activation: std::sync::Arc::new(crate::tool::ToolActivation::default()),
-            context_controller: None,
+            context_controller: std::sync::Arc::new(crate::agent::ContextController::for_test(
+                100_000, 16_384,
+            )),
             conversation_context: Vec::new(),
             agent_runner: None,
             memory_search_backend: None,

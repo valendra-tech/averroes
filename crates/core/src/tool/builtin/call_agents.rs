@@ -345,6 +345,7 @@ mod tests {
     fn context(root: &Path, runner: Arc<CapturingRunner>) -> ToolContext {
         ToolContext {
             working_dir: root.to_path_buf(),
+            workspace_root: root.to_path_buf(),
             session_id: "parent-session".into(),
             agent_id: "parent-agent".into(),
             enabled_tools: vec![
@@ -359,7 +360,9 @@ mod tests {
             ],
             available_tools: Vec::new(),
             tool_activation: Arc::new(crate::tool::ToolActivation::default()),
-            context_controller: None,
+            context_controller: Arc::new(crate::agent::ContextController::for_test(
+                100_000, 16_384,
+            )),
             conversation_context: Vec::new(),
             agent_runner: Some(runner),
             memory_search_backend: None,

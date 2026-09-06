@@ -70,6 +70,9 @@ impl ToolApprovalPolicy {
 #[derive(Clone)]
 pub struct ToolContext {
     pub working_dir: PathBuf,
+    /// Workspace scope used by tools that need a stable project root even
+    /// when the conversation's current directory changes.
+    pub workspace_root: PathBuf,
     pub session_id: String,
     pub agent_id: String,
     /// The tool schemas advertised to the provider for the current request.
@@ -80,9 +83,8 @@ pub struct ToolContext {
     /// Per-agent execution state shared by tools that need a current directory.
     pub tool_activation: Arc<ToolActivation>,
     /// Shared context-window state for tools that need current sizing or
-    /// rollover information. Standalone tool tests and delegated contexts may
-    /// leave this unset.
-    pub context_controller: Option<Arc<crate::agent::ContextController>>,
+    /// rollover information.
+    pub context_controller: Arc<crate::agent::ContextController>,
     /// A deliberately reduced, read-only snapshot for delegated agents.
     pub conversation_context: Vec<crate::provider::ChatMessage>,
     pub agent_runner: Option<Arc<dyn AgentRunner>>,
@@ -116,12 +118,13 @@ impl std::fmt::Debug for ToolContext {
         formatter
             .debug_struct("ToolContext")
             .field("working_dir", &self.working_dir)
+            .field("workspace_root", &self.workspace_root)
             .field("current_dir", &self.current_dir())
             .field("session_id", &self.session_id)
             .field("agent_id", &self.agent_id)
             .field("enabled_tools", &self.enabled_tools.len())
             .field("available_tools", &self.available_tools.len())
-            .field("context_controller", &self.context_controller.is_some())
+            .field("context_controller", &true)
             .field("conversation_context", &self.conversation_context.len())
             .field("agent_runner", &self.agent_runner.is_some())
             .field(

@@ -4,6 +4,7 @@ pub mod browser;
 pub mod call_agents;
 pub mod change_directory;
 pub mod checkpoint;
+pub mod context_window;
 pub mod deep_memory;
 pub mod desktop;
 pub mod discover_tools;
@@ -51,6 +52,7 @@ pub(crate) fn resolve_file_path(current_dir: &Path, requested: &str) -> PathBuf 
 pub fn register_all(registry: &ToolRegistry) {
     registry.register(bash::BashTool::default());
     registry.register(change_directory::ChangeDirectoryTool);
+    registry.register(context_window::NewContextTool);
     registry.register(file_read::FileReadTool);
     registry.register(file_write::FileWriteTool);
     registry.register(patch::PatchTool);

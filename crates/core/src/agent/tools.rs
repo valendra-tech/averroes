@@ -1,17 +1,22 @@
-use super::{Agent, AgentStreamEvent};
+use super::{Agent, AgentStreamEvent, ContextRequest};
 use crate::provider::types::{ContentPart, MessageContent, Role, ToolCall};
 use crate::provider::{ChatMessage, ChatResponse};
 use crate::tool::builtin::ask_user::redact_confirmation_params;
 use crate::tool::{EnabledTool, ToolContext, ToolResult};
 use anyhow::Result;
 use futures::future::join_all;
+use serde_json::Value;
 
 pub(super) struct ToolExecution {
     pub messages: Vec<ChatMessage>,
+    pub context_action: Option<ContextRequest>,
+    pub had_failure: bool,
 }
 
 struct ToolCallExecution {
     message: ChatMessage,
+    context_action: Option<ContextRequest>,
+    had_failure: bool,
 }
 
 impl Agent {
@@ -25,6 +30,8 @@ impl Agent {
             None => {
                 return Ok(ToolExecution {
                     messages: Vec::new(),
+                    context_action: None,
+                    had_failure: false,
                 })
             }
         };
@@ -49,7 +56,8 @@ impl Agent {
                 .collect(),
             available_tools,
             tool_activation: self.tool_activation.clone(),
-            context_controller: Some(self.context_controller.clone()),
+            workspace_root: self.working_dir.clone(),
+            context_controller: self.context_controller.clone(),
             conversation_context: self.messages.lock().await.clone(),
             agent_runner: self.agent_runner(),
             memory_search_backend: self.memory_search_backend.read().unwrap().clone(),
@@ -79,12 +87,27 @@ impl Agent {
             executions
         };
 
+        let had_failure = executions.iter().any(|execution| execution.had_failure);
+        if had_failure {
+            ctx.context_controller.clear_pending_request();
+        }
+        let context_action = if had_failure {
+            None
+        } else {
+            executions
+                .iter()
+                .find_map(|execution| execution.context_action.clone())
+        };
         let messages = executions
             .into_iter()
             .map(|execution| execution.message)
             .collect();
 
-        Ok(ToolExecution { messages })
+        Ok(ToolExecution {
+            messages,
+            context_action,
+            had_failure,
+        })
     }
 
     async fn execute_tool_call(
@@ -140,6 +163,8 @@ impl Agent {
                     tool_call_id: Some(tool_call.id.clone()),
                     tool_calls: None,
                 },
+                context_action: None,
+                had_failure: true,
             };
         }
 
@@ -169,6 +194,8 @@ impl Agent {
                         tool_call_id: Some(tool_call.id.clone()),
                         tool_calls: None,
                     },
+                    context_action: None,
+                    had_failure: true,
                 };
             }
         };
@@ -189,6 +216,21 @@ impl Agent {
             Ok(result) => result,
             Err(error) => ToolResult::error(error.to_string()),
         };
+
+        let context_action = if result.success && tool_call.function.name == "new_context" {
+            result.metadata.as_ref().and_then(|metadata| {
+                (metadata.get("context_action").and_then(Value::as_str) == Some("new_context"))
+                    .then(|| ContextRequest {
+                        handoff: metadata
+                            .get("handoff")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    })
+            })
+        } else {
+            None
+        };
+        let had_failure = !result.success;
 
         if matches!(
             tool_call.function.name.as_str(),
@@ -231,6 +273,8 @@ impl Agent {
                 tool_call_id: Some(tool_call.id.clone()),
                 tool_calls: None,
             },
+            context_action,
+            had_failure,
         }
     }
 }

@@ -762,12 +762,15 @@ mod tests {
     fn test_context(session_id: &str) -> ToolContext {
         ToolContext {
             working_dir: std::path::PathBuf::from("/tmp"),
+            workspace_root: std::path::PathBuf::from("/tmp"),
             session_id: session_id.into(),
             agent_id: "agent".into(),
             enabled_tools: Vec::new(),
             available_tools: Vec::new(),
             tool_activation: Arc::new(ToolActivation::default()),
-            context_controller: None,
+            context_controller: Arc::new(crate::agent::ContextController::for_test(
+                100_000, 16_384,
+            )),
             conversation_context: Vec::new(),
             agent_runner: None,
             memory_search_backend: None,
