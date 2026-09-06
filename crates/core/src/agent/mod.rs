@@ -198,7 +198,7 @@ pub struct Agent {
     state: Arc<Mutex<AgentState>>,
     run_lock: Arc<tokio::sync::Mutex<()>>,
     messages: Arc<tokio::sync::Mutex<Vec<ChatMessage>>>,
-    last_context_usage: Arc<Mutex<Option<ContextUsage>>>,
+    context_controller: Arc<ContextController>,
     understood_context: Arc<std::sync::RwLock<Option<String>>>,
     global_memory_prompt: Arc<std::sync::RwLock<Option<String>>>,
     skill_index: Arc<std::sync::RwLock<Option<Arc<SkillIndex>>>>,
@@ -230,6 +230,12 @@ impl Agent {
     ) -> Self {
         let agent_id = uuid::Uuid::new_v4().to_string();
         let model = config.model.clone();
+        let context_window = provider.context_window(&model);
+        let context_controller = Arc::new(ContextController::new(ContextBudget::new(
+            context_window,
+            0,
+            true,
+        )));
         let messages = {
             let mut msgs = Vec::new();
             if let Some(ref prompt) = config.system_prompt {
@@ -266,7 +272,7 @@ impl Agent {
             state: Arc::new(Mutex::new(AgentState::Idle)),
             run_lock: Arc::new(tokio::sync::Mutex::new(())),
             messages,
-            last_context_usage: Arc::new(Mutex::new(None)),
+            context_controller,
             understood_context: Arc::new(std::sync::RwLock::new(None)),
             global_memory_prompt: Arc::new(std::sync::RwLock::new(None)),
             skill_index: Arc::new(std::sync::RwLock::new(None)),
@@ -283,6 +289,10 @@ impl Agent {
         &self.agent_id
     }
 
+    pub fn context_controller(&self) -> Arc<ContextController> {
+        self.context_controller.clone()
+    }
+
     pub async fn state(&self) -> AgentState {
         *self.state.lock().unwrap()
     }
@@ -290,12 +300,7 @@ impl Agent {
     /// Returns the latest provider usage. Before the first provider response,
     /// token usage is intentionally unknown.
     pub async fn context_usage(&self) -> ContextUsage {
-        let runtime = self.runtime_snapshot();
-        let context_limit = runtime.provider.context_window(&runtime.model);
-        if let Some(usage) = self.last_context_usage.lock().unwrap().as_ref() {
-            return *usage;
-        }
-        ContextUsage::unknown(context_limit)
+        self.context_controller.context_usage()
     }
 
     /// Generates a short conversation title with the selected provider.
@@ -321,12 +326,10 @@ impl Agent {
     pub async fn force_compact(&self) -> Result<ContextUsage> {
         let _run_lock = self.run_lock.lock().await;
         let runtime = self.runtime_snapshot();
-        *self.last_context_usage.lock().unwrap() = None;
+        self.context_controller.clear_usage();
         self.compact_with_runtime(&runtime).await?;
         self.set_state(AgentState::Idle);
-        let usage = self.context_usage().await;
-        *self.last_context_usage.lock().unwrap() = Some(usage);
-        Ok(usage)
+        Ok(self.context_usage().await)
     }
 
     /// Returns the number of messages currently held by the agent. The UI
@@ -342,8 +345,10 @@ impl Agent {
         if has_usage {
             let runtime = self.runtime_snapshot();
             usage.context_limit = runtime.provider.context_window(&runtime.model) as u64;
+            self.context_controller.record_usage(usage);
+        } else {
+            self.context_controller.clear_usage();
         }
-        *self.last_context_usage.lock().unwrap() = has_usage.then_some(usage);
     }
 
     /// Returns the latest compact, model-generated understanding of this
@@ -399,10 +404,13 @@ impl Agent {
         model: String,
         governor: Arc<ResourceGovernor>,
     ) {
+        let context_window = provider.context_window(&model);
         let mut runtime = self.runtime.write().unwrap();
         runtime.provider = provider;
         runtime.model = model;
         runtime.governor = governor;
+        self.context_controller
+            .replace_budget(ContextBudget::new(context_window, 0, true));
     }
 
     pub fn set_reasoning_effort(&self, effort: Option<String>) {
@@ -804,10 +812,8 @@ impl Agent {
         let context_limit = runtime.provider.context_window(&runtime.model);
         let message_count = self.messages.lock().await.len();
         let usage_pressure = self
-            .last_context_usage
-            .lock()
-            .unwrap()
-            .as_ref()
+            .context_controller
+            .usage()
             .and_then(|usage| usage.input_tokens)
             .is_some_and(|input_tokens| {
                 input_tokens as f64 > self.config.compaction.threshold * context_limit as f64
@@ -910,7 +916,7 @@ impl Agent {
         // The previous provider measurement describes the pre-compaction
         // request and must never trigger another compaction by itself. The
         // next model response will replace it with an exact fresh value.
-        *self.last_context_usage.lock().unwrap() = None;
+        self.context_controller.clear_usage();
         if let Some(events) = events {
             let _ = events.send(AgentStreamEvent::CompactionFinished {
                 reason,
@@ -932,7 +938,7 @@ impl Agent {
             return;
         };
         let usage = ContextUsage::from_provider_usage(provider_usage, context_limit);
-        *self.last_context_usage.lock().unwrap() = Some(usage);
+        self.context_controller.record_usage(usage);
         if let Some(events) = events {
             let _ = events.send(AgentStreamEvent::ContextUpdated { usage });
         }
@@ -2102,6 +2108,29 @@ mod tests {
         assert_eq!(usage.reasoning_output_tokens, Some(2));
     }
 
+    #[tokio::test]
+    async fn agent_context_usage_and_restoration_share_the_controller_snapshot() {
+        let agent = Agent::new(
+            AgentConfig {
+                system_prompt: None,
+                tools: Vec::new(),
+                ..Default::default()
+            },
+            Arc::new(SmallContextProvider),
+            test_tool_registry(),
+            Arc::new(ResourceGovernor::new(1, 100)),
+            "controller-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        let controller = agent.context_controller();
+
+        controller.record_usage(ContextUsage::from_usage(3, 1, 10));
+        assert_eq!(agent.context_usage().await.input_tokens, Some(3));
+
+        agent.set_context_usage(ContextUsage::from_usage(4, 1, 10));
+        assert_eq!(controller.usage().unwrap().input_tokens, Some(4));
+    }
+
     fn stream_request() -> ChatRequest {
         ChatRequest {
             model: "test-model".into(),
@@ -2446,12 +2475,16 @@ mod tests {
                 tool_calls: None,
             },
         ];
-        *agent.last_context_usage.lock().unwrap() = Some(ContextUsage::from_usage(9, 1, 10));
+        agent
+            .context_controller()
+            .record_usage(ContextUsage::from_usage(9, 1, 10));
 
         let runtime = agent.runtime_snapshot();
         assert!(agent.should_compact_with_runtime(&runtime).await);
 
-        *agent.last_context_usage.lock().unwrap() = Some(ContextUsage::from_usage(7, 1, 10));
+        agent
+            .context_controller()
+            .record_usage(ContextUsage::from_usage(7, 1, 10));
         assert!(!agent.should_compact_with_runtime(&runtime).await);
     }
 
@@ -2493,7 +2526,9 @@ mod tests {
                 tool_calls: None,
             },
         ];
-        *agent.last_context_usage.lock().unwrap() = Some(ContextUsage::from_usage(9, 0, 10));
+        agent
+            .context_controller()
+            .record_usage(ContextUsage::from_usage(9, 0, 10));
 
         let runtime = agent.runtime_snapshot();
 
@@ -2509,13 +2544,14 @@ mod tests {
             Arc::new(ResourceGovernor::new(1, 100_000)),
         );
         seed_compaction_messages(&agent).await;
-        *agent.last_context_usage.lock().unwrap() =
-            Some(ContextUsage::from_usage(180_000, 20, 200_000));
+        agent
+            .context_controller()
+            .record_usage(ContextUsage::from_usage(180_000, 20, 200_000));
 
         let runtime = agent.runtime_snapshot();
         agent.compact_with_runtime(&runtime).await.unwrap();
 
-        assert!(agent.last_context_usage.lock().unwrap().is_none());
+        assert!(agent.context_controller().usage().is_none());
     }
 
     #[tokio::test]

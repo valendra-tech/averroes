@@ -17,6 +17,23 @@ pub const REMINDER_BUFFER_TOKENS: usize = 32_000;
 const APPROX_CHARS_PER_TOKEN: u64 = 4;
 const IMAGE_ALLOWANCE_TOKENS: u64 = 1_024;
 
+#[derive(Debug, Clone, Copy, Default)]
+struct RequestOverhead {
+    system_prompt_tokens: u64,
+    active_tool_schema_tokens: u64,
+    pending_user_tokens: u64,
+    image_count: u64,
+}
+
+impl RequestOverhead {
+    fn total_tokens(self) -> u64 {
+        self.system_prompt_tokens
+            .saturating_add(self.active_tool_schema_tokens)
+            .saturating_add(self.pending_user_tokens)
+            .saturating_add(self.image_count.saturating_mul(IMAGE_ALLOWANCE_TOKENS))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextBudget {
     pub context_window: u64,
@@ -58,21 +75,23 @@ pub struct ContextRequest {
 
 #[derive(Debug)]
 pub struct ContextController {
-    budget: ContextBudget,
+    budget: RwLock<ContextBudget>,
     window_id: RwLock<String>,
     usage: RwLock<Option<ContextUsage>>,
     pending: Mutex<Option<ContextRequest>>,
     reminder_fingerprint: RwLock<Option<String>>,
+    request_overhead: RwLock<RequestOverhead>,
 }
 
 impl ContextController {
     pub fn new(budget: ContextBudget) -> Self {
         Self {
-            budget,
+            budget: RwLock::new(budget),
             window_id: RwLock::new("initial".into()),
             usage: RwLock::new(None),
             pending: Mutex::new(None),
             reminder_fingerprint: RwLock::new(None),
+            request_overhead: RwLock::new(RequestOverhead::default()),
         }
     }
 
@@ -81,7 +100,7 @@ impl ContextController {
     }
 
     pub fn budget(&self) -> ContextBudget {
-        self.budget
+        *self.budget.read()
     }
 
     pub fn record_usage(&self, usage: ContextUsage) {
@@ -92,8 +111,38 @@ impl ContextController {
         *self.usage.read()
     }
 
+    pub fn context_usage(&self) -> ContextUsage {
+        self.usage()
+            .unwrap_or_else(|| ContextUsage::unknown(self.budget().context_window as usize))
+    }
+
+    pub fn clear_usage(&self) {
+        *self.usage.write() = None;
+    }
+
+    pub fn replace_budget(&self, budget: ContextBudget) {
+        *self.budget.write() = budget;
+        self.clear_usage();
+        *self.reminder_fingerprint.write() = None;
+    }
+
     pub fn window_id(&self) -> String {
         self.window_id.read().clone()
+    }
+
+    pub fn set_request_overhead(
+        &self,
+        system_prompt_tokens: usize,
+        active_tool_schema_tokens: usize,
+        pending_user_tokens: usize,
+        image_count: usize,
+    ) {
+        *self.request_overhead.write() = RequestOverhead {
+            system_prompt_tokens: system_prompt_tokens as u64,
+            active_tool_schema_tokens: active_tool_schema_tokens as u64,
+            pending_user_tokens: pending_user_tokens as u64,
+            image_count: image_count as u64,
+        };
     }
 
     pub fn request_context(&self, handoff: Option<String>) -> Result<(), String> {
@@ -124,37 +173,30 @@ impl ContextController {
     }
 
     pub fn handoff_limit(&self) -> usize {
-        MAX_HANDOFF_CHARS
+        let overhead = *self.request_overhead.read();
+        MAX_HANDOFF_CHARS.min(self.page_capacity_chars(overhead))
     }
 
     /// Returns a safe character budget for a paged text result.
     ///
-    /// `active_tool_tokens` is the complete known request overhead outside the
-    /// page body. When provider usage is not known, only half of the fresh
-    /// operational capacity is exposed so the first request has room for its
-    /// system prompt, schemas, pending input, and response overhead.
+    /// When provider usage is not known, only half of the fresh operational
+    /// capacity is exposed so the first request has room for its system
+    /// prompt, schemas, pending input, image allowance, and response overhead.
     pub fn safe_page_chars(
         &self,
         offset: usize,
+        system_prompt_tokens: usize,
+        active_tool_schema_tokens: usize,
+        pending_user_tokens: usize,
         image_count: usize,
-        active_tool_tokens: usize,
     ) -> Result<usize, String> {
-        let image_tokens = (image_count as u64).saturating_mul(IMAGE_ALLOWANCE_TOKENS);
-        let request_overhead = image_tokens.saturating_add(active_tool_tokens as u64);
-        let fresh_capacity = (self.budget.usable.max(0) as u64)
-            .saturating_sub(PAGE_MARGIN_TOKENS as u64)
-            .saturating_sub(request_overhead);
-
-        let available_tokens = match self.usage().and_then(|usage| usage.input_tokens) {
-            Some(input_tokens) => self
-                .budget
-                .context_window
-                .saturating_sub(input_tokens)
-                .saturating_sub(PAGE_MARGIN_TOKENS as u64)
-                .saturating_sub(request_overhead),
-            None => fresh_capacity / 2,
+        let overhead = RequestOverhead {
+            system_prompt_tokens: system_prompt_tokens as u64,
+            active_tool_schema_tokens: active_tool_schema_tokens as u64,
+            pending_user_tokens: pending_user_tokens as u64,
+            image_count: image_count as u64,
         };
-        let chars = available_tokens.saturating_mul(APPROX_CHARS_PER_TOKEN);
+        let chars = self.page_capacity_chars(overhead) as u64;
         if chars < MIN_PAGE_CHARS as u64 {
             return Err(format!(
                 "safe page at offset {offset} is only {chars} characters; minimum is {MIN_PAGE_CHARS}"
@@ -163,12 +205,31 @@ impl ContextController {
         Ok(chars.min(usize::MAX as u64) as usize)
     }
 
+    fn page_capacity_chars(&self, overhead: RequestOverhead) -> usize {
+        let budget = self.budget();
+        let request_overhead = overhead.total_tokens();
+        let fresh_capacity = (budget.usable.max(0) as u64)
+            .saturating_sub(PAGE_MARGIN_TOKENS as u64)
+            .saturating_sub(request_overhead);
+        let available_tokens = match self.usage().and_then(|usage| usage.input_tokens) {
+            Some(input_tokens) => budget
+                .context_window
+                .saturating_sub(input_tokens)
+                .saturating_sub(PAGE_MARGIN_TOKENS as u64)
+                .saturating_sub(request_overhead),
+            None => fresh_capacity / 2,
+        };
+        available_tokens
+            .saturating_mul(APPROX_CHARS_PER_TOKEN)
+            .min(usize::MAX as u64) as usize
+    }
+
     pub fn reminder_fingerprint(&self) -> String {
         format!(
             "{}:{}:{}",
             self.window_id(),
-            self.budget.context_window,
-            self.budget.reserve_tokens
+            self.budget().context_window,
+            self.budget().reserve_tokens
         )
     }
 
@@ -187,6 +248,7 @@ impl ContextController {
         *self.usage.write() = None;
         *self.pending.lock() = None;
         *self.reminder_fingerprint.write() = None;
+        *self.request_overhead.write() = RequestOverhead::default();
         previous
     }
 }
@@ -249,17 +311,31 @@ mod tests {
     #[test]
     fn dynamic_fresh_capacity_accounts_for_tools_and_images() {
         let controller = ContextController::for_test(100_000, 16_384);
-        let fresh = controller.safe_page_chars(0, 0, 0).unwrap();
-        let loaded = controller.safe_page_chars(0, 4, 8_000).unwrap();
+        let fresh = controller.safe_page_chars(0, 0, 0, 0, 0).unwrap();
+        let loaded = controller
+            .safe_page_chars(0, 8_000, 8_000, 8_000, 4)
+            .unwrap();
 
         assert!(fresh > MIN_PAGE_CHARS);
         assert!(loaded < fresh);
     }
 
     #[test]
+    fn handoff_limit_uses_current_capacity_below_the_fixed_maximum() {
+        let controller = ContextController::for_test(100_000, 16_384);
+        controller.record_usage(ContextUsage::from_usage(95_000, 0, 100_000));
+
+        let limit = controller.handoff_limit();
+        assert!(limit < MAX_HANDOFF_CHARS);
+        assert!(controller
+            .request_context(Some("x".repeat(limit + 1)))
+            .is_err());
+    }
+
+    #[test]
     fn safe_page_limit_preserves_offsets_and_reports_unsupported_pages() {
         let controller = ContextController::for_test(10_000, 9_500);
-        let error = controller.safe_page_chars(123, 0, 0).unwrap_err();
+        let error = controller.safe_page_chars(123, 0, 0, 0, 0).unwrap_err();
         assert!(error.contains("offset 123"));
 
         let limit = controller.handoff_limit();
