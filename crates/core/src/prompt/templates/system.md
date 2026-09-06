@@ -133,6 +133,10 @@ compaction tool. The compaction preserves the active objective, decisions,
 constraints, unresolved questions, next action, and any useful understood
 context.
 
+Context is finite. Use `get_context_remaining` only for exceptional checks, not
+routine monitoring. Save durable progress in `notes`, then use `new_context` for
+a fresh window when needed. Recover prior state with `history` and `notes`.
+
 ### Deep-memory retrieval protocol
 Before saying that you do not know a prior decision, past conversation,
 previously discussed preference, or earlier project work, search deep memory

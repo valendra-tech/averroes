@@ -245,4 +245,20 @@ mod tests {
         assert!(prompt.contains("non-interactive"));
         assert!(prompt.contains("at least 60 seconds"));
     }
+
+    #[test]
+    fn explains_stable_context_recovery_without_a_dynamic_meter() {
+        let builder = PromptBuilder::new();
+        let prompt = builder.build_system("/tmp/workspace", None);
+
+        assert!(prompt.contains("Context is finite"));
+        assert!(prompt.contains("`get_context_remaining` only for exceptional checks"));
+        assert!(prompt.contains("Save durable progress in `notes`"));
+        assert!(prompt.contains("use `new_context` for"));
+        assert!(prompt.contains("a fresh window"));
+        assert!(prompt.contains("Recover prior state with `history` and `notes`"));
+        assert!(!prompt.contains("tokens remaining:"));
+        assert!(!prompt.contains("{{ context_remaining }}"));
+        assert!(!prompt.contains("{{ remaining_tokens }}"));
+    }
 }

@@ -71,7 +71,8 @@ pub fn register_all(registry: &ToolRegistry) {
 
 pub fn register_work_tools(registry: &ToolRegistry, database: Arc<crate::work::WorkDatabase>) {
     registry.set_work_database(database.clone());
-    registry.register(history::HistoryTool::new(database));
+    registry.register(history::HistoryTool::new(database.clone()));
+    registry.register(notes::NotesTool::new(database));
 }
 
 pub fn register_scheduled_task_tools(
@@ -124,5 +125,45 @@ mod tests {
         assert!(registry.get("enable_tools").is_none());
         assert!(registry.get("list_tools").is_none());
         assert!(registry.get("list_agents").is_some());
+    }
+
+    #[test]
+    fn register_all_includes_context_recovery_tools_and_existing_catalog() {
+        let registry = ToolRegistry::new();
+        register_all(&registry);
+
+        assert!(registry.get("new_context").is_some());
+        assert!(registry.get("get_context_remaining").is_some());
+        assert!(registry.get("bash").is_some());
+        assert!(registry.get("history").is_none());
+        assert!(registry.get("notes").is_none());
+    }
+
+    #[test]
+    fn register_work_tools_adds_database_tools_once_and_preserves_them_in_scopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let database =
+            crate::work::WorkDatabase::open_at(directory.path().join("averroes.db")).unwrap();
+        let registry = ToolRegistry::new();
+
+        register_work_tools(&registry, database.clone());
+        register_work_tools(&registry, database.clone());
+
+        assert!(registry.get("history").is_some());
+        assert!(registry.get("notes").is_some());
+        assert_eq!(
+            registry
+                .catalog()
+                .iter()
+                .filter(|tool| tool.name == "history" || tool.name == "notes")
+                .count(),
+            2
+        );
+        assert!(registry.work_database().is_some());
+
+        let scoped = registry.fork();
+        assert!(scoped.get("history").is_some());
+        assert!(scoped.get("notes").is_some());
+        assert!(scoped.work_database().is_some());
     }
 }
