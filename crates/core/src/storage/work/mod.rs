@@ -1827,6 +1827,22 @@ mod tests {
     }
 
     #[test]
+    fn migrations_never_lower_a_newer_user_version() {
+        let (_directory, database) = database();
+        let connection = database.connection.lock();
+        connection
+            .pragma_update(None, "user_version", 42_i64)
+            .unwrap();
+
+        schema::migrate(&connection).unwrap();
+
+        let version = connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(version, 42);
+    }
+
+    #[test]
     fn migration_corrects_the_legacy_gpt_5_6_context_limit() {
         let (_directory, database) = database();
         {

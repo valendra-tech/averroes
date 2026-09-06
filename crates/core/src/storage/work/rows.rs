@@ -6,8 +6,6 @@ use super::{WorkCheckpoint, WorkConversation, WorkDatabaseError, WorkSource, Wor
 use rusqlite::{params, types::Type, Connection, OptionalExtension, Transaction};
 use serde::de::DeserializeOwned;
 
-const MAX_HISTORY_FALLBACK_CANDIDATES: usize = 2_048;
-
 fn json_column<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T> {
     let value = row.get::<_, String>(index)?;
     serde_json::from_str(&value).map_err(|error| {
@@ -298,53 +296,23 @@ fn search_history_page_for_scope(
     if query.trim().is_empty() || limit == 0 {
         return Ok((Vec::new(), 0));
     }
-    let fts_query = fts_match_query(query.trim());
-    let pattern = format!("%{}%", escape_like_pattern(&note_search_key(query.trim())));
-    let search_term = fts_query.as_deref().unwrap_or(&pattern);
-    let (from, filter): (String, &str) = match (conversation_id, workspace_root) {
-        (Some(_), None) if fts_query.is_some() => (
+    let Some(fts_query) = fts_match_query(query.trim()) else {
+        return Ok((Vec::new(), 0));
+    };
+    let (from, filter) = match (conversation_id, workspace_root) {
+        (Some(_), None) => (
             "FROM conversation_history h
              JOIN conversation_history_fts
-               ON conversation_history_fts.rowid = h.rowid"
-                .into(),
+               ON conversation_history_fts.rowid = h.rowid",
             "h.conversation_id = ?1 AND conversation_history_fts MATCH ?2",
         ),
-        (None, Some(_)) if fts_query.is_some() => (
+        (None, Some(_)) => (
             "FROM conversation_history h
              JOIN conversation_history_fts
                ON conversation_history_fts.rowid = h.rowid
              JOIN conversations c ON c.id = h.conversation_id
-             JOIN projects p ON p.id = c.project_id"
-                .into(),
+             JOIN projects p ON p.id = c.project_id",
             "p.root = ?1 AND conversation_history_fts MATCH ?2",
-        ),
-        (Some(_), None) => (
-            format!(
-                "FROM (
-                    SELECT h.*
-                    FROM conversation_history h
-                    WHERE h.conversation_id = ?1
-                      AND h.text_search LIKE ?2 ESCAPE '\\'
-                    ORDER BY h.sequence, h.entry_id
-                    LIMIT {MAX_HISTORY_FALLBACK_CANDIDATES}
-                ) h"
-            ),
-            "1 = 1",
-        ),
-        (None, Some(_)) => (
-            format!(
-                "FROM (
-                    SELECT h.*
-                    FROM conversation_history h
-                    JOIN conversations c ON c.id = h.conversation_id
-                    JOIN projects p ON p.id = c.project_id
-                    WHERE p.root = ?1
-                      AND h.text_search LIKE ?2 ESCAPE '\\'
-                    ORDER BY h.sequence, h.entry_id, h.conversation_id
-                    LIMIT {MAX_HISTORY_FALLBACK_CANDIDATES}
-                ) h"
-            ),
-            "1 = 1",
         ),
         _ => return Ok((Vec::new(), 0)),
     };
@@ -361,11 +329,11 @@ fn search_history_page_for_scope(
     let mut statement = connection.prepare(&page_sql)?;
     let rows = match (conversation_id, workspace_root) {
         (Some(conversation_id), None) => statement.query_map(
-            params![conversation_id, search_term, limit as i64, offset as i64],
+            params![conversation_id, fts_query, limit as i64, offset as i64],
             history_entry_with_conversation_and_total_from_row,
         )?,
         (None, Some(workspace_root)) => statement.query_map(
-            params![workspace_root, search_term, limit as i64, offset as i64],
+            params![workspace_root, fts_query, limit as i64, offset as i64],
             history_entry_with_conversation_and_total_from_row,
         )?,
         _ => unreachable!(),
@@ -378,12 +346,12 @@ fn search_history_page_for_scope(
             (match (conversation_id, workspace_root) {
                 (Some(conversation_id), None) => connection.query_row(
                     &format!("{cte} SELECT COUNT(*) FROM deduped"),
-                    params![conversation_id, search_term],
+                    params![conversation_id, fts_query],
                     |row| row.get::<_, i64>(0),
                 )?,
                 (None, Some(workspace_root)) => connection.query_row(
                     &format!("{cte} SELECT COUNT(*) FROM deduped"),
-                    params![workspace_root, search_term],
+                    params![workspace_root, fts_query],
                     |row| row.get::<_, i64>(0),
                 )?,
                 _ => 0,
@@ -493,7 +461,8 @@ fn escape_like_pattern(value: &str) -> String {
 }
 
 /// Build a safe FTS5 prefix query from Unicode alphanumeric tokens. Queries
-/// without tokens use the explicitly bounded LIKE fallback in the caller.
+/// without tokens are intentionally rejected by the search caller because a
+/// LIKE fallback would either scan unbounded history or falsify pagination.
 fn fts_match_query(query: &str) -> Option<String> {
     let mut tokens = Vec::new();
     let mut token = String::new();

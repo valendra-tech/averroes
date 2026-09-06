@@ -510,6 +510,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_with_no_alphanumeric_tokens_returns_no_results() {
+        let root = tempfile::tempdir().unwrap();
+        let current = conversation("current", None);
+        let (_directory, database) = database_with_workspace(root.path(), &[current]);
+        database
+            .append_history_entries(
+                "current",
+                &[entry(
+                    "punctuation",
+                    1,
+                    WorkHistoryKind::User,
+                    "punctuation !!!",
+                )],
+            )
+            .unwrap();
+
+        let result = HistoryTool::new(database)
+            .execute(
+                &context("current", root.path()),
+                &json!({"operation": "search", "query": "!!!"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.content, "No history entries matched the query.");
+        assert_eq!(result.metadata.as_ref().unwrap()["total"], 0);
+    }
+
+    #[tokio::test]
     async fn search_ranks_original_content_and_kinds_before_history_echoes() {
         let root = tempfile::tempdir().unwrap();
         let current = conversation("current", None);

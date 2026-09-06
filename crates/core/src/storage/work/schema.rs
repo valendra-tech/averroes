@@ -370,7 +370,7 @@ fn migrate_note_search_keys(connection: &Connection) -> rusqlite::Result<()> {
             rusqlite::params![workspace_root, path, path_search, content_search],
         )?;
     }
-    transaction.execute_batch("PRAGMA user_version = 18")?;
+    advance_user_version(&transaction, 18)?;
     transaction.commit()
 }
 
@@ -410,9 +410,9 @@ fn migrate_history_search_keys(connection: &Connection) -> rusqlite::Result<()> 
     }
     transaction.execute_batch(
         "CREATE INDEX IF NOT EXISTS conversation_history_search
-             ON conversation_history(conversation_id, text_search);
-         PRAGMA user_version = 19",
+             ON conversation_history(conversation_id, text_search);",
     )?;
+    advance_user_version(&transaction, 19)?;
     transaction.commit()
 }
 
@@ -456,8 +456,20 @@ fn migrate_history_fts(connection: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
-    transaction.execute_batch("PRAGMA user_version = 20")?;
+    advance_user_version(&transaction, 20)?;
     transaction.commit()
+}
+
+fn advance_user_version(
+    transaction: &rusqlite::Transaction<'_>,
+    minimum_version: i64,
+) -> rusqlite::Result<()> {
+    let current_version =
+        transaction.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    if current_version < minimum_version {
+        transaction.execute_batch(&format!("PRAGMA user_version = {minimum_version}"))?;
+    }
+    Ok(())
 }
 
 fn conversation_has_column(connection: &Connection, column: &str) -> rusqlite::Result<bool> {
