@@ -34,12 +34,41 @@ pub(super) fn append_history_entries(
     entries: &[WorkHistoryEntry],
 ) -> Result<(), WorkDatabaseError> {
     let mut statement = transaction.prepare(
-        "INSERT OR IGNORE INTO conversation_history
+        "INSERT INTO conversation_history
             (conversation_id, entry_id, parent_id, thread_id, window_id, sequence,
              timestamp, kind, text, payload_json, images_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?;
     for entry in entries {
+        if let Some(existing) = load_history_entry(transaction, conversation_id, &entry.entry_id)? {
+            if existing == *entry {
+                continue;
+            }
+            return Err(WorkDatabaseError::HistoryConflict {
+                conversation_id: conversation_id.into(),
+                sequence: entry.sequence,
+                entry_id: entry.entry_id.clone(),
+                existing_entry_id: existing.entry_id,
+            });
+        }
+
+        let existing_entry_id = transaction
+            .query_row(
+                "SELECT entry_id FROM conversation_history
+                 WHERE conversation_id = ?1 AND sequence = ?2",
+                params![conversation_id, entry.sequence],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing_entry_id) = existing_entry_id {
+            return Err(WorkDatabaseError::HistoryConflict {
+                conversation_id: conversation_id.into(),
+                sequence: entry.sequence,
+                entry_id: entry.entry_id.clone(),
+                existing_entry_id,
+            });
+        }
+
         statement.execute(params![
             conversation_id,
             entry.entry_id,
@@ -55,6 +84,24 @@ pub(super) fn append_history_entries(
         ])?;
     }
     Ok(())
+}
+
+pub(super) fn load_history_entry(
+    connection: &Connection,
+    conversation_id: &str,
+    entry_id: &str,
+) -> Result<Option<WorkHistoryEntry>, WorkDatabaseError> {
+    connection
+        .query_row(
+            "SELECT entry_id, parent_id, thread_id, window_id, sequence, timestamp,
+                    kind, text, payload_json, images_json
+             FROM conversation_history
+             WHERE conversation_id = ?1 AND entry_id = ?2",
+            params![conversation_id, entry_id],
+            history_entry_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 pub(super) fn load_history_entries(

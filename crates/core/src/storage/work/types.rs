@@ -292,7 +292,7 @@ pub struct WorkSource {
     pub last_used_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkHistoryKind {
     User,
@@ -301,17 +301,19 @@ pub enum WorkHistoryKind {
     ToolResult,
     ContextWindow,
     Reminder,
+    Unknown(String),
 }
 
 impl WorkHistoryKind {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(super) fn as_str(&self) -> String {
         match self {
-            Self::User => "user",
-            Self::Assistant => "assistant",
-            Self::ToolCall => "tool_call",
-            Self::ToolResult => "tool_result",
-            Self::ContextWindow => "context_window",
-            Self::Reminder => "reminder",
+            Self::User => "user".into(),
+            Self::Assistant => "assistant".into(),
+            Self::ToolCall => "tool_call".into(),
+            Self::ToolResult => "tool_result".into(),
+            Self::ContextWindow => "context_window".into(),
+            Self::Reminder => "reminder".into(),
+            Self::Unknown(value) => value.clone(),
         }
     }
 
@@ -322,7 +324,8 @@ impl WorkHistoryKind {
             "tool_result" => Self::ToolResult,
             "context_window" => Self::ContextWindow,
             "reminder" => Self::Reminder,
-            _ => Self::User,
+            "user" => Self::User,
+            value => Self::Unknown(value.into()),
         }
     }
 }

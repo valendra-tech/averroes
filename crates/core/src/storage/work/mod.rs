@@ -537,11 +537,6 @@ impl WorkDatabase {
             ],
         )?;
         rows::replace_messages(&transaction, conversation)?;
-        rows::append_history_entries(
-            &transaction,
-            &conversation.id,
-            &conversation.history_entries,
-        )?;
         for checkpoint in &conversation.checkpoints {
             rows::upsert_checkpoint_tx(&transaction, &conversation.id, checkpoint)?;
         }
@@ -1023,10 +1018,7 @@ impl WorkDatabase {
         conversation_id: &str,
         entry_id: &str,
     ) -> Result<Option<WorkHistoryEntry>, WorkDatabaseError> {
-        Ok(self
-            .history_entries(conversation_id)?
-            .into_iter()
-            .find(|entry| entry.entry_id == entry_id))
+        rows::load_history_entry(&self.connection.lock(), conversation_id, entry_id)
     }
 
     pub fn list_notes(&self, workspace_root: &str) -> Result<Vec<WorkNote>, WorkDatabaseError> {
@@ -1065,6 +1057,10 @@ impl WorkDatabase {
         Ok(())
     }
 
+    /// Appends a newline-delimited record to a note.
+    ///
+    /// This operation is intentionally non-idempotent: repeating the same
+    /// call appends the record again because this API has no operation key.
     pub fn append_note(
         &self,
         workspace_root: &str,
@@ -1351,6 +1347,13 @@ pub enum WorkDatabaseError {
     InvalidFolder(String),
     #[error("invalid onboarding step: {0}")]
     InvalidOnboardingStep(String),
+    #[error("history entry conflict in conversation '{conversation_id}' at sequence {sequence}: entry '{entry_id}' conflicts with existing entry '{existing_entry_id}'")]
+    HistoryConflict {
+        conversation_id: String,
+        sequence: i64,
+        entry_id: String,
+        existing_entry_id: String,
+    },
 }
 
 #[cfg(test)]
@@ -1426,6 +1429,111 @@ mod tests {
                 .read_note("/workspace", "state.md")
                 .unwrap(),
             Some("progress".into())
+        );
+    }
+
+    #[test]
+    fn history_append_is_idempotent_by_entry_id_but_rejects_sequence_collisions() {
+        let (_directory, database) = database();
+        let conversation = test_conversation("history-collision");
+        database.save_conversation(&conversation).unwrap();
+
+        let first = WorkHistoryEntry::user("window-1", "entry-1", "first");
+        database
+            .append_history_entries("history-collision", std::slice::from_ref(&first))
+            .unwrap();
+        database
+            .append_history_entries("history-collision", std::slice::from_ref(&first))
+            .unwrap();
+
+        let conflicting = WorkHistoryEntry::user("window-1", "entry-2", "different");
+        assert!(matches!(
+            database.append_history_entries("history-collision", &[conflicting]),
+            Err(WorkDatabaseError::HistoryConflict { .. })
+        ));
+        assert_eq!(
+            database.history_entries("history-collision").unwrap(),
+            vec![first]
+        );
+    }
+
+    #[test]
+    fn save_conversation_does_not_replay_history_snapshot() {
+        let (_directory, database) = database();
+        let conversation = test_conversation("history-save");
+        database.save_conversation(&conversation).unwrap();
+
+        let first = WorkHistoryEntry::user("window-1", "entry-1", "first");
+        database
+            .append_history_entries("history-save", std::slice::from_ref(&first))
+            .unwrap();
+
+        let mut restored = database.conversation("history-save").unwrap().unwrap();
+        let unappended = WorkHistoryEntry::user("window-1", "entry-2", "unappended");
+        restored.history_entries.push(unappended);
+        restored.title = "updated".into();
+        database.save_conversation(&restored).unwrap();
+
+        assert_eq!(
+            database.history_entries("history-save").unwrap(),
+            vec![first]
+        );
+    }
+
+    #[test]
+    fn unknown_persisted_history_kind_is_preserved() {
+        let (_directory, database) = database();
+        database
+            .save_conversation(&test_conversation("unknown-history-kind"))
+            .unwrap();
+        database
+            .connection
+            .lock()
+            .execute(
+                "INSERT INTO conversation_history
+                 (conversation_id, entry_id, window_id, sequence, timestamp, kind, text,
+                  payload_json, images_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    "unknown-history-kind",
+                    "entry-1",
+                    "window-1",
+                    0_i64,
+                    0_i64,
+                    "future_kind",
+                    "future event",
+                    "{}",
+                    "[]",
+                ],
+            )
+            .unwrap();
+
+        let restored = database
+            .conversation("unknown-history-kind")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.history_entries[0].kind,
+            WorkHistoryKind::Unknown("future_kind".into())
+        );
+    }
+
+    #[test]
+    fn append_note_is_intentionally_non_idempotent() {
+        let (_directory, database) = database();
+        database
+            .write_note("/workspace", "events.md", "start")
+            .unwrap();
+        database
+            .append_note("/workspace", "events.md", "progress")
+            .unwrap();
+        database
+            .append_note("/workspace", "events.md", "progress")
+            .unwrap();
+
+        assert_eq!(
+            database.read_note("/workspace", "events.md").unwrap(),
+            Some("start\nprogress\nprogress\n".into())
         );
     }
 
