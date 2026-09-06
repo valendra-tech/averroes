@@ -100,12 +100,12 @@ impl HistoryTool {
             return Err(self.invalid(format!("offset must be at most {MAX_SEARCH_OFFSET}")));
         }
 
-        let scope_conversation = self.scope_conversation(ctx)?;
         let (entries, total) = if params.all {
             self.database
                 .search_history_workspace_page(&canonical_workspace_root(ctx), query, limit, offset)
                 .map_err(|error| self.storage_error(error))?
         } else {
+            let scope_conversation = self.scope_conversation(ctx)?;
             self.database
                 .search_history_page(&scope_conversation, query, limit, offset)
                 .map_err(|error| self.storage_error(error))?
@@ -628,6 +628,54 @@ mod tests {
         crate::tool::builtin::register_work_tools(&registry, database);
         assert!(registry.get("history").is_some());
         assert!(registry.fork().get("history").is_some());
+    }
+
+    #[tokio::test]
+    async fn all_search_allows_unknown_delegated_session_without_crossing_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let isolated_root = tempfile::tempdir().unwrap();
+        let current = conversation("workspace-conversation", None);
+        let (_directory, database) = database_with_workspace(root.path(), &[current]);
+        database
+            .append_history_entries(
+                "workspace-conversation",
+                &[entry(
+                    "workspace-entry",
+                    1,
+                    WorkHistoryKind::User,
+                    "in-progress delegation needle",
+                )],
+            )
+            .unwrap();
+
+        let isolated_project = database.open_project(isolated_root.path()).unwrap();
+        let isolated = conversation("isolated", Some(isolated_project.id));
+        database.save_conversation(&isolated).unwrap();
+        database
+            .append_history_entries(
+                "isolated",
+                &[entry(
+                    "isolated-entry",
+                    1,
+                    WorkHistoryKind::User,
+                    "in-progress delegation needle",
+                )],
+            )
+            .unwrap();
+
+        let result = HistoryTool::new(database)
+            .execute(
+                &context("agent-thread:unknown-in-progress", root.path()),
+                &json!({
+                    "operation": "search",
+                    "query": "delegation",
+                    "all": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.content.contains("workspace-entry"));
+        assert!(!result.content.contains("isolated-entry"));
     }
 
     #[tokio::test]
