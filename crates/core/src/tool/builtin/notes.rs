@@ -60,10 +60,11 @@ fn normalize_note_path(path: Option<&str>) -> std::result::Result<String, String
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .ok_or_else(|| "path is required and cannot be empty".to_string())?;
-    let path = Path::new(path);
-    if path.is_absolute() || is_windows_absolute(path.to_string_lossy().as_ref()) {
+    if Path::new(path).is_absolute() || is_windows_absolute(path) {
         return Err("path must be relative to the note namespace".into());
     }
+    let path = path.replace('\\', "/");
+    let path = Path::new(&path);
 
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -149,7 +150,7 @@ impl Tool for NotesTool {
     }
 
     fn description(&self) -> &str {
-        "Read and persist private SQLite-backed notes scoped to the current workspace. Use list, read, write, append, or search; note paths are always relative."
+        "Read and persist private SQLite-backed notes scoped to the current workspace. Use list, read, write, append, or search; note paths are always relative. Concurrent appends are atomic newline records ordered by SQLite transaction commit order, so cross-connection order is nondeterministic."
     }
 
     fn parameters(&self) -> Value {
@@ -200,7 +201,7 @@ impl Tool for NotesTool {
                     .map(|note| note.path.as_str())
                     .collect::<Vec<_>>();
                 let content = if paths.is_empty() {
-                    "No notes found in this workspace.".to_owned()
+                    "no notes found in this workspace.".to_owned()
                 } else {
                     paths.join("\n")
                 };
@@ -238,13 +239,13 @@ impl Tool for NotesTool {
                 let continuation = has_more
                     .then(|| format!("; continue with offset {end}"))
                     .unwrap_or_default();
-                let content = format!(
-                    "[chars {}-{end} of {total}{continuation}]\n{page}",
-                    params.offset
-                );
+                let header = format!("[chars {}-{end} of {total}{continuation}]", params.offset);
+                let content = format!("{header}\n{page}");
                 Ok(ToolResult::ok(content).with_metadata(json!({
                     "op": "read",
                     "path": path,
+                    "header": header,
+                    "page": page,
                     "offset": params.offset,
                     "start": params.offset,
                     "end": end,
@@ -293,7 +294,7 @@ impl Tool for NotesTool {
                     .search_notes(&workspace_root, query)
                     .map_err(|error| database_error(self.name(), error))?;
                 let content = if notes.is_empty() {
-                    format!("No notes matched '{query}'.")
+                    format!("no notes matched '{query}'.")
                 } else {
                     notes
                         .iter()
@@ -392,6 +393,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_list_and_search_results_use_lower_case_contract_text() {
+        let (_directory, database) = database();
+        let tool = NotesTool::new(database);
+        let ctx = context("/workspace");
+
+        let list = tool.execute(&ctx, &json!({"op": "list"})).await.unwrap();
+        assert_eq!(list.content, "no notes found in this workspace.");
+
+        let search = tool
+            .execute(&ctx, &json!({"op": "search", "query": "missing"}))
+            .await
+            .unwrap();
+        assert_eq!(search.content, "no notes matched 'missing'.");
+    }
+
+    #[tokio::test]
     async fn empty_write_clears_note_content() {
         let (_directory, database) = database();
         let tool = NotesTool::new(database);
@@ -454,7 +471,10 @@ mod tests {
             "/absolute.md",
             "C:\\absolute.md",
             "../escape.md",
+            "..\\escape.md",
             "a/../../escape.md",
+            "a\\..\\escape.md",
+            "a/..\\escape.md",
         ] {
             let error = tool
                 .execute(
@@ -499,10 +519,15 @@ mod tests {
             .execute(&ctx, &json!({"op": "read", "path": "large.md"}))
             .await
             .unwrap();
-        assert!(first
-            .content
-            .contains(&format!("chars 0-{page_size} of {}", page_size * 2 + 3)));
-        assert_eq!(first.metadata.as_ref().unwrap()["next_offset"], page_size);
+        let first_metadata = first.metadata.as_ref().unwrap();
+        let first_header = format!(
+            "[chars 0-{page_size} of {}; continue with offset {page_size}]",
+            page_size * 2 + 3
+        );
+        assert_eq!(first_metadata["header"], first_header);
+        assert_eq!(first_metadata["page"], "x".repeat(page_size));
+        assert!(first.content.starts_with(&format!("{first_header}\n")));
+        assert_eq!(first_metadata["next_offset"], page_size);
 
         let second = tool
             .execute(
@@ -511,10 +536,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(second
-            .content
-            .contains(&format!("chars {page_size}-{}", page_size * 2)));
-        assert_eq!(second.metadata.as_ref().unwrap()["offset"], page_size);
+        let second_metadata = second.metadata.as_ref().unwrap();
+        let second_header = format!(
+            "[chars {page_size}-{} of {}; continue with offset {}]",
+            page_size * 2,
+            page_size * 2 + 3,
+            page_size * 2
+        );
+        assert_eq!(second_metadata["header"], second_header);
+        assert_eq!(second_metadata["page"], "x".repeat(page_size));
+        assert!(second.content.starts_with(&format!("{second_header}\n")));
+        assert_eq!(second_metadata["offset"], page_size);
     }
 
     #[tokio::test]
@@ -604,9 +636,20 @@ mod tests {
             .unwrap();
         let records = stored.lines().collect::<Vec<_>>();
         assert_eq!(records.len(), 16);
-        for index in 0..16 {
-            assert!(records.contains(&format!("event-{index}").as_str()));
-        }
+        // SQLite serializes each append as one transaction. Separate
+        // connections may commit in nondeterministic order, so any
+        // permutation of complete records is valid, but interleaving is not.
+        let expected = (0..16)
+            .map(|index| format!("event-{index}"))
+            .collect::<std::collections::HashSet<_>>();
+        let actual = records
+            .iter()
+            .map(|record| (*record).to_owned())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(actual, expected);
+        assert!(records
+            .iter()
+            .all(|record| record.starts_with("event-") && record.len() > 6));
     }
 
     #[test]

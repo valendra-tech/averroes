@@ -1057,10 +1057,13 @@ impl WorkDatabase {
         Ok(())
     }
 
-    /// Appends a newline-delimited record to a note.
+    /// Appends an atomic newline-delimited record to a note.
     ///
     /// This operation is intentionally non-idempotent: repeating the same
     /// call appends the record again because this API has no operation key.
+    /// Concurrent calls are ordered by SQLite transaction commit order. The
+    /// order across connections is nondeterministic, but records never
+    /// interleave because each read-modify-write is one transaction.
     pub fn append_note(
         &self,
         workspace_root: &str,
