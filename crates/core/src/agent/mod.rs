@@ -472,17 +472,20 @@ impl Agent {
     ) {
         let messages = self.messages.lock().await.clone();
         let window_id = self.context_controller.window_id();
-        if let (Some(database), Some(conversation_id)) = (
-            self.history_database.as_ref(),
-            self.history_conversation_id.as_deref(),
-        ) {
-            if let Err(error) = database.save_active_context(conversation_id, &messages, &window_id)
-            {
-                crate::observability::diagnostics::record(
-                    crate::observability::diagnostics::DiagnosticLevel::Warning,
-                    "agent.history",
-                    format!("Could not persist active context snapshot: {error}"),
-                );
+        if self.config.work_id_prefix.is_none() {
+            if let (Some(database), Some(conversation_id)) = (
+                self.history_database.as_ref(),
+                self.history_conversation_id.as_deref(),
+            ) {
+                if let Err(error) =
+                    database.save_active_context(conversation_id, &messages, &window_id)
+                {
+                    crate::observability::diagnostics::record(
+                        crate::observability::diagnostics::DiagnosticLevel::Warning,
+                        "agent.history",
+                        format!("Could not persist active context snapshot: {error}"),
+                    );
+                }
             }
         }
         if let Some(events) = events {
@@ -926,6 +929,7 @@ impl Agent {
                     .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
                     .await
                 {
+                    self.emit_snapshot(stream_events.as_ref()).await;
                     self.set_state(AgentState::Errored);
                     run_state.finish();
                     return Err(error);
@@ -960,6 +964,7 @@ impl Agent {
                         .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
                         .await
                     {
+                        self.emit_snapshot(stream_events.as_ref()).await;
                         self.set_state(AgentState::Errored);
                         run_state.finish();
                         return Err(compaction_error);
@@ -967,6 +972,7 @@ impl Agent {
                     continue;
                 }
                 Err(error) => {
+                    self.emit_snapshot(stream_events.as_ref()).await;
                     self.set_state(AgentState::Errored);
                     run_state.finish();
                     return Err(error);
@@ -996,6 +1002,7 @@ impl Agent {
                     match self.execute_tools(&response, stream_events.as_ref()).await {
                         Ok(execution) => execution,
                         Err(error) => {
+                            self.emit_snapshot(stream_events.as_ref()).await;
                             self.set_state(AgentState::Errored);
                             run_state.finish();
                             return Err(error);
@@ -1015,6 +1022,7 @@ impl Agent {
                         .request_context(context_action.handoff)
                     {
                         self.context_controller.clear_pending_request();
+                        self.emit_snapshot(stream_events.as_ref()).await;
                         self.set_state(AgentState::Errored);
                         run_state.finish();
                         return Err(anyhow::Error::msg(error));
@@ -1054,6 +1062,7 @@ impl Agent {
                 .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
                 .await
             {
+                self.emit_snapshot(stream_events.as_ref()).await;
                 self.set_state(AgentState::Errored);
                 run_state.finish();
                 return Err(error);
@@ -1085,6 +1094,7 @@ impl Agent {
         let response = match response_result {
             Ok(response) => response,
             Err(error) => {
+                self.emit_snapshot(stream_events.as_ref()).await;
                 self.set_state(AgentState::Errored);
                 run_state.finish();
                 return Err(error);
@@ -2456,6 +2466,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegated_snapshot_does_not_overwrite_parent_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("history.db")).unwrap();
+        let mut parent = history_conversation("parent-session");
+        parent.active_context = vec![ChatMessage::user("parent context")];
+        parent.active_window_id = "parent-window".into();
+        database.save_conversation(&parent).unwrap();
+
+        let child = Agent::new(
+            AgentConfig {
+                work_conversation_id: Some("parent-session".into()),
+                work_id_prefix: Some("agent:research:".into()),
+                ..test_agent_config()
+            },
+            Arc::new(TestProvider::new(vec![])),
+            history_registry(database.clone()),
+            test_governor(),
+            "agent-thread:research".into(),
+            PathBuf::from("/tmp"),
+        );
+        child
+            .restore_active_context(vec![ChatMessage::user("child context")])
+            .await;
+        child.set_active_window_id("child-window");
+        child.emit_snapshot(None).await;
+
+        let restored = database.conversation("parent-session").unwrap().unwrap();
+        assert_eq!(restored.active_context, parent.active_context);
+        assert_eq!(restored.active_window_id, parent.active_window_id);
+    }
+
+    #[tokio::test]
     async fn test_agent_state_transitions() {
         let agent = Agent::new(
             test_agent_config(),
@@ -2595,6 +2637,45 @@ mod tests {
         assert!(snapshots.iter().any(|messages| {
             messages.iter().any(|message| {
                 message.role == ProviderRole::Tool && message_text(message).contains("image result")
+            })
+        }));
+    }
+
+    #[tokio::test]
+    async fn provider_error_emits_context_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("history.db")).unwrap();
+        database
+            .save_conversation(&history_conversation("provider-error-session"))
+            .unwrap();
+        let agent = Agent::new(
+            AgentConfig {
+                work_conversation_id: Some("provider-error-session".into()),
+                ..test_agent_config()
+            },
+            Arc::new(ErrorStreamProvider),
+            history_registry(database),
+            test_governor(),
+            "provider-error-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(agent
+            .run_streaming("preserve on error", sender)
+            .await
+            .is_err());
+
+        let snapshots = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|event| match event {
+                AgentStreamEvent::ContextSnapshot { messages, .. } => Some(messages),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(snapshots.iter().any(|messages| {
+            messages.iter().any(|message| {
+                message.role == ProviderRole::User
+                    && message_text(message).contains("preserve on error")
             })
         }));
     }

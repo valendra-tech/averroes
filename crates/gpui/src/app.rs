@@ -7079,11 +7079,9 @@ impl AverroesApp {
                     }
                     AgentStreamEvent::ContextUpdated { .. } => {}
                     AgentStreamEvent::ContextReminder { .. } => {}
-                    event @ (AgentStreamEvent::ContextWindowStarted { .. }
+                    AgentStreamEvent::ContextWindowStarted { .. }
                     | AgentStreamEvent::ContextSnapshot { .. }
-                    | AgentStreamEvent::HistoryEntryAppended { .. }) => {
-                        session.apply_context_history_event(event);
-                    }
+                    | AgentStreamEvent::HistoryEntryAppended { .. } => {}
                     AgentStreamEvent::DelegatedAgentStarted { .. }
                     | AgentStreamEvent::DelegatedAgentEvent { .. } => unreachable!(),
                 }
