@@ -1,6 +1,6 @@
 use super::types::{
-    CheckpointStatus, TaskPriority, TaskStatus, WorkHistoryEntry, WorkHistoryKind, WorkMessage,
-    WorkMessageRole, WorkNote, WorkNoteSearchPage,
+    note_search_key, CheckpointStatus, TaskPriority, TaskStatus, WorkHistoryEntry, WorkHistoryKind,
+    WorkMessage, WorkMessageRole, WorkNote, WorkNoteSearchPage,
 };
 use super::{WorkCheckpoint, WorkConversation, WorkDatabaseError, WorkSource, WorkTask};
 use rusqlite::{params, types::Type, Connection, OptionalExtension, Transaction};
@@ -183,15 +183,20 @@ pub(super) fn upsert_note(
     note: &WorkNote,
 ) -> Result<(), WorkDatabaseError> {
     transaction.execute(
-        "INSERT INTO notes (workspace_root, path, content, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO notes
+            (workspace_root, path, content, path_search, content_search, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(workspace_root, path) DO UPDATE SET
             content = excluded.content,
+            path_search = excluded.path_search,
+            content_search = excluded.content_search,
             updated_at = excluded.updated_at",
         params![
             note.workspace_root,
             note.path,
             note.content,
+            note_search_key(&note.path),
+            note_search_key(&note.content),
             note.created_at,
             note.updated_at,
         ],
@@ -253,13 +258,13 @@ pub(super) fn search_notes(
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let pattern = format!("%{}%", escape_like_pattern(query.trim()));
+    let pattern = format!("%{}%", escape_like_pattern(&note_search_key(query.trim())));
     let mut statement = connection.prepare(
         "SELECT workspace_root, path, content, created_at, updated_at
          FROM notes
          WHERE workspace_root = ?1
-           AND (path LIKE ?2 COLLATE NOCASE ESCAPE '\\'
-                OR content LIKE ?2 COLLATE NOCASE ESCAPE '\\')
+           AND (path_search LIKE ?2 ESCAPE '\\'
+                OR content_search LIKE ?2 ESCAPE '\\')
          ORDER BY updated_at DESC, path COLLATE NOCASE, path",
     )?;
     let rows = statement.query_map(params![workspace_root, pattern], |row| {
@@ -288,13 +293,13 @@ pub(super) fn search_notes_page(
             total: 0,
         });
     }
-    let pattern = format!("%{}%", escape_like_pattern(query));
+    let pattern = format!("%{}%", escape_like_pattern(&note_search_key(query)));
     let total = connection.query_row(
         "SELECT COUNT(*)
          FROM notes
          WHERE workspace_root = ?1
-           AND (path LIKE ?2 COLLATE NOCASE ESCAPE '\\'
-                OR content LIKE ?2 COLLATE NOCASE ESCAPE '\\')",
+           AND (path_search LIKE ?2 ESCAPE '\\'
+                OR content_search LIKE ?2 ESCAPE '\\')",
         params![workspace_root, pattern],
         |row| row.get::<_, i64>(0),
     )?;
@@ -308,8 +313,8 @@ pub(super) fn search_notes_page(
         "SELECT workspace_root, path, content, created_at, updated_at
          FROM notes
          WHERE workspace_root = ?1
-           AND (path LIKE ?2 COLLATE NOCASE ESCAPE '\\'
-                OR content LIKE ?2 COLLATE NOCASE ESCAPE '\\')
+           AND (path_search LIKE ?2 ESCAPE '\\'
+                OR content_search LIKE ?2 ESCAPE '\\')
          ORDER BY updated_at DESC, path COLLATE NOCASE, path
          LIMIT ?3 OFFSET ?4",
     )?;

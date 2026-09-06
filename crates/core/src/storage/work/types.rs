@@ -382,6 +382,12 @@ pub struct WorkNoteSearchPage {
     pub total: usize,
 }
 
+/// SQLite's built-in NOCASE is ASCII-only, so note searches use a persisted
+/// Rust-generated Unicode lowercase key instead.
+pub(crate) fn note_search_key(value: &str) -> String {
+    value.to_lowercase()
+}
+
 fn default_active_window_id() -> String {
     "initial".into()
 }

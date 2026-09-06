@@ -27,21 +27,51 @@ enum NotesOperation {
     Search,
 }
 
+#[derive(Debug)]
+enum Param<T> {
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<T> Default for Param<T> {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+impl<'de, T> Deserialize<'de> for Param<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer).map(|value| match value {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NotesParams {
     op: NotesOperation,
     #[serde(default)]
-    path: Option<String>,
+    path: Param<String>,
     #[serde(default)]
-    content: Option<String>,
+    content: Param<String>,
     #[serde(default)]
-    query: Option<String>,
+    query: Param<String>,
     #[serde(default)]
-    offset: Option<usize>,
+    offset: Param<usize>,
 }
 
-const SEARCH_RESULT_BUDGET_CHARS: usize = 768;
+const MAX_NOTE_PATH_CHARS: usize = 512;
+const MAX_SEARCH_SUMMARY_CHARS: usize = 768;
+const MAX_SEARCH_CANDIDATES: usize = 256;
 
 fn invalid(tool: &str, message: impl Into<String>) -> ToolError {
     ToolError::InvalidParams {
@@ -85,7 +115,13 @@ fn normalize_note_path(path: Option<&str>) -> std::result::Result<String, String
     if components.is_empty() {
         return Err("path must name a note inside the relative note namespace".into());
     }
-    Ok(components.join("/"))
+    let normalized = components.join("/");
+    if normalized.chars().count() > MAX_NOTE_PATH_CHARS {
+        return Err(format!(
+            "path cannot exceed {MAX_NOTE_PATH_CHARS} characters"
+        ));
+    }
+    Ok(normalized)
 }
 
 fn is_windows_absolute(path: &str) -> bool {
@@ -97,22 +133,25 @@ fn is_windows_absolute(path: &str) -> bool {
 }
 
 fn required_content(params: &NotesParams, tool: &str, allow_empty: bool) -> Result<String> {
-    let content = params
-        .content
-        .as_deref()
-        .ok_or_else(|| invalid(tool, "content is required"))?;
+    let Param::Value(content) = &params.content else {
+        return Err(invalid(tool, "content is required"));
+    };
     if !allow_empty && content.trim().is_empty() {
         return Err(invalid(tool, "content cannot be empty"));
     }
-    Ok(content.to_owned())
+    Ok(content.clone())
 }
 
 fn note_path(params: &NotesParams, tool: &str) -> Result<String> {
-    normalize_note_path(params.path.as_deref()).map_err(|message| invalid(tool, message))
+    let path = match &params.path {
+        Param::Value(path) => Some(path.as_str()),
+        Param::Missing | Param::Null => None,
+    };
+    normalize_note_path(path).map_err(|message| invalid(tool, message))
 }
 
-fn reject_present<T>(value: &Option<T>, field: &str, operation: &str, tool: &str) -> Result<()> {
-    if value.is_some() {
+fn reject_present<T>(value: &Param<T>, field: &str, operation: &str, tool: &str) -> Result<()> {
+    if !matches!(value, Param::Missing) {
         return Err(invalid(
             tool,
             format!("{field} is not valid for the {operation} operation"),
@@ -150,11 +189,25 @@ fn validate_operation_fields(params: &NotesParams, tool: &str) -> Result<()> {
 }
 
 fn workspace_root(ctx: &ToolContext, tool: &str) -> Result<String> {
-    let root = ctx.workspace_root.to_string_lossy();
+    let root = ctx
+        .workspace_root
+        .to_str()
+        .ok_or_else(|| invalid(tool, "workspace_root must be valid UTF-8"))?;
     if root.trim().is_empty() {
         return Err(invalid(tool, "workspace_root is required"));
     }
-    Ok(root.into_owned())
+    Ok(root.to_owned())
+}
+
+fn offset(params: &NotesParams, operation: &str, tool: &str) -> Result<usize> {
+    match &params.offset {
+        Param::Missing => Ok(0),
+        Param::Value(offset) => Ok(*offset),
+        Param::Null => Err(invalid(
+            tool,
+            format!("offset must be an integer when provided for {operation}"),
+        )),
+    }
 }
 
 fn char_offset(value: &str, offset: usize) -> usize {
@@ -169,6 +222,10 @@ fn char_slice(value: &str, start: usize, end: usize) -> &str {
     &value[char_offset(value, start)..char_offset(value, end)]
 }
 
+fn truncate_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
 fn note_summary(note: &WorkNote, query: &str) -> String {
     let query = query.to_lowercase();
     let excerpt = note
@@ -177,16 +234,18 @@ fn note_summary(note: &WorkNote, query: &str) -> String {
         .find(|line| line.to_lowercase().contains(&query))
         .or_else(|| note.content.lines().next())
         .unwrap_or_default();
-    let excerpt = excerpt.chars().take(512).collect::<String>();
+    let display_path = truncate_chars(&note.path, 256);
+    let excerpt_limit = MAX_SEARCH_SUMMARY_CHARS.saturating_sub(display_path.chars().count() + 2);
+    let excerpt = truncate_chars(excerpt, excerpt_limit);
     if excerpt.is_empty() {
-        note.path.clone()
+        display_path
     } else {
-        format!("{}: {}", note.path, excerpt)
+        format!("{display_path}: {excerpt}")
     }
 }
 
-fn search_page_limit(page_chars: usize) -> usize {
-    (page_chars / SEARCH_RESULT_BUDGET_CHARS).max(1)
+fn search_candidate_limit(page_chars: usize) -> usize {
+    page_chars.clamp(1, MAX_SEARCH_CANDIDATES)
 }
 
 #[async_trait]
@@ -267,7 +326,7 @@ impl Tool for NotesTool {
                 else {
                     return Ok(ToolResult::error(format!("Note '{path}' does not exist.")));
                 };
-                let offset = params.offset.unwrap_or(0);
+                let offset = offset(&params, "read", self.name())?;
                 let total = note.chars().count();
                 if offset > total {
                     return Err(invalid(
@@ -334,33 +393,42 @@ impl Tool for NotesTool {
                 )
             }
             NotesOperation::Search => {
-                let query = params
-                    .query
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|query| !query.is_empty())
-                    .ok_or_else(|| invalid(self.name(), "query is required and cannot be empty"))?;
-                let offset = params.offset.unwrap_or(0);
+                let query = match &params.query {
+                    Param::Value(query) => Some(query.trim()).filter(|query| !query.is_empty()),
+                    Param::Missing | Param::Null => None,
+                }
+                .ok_or_else(|| invalid(self.name(), "query is required and cannot be empty"))?;
+                let offset = offset(&params, "search", self.name())?;
                 let page_chars = ctx
                     .safe_page_chars(offset)
                     .map_err(|message| invalid(self.name(), message))?;
-                let limit = search_page_limit(page_chars);
+                let limit = search_candidate_limit(page_chars);
                 let page = self
                     .database
                     .search_notes_page(&workspace_root, query, limit, offset)
                     .map_err(|error| database_error(self.name(), error))?;
-                let notes = page.notes;
+                let mut notes = Vec::new();
+                let mut summaries = Vec::new();
+                let mut content_chars = 0;
+                for note in page.notes {
+                    let summary = note_summary(&note, query);
+                    let separator_chars = usize::from(!summaries.is_empty());
+                    if !summaries.is_empty()
+                        && content_chars + separator_chars + summary.chars().count() > page_chars
+                    {
+                        break;
+                    }
+                    content_chars += separator_chars + summary.chars().count();
+                    summaries.push(summary);
+                    notes.push(note);
+                }
                 let returned = notes.len();
                 let next_offset = offset.saturating_add(returned);
                 let has_more = next_offset < page.total;
-                let content = if notes.is_empty() {
+                let content = if summaries.is_empty() {
                     format!("no notes matched '{query}'.")
                 } else {
-                    notes
-                        .iter()
-                        .map(|note| note_summary(note, query))
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    summaries.join("\n")
                 };
                 Ok(ToolResult::ok(content).with_metadata(json!({
                     "op": "search",
@@ -379,7 +447,7 @@ impl Tool for NotesTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_note_path, NotesTool};
+    use super::{normalize_note_path, NotesTool, MAX_NOTE_PATH_CHARS};
     use crate::agent::ContextController;
     use crate::storage::work::WorkDatabase;
     use crate::tool::{Tool, ToolActivation, ToolContext, ToolError, ToolRegistry};
@@ -544,6 +612,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notes_reject_null_fields_that_do_not_belong_to_the_operation() {
+        let (_directory, database) = database();
+        let tool = NotesTool::new(database);
+        let ctx = context("/workspace");
+        let invalid = [
+            json!({"op": "list", "path": null}),
+            json!({"op": "read", "path": "state.md", "content": null}),
+            json!({"op": "write", "path": "state.md", "content": "x", "query": null}),
+            json!({"op": "append", "path": "state.md", "content": "x", "offset": null}),
+            json!({"op": "search", "query": "state", "path": null}),
+        ];
+
+        for params in invalid {
+            let error = tool.execute(&ctx, &params).await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidParams { .. }));
+            assert!(error.to_string().contains("not valid"));
+        }
+    }
+
+    #[tokio::test]
     async fn notes_reject_paths_outside_the_relative_note_namespace() {
         let (_directory, database) = database();
         let tool = NotesTool::new(database);
@@ -610,6 +698,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_matches_unicode_case_and_reports_consistent_metadata() {
+        let (_directory, database) = database();
+        let tool = NotesTool::new(database);
+        let ctx = context("/workspace");
+        tool.execute(
+            &ctx,
+            &json!({"op": "write", "path": "cafe.md", "content": "CAFÉ"}),
+        )
+        .await
+        .unwrap();
+
+        let result = tool
+            .execute(&ctx, &json!({"op": "search", "query": "café"}))
+            .await
+            .unwrap();
+        let metadata = result.metadata.as_ref().unwrap();
+        assert_eq!(metadata["total"], 1);
+        assert_eq!(metadata["count"], 1);
+        assert_eq!(metadata["has_more"], false);
+        assert_eq!(metadata["next_offset"], Value::Null);
+        assert!(result.content.contains("CAFÉ"));
+    }
+
+    #[tokio::test]
     async fn read_pages_content_and_continues_from_the_returned_offset() {
         let (_directory, database) = database();
         let context_controller = Arc::new(ContextController::for_test(10_000, 1_000));
@@ -666,9 +778,9 @@ mod tests {
         let tool = NotesTool::new(database);
         let ctx = context_with_controller("/workspace", context_controller);
         for (path, content) in [
-            ("alpha.md", "needle café"),
-            ("beta.md", "needle 日本語"),
-            ("gamma.md", "needle 🚀"),
+            ("alpha.md", format!("needle café {}", "x".repeat(2_000))),
+            ("beta.md", format!("needle 日本語 {}", "x".repeat(2_000))),
+            ("gamma.md", format!("needle 🚀 {}", "x".repeat(2_000))),
         ] {
             tool.execute(
                 &ctx,
@@ -726,6 +838,63 @@ mod tests {
         assert!(combined.contains("café"));
         assert!(combined.contains("日本語"));
         assert!(combined.contains("🚀"));
+    }
+
+    #[tokio::test]
+    async fn search_page_bounds_long_paths_and_content_to_the_safe_budget() {
+        let (_directory, database) = database();
+        let context_controller = Arc::new(ContextController::for_test(12_000, 2_000));
+        let page_chars = context_controller.safe_page_chars(0, 0, 0, 0, 0).unwrap();
+        let tool = NotesTool::new(database);
+        let ctx = context_with_controller("/workspace", context_controller);
+        let path = format!("{}.md", "p".repeat(MAX_NOTE_PATH_CHARS - 3));
+        let content = format!("needle {}", "x".repeat(page_chars * 8));
+        tool.execute(
+            &ctx,
+            &json!({"op": "write", "path": path, "content": content}),
+        )
+        .await
+        .unwrap();
+
+        let result = tool
+            .execute(&ctx, &json!({"op": "search", "query": "needle"}))
+            .await
+            .unwrap();
+        let metadata = result.metadata.as_ref().unwrap();
+        assert_eq!(metadata["total"], 1);
+        assert_eq!(metadata["count"], 1);
+        assert_eq!(metadata["has_more"], false);
+        assert!(result.content.chars().count() <= page_chars);
+        assert!(!result.content.contains('�'));
+
+        let too_long_path = "p".repeat(MAX_NOTE_PATH_CHARS + 1);
+        let error = tool
+            .execute(
+                &ctx,
+                &json!({"op": "write", "path": too_long_path, "content": "blocked"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidParams { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_non_utf8_workspace_roots_instead_of_lossy_collisions() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let (_directory, database) = database();
+        let tool = NotesTool::new(database);
+        let mut ctx = context("/workspace");
+        ctx.workspace_root = PathBuf::from(OsString::from_vec(vec![b'/', 0xff]));
+
+        let error = tool
+            .execute(&ctx, &json!({"op": "list"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidParams { .. }));
+        assert!(error.to_string().contains("UTF-8"));
     }
 
     #[tokio::test]

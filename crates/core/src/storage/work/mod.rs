@@ -1623,6 +1623,21 @@ mod tests {
     }
 
     #[test]
+    fn search_notes_page_matches_unicode_case_without_losing_count_or_rows() {
+        let (_directory, database) = database();
+        database
+            .write_note("/workspace", "cafe.md", "CAFÉ")
+            .unwrap();
+
+        let page = database
+            .search_notes_page("/workspace", "café", 1, 0)
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.notes.len(), 1);
+        assert_eq!(page.notes[0].content, "CAFÉ");
+    }
+
+    #[test]
     fn migration_corrects_the_legacy_gpt_5_6_context_limit() {
         let (_directory, database) = database();
         {

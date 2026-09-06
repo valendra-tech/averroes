@@ -1,4 +1,4 @@
-use super::types::{WorkConversationFolder, WorkProject};
+use super::types::{note_search_key, WorkConversationFolder, WorkProject};
 use rusqlite::Connection;
 use std::path::PathBuf;
 
@@ -184,6 +184,8 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             workspace_root TEXT NOT NULL,
             path TEXT NOT NULL,
             content TEXT NOT NULL,
+            path_search TEXT NOT NULL DEFAULT '',
+            content_search TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
             PRIMARY KEY (workspace_root, path)
@@ -309,13 +311,54 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
     if !table_has_column(connection, "sources", "title")? {
         connection.execute("ALTER TABLE sources ADD COLUMN title TEXT", [])?;
     }
+    let mut notes_search_keys_added = false;
+    if !table_has_column(connection, "notes", "path_search")? {
+        connection.execute(
+            "ALTER TABLE notes ADD COLUMN path_search TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+        notes_search_keys_added = true;
+    }
+    if !table_has_column(connection, "notes", "content_search")? {
+        connection.execute(
+            "ALTER TABLE notes ADD COLUMN content_search TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+        notes_search_keys_added = true;
+    }
+    if notes_search_keys_added {
+        let mut statement =
+            connection.prepare("SELECT workspace_root, path, content FROM notes")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let notes = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for (workspace_root, path, content) in notes {
+            connection.execute(
+                "UPDATE notes
+                 SET path_search = ?3, content_search = ?4
+                 WHERE workspace_root = ?1 AND path = ?2",
+                rusqlite::params![
+                    workspace_root,
+                    path,
+                    note_search_key(&path),
+                    note_search_key(&content),
+                ],
+            )?;
+        }
+    }
     connection.execute_batch(
         "DROP INDEX IF EXISTS conversation_history_sequence;
          DROP INDEX IF EXISTS conversation_embeddings_model;
          CREATE INDEX conversation_embeddings_model
              ON conversation_embeddings(connection_id, model_id, conversation_id);",
     )?;
-    connection.pragma_update(None, "user_version", 17)?;
+    connection.pragma_update(None, "user_version", 18)?;
     Ok(())
 }
 
