@@ -6,6 +6,8 @@ use super::{WorkCheckpoint, WorkConversation, WorkDatabaseError, WorkSource, Wor
 use rusqlite::{params, types::Type, Connection, OptionalExtension, Transaction};
 use serde::de::DeserializeOwned;
 
+const MAX_HISTORY_FALLBACK_CANDIDATES: usize = 2_048;
+
 fn json_column<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T> {
     let value = row.get::<_, String>(index)?;
     serde_json::from_str(&value).map_err(|error| {
@@ -238,24 +240,8 @@ pub(super) fn search_history(
     limit: usize,
     offset: usize,
 ) -> Result<Vec<WorkHistoryEntry>, WorkDatabaseError> {
-    if query.trim().is_empty() || limit == 0 {
-        return Ok(Vec::new());
-    }
-    let pattern = format!("%{}%", escape_like_pattern(&note_search_key(query.trim())));
-    let mut statement = connection.prepare(
-        "SELECT entry_id, parent_id, thread_id, window_id, sequence, timestamp,
-                kind, text, payload_json, images_json
-         FROM conversation_history
-         WHERE conversation_id = ?1
-           AND text_search LIKE ?2 ESCAPE '\\'
-         ORDER BY sequence, entry_id
-         LIMIT ?3 OFFSET ?4",
-    )?;
-    let rows = statement.query_map(
-        params![conversation_id, pattern, limit as i64, offset as i64],
-        history_entry_from_row,
-    )?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    let (entries, _) = search_history_page(connection, conversation_id, query, limit, offset)?;
+    Ok(entries.into_iter().map(|(_, entry)| entry).collect())
 }
 
 fn ranked_history_cte(from: &str, filter: &str) -> String {
@@ -312,21 +298,57 @@ fn search_history_page_for_scope(
     if query.trim().is_empty() || limit == 0 {
         return Ok((Vec::new(), 0));
     }
+    let fts_query = fts_match_query(query.trim());
     let pattern = format!("%{}%", escape_like_pattern(&note_search_key(query.trim())));
-    let (from, filter) = match (conversation_id, workspace_root) {
+    let search_term = fts_query.as_deref().unwrap_or(&pattern);
+    let (from, filter): (String, &str) = match (conversation_id, workspace_root) {
+        (Some(_), None) if fts_query.is_some() => (
+            "FROM conversation_history h
+             JOIN conversation_history_fts
+               ON conversation_history_fts.rowid = h.rowid"
+                .into(),
+            "h.conversation_id = ?1 AND conversation_history_fts MATCH ?2",
+        ),
+        (None, Some(_)) if fts_query.is_some() => (
+            "FROM conversation_history h
+             JOIN conversation_history_fts
+               ON conversation_history_fts.rowid = h.rowid
+             JOIN conversations c ON c.id = h.conversation_id
+             JOIN projects p ON p.id = c.project_id"
+                .into(),
+            "p.root = ?1 AND conversation_history_fts MATCH ?2",
+        ),
         (Some(_), None) => (
-            "FROM conversation_history h",
-            "h.conversation_id = ?1 AND h.text_search LIKE ?2 ESCAPE '\\'",
+            format!(
+                "FROM (
+                    SELECT h.*
+                    FROM conversation_history h
+                    WHERE h.conversation_id = ?1
+                      AND h.text_search LIKE ?2 ESCAPE '\\'
+                    ORDER BY h.sequence, h.entry_id
+                    LIMIT {MAX_HISTORY_FALLBACK_CANDIDATES}
+                ) h"
+            ),
+            "1 = 1",
         ),
         (None, Some(_)) => (
-            "FROM conversation_history h
-             JOIN conversations c ON c.id = h.conversation_id
-             JOIN projects p ON p.id = c.project_id",
-            "p.root = ?1 AND h.text_search LIKE ?2 ESCAPE '\\'",
+            format!(
+                "FROM (
+                    SELECT h.*
+                    FROM conversation_history h
+                    JOIN conversations c ON c.id = h.conversation_id
+                    JOIN projects p ON p.id = c.project_id
+                    WHERE p.root = ?1
+                      AND h.text_search LIKE ?2 ESCAPE '\\'
+                    ORDER BY h.sequence, h.entry_id, h.conversation_id
+                    LIMIT {MAX_HISTORY_FALLBACK_CANDIDATES}
+                ) h"
+            ),
+            "1 = 1",
         ),
         _ => return Ok((Vec::new(), 0)),
     };
-    let cte = ranked_history_cte(from, filter);
+    let cte = ranked_history_cte(&from, filter);
     let page_sql = format!(
         "{cte}
          SELECT conversation_id, entry_id, parent_id, thread_id, window_id,
@@ -339,11 +361,11 @@ fn search_history_page_for_scope(
     let mut statement = connection.prepare(&page_sql)?;
     let rows = match (conversation_id, workspace_root) {
         (Some(conversation_id), None) => statement.query_map(
-            params![conversation_id, pattern, limit as i64, offset as i64],
+            params![conversation_id, search_term, limit as i64, offset as i64],
             history_entry_with_conversation_and_total_from_row,
         )?,
         (None, Some(workspace_root)) => statement.query_map(
-            params![workspace_root, pattern, limit as i64, offset as i64],
+            params![workspace_root, search_term, limit as i64, offset as i64],
             history_entry_with_conversation_and_total_from_row,
         )?,
         _ => unreachable!(),
@@ -356,12 +378,12 @@ fn search_history_page_for_scope(
             (match (conversation_id, workspace_root) {
                 (Some(conversation_id), None) => connection.query_row(
                     &format!("{cte} SELECT COUNT(*) FROM deduped"),
-                    params![conversation_id, pattern],
+                    params![conversation_id, search_term],
                     |row| row.get::<_, i64>(0),
                 )?,
                 (None, Some(workspace_root)) => connection.query_row(
                     &format!("{cte} SELECT COUNT(*) FROM deduped"),
-                    params![workspace_root, pattern],
+                    params![workspace_root, search_term],
                     |row| row.get::<_, i64>(0),
                 )?,
                 _ => 0,
@@ -430,26 +452,8 @@ pub(super) fn search_history_workspace(
     limit: usize,
     offset: usize,
 ) -> Result<Vec<(String, WorkHistoryEntry)>, WorkDatabaseError> {
-    if query.trim().is_empty() || limit == 0 {
-        return Ok(Vec::new());
-    }
-    let pattern = format!("%{}%", escape_like_pattern(&note_search_key(query.trim())));
-    let mut statement = connection.prepare(
-        "SELECT h.conversation_id, h.entry_id, h.parent_id, h.thread_id, h.window_id,
-                h.sequence, h.timestamp, h.kind, h.text, h.payload_json, h.images_json
-         FROM conversation_history h
-         JOIN conversations c ON c.id = h.conversation_id
-         JOIN projects p ON p.id = c.project_id
-         WHERE p.root = ?1
-           AND h.text_search LIKE ?2 ESCAPE '\\'
-         ORDER BY h.sequence, h.entry_id, h.conversation_id
-         LIMIT ?3 OFFSET ?4",
-    )?;
-    let rows = statement.query_map(
-        params![workspace_root, pattern, limit as i64, offset as i64],
-        history_entry_with_conversation_from_row,
-    )?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    search_history_workspace_page(connection, workspace_root, query, limit, offset)
+        .map(|(entries, _)| entries)
 }
 
 pub(super) fn load_history_entry_in_scope(
@@ -486,6 +490,30 @@ fn escape_like_pattern(value: &str) -> String {
         escaped.push(character);
     }
     escaped
+}
+
+/// Build a safe FTS5 prefix query from Unicode alphanumeric tokens. Queries
+/// without tokens use the explicitly bounded LIKE fallback in the caller.
+fn fts_match_query(query: &str) -> Option<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    for character in query.chars() {
+        if character.is_alphanumeric() {
+            token.push(character);
+        } else if !token.is_empty() {
+            tokens.push(std::mem::take(&mut token));
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    (!tokens.is_empty()).then(|| {
+        tokens
+            .into_iter()
+            .map(|token| format!("\"{token}\"*"))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    })
 }
 
 pub(super) fn upsert_note(

@@ -1788,6 +1788,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(key, "café");
+
+        let matches = connection
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_history_fts
+                 WHERE conversation_history_fts MATCH ?1",
+                ["café"],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(matches, 1);
+    }
+
+    #[test]
+    fn history_fts_indexes_appended_entries() {
+        let (_directory, database) = database();
+        database
+            .save_conversation(&test_conversation("history-fts"))
+            .unwrap();
+        database
+            .append_history_entries(
+                "history-fts",
+                &[WorkHistoryEntry::user("window-1", "entry-1", "CAFÉ")],
+            )
+            .unwrap();
+
+        let matches = database
+            .connection
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_history_fts
+                 WHERE conversation_history_fts MATCH ?1",
+                ["café"],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(matches, 1);
     }
 
     #[test]

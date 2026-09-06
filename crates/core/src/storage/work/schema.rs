@@ -1,5 +1,5 @@
 use super::types::{note_search_key, WorkConversationFolder, WorkProject};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::PathBuf;
 
 pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
@@ -320,6 +320,7 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
     )?;
     migrate_note_search_keys(connection)?;
     migrate_history_search_keys(connection)?;
+    migrate_history_fts(connection)?;
     Ok(())
 }
 
@@ -415,6 +416,50 @@ fn migrate_history_search_keys(connection: &Connection) -> rusqlite::Result<()> 
     transaction.commit()
 }
 
+/// Keep an external-content FTS5 index synchronized with normalized history.
+/// Creation and rebuild happen in one transaction so an interrupted migration
+/// can safely retry on the next open.
+fn migrate_history_fts(connection: &Connection) -> rusqlite::Result<()> {
+    let fts_exists = table_exists(connection, "conversation_history_fts")?;
+    let user_version =
+        connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS conversation_history_fts USING fts5(
+            text,
+            content='conversation_history',
+            content_rowid='rowid',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE TRIGGER IF NOT EXISTS conversation_history_fts_ai
+        AFTER INSERT ON conversation_history BEGIN
+            INSERT INTO conversation_history_fts(rowid, text)
+            VALUES (new.rowid, new.text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS conversation_history_fts_ad
+        AFTER DELETE ON conversation_history BEGIN
+            INSERT INTO conversation_history_fts(conversation_history_fts, rowid, text)
+            VALUES ('delete', old.rowid, old.text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS conversation_history_fts_au
+        AFTER UPDATE ON conversation_history BEGIN
+            INSERT INTO conversation_history_fts(conversation_history_fts, rowid, text)
+            VALUES ('delete', old.rowid, old.text);
+            INSERT INTO conversation_history_fts(rowid, text)
+            VALUES (new.rowid, new.text);
+        END;",
+    )?;
+    if !fts_exists || user_version < 20 {
+        transaction.execute(
+            "INSERT INTO conversation_history_fts(conversation_history_fts)
+             VALUES ('rebuild')",
+            [],
+        )?;
+    }
+    transaction.execute_batch("PRAGMA user_version = 20")?;
+    transaction.commit()
+}
+
 fn conversation_has_column(connection: &Connection, column: &str) -> rusqlite::Result<bool> {
     table_has_column(connection, "conversations", column)
 }
@@ -431,6 +476,19 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> rusql
         }
     }
     Ok(false)
+}
+
+fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+             WHERE type IN ('table', 'view') AND name = ?1
+             LIMIT 1",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|value| value.is_some())
 }
 
 pub(super) fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkProject> {
