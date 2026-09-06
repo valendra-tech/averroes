@@ -1537,6 +1537,8 @@ pub enum WorkDatabaseError {
     InvalidNote(String),
     #[error("invalid onboarding step: {0}")]
     InvalidOnboardingStep(String),
+    #[error("conversation not found: {conversation_id}")]
+    ConversationNotFound { conversation_id: String },
     #[error("history entry conflict in conversation '{conversation_id}' at sequence {sequence}: entry '{entry_id}' conflicts with existing entry '{existing_entry_id}'")]
     HistoryConflict {
         conversation_id: String,
@@ -1739,6 +1741,25 @@ mod tests {
             .unwrap();
         assert_eq!(updated.active_context, real_snapshot.active_context);
         assert_eq!(updated.active_window_id, "window-3");
+    }
+
+    #[test]
+    fn save_active_context_rejects_unknown_conversation() {
+        let (_directory, database) = database();
+
+        let error = database
+            .save_active_context(
+                "missing-conversation",
+                &[crate::provider::ChatMessage::user("context")],
+                "window-1",
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WorkDatabaseError::ConversationNotFound { conversation_id }
+                if conversation_id == "missing-conversation"
+        ));
     }
 
     #[test]

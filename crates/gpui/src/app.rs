@@ -41,8 +41,8 @@ use averroes_core::tool::ToolApprovalPolicy;
 use averroes_core::work::{
     now, CheckpointStatus, ConversationSearchResult, ConversationSummary, EmbeddingConfig,
     EmbeddingIndexStatus, TaskStatus, WorkCheckpoint, WorkConversation, WorkConversationFolder,
-    WorkMessage, WorkMessageRole, WorkProject, WorkSource, WorkTask, WorkToolActivity,
-    WorkToolActivityState, WorkWindowMode, WorkWindowState,
+    WorkHistoryEntry, WorkMessage, WorkMessageRole, WorkProject, WorkSource, WorkTask,
+    WorkToolActivity, WorkToolActivityState, WorkWindowMode, WorkWindowState,
 };
 use base64::Engine as _;
 use gpui::prelude::FluentBuilder as _;
@@ -18490,6 +18490,52 @@ mod workspace_grouping_tests {
             history[1].content,
             MessageContent::Text("Finished answer".into())
         );
+    }
+
+    #[test]
+    fn shell_session_round_trips_active_context_window_and_history_events() {
+        let mut session = ShellSession::new(None, SessionBinding::default());
+        let active_context = vec![ChatMessage::user("provider context")];
+        let entry = WorkHistoryEntry::user("window-2", "entry-1", "durable history");
+
+        session.apply_context_history_event(AgentStreamEvent::ContextSnapshot {
+            window_id: "window-2".into(),
+            messages: active_context.clone(),
+        });
+        session.apply_context_history_event(AgentStreamEvent::ContextWindowStarted {
+            previous_window_id: "initial".into(),
+            window_id: "window-2".into(),
+            reason: "restore".into(),
+            handoff: None,
+            automatic: false,
+        });
+        session.apply_context_history_event(AgentStreamEvent::HistoryEntryAppended {
+            entry: entry.clone(),
+        });
+        session.apply_context_history_event(AgentStreamEvent::HistoryEntryAppended { entry });
+
+        assert_eq!(session.active_context, active_context);
+        assert_eq!(session.active_window_id, "window-2");
+        assert_eq!(session.history_entries.len(), 1);
+        let restored = ShellSession::from_work(session.snapshot(), &[]);
+        assert_eq!(restored.active_context, active_context);
+        assert_eq!(restored.active_window_id, "window-2");
+        assert_eq!(restored.history_entries.len(), 1);
+    }
+
+    #[test]
+    fn active_context_is_unusable_when_sanitization_keeps_only_system() {
+        let system = ChatMessage {
+            role: Role::System,
+            content: MessageContent::Text("configured".into()),
+            tool_call_id: None,
+            tool_calls: None,
+        };
+
+        assert!(!active_context_is_usable(&[system]));
+        assert!(active_context_is_usable(&[ChatMessage::user(
+            "visible fallback"
+        )]));
     }
 
     fn patch_activity(input: &str) -> ToolActivity {

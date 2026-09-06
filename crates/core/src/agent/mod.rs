@@ -2546,10 +2546,49 @@ mod tests {
         assert!(history
             .iter()
             .any(|entry| { entry.kind == WorkHistoryKind::Assistant && entry.text == "done" }));
-        assert_eq!(snapshots.len(), 1);
+        assert!(!snapshots.is_empty());
         assert!(snapshots[0]
             .iter()
             .any(|message| message.content == MessageContent::Text("done".into())));
+    }
+
+    #[tokio::test]
+    async fn tool_batches_emit_an_intermediate_context_snapshot() {
+        let agent = Agent::new(
+            AgentConfig {
+                tools: vec!["image_tool".into()],
+                ..test_agent_config()
+            },
+            Arc::new(TestProvider::new(vec![
+                tool_response(vec![function_tool_call(
+                    "call-snapshot",
+                    "image_tool",
+                    "{}",
+                )]),
+                assistant_response("finished", 10),
+            ])),
+            image_tool_registry(),
+            test_governor(),
+            "snapshot-after-tools".into(),
+            PathBuf::from("/tmp"),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        agent.run_streaming("inspect", sender).await.unwrap();
+
+        let snapshots = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|event| match event {
+                AgentStreamEvent::ContextSnapshot { messages, .. } => Some(messages),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(snapshots.len() >= 2);
+        assert!(snapshots.iter().any(|messages| {
+            messages.iter().any(|message| {
+                message.role == ProviderRole::Tool
+                    && message.content == MessageContent::Text("image result".into())
+            })
+        }));
     }
 
     #[test]
@@ -2806,6 +2845,40 @@ mod tests {
         agent.emit_context_window_started(None, "initial", "test", None, true);
 
         assert_eq!(agent.run("hello").await.unwrap(), "done");
+    }
+
+    #[tokio::test]
+    async fn failed_history_persistence_can_retry_and_only_emits_after_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("history.db")).unwrap();
+        let agent = Agent::new(
+            AgentConfig {
+                work_conversation_id: Some("retry-session".into()),
+                ..test_agent_config()
+            },
+            Arc::new(TestProvider::new(vec![])),
+            history_registry(database.clone()),
+            test_governor(),
+            "retry-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let entry = WorkHistoryEntry::user("initial", "retry-entry", "retry me");
+
+        assert!(agent
+            .emit_history_entry(entry.clone(), Some(&sender))
+            .is_err());
+        assert!(receiver.try_recv().is_err());
+
+        database
+            .save_conversation(&history_conversation("retry-session"))
+            .unwrap();
+        agent.emit_history_entry(entry, Some(&sender)).unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AgentStreamEvent::HistoryEntryAppended { .. }
+        ));
     }
 
     #[tokio::test]
