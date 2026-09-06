@@ -712,10 +712,20 @@ impl Agent {
                             return Err(error);
                         }
                     };
+                let had_failure = tool_execution.had_failure;
+                let context_action = tool_execution.context_action;
+                let messages = tool_execution.messages;
+                if had_failure {
+                    self.context_controller.clear_pending_request();
+                } else if let Some(context_action) = context_action {
+                    self.context_controller
+                        .request_context(context_action.handoff)
+                        .map_err(anyhow::Error::msg)?;
+                }
                 {
                     let mut msgs = self.messages.lock().await;
                     msgs.push(response.message.clone());
-                    msgs.extend(tool_execution.messages);
+                    msgs.extend(messages);
                 }
 
                 continue;
@@ -1730,6 +1740,109 @@ mod tests {
         let registry = ToolRegistry::new();
         registry.register(EchoTool);
         Arc::new(registry)
+    }
+
+    struct OverwritePendingContextTool;
+
+    #[async_trait]
+    impl Tool for OverwritePendingContextTool {
+        fn name(&self) -> &str {
+            "overwrite_pending"
+        }
+
+        fn description(&self) -> &str {
+            "Overwrites the pending context action for batch coordination tests"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            ctx: &ToolContext,
+            _params: &serde_json::Value,
+        ) -> crate::tool::Result<ToolResult> {
+            ctx.context_controller
+                .request_context(Some("overwritten by sibling".into()))
+                .unwrap();
+            Ok(ToolResult::ok("overwritten"))
+        }
+    }
+
+    struct FailingContextSiblingTool;
+
+    #[async_trait]
+    impl Tool for FailingContextSiblingTool {
+        fn name(&self) -> &str {
+            "failing_context_sibling"
+        }
+
+        fn description(&self) -> &str {
+            "Fails so a context action cannot be committed"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: &serde_json::Value,
+        ) -> crate::tool::Result<ToolResult> {
+            Ok(ToolResult::error("sibling failed"))
+        }
+    }
+
+    fn context_action_registry(include_failure: bool) -> Arc<ToolRegistry> {
+        let registry = ToolRegistry::new();
+        registry.register(crate::tool::builtin::context_window::NewContextTool);
+        if include_failure {
+            registry.register(FailingContextSiblingTool);
+        } else {
+            registry.register(OverwritePendingContextTool);
+        }
+        Arc::new(registry)
+    }
+
+    fn tool_response(tool_calls: Vec<ToolCall>) -> ChatResponse {
+        ChatResponse {
+            message: ChatMessage {
+                role: ProviderRole::Assistant,
+                content: MessageContent::Text(String::new()),
+                tool_call_id: None,
+                tool_calls: Some(tool_calls),
+            },
+            usage: None,
+            reasoning: None,
+            stop_reason: None,
+        }
+    }
+
+    fn assistant_response(content: &str) -> ChatResponse {
+        ChatResponse {
+            message: ChatMessage {
+                role: ProviderRole::Assistant,
+                content: MessageContent::Text(content.into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            usage: None,
+            reasoning: None,
+            stop_reason: None,
+        }
+    }
+
+    fn function_tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
     }
 
     fn blocking_tool_registry(started: Arc<tokio::sync::Notify>) -> Arc<ToolRegistry> {
@@ -3025,6 +3138,72 @@ mod tests {
         let result = agent.run("do something").await.unwrap();
         assert_eq!(result, "Done after tool.");
         assert_eq!(agent.state().await, AgentState::Completed);
+    }
+
+    #[tokio::test]
+    async fn successful_tool_batch_recommits_the_context_action() {
+        let provider = Arc::new(TestProvider::new(vec![
+            tool_response(vec![
+                function_tool_call(
+                    "new-context",
+                    "new_context",
+                    r#"{"handoff":"saved handoff"}"#,
+                ),
+                function_tool_call("overwrite", "overwrite_pending", "{}"),
+            ]),
+            assistant_response("continued"),
+        ]));
+        let agent = Agent::new(
+            AgentConfig {
+                tools: vec!["new_context".into(), "overwrite_pending".into()],
+                ..Default::default()
+            },
+            provider,
+            context_action_registry(false),
+            test_governor(),
+            "successful-context-action".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        assert_eq!(agent.run("continue").await.unwrap(), "continued");
+        assert_eq!(
+            agent
+                .context_controller()
+                .pending_request()
+                .unwrap()
+                .handoff
+                .as_deref(),
+            Some("saved handoff")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_sibling_clears_the_pending_context_action() {
+        let provider = Arc::new(TestProvider::new(vec![
+            tool_response(vec![
+                function_tool_call(
+                    "new-context",
+                    "new_context",
+                    r#"{"handoff":"discard this"}"#,
+                ),
+                function_tool_call("failure", "failing_context_sibling", "{}"),
+            ]),
+            assistant_response("continued"),
+        ]));
+        let agent = Agent::new(
+            AgentConfig {
+                tools: vec!["new_context".into(), "failing_context_sibling".into()],
+                ..Default::default()
+            },
+            provider,
+            context_action_registry(true),
+            test_governor(),
+            "failed-context-action".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        assert_eq!(agent.run("continue").await.unwrap(), "continued");
+        assert!(agent.context_controller().pending_request().is_none());
     }
 
     #[tokio::test]

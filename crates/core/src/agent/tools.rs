@@ -88,9 +88,6 @@ impl Agent {
         };
 
         let had_failure = executions.iter().any(|execution| execution.had_failure);
-        if had_failure {
-            ctx.context_controller.clear_pending_request();
-        }
         let context_action = if had_failure {
             None
         } else {
