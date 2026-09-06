@@ -135,6 +135,7 @@ impl Stream for GovernedChatStream {
 pub(super) struct RunStateGuard {
     state: Arc<Mutex<AgentState>>,
     finished: bool,
+    cancel_callback: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl RunStateGuard {
@@ -142,7 +143,12 @@ impl RunStateGuard {
         Self {
             state,
             finished: false,
+            cancel_callback: None,
         }
+    }
+
+    pub(super) fn on_cancel(&mut self, callback: Box<dyn FnOnce() + Send + 'static>) {
+        self.cancel_callback = Some(callback);
     }
 
     pub(super) fn finish(&mut self) {
@@ -153,6 +159,9 @@ impl RunStateGuard {
 impl Drop for RunStateGuard {
     fn drop(&mut self) {
         if !self.finished {
+            if let Some(callback) = self.cancel_callback.take() {
+                callback();
+            }
             *self.state.lock().unwrap() = AgentState::Cancelled;
         }
     }

@@ -889,6 +889,9 @@ impl Agent {
     ) -> Result<String> {
         let _run_lock = self.run_lock.lock().await;
         let mut run_state = RunStateGuard::new(self.state.clone());
+        if let Some(callback) = self.cancellation_snapshot_callback(stream_events.as_ref()) {
+            run_state.on_cancel(callback);
+        }
         let skill_context = self.resolve_skill_context(user_input).await;
 
         let user_message = ChatMessage {
@@ -1127,6 +1130,47 @@ impl Agent {
         self.set_state(AgentState::Completed);
         run_state.finish();
         Ok(final_text)
+    }
+
+    fn cancellation_snapshot_callback(
+        &self,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+    ) -> Option<Box<dyn FnOnce() + Send + 'static>> {
+        if self.config.work_id_prefix.is_some() || self.history_database.is_none() {
+            return None;
+        }
+
+        let messages = self.messages.clone();
+        let context_controller = self.context_controller.clone();
+        let database = self.history_database.clone();
+        let conversation_id = self.history_conversation_id.clone();
+        let events = events.cloned();
+        Some(Box::new(move || {
+            let Ok(messages) = messages.try_lock() else {
+                return;
+            };
+            let messages = messages.clone();
+            let window_id = context_controller.window_id();
+            if let (Some(database), Some(conversation_id)) =
+                (database.as_ref(), conversation_id.as_deref())
+            {
+                if let Err(error) =
+                    database.save_active_context(conversation_id, &messages, &window_id)
+                {
+                    crate::observability::diagnostics::record(
+                        crate::observability::diagnostics::DiagnosticLevel::Warning,
+                        "agent.history",
+                        format!("Could not persist cancelled context snapshot: {error}"),
+                    );
+                }
+            }
+            if let Some(events) = events {
+                let _ = events.send(AgentStreamEvent::ContextSnapshot {
+                    window_id,
+                    messages,
+                });
+            }
+        }))
     }
 
     async fn chat_with_governor(
@@ -3171,6 +3215,45 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(governor.tokens_available(), 10_000);
         assert_eq!(agent.state().await, AgentState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancellation_persists_active_context_for_recovery() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("history.db")).unwrap();
+        database
+            .save_conversation(&history_conversation("cancel-persist-session"))
+            .unwrap();
+        let agent = Arc::new(Agent::new(
+            AgentConfig {
+                work_conversation_id: Some("cancel-persist-session".into()),
+                ..test_agent_config()
+            },
+            Arc::new(BlockingProvider {
+                started: started.clone(),
+            }),
+            history_registry(database.clone()),
+            test_governor(),
+            "cancel-persist-session".into(),
+            PathBuf::from("/tmp"),
+        ));
+
+        let task_agent = agent.clone();
+        let task = tokio::spawn(async move { task_agent.run("recover after cancel").await });
+        started.notified().await;
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let restored = database
+            .conversation("cancel-persist-session")
+            .unwrap()
+            .unwrap();
+        assert!(restored.active_context.iter().any(|message| {
+            message.role == ProviderRole::User
+                && message_text(message).contains("recover after cancel")
+        }));
     }
 
     #[tokio::test]
