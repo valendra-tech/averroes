@@ -19,6 +19,7 @@ pub mod list_agents;
 pub mod list_skills;
 pub mod list_tools;
 pub mod load_skill;
+pub mod notes;
 pub mod patch;
 pub mod scheduled;
 pub mod search_memory;

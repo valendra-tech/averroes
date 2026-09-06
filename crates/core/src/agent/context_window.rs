@@ -177,6 +177,16 @@ impl ContextController {
         };
     }
 
+    pub(crate) fn request_overhead(&self) -> (usize, usize, usize, usize) {
+        let overhead = *self.request_overhead.read();
+        (
+            overhead.system_prompt_tokens as usize,
+            overhead.active_tool_schema_tokens as usize,
+            overhead.pending_user_tokens as usize,
+            overhead.image_count as usize,
+        )
+    }
+
     pub fn request_context(&self, handoff: Option<String>) -> Result<(), String> {
         let handoff = handoff
             .filter(|handoff| !handoff.trim().is_empty())

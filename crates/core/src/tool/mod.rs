@@ -105,6 +105,18 @@ impl ToolContext {
     pub fn set_current_dir(&self, path: PathBuf) {
         self.tool_activation.set_current_directory(path);
     }
+
+    pub(crate) fn safe_page_chars(&self, offset: usize) -> std::result::Result<usize, String> {
+        let (system_prompt_tokens, active_tool_schema_tokens, pending_user_tokens, image_count) =
+            self.context_controller.request_overhead();
+        self.context_controller.safe_page_chars(
+            offset,
+            system_prompt_tokens,
+            active_tool_schema_tokens,
+            pending_user_tokens,
+            image_count,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1078,6 +1078,7 @@ impl AppRuntime {
             LaunchdManager::discover().map_err(|error| RuntimeError::Runtime(error.to_string()))?;
         let scheduled_tasks = Arc::new(ScheduledTaskService::new(database.clone(), launchd));
         builtin::register_scheduled_task_tools(&tools, scheduled_tasks.clone());
+        tools.register(builtin::notes::NotesTool::new(database.clone()));
         tools.register(builtin::search_memory::SearchMemoryTool::new(
             database.clone(),
         ));
