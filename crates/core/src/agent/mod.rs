@@ -30,8 +30,9 @@ use std::time::Duration;
 
 pub use context::ContextUsage;
 pub use context_window::{
-    ContextBudget, ContextController, ContextRequest, CONTEXT_RESERVE_TOKENS, MAX_HANDOFF_CHARS,
-    MAX_RECOVERY_RECORD_CHARS, MIN_PAGE_CHARS, MIN_USABLE_TOKENS, PAGE_MARGIN_TOKENS,
+    build_auto_handoff, build_auto_handoff_for_window, ContextBudget, ContextController,
+    ContextRequest, CONTEXT_RESERVE_TOKENS, MAX_HANDOFF_CHARS, MAX_RECOVERY_RECORD_CHARS,
+    MAX_REMINDER_CHARS, MIN_PAGE_CHARS, MIN_USABLE_TOKENS, PAGE_MARGIN_TOKENS,
     REMINDER_BUFFER_TOKENS,
 };
 
@@ -502,6 +503,26 @@ impl Agent {
                 .finish_errored_after_snapshot(events, run_state, error)
                 .await);
         };
+        self.commit_context_rollover_request(
+            request,
+            "explicit new_context tool",
+            "explicit_new_context",
+            false,
+            events,
+            run_state,
+        )
+        .await
+    }
+
+    async fn commit_context_rollover_request(
+        &self,
+        request: ContextRequest,
+        reason: &str,
+        origin: &str,
+        automatic: bool,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+        run_state: &mut RunStateGuard,
+    ) -> Result<bool> {
         let previous_window_id = self.context_controller.window_id();
         let window_id = uuid::Uuid::new_v4().to_string();
         let messages = self.fresh_context_messages(request.handoff.as_deref());
@@ -512,7 +533,8 @@ impl Agent {
                 "old_window_id": previous_window_id,
                 "new_window_id": window_id,
                 "handoff": request.handoff,
-                "reason": "explicit_new_context",
+                "reason": origin,
+                "origin": origin,
             }),
             Vec::new(),
         );
@@ -556,14 +578,162 @@ impl Agent {
         self.emit_context_window_started(
             events,
             previous_window_id,
-            "explicit new_context tool",
+            reason,
             request.handoff,
-            false,
+            automatic,
         );
         if let Some(events) = events {
             let _ = events.send(AgentStreamEvent::ContextSnapshot {
                 window_id,
                 messages,
+            });
+        }
+        Ok(true)
+    }
+
+    async fn try_automatic_rollover(
+        &self,
+        force: bool,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+        run_state: &mut RunStateGuard,
+    ) -> Result<bool> {
+        let budget = self.context_controller.budget();
+        if !budget.automatic_enabled() {
+            return Ok(false);
+        }
+        let due = self
+            .context_controller
+            .usage()
+            .and_then(|usage| usage.input_tokens)
+            .is_some_and(|input_tokens| input_tokens >= budget.rollover_at);
+        if !force && !due {
+            return Ok(false);
+        }
+
+        let current_window_id = self.context_controller.window_id();
+        let limit = self.context_controller.fresh_handoff_limit();
+        let entries = match self.recovery_history_entries().await {
+            Ok(entries) => entries,
+            Err(error) => {
+                crate::observability::diagnostics::record(
+                    crate::observability::diagnostics::DiagnosticLevel::Warning,
+                    "agent.context",
+                    format!(
+                        "Could not load history for automatic context recovery; preserving compaction path: {error}"
+                    ),
+                );
+                return Ok(false);
+            }
+        };
+        let handoff = match build_auto_handoff_for_window(&entries, &current_window_id, limit) {
+            Ok(handoff) => handoff,
+            Err(error) => {
+                crate::observability::diagnostics::record(
+                    crate::observability::diagnostics::DiagnosticLevel::Warning,
+                    "agent.context",
+                    format!(
+                        "Automatic context rollover skipped because the recovery handoff is unsafe: {error}"
+                    ),
+                );
+                return Ok(false);
+            }
+        };
+
+        self.commit_context_rollover_request(
+            ContextRequest {
+                handoff: Some(handoff),
+            },
+            if force {
+                "automatic provider context overflow"
+            } else {
+                "automatic context rollover"
+            },
+            "automatic_rollover",
+            true,
+            events,
+            run_state,
+        )
+        .await
+    }
+
+    async fn recovery_history_entries(&self) -> Result<Vec<WorkHistoryEntry>> {
+        if let (Some(database), Some(conversation_id)) = (
+            self.history_database.as_ref(),
+            self.history_conversation_id.as_deref(),
+        ) {
+            let mut entries = database
+                .history_entries(conversation_id)
+                .map_err(anyhow::Error::from)?;
+            if let Some(thread_id) = self.config.work_id_prefix.as_deref() {
+                entries.retain(|entry| entry.thread_id.as_deref() == Some(thread_id));
+            }
+            return Ok(entries);
+        }
+
+        let messages = self.messages.lock().await.clone();
+        let mut entries = Vec::new();
+        for message in &messages {
+            match message.role {
+                Role::System => {}
+                Role::User => entries.push(self.history_entry_for_message(
+                    WorkHistoryKind::User,
+                    message,
+                    json!({"role": "user"}),
+                )),
+                Role::Assistant => {
+                    entries.extend(self.history_entries_for_provider_message(message))
+                }
+                Role::Tool => entries.push(self.new_history_entry(
+                    WorkHistoryKind::ToolResult,
+                    message_text(message),
+                    json!({
+                        "call_id": message.tool_call_id,
+                        "success": true,
+                    }),
+                    message_images(message),
+                )),
+            }
+        }
+        Ok(entries)
+    }
+
+    async fn insert_automatic_reminder(
+        &self,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+    ) -> Result<bool> {
+        let Some(claim) = self.context_controller.claim_automatic_reminder() else {
+            return Ok(false);
+        };
+        let reminder = context_window::truncate_utf8(
+            &format!(
+                "[Context reminder] This window is near automatic rollover. Continue the current task and preserve any durable progress before the next request. Approximately {} tokens remain until the automatic rollover line.",
+                claim.remaining_tokens
+            ),
+            MAX_REMINDER_CHARS,
+        );
+        let entry = self.new_history_entry(
+            WorkHistoryKind::Reminder,
+            reminder.clone(),
+            json!({
+                "fingerprint": claim.fingerprint,
+                "remaining_tokens": claim.remaining_tokens,
+                "rollover_at": claim.rollover_at,
+            }),
+            Vec::new(),
+        );
+        if let Err(error) = self.emit_history_entry(entry, events) {
+            self.context_controller.clear_reminder(&claim.fingerprint);
+            return Err(error);
+        }
+        let mut messages = self.messages.lock().await;
+        insert_system_context(&mut messages, reminder);
+        drop(messages);
+        if let Some(events) = events {
+            let _ = events.send(AgentStreamEvent::ContextReminder {
+                window_id: self.context_controller.window_id(),
+                fingerprint: claim.fingerprint,
+                remaining_tokens: Some(claim.remaining_tokens),
+                rollover_at: claim.rollover_at,
             });
         }
         Ok(true)
@@ -1054,6 +1224,19 @@ impl Agent {
         let mut tool_iterations = 0;
         while tool_iterations < self.config.max_iterations {
             let runtime = self.runtime_snapshot();
+            if self
+                .try_automatic_rollover(false, stream_events.as_ref(), &mut run_state)
+                .await?
+            {
+                continue;
+            }
+            if self
+                .insert_automatic_reminder(stream_events.as_ref())
+                .await?
+            {
+                self.emit_snapshot_or_fail(stream_events.as_ref(), &mut run_state)
+                    .await?;
+            }
             if self.should_compact_with_runtime(&runtime).await {
                 if let Err(error) = self
                     .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
@@ -1088,6 +1271,12 @@ impl Agent {
                 Ok(response) => response,
                 Err(error) if is_context_error(&error) && context_retries < 2 => {
                     context_retries += 1;
+                    if self
+                        .try_automatic_rollover(true, stream_events.as_ref(), &mut run_state)
+                        .await?
+                    {
+                        continue;
+                    }
                     crate::observability::diagnostics::record(
                         crate::observability::diagnostics::DiagnosticLevel::Warning,
                         "agent.compaction",
@@ -1207,7 +1396,17 @@ impl Agent {
         );
 
         let runtime = self.runtime_snapshot();
-        if self.should_compact_with_runtime(&runtime).await {
+        let automatic_rollover = self
+            .try_automatic_rollover(false, stream_events.as_ref(), &mut run_state)
+            .await?;
+        if self
+            .insert_automatic_reminder(stream_events.as_ref())
+            .await?
+        {
+            self.emit_snapshot_or_fail(stream_events.as_ref(), &mut run_state)
+                .await?;
+        }
+        if !automatic_rollover && self.should_compact_with_runtime(&runtime).await {
             if let Err(error) = self
                 .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
                 .await
@@ -1783,6 +1982,11 @@ mod tests {
         requests: std::sync::Mutex<Vec<ChatRequest>>,
     }
 
+    struct OverflowThenSuccessProvider {
+        call_count: std::sync::Mutex<usize>,
+        requests: std::sync::Mutex<Vec<ChatRequest>>,
+    }
+
     struct BlockingProvider {
         started: Arc<tokio::sync::Notify>,
     }
@@ -1869,6 +2073,15 @@ mod tests {
         }
     }
 
+    impl OverflowThenSuccessProvider {
+        fn new() -> Self {
+            Self {
+                call_count: std::sync::Mutex::new(0),
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
     impl StreamProvider {
         fn new(with_reasoning: bool) -> Self {
             Self { with_reasoning }
@@ -1929,6 +2142,43 @@ mod tests {
                 usage: response.usage,
             }));
             Ok(Box::new(futures::stream::iter(events)))
+        }
+
+        fn context_window(&self, _m: &str) -> usize {
+            200_000
+        }
+
+        fn supports_tools(&self, _m: &str) -> bool {
+            true
+        }
+
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+    }
+
+    #[async_trait]
+    impl Provider for OverflowThenSuccessProvider {
+        async fn chat(&self, request: ChatRequest) -> crate::provider::Result<ChatResponse> {
+            self.requests.lock().unwrap().push(request);
+            let mut count = self.call_count.lock().unwrap();
+            let response = if *count == 0 {
+                Err(ProviderError::ContextExceeded {
+                    used: 200_001,
+                    limit: 200_000,
+                })
+            } else {
+                Ok(assistant_response("recovered after overflow", 10))
+            };
+            *count += 1;
+            response
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> crate::provider::Result<crate::provider::ChatStream> {
+            unimplemented!()
         }
 
         fn context_window(&self, _m: &str) -> usize {
@@ -2433,7 +2683,7 @@ mod tests {
             _params: &serde_json::Value,
         ) -> crate::tool::Result<ToolResult> {
             ctx.context_controller
-                .set_request_overhead(180_000, 0, 0, 0);
+                .set_request_overhead(198_000, 0, 0, 0);
             Ok(ToolResult::ok("capacity shrunk"))
         }
     }
@@ -4349,6 +4599,215 @@ mod tests {
         let result = agent.run("do something").await.unwrap();
         assert_eq!(result, "Done after tool.");
         assert_eq!(agent.state().await, AgentState::Completed);
+    }
+
+    #[tokio::test]
+    async fn automatic_rollover_happens_before_existing_compaction_at_the_native_line() {
+        let mut first = tool_response(vec![function_tool_call(
+            "echo-call",
+            "echo",
+            r#"{"text":"tool result remains recoverable"}"#,
+        )]);
+        first.usage = Some(TokenUsage {
+            input_tokens: 199_001,
+            output_tokens: 1,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            reasoning_output_tokens: None,
+        });
+        let provider = Arc::new(TestProvider::new(vec![
+            first,
+            assistant_response("continued automatically", 10),
+        ]));
+        let provider_ref = provider.clone();
+        let agent = Agent::new(
+            AgentConfig {
+                tools: vec!["echo".into()],
+                ..test_agent_config()
+            },
+            provider,
+            test_tool_registry(),
+            test_governor(),
+            "automatic-boundary".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            agent
+                .run_streaming("continue the current task", sender)
+                .await
+                .unwrap(),
+            "continued automatically"
+        );
+
+        let requests = provider_ref.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]
+            .messages
+            .iter()
+            .any(|message| message_text(message).contains("tool result remains recoverable")));
+        assert!(requests[1]
+            .messages
+            .iter()
+            .any(|message| message_text(message).contains("[Context handoff]")));
+        let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::ContextWindowStarted {
+                automatic: true,
+                reason,
+                ..
+            } if reason.contains("automatic")
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentStreamEvent::CompactionStarted { .. })));
+    }
+
+    #[tokio::test]
+    async fn automatic_reminder_is_emitted_once_before_the_next_provider_request() {
+        let mut first = tool_response(vec![function_tool_call(
+            "echo-call",
+            "echo",
+            r#"{"text":"reminder result"}"#,
+        )]);
+        first.usage = Some(TokenUsage {
+            input_tokens: 185_000,
+            output_tokens: 1,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            reasoning_output_tokens: None,
+        });
+        let provider = Arc::new(TestProvider::new(vec![
+            first,
+            assistant_response("done", 10),
+        ]));
+        let provider_ref = provider.clone();
+        let agent = Agent::new(
+            AgentConfig {
+                tools: vec!["echo".into()],
+                compaction: CompactionConfig {
+                    threshold: 0.99,
+                    ..Default::default()
+                },
+                ..test_agent_config()
+            },
+            provider,
+            test_tool_registry(),
+            test_governor(),
+            "automatic-reminder".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            agent.run_streaming("continue", sender).await.unwrap(),
+            "done"
+        );
+
+        let requests = provider_ref.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1]
+                .messages
+                .iter()
+                .filter(|message| message_text(message).contains("[Context reminder]"))
+                .count(),
+            1
+        );
+        let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentStreamEvent::ContextReminder { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_overflow_attempts_a_no_summary_automatic_rollover_before_compaction() {
+        let provider = Arc::new(OverflowThenSuccessProvider::new());
+        let provider_ref = provider.clone();
+        let agent = Agent::new(
+            test_agent_config(),
+            provider,
+            test_tool_registry(),
+            test_governor(),
+            "automatic-overflow".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        assert_eq!(
+            agent
+                .run("recover from the provider overflow")
+                .await
+                .unwrap(),
+            "recovered after overflow"
+        );
+        let requests = provider_ref.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1]
+            .messages
+            .iter()
+            .any(|message| message_text(message).contains("[Context handoff]")));
+    }
+
+    #[tokio::test]
+    async fn unsafe_automatic_handoff_falls_back_to_existing_compaction() {
+        let mut first = tool_response(vec![function_tool_call(
+            "shrink",
+            "shrink_context_capacity",
+            "{}",
+        )]);
+        first.usage = Some(TokenUsage {
+            input_tokens: 199_001,
+            output_tokens: 1,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            reasoning_output_tokens: None,
+        });
+        let provider = Arc::new(TestProvider::new(vec![
+            first,
+            assistant_response("after compaction", 10),
+        ]));
+        let agent = Agent::new(
+            AgentConfig {
+                tools: vec!["shrink_context_capacity".into()],
+                compaction: CompactionConfig {
+                    strategy: CompactionStrategyType::Trim,
+                    threshold: 0.8,
+                    keep_last: 20,
+                },
+                ..test_agent_config()
+            },
+            provider,
+            shrinking_context_action_registry(),
+            test_governor(),
+            "automatic-unsafe".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            agent
+                .run_streaming("continue despite an unsafe handoff", sender)
+                .await
+                .unwrap(),
+            "after compaction"
+        );
+        let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentStreamEvent::ContextWindowStarted {
+                automatic: true,
+                ..
+            }
+        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentStreamEvent::CompactionStarted { .. })));
     }
 
     #[tokio::test]

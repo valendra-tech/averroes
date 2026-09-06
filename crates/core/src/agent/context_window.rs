@@ -1,5 +1,7 @@
 use super::ContextUsage;
+use crate::storage::work::{WorkHistoryEntry, WorkHistoryKind};
 use parking_lot::{Mutex, RwLock};
+use std::fmt;
 
 /// Absolute character bound for a handoff carried into a fresh context.
 pub const MAX_HANDOFF_CHARS: usize = 20_000;
@@ -15,6 +17,8 @@ pub const MIN_USABLE_TOKENS: usize = 10_000;
 pub const REMINDER_BUFFER_TOKENS: usize = 32_000;
 /// Tokens kept free from the provider window for agent rollover safety.
 pub const CONTEXT_RESERVE_TOKENS: usize = 1_000;
+/// Maximum size of the automatic reminder inserted into provider context.
+pub const MAX_REMINDER_CHARS: usize = 512;
 
 /// Worst-case UTF-8 width used when converting a token budget to a character
 /// budget without seeing the page contents.
@@ -76,6 +80,34 @@ impl ContextBudget {
 pub struct ContextRequest {
     pub handoff: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReminderClaim {
+    pub fingerprint: String,
+    pub remaining_tokens: u64,
+    pub rollover_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomaticHandoffError {
+    reason: String,
+}
+
+impl AutomaticHandoffError {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for AutomaticHandoffError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for AutomaticHandoffError {}
 
 #[derive(Debug)]
 pub struct ContextController {
@@ -234,6 +266,14 @@ impl ContextController {
         MAX_HANDOFF_CHARS.min(self.page_capacity_chars(overhead))
     }
 
+    /// Returns the safe capacity available in a fresh provider window. At the
+    /// old window's rollover line, the remaining capacity is exhausted and
+    /// cannot be used to size the handoff that will be sent to the new one.
+    pub fn fresh_handoff_limit(&self) -> usize {
+        let overhead = *self.request_overhead.read();
+        MAX_HANDOFF_CHARS.min(self.fresh_page_capacity_chars(overhead))
+    }
+
     /// Returns a safe character budget for a paged text result.
     ///
     /// When provider usage is not known, only half of the fresh operational
@@ -281,6 +321,16 @@ impl ContextController {
             .min(usize::MAX as u64) as usize
     }
 
+    fn fresh_page_capacity_chars(&self, overhead: RequestOverhead) -> usize {
+        let budget = self.budget();
+        let available_tokens = (budget.usable.max(0) as u64)
+            .saturating_sub(PAGE_MARGIN_TOKENS as u64)
+            .saturating_sub(overhead.total_tokens());
+        available_tokens
+            .saturating_div(MAX_UTF8_BYTES_PER_CHAR)
+            .min(usize::MAX as u64) as usize
+    }
+
     pub fn reminder_fingerprint(&self) -> String {
         format!(
             "{}:{}:{}",
@@ -296,6 +346,38 @@ impl ContextController {
 
     pub fn reminder_matches(&self, fingerprint: impl AsRef<str>) -> bool {
         self.reminder_fingerprint.read().as_deref() == Some(fingerprint.as_ref())
+    }
+
+    /// Atomically claims the one automatic reminder allowed for this window
+    /// and budget fingerprint. Explicit context actions do not use this path.
+    pub fn claim_automatic_reminder(&self) -> Option<ReminderClaim> {
+        let budget = self.budget();
+        if !budget.automatic_enabled() {
+            return None;
+        }
+        let input_tokens = self.usage().and_then(|usage| usage.input_tokens)?;
+        if input_tokens < budget.remind_at() || input_tokens >= budget.rollover_at {
+            return None;
+        }
+
+        let fingerprint = self.reminder_fingerprint();
+        let mut claimed = self.reminder_fingerprint.write();
+        if claimed.as_deref() == Some(fingerprint.as_str()) {
+            return None;
+        }
+        *claimed = Some(fingerprint.clone());
+        Some(ReminderClaim {
+            fingerprint,
+            remaining_tokens: budget.rollover_at.saturating_sub(input_tokens),
+            rollover_at: budget.rollover_at,
+        })
+    }
+
+    pub fn clear_reminder(&self, fingerprint: impl AsRef<str>) {
+        let mut claimed = self.reminder_fingerprint.write();
+        if claimed.as_deref() == Some(fingerprint.as_ref()) {
+            *claimed = None;
+        }
     }
 
     /// Starts a new provider context and clears state that belongs only to the
@@ -318,10 +400,275 @@ pub fn truncate_utf8(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+/// Builds a bounded, provider-facing recovery handoff for the active window.
+/// Required owner/tool anchors are atomic: if they do not fit, returning an
+/// error lets the caller preserve the existing compaction/error path instead
+/// of silently dropping continuation state.
+pub fn build_auto_handoff_for_window(
+    entries: &[WorkHistoryEntry],
+    current_window_id: &str,
+    max_chars: usize,
+) -> Result<String, AutomaticHandoffError> {
+    let max_chars = max_chars.min(MAX_HANDOFF_CHARS);
+    if max_chars == 0 {
+        return Err(AutomaticHandoffError::new(
+            "automatic handoff has no safe character capacity",
+        ));
+    }
+
+    let current_entries = entries
+        .iter()
+        .filter(|entry| entry.window_id == current_window_id)
+        .collect::<Vec<_>>();
+    let owner = current_entries
+        .iter()
+        .rev()
+        .copied()
+        .find(|entry| entry.kind == WorkHistoryKind::User)
+        .or_else(|| {
+            entries
+                .iter()
+                .rev()
+                .find(|entry| entry.kind == WorkHistoryKind::User)
+        })
+        .ok_or_else(|| {
+            AutomaticHandoffError::new("automatic handoff is missing its owner anchor")
+        })?;
+
+    let mut handoff = String::new();
+    append_handoff_section(
+        &mut handoff,
+        "[Current owner input]\n",
+        &format_anchor(owner),
+        max_chars,
+        true,
+        "owner anchor",
+    )?;
+
+    if let Some(latest_direct_input) = entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == WorkHistoryKind::User && entry.entry_id != owner.entry_id)
+    {
+        append_handoff_section(
+            &mut handoff,
+            "\n[Latest direct input]\n",
+            &format_anchor(latest_direct_input),
+            max_chars,
+            true,
+            "latest direct input",
+        )?;
+    }
+
+    if let Some(answer) = current_entries.iter().rev().find(|entry| {
+        entry.kind == WorkHistoryKind::ToolResult
+            && entry.payload.get("name").and_then(|value| value.as_str()) == Some("ask_user")
+            && entry
+                .payload
+                .get("success")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+    }) {
+        append_handoff_section(
+            &mut handoff,
+            "\n[Latest successful ask_user answer]\n",
+            &format_anchor(answer),
+            max_chars,
+            true,
+            "successful ask_user answer",
+        )?;
+    }
+
+    let trailing_batch = trailing_unconsumed_tool_batch(&current_entries);
+    if !trailing_batch.is_empty() {
+        let mut batch = String::new();
+        for entry in trailing_batch {
+            if !batch.is_empty() {
+                batch.push('\n');
+            }
+            batch.push_str(&format_recovery_entry(entry));
+        }
+        append_handoff_section(
+            &mut handoff,
+            "\n[Trailing unconsumed tool batch]\n",
+            &batch,
+            max_chars,
+            true,
+            "trailing tool batch",
+        )?;
+    }
+
+    if let Some(previous) = entries.iter().rev().find(|entry| {
+        entry.kind == WorkHistoryKind::ContextWindow
+            && entry
+                .payload
+                .get("handoff")
+                .and_then(|value| value.as_str())
+                .is_some_and(|handoff| !handoff.trim().is_empty())
+    }) {
+        let stale = previous
+            .payload
+            .get("handoff")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let _ = append_handoff_section(
+            &mut handoff,
+            "\n[Previous checkpoint/handoff — possibly stale]\n",
+            &bounded_recovery_text(stale),
+            max_chars,
+            false,
+            "stale checkpoint",
+        );
+    }
+
+    if handoff.is_empty() {
+        return Err(AutomaticHandoffError::new(
+            "automatic handoff did not contain a safe recovery anchor",
+        ));
+    }
+    Ok(handoff)
+}
+
+pub fn build_auto_handoff(
+    entries: &[WorkHistoryEntry],
+    max_chars: usize,
+) -> Result<String, AutomaticHandoffError> {
+    let current_window_id = entries
+        .iter()
+        .rev()
+        .map(|entry| entry.window_id.as_str())
+        .find(|window_id| !window_id.is_empty())
+        .unwrap_or("initial");
+    build_auto_handoff_for_window(entries, current_window_id, max_chars)
+}
+
+fn append_handoff_section(
+    handoff: &mut String,
+    heading: &str,
+    body: &str,
+    max_chars: usize,
+    required: bool,
+    label: &str,
+) -> Result<(), AutomaticHandoffError> {
+    let section = format!("{heading}{body}");
+    if handoff
+        .chars()
+        .count()
+        .saturating_add(section.chars().count())
+        <= max_chars
+    {
+        handoff.push_str(&section);
+        return Ok(());
+    }
+    if required {
+        return Err(AutomaticHandoffError::new(format!(
+            "automatic handoff {label} does not fit within the safe limit"
+        )));
+    }
+    Ok(())
+}
+
+fn bounded_recovery_text(text: &str) -> String {
+    if text.chars().count() <= MAX_RECOVERY_RECORD_CHARS {
+        text.to_owned()
+    } else {
+        format!(
+            "{}\n[… recovery record truncated …]",
+            truncate_utf8(text, MAX_RECOVERY_RECORD_CHARS.saturating_sub(32))
+        )
+    }
+}
+
+fn format_anchor(entry: &WorkHistoryEntry) -> String {
+    let mut text = bounded_recovery_text(&entry.text);
+    let images = summarize_images(entry);
+    if !images.is_empty() {
+        text.push(' ');
+        text.push_str(&images);
+        text.push_str(" [history entry id: ");
+        text.push_str(&entry.entry_id);
+        text.push(']');
+    }
+    text
+}
+
+fn trailing_unconsumed_tool_batch<'a>(
+    entries: &'a [&'a WorkHistoryEntry],
+) -> Vec<&'a WorkHistoryEntry> {
+    let start = entries
+        .iter()
+        .rposition(|entry| {
+            !matches!(
+                &entry.kind,
+                WorkHistoryKind::ToolCall | WorkHistoryKind::ToolResult
+            )
+        })
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    entries[start..]
+        .iter()
+        .copied()
+        .filter(|entry| {
+            matches!(
+                &entry.kind,
+                WorkHistoryKind::ToolCall | WorkHistoryKind::ToolResult
+            )
+        })
+        .collect()
+}
+
+fn format_recovery_entry(entry: &WorkHistoryEntry) -> String {
+    let body = match &entry.kind {
+        WorkHistoryKind::ToolCall => {
+            let name = entry
+                .payload
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("tool");
+            let arguments = entry
+                .payload
+                .get("arguments")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .unwrap_or_else(|| entry.text.clone());
+            format!("{name}({})", bounded_recovery_text(&arguments))
+        }
+        WorkHistoryKind::ToolResult => bounded_recovery_text(&entry.text),
+        _ => bounded_recovery_text(&entry.text),
+    };
+    let images = summarize_images(entry);
+    if images.is_empty() {
+        format!("- {body} [history entry id: {}]", entry.entry_id)
+    } else {
+        format!("- {body} {images} [history entry id: {}]", entry.entry_id)
+    }
+}
+
+fn summarize_images(entry: &WorkHistoryEntry) -> String {
+    if entry.images.is_empty() {
+        return String::new();
+    }
+    let mut types = std::collections::BTreeMap::<&str, usize>::new();
+    for image in &entry.images {
+        *types.entry(image.media_type.as_str()).or_default() += 1;
+    }
+    let media = types
+        .into_iter()
+        .map(|(media_type, count)| format!("{count}×{media_type}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[images: {media}]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::ContextUsage;
+    use crate::storage::work::{WorkHistoryEntry, WorkHistoryKind};
 
     #[test]
     fn budget_uses_reserve_and_caps_the_reminder_band() {
@@ -510,5 +857,107 @@ mod tests {
         assert!(controller.reminder_matches(&fingerprint));
         controller.begin_window("window-2");
         assert!(!controller.reminder_matches(&fingerprint));
+    }
+
+    #[test]
+    fn automatic_reminder_is_claimed_once_per_window_budget_fingerprint() {
+        let controller = ContextController::for_test(100_000, 16_384);
+        controller.record_usage(ContextUsage::from_usage(78_000, 1, 100_000));
+
+        let first = controller.claim_automatic_reminder();
+        let second = controller.claim_automatic_reminder();
+
+        assert!(first.is_some());
+        assert!(second.is_none());
+        assert_eq!(
+            first.unwrap().fingerprint,
+            controller.reminder_fingerprint()
+        );
+    }
+
+    #[test]
+    fn automatic_reminder_is_never_claimed_below_band_or_when_automatic_is_unsupported() {
+        let below_band = ContextController::for_test(100_000, 16_384);
+        below_band.record_usage(ContextUsage::from_usage(70_000, 1, 100_000));
+        assert!(below_band.claim_automatic_reminder().is_none());
+
+        let disabled = ContextController::new(ContextBudget::new(100_000, 16_384, false));
+        disabled.record_usage(ContextUsage::from_usage(78_000, 1, 100_000));
+        assert!(disabled.claim_automatic_reminder().is_none());
+
+        let unsupported = ContextController::new(ContextBudget::new(32_000, 24_000, true));
+        unsupported.record_usage(ContextUsage::from_usage(8_500, 1, 32_000));
+        assert!(unsupported.claim_automatic_reminder().is_none());
+    }
+
+    #[test]
+    fn automatic_handoff_preserves_owner_anchor_and_trailing_unconsumed_tool_results() {
+        let entries = vec![
+            WorkHistoryEntry::user("window-1", "user-1", "run the checks"),
+            WorkHistoryEntry {
+                entry_id: "call-1".into(),
+                parent_id: None,
+                thread_id: None,
+                window_id: "window-1".into(),
+                sequence: 2,
+                timestamp: 2,
+                kind: WorkHistoryKind::ToolCall,
+                text: "bash({\"command\":\"cargo test\"})".into(),
+                payload: serde_json::json!({
+                    "call_id": "call-1",
+                    "name": "bash",
+                    "arguments": "{\"command\":\"cargo test\"}"
+                }),
+                images: Vec::new(),
+            },
+            WorkHistoryEntry {
+                entry_id: "result-1".into(),
+                parent_id: None,
+                thread_id: None,
+                window_id: "window-1".into(),
+                sequence: 3,
+                timestamp: 3,
+                kind: WorkHistoryKind::ToolResult,
+                text: "cargo test failed".into(),
+                payload: serde_json::json!({
+                    "call_id": "call-1",
+                    "name": "bash",
+                    "success": false
+                }),
+                images: Vec::new(),
+            },
+        ];
+
+        let handoff = build_auto_handoff_for_window(&entries, "window-1", 20_000).unwrap();
+        assert!(handoff.contains("run the checks"));
+        assert!(handoff.contains("cargo test failed"));
+        assert!(handoff.contains("cargo test"));
+        assert!(handoff.chars().count() <= 20_000);
+    }
+
+    #[test]
+    fn automatic_handoff_rejects_required_anchors_that_do_not_fit() {
+        let entries = vec![WorkHistoryEntry::user(
+            "window-1",
+            "user-1",
+            "user input that cannot fit safely",
+        )];
+
+        let error = build_auto_handoff_for_window(&entries, "window-1", 8).unwrap_err();
+        assert!(error.to_string().contains("anchor"));
+    }
+
+    #[test]
+    fn automatic_handoff_summarizes_images_without_copying_payloads() {
+        let mut entry = WorkHistoryEntry::user("window-1", "image-entry", "inspect this image");
+        entry.images.push(crate::provider::types::ImageSource {
+            media_type: "image/png".into(),
+            data: "base64-image-data".into(),
+        });
+
+        let handoff = build_auto_handoff_for_window(&[entry], "window-1", 20_000).unwrap();
+        assert!(handoff.contains("1×image/png"));
+        assert!(handoff.contains("image-entry"));
+        assert!(!handoff.contains("base64-image-data"));
     }
 }
