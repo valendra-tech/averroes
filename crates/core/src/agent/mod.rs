@@ -755,6 +755,7 @@ impl Agent {
             &mut request.messages,
             ITERATION_LIMIT_FINAL_CONTEXT.to_owned(),
         );
+        self.record_request_overhead(&request.messages, request.system.as_deref(), &request.tools);
 
         self.set_state(AgentState::Thinking);
         let response_result = match stream_events.as_ref() {
@@ -972,6 +973,27 @@ impl Agent {
             .collect()
     }
 
+    fn record_request_overhead(
+        &self,
+        messages: &[ChatMessage],
+        system_context: Option<&str>,
+        tools: &[ToolDefinition],
+    ) {
+        let system_prompt_tokens = estimate_system_prompt_tokens(messages)
+            .saturating_add(system_context.map(estimate_tokens).unwrap_or(0));
+        let active_tool_schema_tokens = serde_json::to_string(tools)
+            .map(|serialized| estimate_tokens(&serialized))
+            .unwrap_or_default();
+        let pending_user_tokens = estimate_pending_user_tokens(messages);
+        let image_count = count_images(messages);
+        self.context_controller.set_request_overhead(
+            system_prompt_tokens,
+            active_tool_schema_tokens,
+            pending_user_tokens,
+            image_count,
+        );
+    }
+
     fn build_request(
         &self,
         mut messages: Vec<ChatMessage>,
@@ -1003,19 +1025,7 @@ impl Agent {
             insert_system_context(&mut messages, global_memory);
         }
         let tools = self.build_tool_definitions();
-        let system_prompt_tokens = estimate_system_prompt_tokens(&messages)
-            .saturating_add(skill_context.as_deref().map(estimate_tokens).unwrap_or(0));
-        let active_tool_schema_tokens = serde_json::to_string(&tools)
-            .map(|serialized| estimate_tokens(&serialized))
-            .unwrap_or_default();
-        let pending_user_tokens = estimate_pending_user_tokens(&messages);
-        let image_count = count_images(&messages);
-        self.context_controller.set_request_overhead(
-            system_prompt_tokens,
-            active_tool_schema_tokens,
-            pending_user_tokens,
-            image_count,
-        );
+        self.record_request_overhead(&messages, skill_context.as_deref(), &tools);
         ChatRequest {
             model,
             messages,
@@ -2872,7 +2882,13 @@ mod tests {
                     tool_call_id: None,
                     tool_calls: None,
                 },
-                usage: None,
+                usage: Some(TokenUsage {
+                    input_tokens: 195_000,
+                    output_tokens: 1,
+                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                    reasoning_output_tokens: None,
+                }),
                 reasoning: None,
                 stop_reason: None,
             });
@@ -2898,15 +2914,39 @@ mod tests {
         );
         assert_eq!(agent.state().await, AgentState::Completed);
 
-        let requests = provider.requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
-        assert!(!requests[0].tools.is_empty());
-        assert!(!requests[1].tools.is_empty());
-        assert!(requests[2].tools.is_empty());
-        assert!(requests[2].messages.iter().any(|message| {
-            message.role == ProviderRole::System
-                && message_text(message).contains("Tool execution budget reached")
-        }));
+        let final_request = {
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(!requests[0].tools.is_empty());
+            assert!(!requests[1].tools.is_empty());
+            assert!(requests[2].tools.is_empty());
+            assert!(requests[2].messages.iter().any(|message| {
+                message.role == ProviderRole::System
+                    && message_text(message).contains("Tool execution budget reached")
+            }));
+            requests[2].clone()
+        };
+
+        let expected = ContextController::for_test(200_000, 0);
+        expected.record_usage(ContextUsage::from_usage(195_000, 1, 200_000));
+        expected.set_request_overhead(
+            estimate_system_prompt_tokens(&final_request.messages).saturating_add(
+                final_request
+                    .system
+                    .as_deref()
+                    .map(estimate_tokens)
+                    .unwrap_or(0),
+            ),
+            serde_json::to_string(&final_request.tools)
+                .map(|serialized| estimate_tokens(&serialized))
+                .unwrap_or_default(),
+            estimate_pending_user_tokens(&final_request.messages),
+            count_images(&final_request.messages),
+        );
+        assert_eq!(
+            agent.context_controller().handoff_limit(),
+            expected.handoff_limit()
+        );
     }
 
     #[tokio::test]
