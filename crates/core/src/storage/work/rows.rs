@@ -162,9 +162,9 @@ pub(super) fn resolve_history_conversation(
         .query_row(
             "SELECT c.id
              FROM conversations c
-             LEFT JOIN projects p ON p.id = c.project_id
+             JOIN projects p ON p.id = c.project_id
              WHERE c.id = ?1
-               AND (c.project_id IS NULL OR p.root = ?2)
+               AND p.root = ?2
              LIMIT 1",
             params![session_id, workspace_root],
             |row| row.get::<_, String>(0),
@@ -247,6 +247,139 @@ pub(super) fn search_history(
         history_entry_from_row,
     )?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn ranked_history_cte(from: &str, filter: &str) -> String {
+    format!(
+        "WITH candidates AS (
+            SELECT h.conversation_id, h.entry_id, h.parent_id, h.thread_id, h.window_id,
+                   h.sequence, h.timestamp, h.kind, h.text, h.payload_json, h.images_json,
+                   CASE WHEN
+                       json_extract(h.payload_json, '$.derived') = 1
+                       OR json_extract(h.payload_json, '$.echo') = 1
+                       OR lower(COALESCE(json_extract(h.payload_json, '$.source'), '')) LIKE '%history%'
+                       OR lower(COALESCE(json_extract(h.payload_json, '$.source'), '')) LIKE '%note%'
+                       OR lower(COALESCE(json_extract(h.payload_json, '$.origin'), '')) LIKE '%history%'
+                       OR lower(COALESCE(json_extract(h.payload_json, '$.origin'), '')) LIKE '%note%'
+                       OR lower(COALESCE(json_extract(h.payload_json, '$.tool'), '')) LIKE '%history%'
+                       OR lower(COALESCE(json_extract(h.payload_json, '$.tool'), '')) LIKE '%note%'
+                   THEN 1 ELSE 0 END AS derived_rank,
+                   CASE h.kind
+                       WHEN 'user' THEN 0
+                       WHEN 'assistant' THEN 1
+                       WHEN 'tool_call' THEN 2
+                       WHEN 'tool_result' THEN 3
+                       WHEN 'context_window' THEN 4
+                       WHEN 'reminder' THEN 5
+                       ELSE 6
+                   END AS kind_rank
+            {from}
+            WHERE {filter}
+        ), ranked AS (
+            SELECT candidates.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY entry_id
+                       ORDER BY derived_rank, kind_rank, sequence, entry_id, conversation_id
+                   ) AS duplicate_rank
+            FROM candidates
+        ), deduped AS (
+            SELECT conversation_id, entry_id, parent_id, thread_id, window_id,
+                   sequence, timestamp, kind, text, payload_json, images_json,
+                   derived_rank, kind_rank
+            FROM ranked
+            WHERE duplicate_rank = 1
+        )",
+    )
+}
+
+fn search_history_page_for_scope(
+    connection: &Connection,
+    conversation_id: Option<&str>,
+    workspace_root: Option<&str>,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<(Vec<(String, WorkHistoryEntry)>, usize), WorkDatabaseError> {
+    if query.trim().is_empty() || limit == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    let pattern = format!("%{}%", escape_like_pattern(query.trim()));
+    let (from, filter) = match (conversation_id, workspace_root) {
+        (Some(_), None) => (
+            "FROM conversation_history h",
+            "h.conversation_id = ?1 AND h.text LIKE ?2 COLLATE NOCASE ESCAPE '\\'",
+        ),
+        (None, Some(_)) => (
+            "FROM conversation_history h
+             JOIN conversations c ON c.id = h.conversation_id
+             JOIN projects p ON p.id = c.project_id",
+            "p.root = ?1 AND h.text LIKE ?2 COLLATE NOCASE ESCAPE '\\'",
+        ),
+        _ => return Ok((Vec::new(), 0)),
+    };
+    let cte = ranked_history_cte(from, filter);
+    let total = match (conversation_id, workspace_root) {
+        (Some(conversation_id), None) => connection.query_row(
+            &format!("{cte} SELECT COUNT(*) FROM deduped"),
+            params![conversation_id, pattern],
+            |row| row.get::<_, i64>(0),
+        )?,
+        (None, Some(workspace_root)) => connection.query_row(
+            &format!("{cte} SELECT COUNT(*) FROM deduped"),
+            params![workspace_root, pattern],
+            |row| row.get::<_, i64>(0),
+        )?,
+        _ => 0,
+    } as usize;
+
+    let page_sql = format!(
+        "{cte}
+         SELECT conversation_id, entry_id, parent_id, thread_id, window_id,
+                sequence, timestamp, kind, text, payload_json, images_json
+         FROM deduped
+         ORDER BY derived_rank, kind_rank, sequence, entry_id, conversation_id
+         LIMIT ?3 OFFSET ?4"
+    );
+    let mut statement = connection.prepare(&page_sql)?;
+    let rows = match (conversation_id, workspace_root) {
+        (Some(conversation_id), None) => statement.query_map(
+            params![conversation_id, pattern, limit as i64, offset as i64],
+            history_entry_with_conversation_from_row,
+        )?,
+        (None, Some(workspace_root)) => statement.query_map(
+            params![workspace_root, pattern, limit as i64, offset as i64],
+            history_entry_with_conversation_from_row,
+        )?,
+        _ => unreachable!(),
+    };
+    Ok((rows.collect::<rusqlite::Result<Vec<_>>>()?, total))
+}
+
+pub(super) fn search_history_page(
+    connection: &Connection,
+    conversation_id: &str,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<(Vec<(String, WorkHistoryEntry)>, usize), WorkDatabaseError> {
+    search_history_page_for_scope(
+        connection,
+        Some(conversation_id),
+        None,
+        query,
+        limit,
+        offset,
+    )
+}
+
+pub(super) fn search_history_workspace_page(
+    connection: &Connection,
+    workspace_root: &str,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<(Vec<(String, WorkHistoryEntry)>, usize), WorkDatabaseError> {
+    search_history_page_for_scope(connection, None, Some(workspace_root), query, limit, offset)
 }
 
 pub(super) fn list_history_workspace(

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const DEFAULT_SEARCH_LIMIT: usize = 10;
@@ -101,41 +101,21 @@ impl HistoryTool {
         }
 
         let scope_conversation = self.scope_conversation(ctx)?;
-        let mut entries = if params.all {
+        let (entries, total) = if params.all {
             self.database
-                .history_entries_for_workspace(&canonical_workspace_root(ctx))
+                .search_history_workspace_page(&canonical_workspace_root(ctx), query, limit, offset)
                 .map_err(|error| self.storage_error(error))?
         } else {
             self.database
-                .history_entries(&scope_conversation)
+                .search_history_page(&scope_conversation, query, limit, offset)
                 .map_err(|error| self.storage_error(error))?
-                .into_iter()
-                .map(|entry| (scope_conversation.clone(), entry))
-                .collect()
         };
-        let query = query.to_lowercase();
-        entries.retain(|(_, entry)| entry.text.to_lowercase().contains(&query));
-
-        entries.sort_by(|(left_conversation, left), (right_conversation, right)| {
-            derived_rank(left)
-                .cmp(&derived_rank(right))
-                .then_with(|| kind_rank(&left.kind).cmp(&kind_rank(&right.kind)))
-                .then_with(|| left.sequence.cmp(&right.sequence))
-                .then_with(|| left.entry_id.cmp(&right.entry_id))
-                .then_with(|| left_conversation.cmp(right_conversation))
-        });
-
-        let mut seen = HashSet::new();
-        entries.retain(|(_, entry)| seen.insert(entry.entry_id.clone()));
-        let total = entries.len();
         let page = entries
             .iter()
-            .skip(offset)
-            .take(limit)
             .map(|(conversation_id, entry)| format_search_entry(conversation_id, entry))
             .collect::<Vec<_>>();
-        let has_more = total > offset.saturating_add(page.len());
-        let next_offset = has_more.then_some(offset.saturating_add(page.len()));
+        let has_more = total > offset.saturating_add(entries.len());
+        let next_offset = has_more.then_some(offset.saturating_add(entries.len()));
         let content = if page.is_empty() {
             "No history entries matched the query.".into()
         } else {
@@ -212,8 +192,12 @@ impl HistoryTool {
         self.database
             .resolve_history_conversation(&ctx.session_id, &workspace_root)
             .map_err(|error| self.storage_error(error))?
-            .or_else(|| Some(ctx.session_id.clone()))
-            .ok_or_else(|| self.invalid("conversation scope could not be resolved"))
+            .ok_or_else(|| {
+                self.invalid(format!(
+                    "conversation '{}' was not found in workspace '{}'",
+                    ctx.session_id, workspace_root
+                ))
+            })
     }
 }
 
@@ -280,18 +264,6 @@ impl Tool for HistoryTool {
     }
 }
 
-fn kind_rank(kind: &WorkHistoryKind) -> u8 {
-    match kind {
-        WorkHistoryKind::User => 0,
-        WorkHistoryKind::Assistant => 1,
-        WorkHistoryKind::ToolCall => 2,
-        WorkHistoryKind::ToolResult => 3,
-        WorkHistoryKind::ContextWindow => 4,
-        WorkHistoryKind::Reminder => 5,
-        WorkHistoryKind::Unknown(_) => 6,
-    }
-}
-
 fn kind_name(kind: &WorkHistoryKind) -> String {
     match kind {
         WorkHistoryKind::User => "user",
@@ -303,26 +275,6 @@ fn kind_name(kind: &WorkHistoryKind) -> String {
         WorkHistoryKind::Unknown(value) => value,
     }
     .into()
-}
-
-fn derived_rank(entry: &WorkHistoryEntry) -> u8 {
-    let payload = &entry.payload;
-    let explicit = payload
-        .get("derived")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || payload
-            .get("echo")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-    let source = ["source", "origin", "tool"]
-        .into_iter()
-        .filter_map(|key| payload.get(key).and_then(Value::as_str))
-        .any(|value| {
-            let value = value.to_ascii_lowercase();
-            value.contains("history") || value.contains("note")
-        });
-    u8::from(explicit || source)
 }
 
 fn format_search_entry(conversation_id: &str, entry: &WorkHistoryEntry) -> String {
@@ -679,6 +631,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_session_id_in_another_workspace_cannot_be_used_as_fallback_scope() {
+        let requested_root = tempfile::tempdir().unwrap();
+        let stored_root = tempfile::tempdir().unwrap();
+        let current = conversation("shared-session", None);
+        let (_directory, database) = database_with_workspace(stored_root.path(), &[current]);
+        database
+            .append_history_entries(
+                "shared-session",
+                &[entry(
+                    "foreign-entry",
+                    1,
+                    WorkHistoryKind::User,
+                    "foreign workspace secret",
+                )],
+            )
+            .unwrap();
+
+        let error = HistoryTool::new(database)
+            .execute(
+                &context("shared-session", requested_root.path()),
+                &json!({"operation": "read", "id": "foreign-entry"}),
+            )
+            .await
+            .unwrap_err();
+        match error {
+            ToolError::InvalidParams { message, .. } => {
+                assert!(message.contains("workspace"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn search_pagination_reports_total_and_consistent_offsets() {
         let root = tempfile::tempdir().unwrap();
         let current = conversation("current", None);
@@ -768,6 +753,39 @@ mod tests {
             .await
             .unwrap();
         assert!(result.content.contains("original"));
+    }
+
+    #[test]
+    fn storage_history_page_ranks_before_applying_limit_and_reports_total() {
+        let root = tempfile::tempdir().unwrap();
+        let current = conversation("current", None);
+        let (_directory, database) = database_with_workspace(root.path(), &[current]);
+        let mut entries = (0..512)
+            .map(|sequence| {
+                entry(
+                    &format!("context-{sequence}"),
+                    sequence,
+                    WorkHistoryKind::ContextWindow,
+                    "storage page needle",
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.push(entry(
+            "storage-original",
+            1_000,
+            WorkHistoryKind::User,
+            "storage page needle original",
+        ));
+        database
+            .append_history_entries("current", &entries)
+            .unwrap();
+
+        let (page, total) = database
+            .search_history_page("current", "needle", 1, 0)
+            .unwrap();
+        assert_eq!(total, 513);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].1.entry_id, "storage-original");
     }
 
     #[tokio::test]

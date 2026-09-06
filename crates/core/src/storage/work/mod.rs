@@ -1021,6 +1021,38 @@ impl WorkDatabase {
         )
     }
 
+    pub fn search_history_page(
+        &self,
+        conversation_id: &str,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<(String, WorkHistoryEntry)>, usize), WorkDatabaseError> {
+        rows::search_history_page(
+            &self.connection.lock(),
+            conversation_id,
+            query,
+            limit,
+            offset,
+        )
+    }
+
+    pub fn search_history_workspace_page(
+        &self,
+        workspace_root: &str,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<(String, WorkHistoryEntry)>, usize), WorkDatabaseError> {
+        rows::search_history_workspace_page(
+            &self.connection.lock(),
+            workspace_root,
+            query,
+            limit,
+            offset,
+        )
+    }
+
     pub fn history_entries_for_workspace(
         &self,
         workspace_root: &str,
