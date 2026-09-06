@@ -124,6 +124,7 @@ impl ContextController {
         *self.budget.write() = budget;
         self.clear_usage();
         *self.reminder_fingerprint.write() = None;
+        *self.request_overhead.write() = RequestOverhead::default();
     }
 
     pub fn window_id(&self) -> String {
@@ -190,12 +191,13 @@ impl ContextController {
         pending_user_tokens: usize,
         image_count: usize,
     ) -> Result<usize, String> {
-        let overhead = RequestOverhead {
-            system_prompt_tokens: system_prompt_tokens as u64,
-            active_tool_schema_tokens: active_tool_schema_tokens as u64,
-            pending_user_tokens: pending_user_tokens as u64,
-            image_count: image_count as u64,
-        };
+        self.set_request_overhead(
+            system_prompt_tokens,
+            active_tool_schema_tokens,
+            pending_user_tokens,
+            image_count,
+        );
+        let overhead = *self.request_overhead.read();
         let chars = self.page_capacity_chars(overhead) as u64;
         if chars < MIN_PAGE_CHARS as u64 {
             return Err(format!(
@@ -318,6 +320,35 @@ mod tests {
 
         assert!(fresh > MIN_PAGE_CHARS);
         assert!(loaded < fresh);
+    }
+
+    #[test]
+    fn request_overhead_snapshot_reduces_page_and_handoff_capacity() {
+        let controller = ContextController::for_test(100_000, 16_384);
+        let fresh_page = controller.safe_page_chars(0, 0, 0, 0, 0).unwrap();
+        let fresh_handoff = controller.handoff_limit();
+
+        let loaded_page = controller
+            .safe_page_chars(0, 25_000, 25_000, 25_000, 0)
+            .unwrap();
+        let loaded_handoff = controller.handoff_limit();
+
+        assert!(loaded_page < fresh_page);
+        assert!(loaded_handoff < fresh_handoff);
+    }
+
+    #[test]
+    fn budget_and_window_resets_clear_request_overhead() {
+        let controller = ContextController::for_test(100_000, 16_384);
+        controller.set_request_overhead(25_000, 25_000, 25_000, 0);
+        assert!(controller.handoff_limit() < MAX_HANDOFF_CHARS);
+
+        controller.replace_budget(ContextBudget::new(100_000, 16_384, true));
+        assert_eq!(controller.handoff_limit(), MAX_HANDOFF_CHARS);
+
+        controller.set_request_overhead(25_000, 25_000, 25_000, 0);
+        controller.begin_window("window-2");
+        assert_eq!(controller.handoff_limit(), MAX_HANDOFF_CHARS);
     }
 
     #[test]

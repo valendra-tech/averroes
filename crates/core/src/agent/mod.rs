@@ -13,7 +13,7 @@ use crate::compaction::{
     compact_tool_outputs, sanitize_tool_history, CompactionConfig, CompactionStrategy,
     CompactionStrategyType,
 };
-use crate::provider::types::{MessageContent, Role};
+use crate::provider::types::{ContentPart, MessageContent, Role};
 use crate::provider::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolDefinition};
 use crate::runtime::ResourceGovernor;
 use crate::skill::SkillIndex;
@@ -35,6 +35,7 @@ const MAX_AUTO_SKILL_CONTEXT_BYTES: usize = 32 * 1024;
 const MAX_SKILL_CATALOG_BYTES: usize = 8 * 1024;
 const PROVIDER_INITIAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_SILENT_PROVIDER_RETRIES: usize = 1;
+const APPROX_CHARS_PER_TOKEN: usize = 4;
 const ITERATION_LIMIT_FINAL_CONTEXT: &str = concat!(
     "[Tool execution budget reached]\n\n",
     "Tool use is disabled for this response. Use the results already available in the conversation ",
@@ -1001,15 +1002,69 @@ impl Agent {
         if let Some(global_memory) = self.global_memory_prompt.read().unwrap().clone() {
             insert_system_context(&mut messages, global_memory);
         }
+        let tools = self.build_tool_definitions();
+        let system_prompt_tokens = estimate_system_prompt_tokens(&messages)
+            .saturating_add(skill_context.as_deref().map(estimate_tokens).unwrap_or(0));
+        let active_tool_schema_tokens = serde_json::to_string(&tools)
+            .map(|serialized| estimate_tokens(&serialized))
+            .unwrap_or_default();
+        let pending_user_tokens = estimate_pending_user_tokens(&messages);
+        let image_count = count_images(&messages);
+        self.context_controller.set_request_overhead(
+            system_prompt_tokens,
+            active_tool_schema_tokens,
+            pending_user_tokens,
+            image_count,
+        );
         ChatRequest {
             model,
             messages,
-            tools: self.build_tool_definitions(),
+            tools,
             temperature: self.config.temperature,
             system: skill_context,
             reasoning_effort: runtime.reasoning_effort,
         }
     }
+}
+
+fn estimate_tokens(value: &str) -> usize {
+    value.len().saturating_add(APPROX_CHARS_PER_TOKEN - 1) / APPROX_CHARS_PER_TOKEN
+}
+
+fn estimate_content_tokens(content: &MessageContent) -> usize {
+    serde_json::to_string(content)
+        .map(|serialized| estimate_tokens(&serialized))
+        .unwrap_or_default()
+}
+
+fn estimate_system_prompt_tokens(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .map(|message| estimate_content_tokens(&message.content))
+        .sum()
+}
+
+fn estimate_pending_user_tokens(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User)
+        .map(|message| estimate_content_tokens(&message.content))
+        .unwrap_or_default()
+}
+
+fn count_images(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| match &message.content {
+            MessageContent::Text(_) => 0,
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter(|part| matches!(part, ContentPart::Image { .. }))
+                .count(),
+        })
+        .sum()
 }
 
 fn refresh_project_instructions(
