@@ -2594,8 +2594,7 @@ mod tests {
         assert!(snapshots.len() >= 2);
         assert!(snapshots.iter().any(|messages| {
             messages.iter().any(|message| {
-                message.role == ProviderRole::Tool
-                    && message.content == MessageContent::Text("image result".into())
+                message.role == ProviderRole::Tool && message_text(message).contains("image result")
             })
         }));
     }
@@ -2846,7 +2845,7 @@ mod tests {
             PathBuf::from("/tmp"),
         );
 
-        agent.emit_history_entry(
+        let _ = agent.emit_history_entry(
             WorkHistoryEntry::user("initial", "entry-1", "not streamed"),
             None,
         );
