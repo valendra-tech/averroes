@@ -469,6 +469,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_matches_unicode_case_in_current_and_workspace_scopes() {
+        let root = tempfile::tempdir().unwrap();
+        let current = conversation("current", None);
+        let other = conversation("other", None);
+        let (_directory, database) = database_with_workspace(root.path(), &[current, other]);
+        database
+            .append_history_entries(
+                "current",
+                &[entry("current-cafe", 1, WorkHistoryKind::User, "CAFÉ")],
+            )
+            .unwrap();
+        database
+            .append_history_entries(
+                "other",
+                &[entry("other-cafe", 1, WorkHistoryKind::User, "café")],
+            )
+            .unwrap();
+
+        let tool = HistoryTool::new(database);
+        let current_result = tool
+            .execute(
+                &context("current", root.path()),
+                &json!({"operation": "search", "query": "café"}),
+            )
+            .await
+            .unwrap();
+        assert!(current_result.content.contains("current-cafe"));
+
+        let workspace_result = tool
+            .execute(
+                &context("current", root.path()),
+                &json!({"operation": "search", "query": "café", "all": true}),
+            )
+            .await
+            .unwrap();
+        assert!(workspace_result.content.contains("current-cafe"));
+        assert!(workspace_result.content.contains("other-cafe"));
+        assert_eq!(workspace_result.metadata.as_ref().unwrap()["total"], 2);
+    }
+
+    #[tokio::test]
     async fn search_ranks_original_content_and_kinds_before_history_echoes() {
         let root = tempfile::tempdir().unwrap();
         let current = conversation("current", None);
@@ -834,6 +875,13 @@ mod tests {
         assert_eq!(total, 513);
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].1.entry_id, "storage-original");
+
+        let (next_page, next_total) = database
+            .search_history_page("current", "needle", 1, 1)
+            .unwrap();
+        assert_eq!(next_total, 513);
+        assert_eq!(next_page.len(), 1);
+        assert_eq!(next_page[0].1.entry_id, "context-0");
     }
 
     #[tokio::test]

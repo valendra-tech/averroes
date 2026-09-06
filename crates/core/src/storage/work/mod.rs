@@ -1626,9 +1626,9 @@ mod tests {
             .lock()
             .execute(
                 "INSERT INTO conversation_history
-                 (conversation_id, entry_id, window_id, sequence, timestamp, kind, text,
-                  payload_json, images_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (conversation_id, entry_id, window_id, sequence, timestamp, kind, text,
+                  text_search, payload_json, images_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     "unknown-history-kind",
                     "entry-1",
@@ -1637,6 +1637,7 @@ mod tests {
                     0_i64,
                     "future_kind",
                     "future event",
+                    note_search_key("future event"),
                     "{}",
                     "[]",
                 ],
@@ -1747,6 +1748,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(keys, ("cafe.md".to_owned(), "café".to_owned()));
+    }
+
+    #[test]
+    fn history_search_key_migration_backfills_legacy_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = rusqlite::Connection::open(directory.path().join("legacy.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE conversation_history (
+                    conversation_id TEXT NOT NULL,
+                    entry_id TEXT NOT NULL,
+                    parent_id TEXT,
+                    thread_id TEXT,
+                    window_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    images_json TEXT NOT NULL DEFAULT '[]',
+                    PRIMARY KEY (conversation_id, entry_id),
+                    UNIQUE (conversation_id, sequence)
+                );
+                INSERT INTO conversation_history
+                    (conversation_id, entry_id, window_id, sequence, timestamp, kind, text)
+                VALUES ('legacy', 'entry-1', 'window-1', 0, 0, 'user', 'CAFÉ');",
+            )
+            .unwrap();
+
+        schema::migrate(&connection).unwrap();
+
+        let key = connection
+            .query_row(
+                "SELECT text_search FROM conversation_history
+                 WHERE conversation_id = 'legacy' AND entry_id = 'entry-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(key, "café");
     }
 
     #[test]

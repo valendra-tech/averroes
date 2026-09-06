@@ -173,6 +173,7 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             timestamp INTEGER NOT NULL,
             kind TEXT NOT NULL,
             text TEXT NOT NULL,
+            text_search TEXT NOT NULL DEFAULT '',
             payload_json TEXT NOT NULL DEFAULT '{}',
             images_json TEXT NOT NULL DEFAULT '[]',
             PRIMARY KEY (conversation_id, entry_id),
@@ -318,6 +319,7 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
              ON conversation_embeddings(connection_id, model_id, conversation_id);",
     )?;
     migrate_note_search_keys(connection)?;
+    migrate_history_search_keys(connection)?;
     Ok(())
 }
 
@@ -368,6 +370,48 @@ fn migrate_note_search_keys(connection: &Connection) -> rusqlite::Result<()> {
         )?;
     }
     transaction.execute_batch("PRAGMA user_version = 18")?;
+    transaction.commit()
+}
+
+/// Add and backfill the normalized history search key as one retryable
+/// migration unit. The key is generated in Rust because SQLite NOCASE only
+/// handles ASCII case folding.
+fn migrate_history_search_keys(connection: &Connection) -> rusqlite::Result<()> {
+    let text_search_exists = table_has_column(connection, "conversation_history", "text_search")?;
+    let transaction = connection.unchecked_transaction()?;
+    if !text_search_exists {
+        transaction.execute(
+            "ALTER TABLE conversation_history ADD COLUMN text_search TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+
+    let mut statement = transaction.prepare(
+        "SELECT conversation_id, entry_id, text FROM conversation_history
+         WHERE text_search = '' AND text <> ''",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let entries = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (conversation_id, entry_id, text) in entries {
+        transaction.execute(
+            "UPDATE conversation_history
+             SET text_search = ?3
+             WHERE conversation_id = ?1 AND entry_id = ?2",
+            rusqlite::params![conversation_id, entry_id, note_search_key(&text)],
+        )?;
+    }
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS conversation_history_search
+             ON conversation_history(conversation_id, text_search);
+         PRAGMA user_version = 19",
+    )?;
     transaction.commit()
 }
 

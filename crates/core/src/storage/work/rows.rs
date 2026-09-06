@@ -41,6 +41,14 @@ fn history_entry_with_conversation_from_row(
     Ok((row.get(0)?, history_entry_from_row_at(row, 1)?))
 }
 
+fn history_entry_with_conversation_and_total_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(String, WorkHistoryEntry, usize)> {
+    let (conversation_id, entry) = history_entry_with_conversation_from_row(row)?;
+    let total = row.get::<_, i64>(11)? as usize;
+    Ok((conversation_id, entry, total))
+}
+
 pub(super) fn append_history_entries(
     transaction: &Transaction<'_>,
     conversation_id: &str,
@@ -52,8 +60,8 @@ pub(super) fn append_history_entries(
         let inserted = match transaction.execute(
             "INSERT INTO conversation_history
             (conversation_id, entry_id, parent_id, thread_id, window_id, sequence,
-             timestamp, kind, text, payload_json, images_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            timestamp, kind, text, text_search, payload_json, images_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(conversation_id, entry_id) DO NOTHING",
             params![
                 conversation_id,
@@ -65,6 +73,7 @@ pub(super) fn append_history_entries(
                 entry.timestamp,
                 entry.kind.as_str(),
                 entry.text,
+                note_search_key(&entry.text),
                 payload,
                 images,
             ],
@@ -232,13 +241,13 @@ pub(super) fn search_history(
     if query.trim().is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
-    let pattern = format!("%{}%", escape_like_pattern(query.trim()));
+    let pattern = format!("%{}%", escape_like_pattern(&note_search_key(query.trim())));
     let mut statement = connection.prepare(
         "SELECT entry_id, parent_id, thread_id, window_id, sequence, timestamp,
                 kind, text, payload_json, images_json
          FROM conversation_history
          WHERE conversation_id = ?1
-           AND text LIKE ?2 COLLATE NOCASE ESCAPE '\\'
+           AND text_search LIKE ?2 ESCAPE '\\'
          ORDER BY sequence, entry_id
          LIMIT ?3 OFFSET ?4",
     )?;
@@ -303,39 +312,26 @@ fn search_history_page_for_scope(
     if query.trim().is_empty() || limit == 0 {
         return Ok((Vec::new(), 0));
     }
-    let pattern = format!("%{}%", escape_like_pattern(query.trim()));
+    let pattern = format!("%{}%", escape_like_pattern(&note_search_key(query.trim())));
     let (from, filter) = match (conversation_id, workspace_root) {
         (Some(_), None) => (
             "FROM conversation_history h",
-            "h.conversation_id = ?1 AND h.text LIKE ?2 COLLATE NOCASE ESCAPE '\\'",
+            "h.conversation_id = ?1 AND h.text_search LIKE ?2 ESCAPE '\\'",
         ),
         (None, Some(_)) => (
             "FROM conversation_history h
              JOIN conversations c ON c.id = h.conversation_id
              JOIN projects p ON p.id = c.project_id",
-            "p.root = ?1 AND h.text LIKE ?2 COLLATE NOCASE ESCAPE '\\'",
+            "p.root = ?1 AND h.text_search LIKE ?2 ESCAPE '\\'",
         ),
         _ => return Ok((Vec::new(), 0)),
     };
     let cte = ranked_history_cte(from, filter);
-    let total = match (conversation_id, workspace_root) {
-        (Some(conversation_id), None) => connection.query_row(
-            &format!("{cte} SELECT COUNT(*) FROM deduped"),
-            params![conversation_id, pattern],
-            |row| row.get::<_, i64>(0),
-        )?,
-        (None, Some(workspace_root)) => connection.query_row(
-            &format!("{cte} SELECT COUNT(*) FROM deduped"),
-            params![workspace_root, pattern],
-            |row| row.get::<_, i64>(0),
-        )?,
-        _ => 0,
-    } as usize;
-
     let page_sql = format!(
         "{cte}
          SELECT conversation_id, entry_id, parent_id, thread_id, window_id,
-                sequence, timestamp, kind, text, payload_json, images_json
+                sequence, timestamp, kind, text, payload_json, images_json,
+                COUNT(*) OVER () AS total
          FROM deduped
          ORDER BY derived_rank, kind_rank, sequence, entry_id, conversation_id
          LIMIT ?3 OFFSET ?4"
@@ -344,15 +340,40 @@ fn search_history_page_for_scope(
     let rows = match (conversation_id, workspace_root) {
         (Some(conversation_id), None) => statement.query_map(
             params![conversation_id, pattern, limit as i64, offset as i64],
-            history_entry_with_conversation_from_row,
+            history_entry_with_conversation_and_total_from_row,
         )?,
         (None, Some(workspace_root)) => statement.query_map(
             params![workspace_root, pattern, limit as i64, offset as i64],
-            history_entry_with_conversation_from_row,
+            history_entry_with_conversation_and_total_from_row,
         )?,
         _ => unreachable!(),
     };
-    Ok((rows.collect::<rusqlite::Result<Vec<_>>>()?, total))
+    let page = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let total = match page.first() {
+        Some((_, _, total)) => *total,
+        None => {
+            (match (conversation_id, workspace_root) {
+                (Some(conversation_id), None) => connection.query_row(
+                    &format!("{cte} SELECT COUNT(*) FROM deduped"),
+                    params![conversation_id, pattern],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                (None, Some(workspace_root)) => connection.query_row(
+                    &format!("{cte} SELECT COUNT(*) FROM deduped"),
+                    params![workspace_root, pattern],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                _ => 0,
+            }) as usize
+        }
+    };
+    Ok((
+        page.into_iter()
+            .map(|(conversation_id, entry, _)| (conversation_id, entry))
+            .collect(),
+        total,
+    ))
 }
 
 pub(super) fn search_history_page(
@@ -412,7 +433,7 @@ pub(super) fn search_history_workspace(
     if query.trim().is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
-    let pattern = format!("%{}%", escape_like_pattern(query.trim()));
+    let pattern = format!("%{}%", escape_like_pattern(&note_search_key(query.trim())));
     let mut statement = connection.prepare(
         "SELECT h.conversation_id, h.entry_id, h.parent_id, h.thread_id, h.window_id,
                 h.sequence, h.timestamp, h.kind, h.text, h.payload_json, h.images_json
@@ -420,7 +441,7 @@ pub(super) fn search_history_workspace(
          JOIN conversations c ON c.id = h.conversation_id
          JOIN projects p ON p.id = c.project_id
          WHERE p.root = ?1
-           AND h.text LIKE ?2 COLLATE NOCASE ESCAPE '\\'
+           AND h.text_search LIKE ?2 ESCAPE '\\'
          ORDER BY h.sequence, h.entry_id, h.conversation_id
          LIMIT ?3 OFFSET ?4",
     )?;
