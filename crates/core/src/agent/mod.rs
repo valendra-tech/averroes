@@ -26,8 +26,9 @@ use std::time::Duration;
 
 pub use context::ContextUsage;
 pub use context_window::{
-    ContextBudget, ContextController, ContextRequest, MAX_HANDOFF_CHARS, MAX_RECOVERY_RECORD_CHARS,
-    MIN_PAGE_CHARS, MIN_USABLE_TOKENS, PAGE_MARGIN_TOKENS, REMINDER_BUFFER_TOKENS,
+    ContextBudget, ContextController, ContextRequest, CONTEXT_RESERVE_TOKENS, MAX_HANDOFF_CHARS,
+    MAX_RECOVERY_RECORD_CHARS, MIN_PAGE_CHARS, MIN_USABLE_TOKENS, PAGE_MARGIN_TOKENS,
+    REMINDER_BUFFER_TOKENS,
 };
 
 const MAX_AUTO_SKILLS: usize = 3;
@@ -234,7 +235,7 @@ impl Agent {
         let context_window = provider.context_window(&model);
         let context_controller = Arc::new(ContextController::new(ContextBudget::new(
             context_window,
-            0,
+            CONTEXT_RESERVE_TOKENS,
             true,
         )));
         let messages = {
@@ -410,8 +411,11 @@ impl Agent {
         runtime.provider = provider;
         runtime.model = model;
         runtime.governor = governor;
-        self.context_controller
-            .replace_budget(ContextBudget::new(context_window, 0, true));
+        self.context_controller.replace_budget(ContextBudget::new(
+            context_window,
+            CONTEXT_RESERVE_TOKENS,
+            true,
+        ));
     }
 
     pub fn set_reasoning_effort(&self, effort: Option<String>) {
@@ -646,6 +650,7 @@ impl Agent {
             let messages = self.messages.lock().await.clone();
             let request =
                 self.build_request(messages, runtime.model.clone(), skill_context.clone());
+            let generation = self.context_controller.current_generation();
 
             self.set_state(AgentState::Thinking);
 
@@ -686,6 +691,7 @@ impl Agent {
                 &response,
                 runtime.provider.context_window(&runtime.model),
                 stream_events.as_ref(),
+                generation,
             );
 
             if response
@@ -756,6 +762,7 @@ impl Agent {
             ITERATION_LIMIT_FINAL_CONTEXT.to_owned(),
         );
         self.record_request_overhead(&request.messages, request.system.as_deref(), &request.tools);
+        let generation = self.context_controller.current_generation();
 
         self.set_state(AgentState::Thinking);
         let response_result = match stream_events.as_ref() {
@@ -777,6 +784,7 @@ impl Agent {
             &response,
             runtime.provider.context_window(&runtime.model),
             stream_events.as_ref(),
+            generation,
         );
 
         let mut final_message = response.message;
@@ -935,14 +943,21 @@ impl Agent {
         response: &ChatResponse,
         context_limit: usize,
         events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+        generation: u64,
     ) {
         let Some(provider_usage) = response.usage.as_ref() else {
+            self.context_controller
+                .clear_usage_for_generation(generation);
             return;
         };
         let usage = ContextUsage::from_provider_usage(provider_usage, context_limit);
-        self.context_controller.record_usage(usage);
-        if let Some(events) = events {
-            let _ = events.send(AgentStreamEvent::ContextUpdated { usage });
+        if self
+            .context_controller
+            .record_usage_for_generation(generation, usage)
+        {
+            if let Some(events) = events {
+                let _ = events.send(AgentStreamEvent::ContextUpdated { usage });
+            }
         }
     }
 
@@ -1037,6 +1052,9 @@ impl Agent {
     }
 }
 
+/// Conservatively estimates request tokens from serialized character length.
+/// This deliberately avoids provider-specific wire serialization and leaves
+/// room for framing and tokenizer differences.
 fn estimate_tokens(value: &str) -> usize {
     value.len().saturating_add(APPROX_CHARS_PER_TOKEN - 1) / APPROX_CHARS_PER_TOKEN
 }
@@ -1158,7 +1176,7 @@ mod tests {
     use super::*;
     use crate::provider::types::{FunctionCall, Role as ProviderRole, TokenUsage, ToolCall};
     use crate::provider::{ProviderError, StreamEvent};
-    use crate::tool::{ToolContext, ToolResult};
+    use crate::tool::{Tool, ToolContext, ToolResult};
     use async_trait::async_trait;
     use futures::{Stream, StreamExt};
     use std::pin::Pin;
@@ -2196,6 +2214,165 @@ mod tests {
         assert_eq!(controller.usage().unwrap().input_tokens, Some(4));
     }
 
+    #[tokio::test]
+    async fn missing_provider_usage_clears_stale_context_usage() {
+        let agent = Agent::new(
+            AgentConfig {
+                system_prompt: None,
+                tools: Vec::new(),
+                ..Default::default()
+            },
+            Arc::new(SmallContextProvider),
+            test_tool_registry(),
+            Arc::new(ResourceGovernor::new(1, 100)),
+            "missing-usage-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        let controller = agent.context_controller();
+        controller.record_usage(ContextUsage::from_usage(9, 1, 10));
+
+        agent.record_context_usage(
+            &ChatResponse {
+                message: ChatMessage {
+                    role: ProviderRole::Assistant,
+                    content: MessageContent::Text("no usage".into()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                usage: None,
+                reasoning: None,
+                stop_reason: None,
+            },
+            10,
+            None,
+            controller.current_generation(),
+        );
+
+        assert!(controller.usage().is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_provider_usage_cannot_overwrite_a_new_context_window() {
+        let agent = Agent::new(
+            AgentConfig {
+                system_prompt: None,
+                tools: Vec::new(),
+                ..Default::default()
+            },
+            Arc::new(SmallContextProvider),
+            test_tool_registry(),
+            Arc::new(ResourceGovernor::new(1, 100)),
+            "stale-usage-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        let controller = agent.context_controller();
+        let previous_generation = controller.current_generation();
+        controller.begin_window("window-2");
+
+        agent.record_context_usage(
+            &ChatResponse {
+                message: ChatMessage {
+                    role: ProviderRole::Assistant,
+                    content: MessageContent::Text("late usage".into()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                usage: Some(TokenUsage {
+                    input_tokens: 9,
+                    output_tokens: 1,
+                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                    reasoning_output_tokens: None,
+                }),
+                reasoning: None,
+                stop_reason: None,
+            },
+            10,
+            None,
+            previous_generation,
+        );
+
+        assert!(controller.usage().is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_tool_context_shares_the_context_controller_arc() {
+        struct ContextCaptureTool {
+            observed: Arc<std::sync::Mutex<Option<Arc<ContextController>>>>,
+        }
+
+        #[async_trait]
+        impl Tool for ContextCaptureTool {
+            fn name(&self) -> &str {
+                "capture_context"
+            }
+
+            fn description(&self) -> &str {
+                "Captures the controller from the tool context"
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+
+            async fn execute(
+                &self,
+                ctx: &ToolContext,
+                _params: &serde_json::Value,
+            ) -> crate::tool::Result<ToolResult> {
+                *self.observed.lock().unwrap() = ctx.context_controller.clone();
+                Ok(ToolResult::ok("captured"))
+            }
+        }
+
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let registry = ToolRegistry::new();
+        registry.register(ContextCaptureTool {
+            observed: observed.clone(),
+        });
+        let agent = Agent::new(
+            AgentConfig {
+                system_prompt: None,
+                tools: vec!["capture_context".into()],
+                ..Default::default()
+            },
+            Arc::new(SmallContextProvider),
+            Arc::new(registry),
+            Arc::new(ResourceGovernor::new(1, 100)),
+            "tool-context-session".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        agent
+            .execute_tools(
+                &ChatResponse {
+                    message: ChatMessage {
+                        role: ProviderRole::Assistant,
+                        content: MessageContent::Text(String::new()),
+                        tool_call_id: None,
+                        tool_calls: Some(vec![ToolCall {
+                            id: "capture-1".into(),
+                            call_type: "function".into(),
+                            function: FunctionCall {
+                                name: "capture_context".into(),
+                                arguments: "{}".into(),
+                            },
+                        }]),
+                    },
+                    usage: None,
+                    reasoning: None,
+                    stop_reason: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let exposed = observed.lock().unwrap().clone().unwrap();
+        let controller = agent.context_controller();
+        assert!(Arc::ptr_eq(&controller, &exposed));
+    }
+
     fn stream_request() -> ChatRequest {
         ChatRequest {
             model: "test-model".into(),
@@ -2927,7 +3104,7 @@ mod tests {
             requests[2].clone()
         };
 
-        let expected = ContextController::for_test(200_000, 0);
+        let expected = ContextController::for_test(200_000, CONTEXT_RESERVE_TOKENS);
         expected.record_usage(ContextUsage::from_usage(195_000, 1, 200_000));
         expected.set_request_overhead(
             estimate_system_prompt_tokens(&final_request.messages).saturating_add(

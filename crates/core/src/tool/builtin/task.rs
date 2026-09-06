@@ -683,6 +683,7 @@ mod tests {
             enabled_tools: Vec::new(),
             available_tools: Vec::new(),
             tool_activation: Arc::new(crate::tool::ToolActivation::default()),
+            context_controller: None,
             conversation_context: Vec::new(),
             agent_runner: None,
             memory_search_backend: None,
@@ -938,6 +939,7 @@ mod tests {
         let delegated_context = ToolContext {
             session_id: "agent-thread:research".into(),
             tool_activation: activation,
+            context_controller: None,
             ..context()
         };
 

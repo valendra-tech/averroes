@@ -124,6 +124,7 @@ mod tests {
             enabled_tools: Vec::new(),
             available_tools: Vec::new(),
             tool_activation: Arc::new(ToolActivation::default()),
+            context_controller: None,
             conversation_context: Vec::new(),
             agent_runner: None,
             memory_search_backend: None,

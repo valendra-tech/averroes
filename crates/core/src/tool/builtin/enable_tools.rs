@@ -101,6 +101,7 @@ mod tests {
                 description: "Searches the internet".into(),
             }],
             tool_activation: Arc::new(ToolActivation::default()),
+            context_controller: None,
             conversation_context: Vec::new(),
             agent_runner: None,
             memory_search_backend: None,

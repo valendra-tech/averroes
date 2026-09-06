@@ -13,6 +13,8 @@ pub const MIN_PAGE_CHARS: usize = 1_000;
 pub const MIN_USABLE_TOKENS: usize = 10_000;
 /// Reminders occupy at most this many tokens before the rollover line.
 pub const REMINDER_BUFFER_TOKENS: usize = 32_000;
+/// Tokens kept free from the provider window for agent rollover safety.
+pub const CONTEXT_RESERVE_TOKENS: usize = 1_000;
 
 const APPROX_CHARS_PER_TOKEN: u64 = 4;
 const IMAGE_ALLOWANCE_TOKENS: u64 = 1_024;
@@ -77,6 +79,7 @@ pub struct ContextRequest {
 pub struct ContextController {
     budget: RwLock<ContextBudget>,
     window_id: RwLock<String>,
+    generation: RwLock<u64>,
     usage: RwLock<Option<ContextUsage>>,
     pending: Mutex<Option<ContextRequest>>,
     reminder_fingerprint: RwLock<Option<String>>,
@@ -88,6 +91,7 @@ impl ContextController {
         Self {
             budget: RwLock::new(budget),
             window_id: RwLock::new("initial".into()),
+            generation: RwLock::new(0),
             usage: RwLock::new(None),
             pending: Mutex::new(None),
             reminder_fingerprint: RwLock::new(None),
@@ -107,6 +111,19 @@ impl ContextController {
         *self.usage.write() = Some(usage);
     }
 
+    pub fn current_generation(&self) -> u64 {
+        *self.generation.read()
+    }
+
+    pub fn record_usage_for_generation(&self, generation: u64, usage: ContextUsage) -> bool {
+        let current_generation = self.generation.read();
+        if *current_generation != generation {
+            return false;
+        }
+        *self.usage.write() = Some(usage);
+        true
+    }
+
     pub fn usage(&self) -> Option<ContextUsage> {
         *self.usage.read()
     }
@@ -120,9 +137,19 @@ impl ContextController {
         *self.usage.write() = None;
     }
 
+    pub fn clear_usage_for_generation(&self, generation: u64) -> bool {
+        let current_generation = self.generation.read();
+        if *current_generation != generation {
+            return false;
+        }
+        self.clear_usage();
+        true
+    }
+
     pub fn replace_budget(&self, budget: ContextBudget) {
         *self.budget.write() = budget;
         self.clear_usage();
+        *self.pending.lock() = None;
         *self.reminder_fingerprint.write() = None;
         *self.request_overhead.write() = RequestOverhead::default();
     }
@@ -214,8 +241,7 @@ impl ContextController {
             .saturating_sub(PAGE_MARGIN_TOKENS as u64)
             .saturating_sub(request_overhead);
         let available_tokens = match self.usage().and_then(|usage| usage.input_tokens) {
-            Some(input_tokens) => budget
-                .context_window
+            Some(input_tokens) => (budget.usable.max(0) as u64)
                 .saturating_sub(input_tokens)
                 .saturating_sub(PAGE_MARGIN_TOKENS as u64)
                 .saturating_sub(request_overhead),
@@ -246,7 +272,9 @@ impl ContextController {
     /// Starts a new provider context and clears state that belongs only to the
     /// previous window. Returns the previous window id for lifecycle events.
     pub fn begin_window(&self, window_id: impl Into<String>) -> String {
+        let mut generation = self.generation.write();
         let previous = std::mem::replace(&mut *self.window_id.write(), window_id.into());
+        *generation = generation.saturating_add(1);
         *self.usage.write() = None;
         *self.pending.lock() = None;
         *self.reminder_fingerprint.write() = None;
@@ -311,6 +339,17 @@ mod tests {
     }
 
     #[test]
+    fn known_usage_page_capacity_honors_the_reserved_tokens() {
+        let controller = ContextController::for_test(100_000, 20_000);
+        controller.record_usage(ContextUsage::from_usage(60_000, 0, 100_000));
+
+        assert_eq!(
+            controller.safe_page_chars(0, 0, 0, 0, 0).unwrap(),
+            (20_000 - PAGE_MARGIN_TOKENS) * 4
+        );
+    }
+
+    #[test]
     fn dynamic_fresh_capacity_accounts_for_tools_and_images() {
         let controller = ContextController::for_test(100_000, 16_384);
         let fresh = controller.safe_page_chars(0, 0, 0, 0, 0).unwrap();
@@ -341,14 +380,38 @@ mod tests {
     fn budget_and_window_resets_clear_request_overhead() {
         let controller = ContextController::for_test(100_000, 16_384);
         controller.set_request_overhead(25_000, 25_000, 25_000, 0);
+        controller
+            .request_context(Some("pending handoff".into()))
+            .unwrap();
         assert!(controller.handoff_limit() < MAX_HANDOFF_CHARS);
 
         controller.replace_budget(ContextBudget::new(100_000, 16_384, true));
         assert_eq!(controller.handoff_limit(), MAX_HANDOFF_CHARS);
+        assert!(controller.pending_request().is_none());
 
         controller.set_request_overhead(25_000, 25_000, 25_000, 0);
         controller.begin_window("window-2");
         assert_eq!(controller.handoff_limit(), MAX_HANDOFF_CHARS);
+    }
+
+    #[test]
+    fn usage_from_a_previous_generation_is_ignored() {
+        let controller = ContextController::for_test(100_000, 16_384);
+        let previous_generation = controller.current_generation();
+
+        controller.begin_window("window-2");
+
+        assert_eq!(controller.current_generation(), previous_generation + 1);
+        assert!(!controller.record_usage_for_generation(
+            previous_generation,
+            ContextUsage::from_usage(50_000, 1, 100_000),
+        ));
+        assert!(controller.usage().is_none());
+        assert!(controller.record_usage_for_generation(
+            controller.current_generation(),
+            ContextUsage::from_usage(25_000, 1, 100_000),
+        ));
+        assert_eq!(controller.usage().unwrap().input_tokens, Some(25_000));
     }
 
     #[test]

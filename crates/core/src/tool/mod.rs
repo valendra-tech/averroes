@@ -79,6 +79,10 @@ pub struct ToolContext {
     pub available_tools: Vec<EnabledTool>,
     /// Per-agent execution state shared by tools that need a current directory.
     pub tool_activation: Arc<ToolActivation>,
+    /// Shared context-window state for tools that need current sizing or
+    /// rollover information. Standalone tool tests and delegated contexts may
+    /// leave this unset.
+    pub context_controller: Option<Arc<crate::agent::ContextController>>,
     /// A deliberately reduced, read-only snapshot for delegated agents.
     pub conversation_context: Vec<crate::provider::ChatMessage>,
     pub agent_runner: Option<Arc<dyn AgentRunner>>,
@@ -117,6 +121,7 @@ impl std::fmt::Debug for ToolContext {
             .field("agent_id", &self.agent_id)
             .field("enabled_tools", &self.enabled_tools.len())
             .field("available_tools", &self.available_tools.len())
+            .field("context_controller", &self.context_controller.is_some())
             .field("conversation_context", &self.conversation_context.len())
             .field("agent_runner", &self.agent_runner.is_some())
             .field(

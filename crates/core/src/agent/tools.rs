@@ -49,6 +49,7 @@ impl Agent {
                 .collect(),
             available_tools,
             tool_activation: self.tool_activation.clone(),
+            context_controller: Some(self.context_controller.clone()),
             conversation_context: self.messages.lock().await.clone(),
             agent_runner: self.agent_runner(),
             memory_search_backend: self.memory_search_backend.read().unwrap().clone(),
