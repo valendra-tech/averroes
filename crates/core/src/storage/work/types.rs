@@ -327,7 +327,7 @@ impl WorkHistoryKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkHistoryEntry {
     pub entry_id: String,
     #[serde(default)]
@@ -344,6 +344,8 @@ pub struct WorkHistoryEntry {
     #[serde(default)]
     pub images: Vec<ImageSource>,
 }
+
+impl Eq for ImageSource {}
 
 impl WorkHistoryEntry {
     pub fn user(window_id: &str, entry_id: &str, text: &str) -> Self {
