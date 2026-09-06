@@ -33,57 +33,78 @@ pub(super) fn append_history_entries(
     conversation_id: &str,
     entries: &[WorkHistoryEntry],
 ) -> Result<(), WorkDatabaseError> {
-    let mut statement = transaction.prepare(
-        "INSERT INTO conversation_history
+    for entry in entries {
+        let payload = serde_json::to_string(&entry.payload)?;
+        let images = serde_json::to_string(&entry.images)?;
+        let inserted = match transaction.execute(
+            "INSERT INTO conversation_history
             (conversation_id, entry_id, parent_id, thread_id, window_id, sequence,
              timestamp, kind, text, payload_json, images_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-    )?;
-    for entry in entries {
-        if let Some(existing) = load_history_entry(transaction, conversation_id, &entry.entry_id)? {
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(conversation_id, entry_id) DO NOTHING",
+            params![
+                conversation_id,
+                entry.entry_id,
+                entry.parent_id,
+                entry.thread_id,
+                entry.window_id,
+                entry.sequence,
+                entry.timestamp,
+                entry.kind.as_str(),
+                entry.text,
+                payload,
+                images,
+            ],
+        ) {
+            Ok(inserted) => inserted,
+            Err(error) => {
+                match transaction
+                    .query_row(
+                        "SELECT entry_id FROM conversation_history
+                         WHERE conversation_id = ?1 AND sequence = ?2",
+                        params![conversation_id, entry.sequence],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                {
+                    Ok(Some(existing_entry_id)) => {
+                        return Err(history_conflict(conversation_id, entry, existing_entry_id));
+                    }
+                    Ok(None) => return Err(error.into()),
+                    Err(query_error) => return Err(query_error.into()),
+                }
+            }
+        };
+
+        if inserted == 0 {
+            let Some(existing) = load_history_entry(transaction, conversation_id, &entry.entry_id)?
+            else {
+                return Err(history_conflict(
+                    conversation_id,
+                    entry,
+                    entry.entry_id.clone(),
+                ));
+            };
             if existing == *entry {
                 continue;
             }
-            return Err(WorkDatabaseError::HistoryConflict {
-                conversation_id: conversation_id.into(),
-                sequence: entry.sequence,
-                entry_id: entry.entry_id.clone(),
-                existing_entry_id: existing.entry_id,
-            });
+            return Err(history_conflict(conversation_id, entry, existing.entry_id));
         }
-
-        let existing_entry_id = transaction
-            .query_row(
-                "SELECT entry_id FROM conversation_history
-                 WHERE conversation_id = ?1 AND sequence = ?2",
-                params![conversation_id, entry.sequence],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if let Some(existing_entry_id) = existing_entry_id {
-            return Err(WorkDatabaseError::HistoryConflict {
-                conversation_id: conversation_id.into(),
-                sequence: entry.sequence,
-                entry_id: entry.entry_id.clone(),
-                existing_entry_id,
-            });
-        }
-
-        statement.execute(params![
-            conversation_id,
-            entry.entry_id,
-            entry.parent_id,
-            entry.thread_id,
-            entry.window_id,
-            entry.sequence,
-            entry.timestamp,
-            entry.kind.as_str(),
-            entry.text,
-            serde_json::to_string(&entry.payload)?,
-            serde_json::to_string(&entry.images)?,
-        ])?;
     }
     Ok(())
+}
+
+fn history_conflict(
+    conversation_id: &str,
+    entry: &WorkHistoryEntry,
+    existing_entry_id: String,
+) -> WorkDatabaseError {
+    WorkDatabaseError::HistoryConflict {
+        conversation_id: conversation_id.into(),
+        sequence: entry.sequence,
+        entry_id: entry.entry_id.clone(),
+        existing_entry_id,
+    }
 }
 
 pub(super) fn load_history_entry(

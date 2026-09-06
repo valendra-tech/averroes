@@ -1446,6 +1446,12 @@ mod tests {
             .append_history_entries("history-collision", std::slice::from_ref(&first))
             .unwrap();
 
+        let conflicting_payload = WorkHistoryEntry::user("window-1", "entry-1", "changed");
+        assert!(matches!(
+            database.append_history_entries("history-collision", &[conflicting_payload]),
+            Err(WorkDatabaseError::HistoryConflict { .. })
+        ));
+
         let conflicting = WorkHistoryEntry::user("window-1", "entry-2", "different");
         assert!(matches!(
             database.append_history_entries("history-collision", &[conflicting]),
@@ -1454,6 +1460,33 @@ mod tests {
         assert_eq!(
             database.history_entries("history-collision").unwrap(),
             vec![first]
+        );
+    }
+
+    #[test]
+    fn concurrent_history_appends_are_idempotent_across_connections() {
+        let (_directory, database) = database();
+        database
+            .save_conversation(&test_conversation("history-concurrent"))
+            .unwrap();
+        let second_database = WorkDatabase::open_at(database.path().to_path_buf()).unwrap();
+        let entry = WorkHistoryEntry::user("window-1", "entry-1", "first");
+
+        let first_database = database.clone();
+        let first_entry = entry.clone();
+        let first = std::thread::spawn(move || {
+            first_database.append_history_entries("history-concurrent", &[first_entry])
+        });
+        let second_entry = entry.clone();
+        let second = std::thread::spawn(move || {
+            second_database.append_history_entries("history-concurrent", &[second_entry])
+        });
+
+        assert!(first.join().unwrap().is_ok());
+        assert!(second.join().unwrap().is_ok());
+        assert_eq!(
+            database.history_entries("history-concurrent").unwrap(),
+            vec![entry]
         );
     }
 

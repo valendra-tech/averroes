@@ -178,8 +178,6 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY (conversation_id, entry_id),
             UNIQUE (conversation_id, sequence)
         );
-        CREATE INDEX IF NOT EXISTS conversation_history_sequence
-            ON conversation_history(conversation_id, sequence);
         CREATE INDEX IF NOT EXISTS conversation_history_kind_sequence
             ON conversation_history(conversation_id, kind, sequence);
         CREATE TABLE IF NOT EXISTS notes (
@@ -312,7 +310,8 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         connection.execute("ALTER TABLE sources ADD COLUMN title TEXT", [])?;
     }
     connection.execute_batch(
-        "DROP INDEX IF EXISTS conversation_embeddings_model;
+        "DROP INDEX IF EXISTS conversation_history_sequence;
+         DROP INDEX IF EXISTS conversation_embeddings_model;
          CREATE INDEX conversation_embeddings_model
              ON conversation_embeddings(connection_id, model_id, conversation_id);",
     )?;
