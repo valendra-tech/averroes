@@ -551,15 +551,12 @@ impl Agent {
     fn history_entries_for_provider_message(&self, message: &ChatMessage) -> Vec<WorkHistoryEntry> {
         let mut entries = Vec::new();
         let images = message_images(message);
-        let text = message_text(message);
         let tool_calls = message.tool_calls.as_deref().unwrap_or_default();
-        if !text.is_empty() || tool_calls.is_empty() {
-            entries.push(self.history_entry_for_message(
-                WorkHistoryKind::Assistant,
-                message,
-                json!({"role": "assistant"}),
-            ));
-        }
+        entries.push(self.history_entry_for_message(
+            WorkHistoryKind::Assistant,
+            message,
+            json!({"role": "assistant"}),
+        ));
         for tool_call in tool_calls {
             entries.push(self.new_history_entry(
                 WorkHistoryKind::ToolCall,
@@ -2553,6 +2550,31 @@ mod tests {
         assert!(snapshots[0]
             .iter()
             .any(|message| message.content == MessageContent::Text("done".into())));
+    }
+
+    #[test]
+    fn provider_tool_call_response_also_emits_empty_assistant_history() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "tool-call-history-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        let message = ChatMessage {
+            role: ProviderRole::Assistant,
+            content: MessageContent::Text(String::new()),
+            tool_call_id: None,
+            tool_calls: Some(vec![function_tool_call("call-1", "echo", "{}")]),
+        };
+
+        let entries = agent.history_entries_for_provider_message(&message);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, WorkHistoryKind::Assistant);
+        assert!(entries[0].text.is_empty());
+        assert_eq!(entries[1].kind, WorkHistoryKind::ToolCall);
     }
 
     #[tokio::test]

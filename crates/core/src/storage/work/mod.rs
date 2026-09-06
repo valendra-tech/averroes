@@ -484,9 +484,26 @@ impl WorkDatabase {
         let agent_threads = serde_json::to_string(&conversation.agent_threads)?;
         let agent_thread_transcripts =
             serde_json::to_string(&conversation.agent_thread_transcripts)?;
-        let active_context = serde_json::to_string(&conversation.active_context)?;
+        let mut active_context = serde_json::to_string(&conversation.active_context)?;
+        let mut active_window_id = conversation.active_window_id.clone();
         let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
+        if conversation.active_context.is_empty() && conversation.active_window_id == "initial" {
+            if let Some((stored_active_context, stored_active_window_id)) = transaction
+                .query_row(
+                    "SELECT active_context_json, active_window_id
+                     FROM conversations WHERE id = ?1",
+                    params![conversation.id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+            {
+                if stored_active_context != "[]" || stored_active_window_id != "initial" {
+                    active_context = stored_active_context;
+                    active_window_id = stored_active_window_id;
+                }
+            }
+        }
         let existing_updated_at = transaction
             .query_row(
                 "SELECT updated_at FROM conversations WHERE id = ?1",
@@ -533,7 +550,7 @@ impl WorkDatabase {
                 agent_threads,
                 agent_thread_transcripts,
                 active_context,
-                conversation.active_window_id,
+                active_window_id,
             ],
         )?;
         rows::replace_messages(&transaction, conversation)?;
@@ -1686,6 +1703,42 @@ mod tests {
             database.history_entries("history-save").unwrap(),
             vec![first]
         );
+    }
+
+    #[test]
+    fn save_conversation_does_not_overwrite_durable_context_with_ui_placeholder() {
+        let (_directory, database) = database();
+        let mut durable = test_conversation("context-preservation");
+        durable.active_context = vec![crate::provider::ChatMessage::user("durable context")];
+        durable.active_window_id = "window-2".into();
+        database.save_conversation(&durable).unwrap();
+
+        let mut ui_snapshot = database
+            .conversation("context-preservation")
+            .unwrap()
+            .unwrap();
+        ui_snapshot.title = "updated by UI".into();
+        ui_snapshot.active_context.clear();
+        ui_snapshot.active_window_id = "initial".into();
+        database.save_conversation(&ui_snapshot).unwrap();
+
+        let restored = database
+            .conversation("context-preservation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.active_context, durable.active_context);
+        assert_eq!(restored.active_window_id, "window-2");
+
+        let mut real_snapshot = ui_snapshot;
+        real_snapshot.active_context = vec![crate::provider::ChatMessage::user("new context")];
+        real_snapshot.active_window_id = "window-3".into();
+        database.save_conversation(&real_snapshot).unwrap();
+        let updated = database
+            .conversation("context-preservation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.active_context, real_snapshot.active_context);
+        assert_eq!(updated.active_window_id, "window-3");
     }
 
     #[test]

@@ -191,6 +191,10 @@ fn stream_event_requires_immediate_flush(event: &AgentStreamEvent) -> bool {
             | AgentStreamEvent::ContextUpdated { .. }
             | AgentStreamEvent::CompactionStarted { .. }
             | AgentStreamEvent::CompactionFinished { .. }
+            | AgentStreamEvent::ContextReminder { .. }
+            | AgentStreamEvent::ContextWindowStarted { .. }
+            | AgentStreamEvent::ContextSnapshot { .. }
+            | AgentStreamEvent::HistoryEntryAppended { .. }
             | AgentStreamEvent::DelegatedAgentStarted { .. }
     ) || matches!(
         event,
@@ -8800,6 +8804,9 @@ impl AverroesApp {
                     let agent_context = restored_context.clone();
                     let agent_usage = restored_usage;
                     let request = runtime.spawn_background(async move {
+                        let persisted_conversation = task_runtime
+                            .database
+                            .conversation(agent_session_id.as_str())?;
                         let agent = task_runtime
                             .new_agent(
                                 &agent_session_id,
@@ -8807,7 +8814,18 @@ impl AverroesApp {
                                 agent_working_dir.as_deref(),
                             )
                             .await?;
-                        agent.restore_conversation_history(agent_history).await;
+                        if let Some(conversation) = persisted_conversation {
+                            if conversation.active_context.is_empty() {
+                                agent.restore_conversation_history(agent_history).await;
+                            } else {
+                                agent
+                                    .restore_active_context(conversation.active_context)
+                                    .await;
+                                agent.set_active_window_id(conversation.active_window_id);
+                            }
+                        } else {
+                            agent.restore_conversation_history(agent_history).await;
+                        }
                         agent.set_understood_context(agent_context);
                         agent.set_context_usage(agent_usage);
                         Ok(agent)
