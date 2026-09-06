@@ -648,9 +648,9 @@ impl Agent {
 
             let runtime = self.runtime_snapshot();
             let messages = self.messages.lock().await.clone();
-            let request =
-                self.build_request(messages, runtime.model.clone(), skill_context.clone());
-            let generation = self.context_controller.current_generation();
+            let (generation, request) = capture_generation_before(&self.context_controller, || {
+                self.build_request(messages, runtime.model.clone(), skill_context.clone())
+            });
 
             self.set_state(AgentState::Thinking);
 
@@ -755,14 +755,15 @@ impl Agent {
         // The final synthesis does not need the per-turn skill catalogue. In
         // addition to saving context, omitting it avoids instructions that
         // may encourage another tool call when tools are deliberately off.
-        let mut request = self.build_request(messages, runtime.model.clone(), None);
+        let (generation, mut request) = capture_generation_before(&self.context_controller, || {
+            self.build_request(messages, runtime.model.clone(), None)
+        });
         request.tools.clear();
         insert_system_context(
             &mut request.messages,
             ITERATION_LIMIT_FINAL_CONTEXT.to_owned(),
         );
         self.record_request_overhead(&request.messages, request.system.as_deref(), &request.tools);
-        let generation = self.context_controller.current_generation();
 
         self.set_state(AgentState::Thinking);
         let response_result = match stream_events.as_ref() {
@@ -1054,6 +1055,14 @@ impl Agent {
             reasoning_effort: runtime.reasoning_effort,
         }
     }
+}
+
+fn capture_generation_before<T>(
+    controller: &ContextController,
+    build_request: impl FnOnce() -> T,
+) -> (u64, T) {
+    let generation = controller.current_generation();
+    (generation, build_request())
 }
 
 /// Conservatively estimates request tokens from UTF-8 bytes. ASCII uses the
@@ -2048,6 +2057,23 @@ mod tests {
 
         assert_eq!(agent.run("hello").await.unwrap(), "reconfigured response");
         assert_eq!(new_governor.tokens_available(), 100);
+    }
+
+    #[test]
+    fn context_generation_is_captured_before_request_building() {
+        let controller = Arc::new(ContextController::for_test(100_000, 1_000));
+        let previous_generation = controller.current_generation();
+
+        let (captured_generation, ()) = capture_generation_before(&controller, || {
+            controller.replace_budget(ContextBudget::new(200_000, 1_000, true));
+        });
+
+        assert_eq!(captured_generation, previous_generation);
+        assert_eq!(controller.current_generation(), previous_generation + 1);
+        assert!(!controller.record_usage_for_generation(
+            captured_generation,
+            ContextUsage::from_usage(9, 1, 100_000),
+        ));
     }
 
     #[tokio::test]
