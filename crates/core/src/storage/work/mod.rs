@@ -984,7 +984,7 @@ impl WorkDatabase {
         entries: &[WorkHistoryEntry],
     ) -> Result<(), WorkDatabaseError> {
         let mut connection = self.connection.lock();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         rows::append_history_entries(&transaction, conversation_id, entries)?;
         transaction.commit()?;
         Ok(())
@@ -1584,8 +1584,10 @@ mod tests {
             second_database.append_history_entries("history-concurrent", &[second_entry])
         });
 
-        assert!(first.join().unwrap().is_ok());
-        assert!(second.join().unwrap().is_ok());
+        let first_result = first.join().unwrap();
+        assert!(first_result.is_ok(), "{first_result:?}");
+        let second_result = second.join().unwrap();
+        assert!(second_result.is_ok(), "{second_result:?}");
         assert_eq!(
             database.history_entries("history-concurrent").unwrap(),
             vec![entry]
