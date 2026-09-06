@@ -999,6 +999,9 @@ struct ShellSession {
     unread: bool,
     persisted: bool,
     context_summary: Option<String>,
+    active_context: Vec<ChatMessage>,
+    active_window_id: String,
+    history_entries: Vec<WorkHistoryEntry>,
     checkpoints: Vec<WorkCheckpoint>,
     tasks: Vec<WorkTask>,
     sources: Vec<WorkSource>,
@@ -1031,6 +1034,9 @@ impl ShellSession {
             unread: false,
             persisted: false,
             context_summary: None,
+            active_context: Vec::new(),
+            active_window_id: "initial".into(),
+            history_entries: Vec::new(),
             checkpoints: Vec::new(),
             tasks: Vec::new(),
             sources: Vec::new(),
@@ -1073,6 +1079,9 @@ impl ShellSession {
             unread: conversation.unread,
             persisted: true,
             context_summary: conversation.context_summary,
+            active_context: conversation.active_context,
+            active_window_id: conversation.active_window_id,
+            history_entries: conversation.history_entries,
             checkpoints: conversation.checkpoints,
             tasks: conversation.tasks,
             sources: normalize_tool_sources(conversation.sources),
@@ -1120,6 +1129,9 @@ impl ShellSession {
             binding: self.binding.clone(),
             context_summary: self.context_summary.clone(),
             context_usage: self.context_usage,
+            active_context: self.active_context.clone(),
+            active_window_id: self.active_window_id.clone(),
+            history_entries: self.history_entries.clone(),
             messages: self.messages.iter().map(work_message_from_shell).collect(),
             checkpoints: self.checkpoints.clone(),
             tasks: self.tasks.clone(),
@@ -1139,11 +1151,39 @@ impl ShellSession {
                     )
                 })
                 .collect(),
-            active_context: Vec::new(),
-            active_window_id: "initial".into(),
-            history_entries: Vec::new(),
         }
     }
+
+    fn apply_context_history_event(&mut self, event: AgentStreamEvent) {
+        match event {
+            AgentStreamEvent::ContextSnapshot {
+                window_id,
+                messages,
+            } => {
+                self.active_context = messages;
+                self.active_window_id = window_id;
+            }
+            AgentStreamEvent::ContextWindowStarted { window_id, .. } => {
+                self.active_window_id = window_id;
+            }
+            AgentStreamEvent::HistoryEntryAppended { entry } => {
+                if !self
+                    .history_entries
+                    .iter()
+                    .any(|existing| existing.entry_id == entry.entry_id)
+                {
+                    self.history_entries.push(entry);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn active_context_is_usable(messages: &[ChatMessage]) -> bool {
+    messages
+        .iter()
+        .any(|message| matches!(message.role, Role::User | Role::Assistant | Role::Tool))
 }
 
 #[derive(Clone)]
@@ -7038,10 +7078,12 @@ impl AverroesApp {
                         }
                     }
                     AgentStreamEvent::ContextUpdated { .. } => {}
-                    AgentStreamEvent::ContextReminder { .. }
-                    | AgentStreamEvent::ContextWindowStarted { .. }
+                    AgentStreamEvent::ContextReminder { .. } => {}
+                    event @ (AgentStreamEvent::ContextWindowStarted { .. }
                     | AgentStreamEvent::ContextSnapshot { .. }
-                    | AgentStreamEvent::HistoryEntryAppended { .. } => {}
+                    | AgentStreamEvent::HistoryEntryAppended { .. }) => {
+                        session.apply_context_history_event(event);
+                    }
                     AgentStreamEvent::DelegatedAgentStarted { .. }
                     | AgentStreamEvent::DelegatedAgentEvent { .. } => unreachable!(),
                 }
@@ -7394,10 +7436,18 @@ impl AverroesApp {
                 }
                 self.refresh_remote_live_reply(session_id, true, cx);
             }
-            AgentStreamEvent::ContextReminder { .. }
-            | AgentStreamEvent::ContextWindowStarted { .. }
+            AgentStreamEvent::ContextReminder { .. } => {}
+            event @ (AgentStreamEvent::ContextWindowStarted { .. }
             | AgentStreamEvent::ContextSnapshot { .. }
-            | AgentStreamEvent::HistoryEntryAppended { .. } => {}
+            | AgentStreamEvent::HistoryEntryAppended { .. }) => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| &session.id == session_id)
+                {
+                    session.apply_context_history_event(event);
+                }
+            }
         }
         self.remeasure_active_conversation_tail(session_id);
     }
@@ -8821,7 +8871,12 @@ impl AverroesApp {
                                 agent
                                     .restore_active_context(conversation.active_context)
                                     .await;
-                                agent.set_active_window_id(conversation.active_window_id);
+                                if active_context_is_usable(&agent.active_context_snapshot().await)
+                                {
+                                    agent.set_active_window_id(conversation.active_window_id);
+                                } else {
+                                    agent.restore_conversation_history(agent_history).await;
+                                }
                             }
                         } else {
                             agent.restore_conversation_history(agent_history).await;

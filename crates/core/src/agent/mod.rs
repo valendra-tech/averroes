@@ -440,19 +440,27 @@ impl Agent {
         &self,
         entry: WorkHistoryEntry,
         events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
-    ) {
-        let should_emit = self
+    ) -> Result<()> {
+        if self
             .emitted_history_ids
             .lock()
             .unwrap()
-            .insert(entry.entry_id.clone());
-        if !should_emit {
-            return;
+            .contains(&entry.entry_id)
+        {
+            return Ok(());
         }
-        let entry = self.persist_history_entry(entry);
-        if let Some(events) = events {
-            let _ = events.send(AgentStreamEvent::HistoryEntryAppended { entry });
+        let entry = self.persist_history_entry(entry)?;
+        if self
+            .emitted_history_ids
+            .lock()
+            .unwrap()
+            .insert(entry.entry_id.clone())
+        {
+            if let Some(events) = events {
+                let _ = events.send(AgentStreamEvent::HistoryEntryAppended { entry });
+            }
         }
+        Ok(())
     }
 
     /// Emits and persists the current provider context at a lifecycle
@@ -511,15 +519,15 @@ impl Agent {
         }
     }
 
-    fn persist_history_entry(&self, entry: WorkHistoryEntry) -> WorkHistoryEntry {
+    fn persist_history_entry(&self, entry: WorkHistoryEntry) -> Result<WorkHistoryEntry> {
         let (Some(database), Some(conversation_id)) = (
             self.history_database.as_ref(),
             self.history_conversation_id.as_deref(),
         ) else {
-            return entry;
+            return Ok(entry);
         };
         match database.append_history_entry(conversation_id, &entry) {
-            Ok(stored) => stored,
+            Ok(stored) => Ok(stored),
             Err(error) => {
                 crate::observability::diagnostics::record(
                     crate::observability::diagnostics::DiagnosticLevel::Warning,
@@ -529,7 +537,7 @@ impl Agent {
                         entry.entry_id
                     ),
                 );
-                entry
+                Err(error.into())
             }
         }
     }
@@ -907,7 +915,7 @@ impl Agent {
                 json!({"role": "user"}),
             ),
             stream_events.as_ref(),
-        );
+        )?;
 
         let mut context_retries = 0;
         let mut tool_iterations = 0;
@@ -972,7 +980,7 @@ impl Agent {
                 generation,
             );
             for entry in self.history_entries_for_provider_message(&response.message) {
-                self.emit_history_entry(entry, stream_events.as_ref());
+                self.emit_history_entry(entry, stream_events.as_ref())?;
             }
 
             if response
@@ -994,7 +1002,7 @@ impl Agent {
                         }
                     };
                 for entry in tool_execution.history_entries.iter().cloned() {
-                    self.emit_history_entry(entry, stream_events.as_ref());
+                    self.emit_history_entry(entry, stream_events.as_ref())?;
                 }
                 let had_failure = tool_execution.had_failure;
                 let context_action = tool_execution.context_action;
@@ -1017,6 +1025,7 @@ impl Agent {
                     msgs.push(response.message.clone());
                     msgs.extend(messages);
                 }
+                self.emit_snapshot(stream_events.as_ref()).await;
 
                 continue;
             }
@@ -1088,7 +1097,7 @@ impl Agent {
             generation,
         );
         for entry in self.history_entries_for_provider_message(&response.message) {
-            self.emit_history_entry(entry, stream_events.as_ref());
+            self.emit_history_entry(entry, stream_events.as_ref())?;
         }
 
         let mut final_message = response.message;

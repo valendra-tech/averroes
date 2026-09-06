@@ -1058,12 +1058,17 @@ impl WorkDatabase {
         active_window_id: &str,
     ) -> Result<(), WorkDatabaseError> {
         let active_context = serde_json::to_string(active_context)?;
-        self.connection.lock().execute(
+        let rows_affected = self.connection.lock().execute(
             "UPDATE conversations
              SET active_context_json = ?2, active_window_id = ?3, updated_at = ?4
              WHERE id = ?1",
             params![conversation_id, active_context, active_window_id, now()],
         )?;
+        if rows_affected == 0 {
+            return Err(WorkDatabaseError::ConversationNotFound {
+                conversation_id: conversation_id.into(),
+            });
+        }
         Ok(())
     }
 
