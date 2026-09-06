@@ -612,7 +612,7 @@ impl RuntimeAgentRunner {
                 request.parent_objective.trim()
             )
         };
-        let agent = Arc::new(Agent::new(
+        let agent = Arc::new(Agent::new_with_workspace_root(
             AgentConfig {
                 name: format!(
                     "delegated-{}",
@@ -623,7 +623,7 @@ impl RuntimeAgentRunner {
                     "{}{parent_context}\n\n## Delegation boundary\nYou are a delegated leaf agent. Do not call `list_agents`, `call_agent`, or `call_agents`, and do not start another subagent. Complete the assigned objective yourself and return your result to the parent agent.",
                     self.system_prompt
                 )),
-                project_instructions_root: Some(request.working_dir.clone()),
+                project_instructions_root: Some(request.workspace_root.clone()),
                 tools,
                 max_iterations: 24,
                 compaction: self.compaction.clone(),
@@ -639,6 +639,7 @@ impl RuntimeAgentRunner {
             self.tool_registry.clone(),
             self.governor.clone(),
             format!("agent-thread:{thread_id}"),
+            request.workspace_root,
             request.working_dir,
         ));
         agent.set_memory_search_backend(self.memory_search_backend.clone());

@@ -210,6 +210,7 @@ pub struct Agent {
     user_questions_allowed: Arc<AtomicBool>,
     agent_id: String,
     session_id: String,
+    workspace_root: PathBuf,
     working_dir: PathBuf,
 }
 
@@ -228,6 +229,26 @@ impl Agent {
         tool_registry: Arc<ToolRegistry>,
         governor: Arc<ResourceGovernor>,
         session_id: String,
+        working_dir: PathBuf,
+    ) -> Self {
+        Self::new_with_workspace_root(
+            config,
+            provider,
+            tool_registry,
+            governor,
+            session_id,
+            working_dir.clone(),
+            working_dir,
+        )
+    }
+
+    pub fn new_with_workspace_root(
+        config: AgentConfig,
+        provider: Arc<dyn Provider>,
+        tool_registry: Arc<ToolRegistry>,
+        governor: Arc<ResourceGovernor>,
+        session_id: String,
+        workspace_root: PathBuf,
         working_dir: PathBuf,
     ) -> Self {
         let agent_id = uuid::Uuid::new_v4().to_string();
@@ -283,6 +304,7 @@ impl Agent {
             user_questions_allowed: Arc::new(AtomicBool::new(allow_user_questions)),
             agent_id,
             session_id,
+            workspace_root,
             working_dir,
         }
     }
@@ -2499,7 +2521,7 @@ mod tests {
     #[tokio::test]
     async fn agent_tool_context_shares_the_context_controller_arc() {
         struct ContextCaptureTool {
-            observed: Arc<std::sync::Mutex<Option<Arc<ContextController>>>>,
+            observed: Arc<std::sync::Mutex<Option<(Arc<ContextController>, PathBuf, PathBuf)>>>,
         }
 
         #[async_trait]
@@ -2521,7 +2543,11 @@ mod tests {
                 ctx: &ToolContext,
                 _params: &serde_json::Value,
             ) -> crate::tool::Result<ToolResult> {
-                *self.observed.lock().unwrap() = Some(ctx.context_controller.clone());
+                *self.observed.lock().unwrap() = Some((
+                    ctx.context_controller.clone(),
+                    ctx.workspace_root.clone(),
+                    ctx.current_dir(),
+                ));
                 Ok(ToolResult::ok("captured"))
             }
         }
@@ -2531,7 +2557,9 @@ mod tests {
         registry.register(ContextCaptureTool {
             observed: observed.clone(),
         });
-        let agent = Agent::new(
+        let workspace_root = PathBuf::from("/workspace");
+        let working_dir = workspace_root.join("nested");
+        let agent = Agent::new_with_workspace_root(
             AgentConfig {
                 system_prompt: None,
                 tools: vec!["capture_context".into()],
@@ -2541,7 +2569,8 @@ mod tests {
             Arc::new(registry),
             Arc::new(ResourceGovernor::new(1, 100)),
             "tool-context-session".into(),
-            PathBuf::from("/tmp"),
+            workspace_root.clone(),
+            working_dir.clone(),
         );
 
         agent
@@ -2569,9 +2598,12 @@ mod tests {
             .await
             .unwrap();
 
-        let exposed = observed.lock().unwrap().clone().unwrap();
+        let (exposed, exposed_workspace_root, exposed_working_dir) =
+            observed.lock().unwrap().clone().unwrap();
         let controller = agent.context_controller();
         assert!(Arc::ptr_eq(&controller, &exposed));
+        assert_eq!(exposed_workspace_root, workspace_root);
+        assert_eq!(exposed_working_dir, working_dir);
     }
 
     #[test]

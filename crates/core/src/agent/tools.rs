@@ -94,7 +94,7 @@ impl Agent {
                 .collect(),
             available_tools,
             tool_activation: self.tool_activation.clone(),
-            workspace_root: self.working_dir.clone(),
+            workspace_root: self.workspace_root.clone(),
             context_controller: self.context_controller.clone(),
             conversation_context: self.messages.lock().await.clone(),
             agent_runner: self.agent_runner(),

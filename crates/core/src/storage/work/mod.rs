@@ -6,7 +6,7 @@ mod rows;
 mod schema;
 mod types;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1074,7 +1074,7 @@ impl WorkDatabase {
             return Ok(());
         }
         let mut connection = self.connection.lock();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = rows::load_note(&transaction, workspace_root, path)?;
         let content = content.trim_end_matches('\n');
         if content.is_empty() {

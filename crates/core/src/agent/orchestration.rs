@@ -43,6 +43,9 @@ pub struct AgentCallRequest {
     pub tools: Vec<String>,
     pub prompt: String,
     pub model_id: Option<String>,
+    /// Stable workspace scope for the delegated agent's workspace-scoped tools.
+    pub workspace_root: PathBuf,
+    /// Current directory for the delegated agent's relative filesystem work.
     pub working_dir: PathBuf,
     pub context: Vec<ChatMessage>,
     pub tool_approval_policy: ToolApprovalPolicy,

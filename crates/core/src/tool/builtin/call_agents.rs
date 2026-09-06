@@ -147,6 +147,7 @@ impl Tool for CallAgentsTool {
                 .collect(),
             prompt,
             model_id,
+            workspace_root: ctx.workspace_root.clone(),
             working_dir: ctx.current_dir(),
             context: reduced_context(&ctx.conversation_context),
             tool_approval_policy: ctx.tool_activation.approval_policy(),
@@ -398,6 +399,7 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(request.working_dir, nested);
+        assert_eq!(request.workspace_root, directory.path());
         assert_eq!(request.tools, vec!["file_read", "web_fetch"]);
         assert_eq!(request.prompt, "inspect the current project");
         assert_eq!(request.agent_id, "default");

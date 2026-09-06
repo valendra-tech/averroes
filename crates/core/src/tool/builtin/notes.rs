@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use crate::tool::{Result, Tool, ToolContext, ToolError, ToolResult};
@@ -66,11 +66,13 @@ fn normalize_note_path(path: Option<&str>) -> std::result::Result<String, String
     let path = path.replace('\\', "/");
     let path = Path::new(&path);
 
-    let mut normalized = PathBuf::new();
+    let mut components = Vec::new();
     for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::Normal(component) => normalized.push(component),
+            Component::Normal(component) => {
+                components.push(component.to_string_lossy().into_owned())
+            }
             Component::ParentDir => return Err("path cannot contain '..' components".into()),
             Component::RootDir | Component::Prefix(_) => {
                 return Err("path must stay inside the relative note namespace".into())
@@ -78,10 +80,10 @@ fn normalize_note_path(path: Option<&str>) -> std::result::Result<String, String
         }
     }
 
-    if normalized.as_os_str().is_empty() || normalized.is_absolute() {
+    if components.is_empty() {
         return Err("path must name a note inside the relative note namespace".into());
     }
-    Ok(normalized.to_string_lossy().into_owned())
+    Ok(components.join("/"))
 }
 
 fn is_windows_absolute(path: &str) -> bool {
@@ -108,11 +110,11 @@ fn note_path(params: &NotesParams, tool: &str) -> Result<String> {
 }
 
 fn workspace_root(ctx: &ToolContext, tool: &str) -> Result<String> {
-    let root = ctx.workspace_root.to_string_lossy().trim().to_owned();
-    if root.is_empty() {
+    let root = ctx.workspace_root.to_string_lossy();
+    if root.trim().is_empty() {
         return Err(invalid(tool, "workspace_root is required"));
     }
-    Ok(root)
+    Ok(root.into_owned())
 }
 
 fn char_offset(value: &str, offset: usize) -> usize {
@@ -271,6 +273,12 @@ impl Tool for NotesTool {
             NotesOperation::Append => {
                 let path = note_path(&params, self.name())?;
                 let content = required_content(&params, self.name(), false)?;
+                if content.contains('\n') || content.contains('\r') {
+                    return Err(invalid(
+                        self.name(),
+                        "content cannot contain newline characters",
+                    ));
+                }
                 self.database
                     .append_note(&workspace_root, &path, &content)
                     .map_err(|error| database_error(self.name(), error))?;
@@ -315,7 +323,7 @@ impl Tool for NotesTool {
 
 #[cfg(test)]
 mod tests {
-    use super::NotesTool;
+    use super::{normalize_note_path, NotesTool};
     use crate::agent::ContextController;
     use crate::storage::work::WorkDatabase;
     use crate::tool::{Tool, ToolActivation, ToolContext, ToolError, ToolRegistry};
@@ -499,6 +507,32 @@ mod tests {
         assert!(read.content.contains("safe"));
     }
 
+    #[test]
+    fn note_path_keys_use_forward_slashes_on_every_host() {
+        assert_eq!(
+            normalize_note_path(Some("nested\\mixed/state.md")).unwrap(),
+            "nested/mixed/state.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_rejects_embedded_line_breaks() {
+        let (_directory, database) = database();
+        let tool = NotesTool::new(database);
+        let ctx = context("/workspace");
+
+        for content in ["first\nsecond", "first\rsecond"] {
+            let error = tool
+                .execute(
+                    &ctx,
+                    &json!({"op": "append", "path": "events.md", "content": content}),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolError::InvalidParams { .. }));
+        }
+    }
+
     #[tokio::test]
     async fn read_pages_content_and_continues_from_the_returned_offset() {
         let (_directory, database) = database();
@@ -596,6 +630,27 @@ mod tests {
             .await
             .unwrap();
         assert!(!read_b.success);
+    }
+
+    #[tokio::test]
+    async fn workspace_root_whitespace_is_part_of_the_isolation_key() {
+        let (_directory, database) = database();
+        let tool = NotesTool::new(database);
+        let exact = context("/workspace");
+        let suffixed = context("/workspace ");
+
+        tool.execute(
+            &exact,
+            &json!({"op": "write", "path": "state.md", "content": "exact"}),
+        )
+        .await
+        .unwrap();
+
+        let suffixed_read = tool
+            .execute(&suffixed, &json!({"op": "read", "path": "state.md"}))
+            .await
+            .unwrap();
+        assert!(!suffixed_read.success);
     }
 
     #[tokio::test]
