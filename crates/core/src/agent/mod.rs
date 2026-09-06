@@ -36,6 +36,13 @@ pub use context_window::{
     REMINDER_BUFFER_TOKENS,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomaticRolloverResult {
+    NotNeeded,
+    Committed,
+    Unsafe,
+}
+
 const MAX_AUTO_SKILLS: usize = 3;
 const MAX_AUTO_SKILL_CONTEXT_BYTES: usize = 32 * 1024;
 const MAX_SKILL_CATALOG_BYTES: usize = 8 * 1024;
@@ -596,10 +603,10 @@ impl Agent {
         force: bool,
         events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
         run_state: &mut RunStateGuard,
-    ) -> Result<bool> {
+    ) -> Result<AutomaticRolloverResult> {
         let budget = self.context_controller.budget();
         if !budget.automatic_enabled() {
-            return Ok(false);
+            return Ok(AutomaticRolloverResult::NotNeeded);
         }
         let due = self
             .context_controller
@@ -607,7 +614,7 @@ impl Agent {
             .and_then(|usage| usage.input_tokens)
             .is_some_and(|input_tokens| input_tokens >= budget.rollover_at);
         if !force && !due {
-            return Ok(false);
+            return Ok(AutomaticRolloverResult::NotNeeded);
         }
 
         let current_window_id = self.context_controller.window_id();
@@ -622,7 +629,7 @@ impl Agent {
                         "Could not load history for automatic context recovery; preserving compaction path: {error}"
                     ),
                 );
-                return Ok(false);
+                return Ok(AutomaticRolloverResult::Unsafe);
             }
         };
         let handoff = match build_auto_handoff_for_window(&entries, &current_window_id, limit) {
@@ -635,25 +642,31 @@ impl Agent {
                         "Automatic context rollover skipped because the recovery handoff is unsafe: {error}"
                     ),
                 );
-                return Ok(false);
+                return Ok(AutomaticRolloverResult::Unsafe);
             }
         };
 
-        self.commit_context_rollover_request(
-            ContextRequest {
-                handoff: Some(handoff),
-            },
-            if force {
-                "automatic provider context overflow"
-            } else {
-                "automatic context rollover"
-            },
-            "automatic_rollover",
-            true,
-            events,
-            run_state,
-        )
-        .await
+        let committed = self
+            .commit_context_rollover_request(
+                ContextRequest {
+                    handoff: Some(handoff),
+                },
+                if force {
+                    "automatic provider context overflow"
+                } else {
+                    "automatic context rollover"
+                },
+                "automatic_rollover",
+                true,
+                events,
+                run_state,
+            )
+            .await?;
+        Ok(if committed {
+            AutomaticRolloverResult::Committed
+        } else {
+            AutomaticRolloverResult::Unsafe
+        })
     }
 
     async fn recovery_history_entries(&self) -> Result<Vec<WorkHistoryEntry>> {
@@ -664,13 +677,22 @@ impl Agent {
             let mut entries = database
                 .history_entries(conversation_id)
                 .map_err(anyhow::Error::from)?;
-            if let Some(thread_id) = self.config.work_id_prefix.as_deref() {
-                entries.retain(|entry| entry.thread_id.as_deref() == Some(thread_id));
-            }
+            entries.retain(|entry| {
+                entry.thread_id.as_deref() == self.config.work_id_prefix.as_deref()
+            });
             return Ok(entries);
         }
 
         let messages = self.messages.lock().await.clone();
+        let tool_names = messages
+            .iter()
+            .filter_map(|message| {
+                (message.role == Role::Assistant)
+                    .then_some(message.tool_calls.as_deref().unwrap_or_default())
+            })
+            .flatten()
+            .map(|tool_call| (tool_call.id.clone(), tool_call.function.name.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
         let mut entries = Vec::new();
         for message in &messages {
             match message.role {
@@ -683,15 +705,23 @@ impl Agent {
                 Role::Assistant => {
                     entries.extend(self.history_entries_for_provider_message(message))
                 }
-                Role::Tool => entries.push(self.new_history_entry(
-                    WorkHistoryKind::ToolResult,
-                    message_text(message),
-                    json!({
+                Role::Tool => {
+                    let mut payload = json!({
                         "call_id": message.tool_call_id,
                         "success": true,
-                    }),
-                    message_images(message),
-                )),
+                    });
+                    if let Some(call_id) = message.tool_call_id.as_deref() {
+                        if let Some(name) = tool_names.get(call_id) {
+                            payload["name"] = json!(name);
+                        }
+                    }
+                    entries.push(self.new_history_entry(
+                        WorkHistoryKind::ToolResult,
+                        message_text(message),
+                        payload,
+                        message_images(message),
+                    ));
+                }
             }
         }
         Ok(entries)
@@ -699,9 +729,10 @@ impl Agent {
 
     async fn insert_automatic_reminder(
         &self,
+        model: &str,
         events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
     ) -> Result<bool> {
-        let Some(claim) = self.context_controller.claim_automatic_reminder() else {
+        let Some(claim) = self.context_controller.claim_automatic_reminder(model) else {
             return Ok(false);
         };
         let reminder = context_window::truncate_utf8(
@@ -737,6 +768,20 @@ impl Agent {
             });
         }
         Ok(true)
+    }
+
+    async fn compact_or_finish(
+        &self,
+        runtime: &AgentRuntime,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+        run_state: &mut RunStateGuard,
+    ) -> Result<()> {
+        if let Err(error) = self.compact_with_runtime_with_events(runtime, events).await {
+            return Err(self
+                .finish_errored_after_snapshot(events, run_state, error)
+                .await);
+        }
+        Ok(())
     }
 
     fn fresh_context_messages(&self, handoff: Option<&str>) -> Vec<ChatMessage> {
@@ -1224,31 +1269,27 @@ impl Agent {
         let mut tool_iterations = 0;
         while tool_iterations < self.config.max_iterations {
             let runtime = self.runtime_snapshot();
-            if self
+            match self
                 .try_automatic_rollover(false, stream_events.as_ref(), &mut run_state)
                 .await?
             {
-                continue;
-            }
-            if self
-                .insert_automatic_reminder(stream_events.as_ref())
-                .await?
-            {
-                self.emit_snapshot_or_fail(stream_events.as_ref(), &mut run_state)
-                    .await?;
-            }
-            if self.should_compact_with_runtime(&runtime).await {
-                if let Err(error) = self
-                    .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
-                    .await
-                {
-                    return Err(self
-                        .finish_errored_after_snapshot(
-                            stream_events.as_ref(),
-                            &mut run_state,
-                            error,
-                        )
-                        .await);
+                AutomaticRolloverResult::Committed => continue,
+                AutomaticRolloverResult::Unsafe => {
+                    self.compact_or_finish(&runtime, stream_events.as_ref(), &mut run_state)
+                        .await?;
+                }
+                AutomaticRolloverResult::NotNeeded => {
+                    if self
+                        .insert_automatic_reminder(&runtime.model, stream_events.as_ref())
+                        .await?
+                    {
+                        self.emit_snapshot_or_fail(stream_events.as_ref(), &mut run_state)
+                            .await?;
+                    }
+                    if self.should_compact_with_runtime(&runtime).await {
+                        self.compact_or_finish(&runtime, stream_events.as_ref(), &mut run_state)
+                            .await?;
+                    }
                 }
             }
 
@@ -1271,10 +1312,11 @@ impl Agent {
                 Ok(response) => response,
                 Err(error) if is_context_error(&error) && context_retries < 2 => {
                     context_retries += 1;
-                    if self
-                        .try_automatic_rollover(true, stream_events.as_ref(), &mut run_state)
-                        .await?
-                    {
+                    if matches!(
+                        self.try_automatic_rollover(true, stream_events.as_ref(), &mut run_state)
+                            .await?,
+                        AutomaticRolloverResult::Committed
+                    ) {
                         continue;
                     }
                     crate::observability::diagnostics::record(
@@ -1282,18 +1324,8 @@ impl Agent {
                         "agent.compaction",
                         format!("Provider rejected the context; compacting and retrying: {error}"),
                     );
-                    if let Err(compaction_error) = self
-                        .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
-                        .await
-                    {
-                        return Err(self
-                            .finish_errored_after_snapshot(
-                                stream_events.as_ref(),
-                                &mut run_state,
-                                compaction_error,
-                            )
-                            .await);
-                    }
+                    self.compact_or_finish(&runtime, stream_events.as_ref(), &mut run_state)
+                        .await?;
                     continue;
                 }
                 Err(error) => {
@@ -1399,21 +1431,24 @@ impl Agent {
         let automatic_rollover = self
             .try_automatic_rollover(false, stream_events.as_ref(), &mut run_state)
             .await?;
-        if self
-            .insert_automatic_reminder(stream_events.as_ref())
-            .await?
-        {
-            self.emit_snapshot_or_fail(stream_events.as_ref(), &mut run_state)
-                .await?;
-        }
-        if !automatic_rollover && self.should_compact_with_runtime(&runtime).await {
-            if let Err(error) = self
-                .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
-                .await
-            {
-                return Err(self
-                    .finish_errored_after_snapshot(stream_events.as_ref(), &mut run_state, error)
-                    .await);
+        match automatic_rollover {
+            AutomaticRolloverResult::Unsafe => {
+                self.compact_or_finish(&runtime, stream_events.as_ref(), &mut run_state)
+                    .await?;
+            }
+            AutomaticRolloverResult::Committed => {}
+            AutomaticRolloverResult::NotNeeded => {
+                if self
+                    .insert_automatic_reminder(&runtime.model, stream_events.as_ref())
+                    .await?
+                {
+                    self.emit_snapshot_or_fail(stream_events.as_ref(), &mut run_state)
+                        .await?;
+                }
+                if self.should_compact_with_runtime(&runtime).await {
+                    self.compact_or_finish(&runtime, stream_events.as_ref(), &mut run_state)
+                        .await?;
+                }
             }
         }
 
@@ -4777,7 +4812,7 @@ mod tests {
                 tools: vec!["shrink_context_capacity".into()],
                 compaction: CompactionConfig {
                     strategy: CompactionStrategyType::Trim,
-                    threshold: 0.8,
+                    threshold: 2.0,
                     keep_last: 20,
                 },
                 ..test_agent_config()
@@ -4808,6 +4843,102 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, AgentStreamEvent::CompactionStarted { .. })));
+    }
+
+    #[tokio::test]
+    async fn root_recovery_handoff_excludes_delegated_siblings_in_the_same_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("history.db")).unwrap();
+        database
+            .save_conversation(&history_conversation("root-scope"))
+            .unwrap();
+        let root_entry = WorkHistoryEntry {
+            entry_id: "root-user".into(),
+            parent_id: None,
+            thread_id: None,
+            window_id: "shared-window".into(),
+            sequence: 1,
+            timestamp: 1,
+            kind: WorkHistoryKind::User,
+            text: "root objective".into(),
+            payload: json!({}),
+            images: Vec::new(),
+        };
+        let delegated_entry = WorkHistoryEntry {
+            entry_id: "delegated-user".into(),
+            parent_id: None,
+            thread_id: Some("agent:child:".into()),
+            window_id: "shared-window".into(),
+            sequence: 2,
+            timestamp: 2,
+            kind: WorkHistoryKind::User,
+            text: "delegated sibling objective".into(),
+            payload: json!({}),
+            images: Vec::new(),
+        };
+        database
+            .append_history_entries("root-scope", &[root_entry, delegated_entry])
+            .unwrap();
+
+        let agent = Agent::new(
+            AgentConfig {
+                work_conversation_id: Some("root-scope".into()),
+                ..test_agent_config()
+            },
+            Arc::new(TestProvider::new(vec![])),
+            history_registry(database),
+            test_governor(),
+            "root-scope".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        let entries = agent.recovery_history_entries().await.unwrap();
+        let handoff = build_auto_handoff_for_window(&entries, "shared-window", 20_000).unwrap();
+
+        assert!(handoff.contains("root objective"));
+        assert!(!handoff.contains("delegated sibling objective"));
+    }
+
+    #[tokio::test]
+    async fn in_memory_recovery_handoff_preserves_successful_ask_user_answers() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "ask-user-recovery".into(),
+            PathBuf::from("/tmp"),
+        );
+        *agent.messages.lock().await = vec![
+            ChatMessage::user("continue the task"),
+            ChatMessage {
+                role: ProviderRole::Assistant,
+                content: MessageContent::Text(String::new()),
+                tool_call_id: None,
+                tool_calls: Some(vec![function_tool_call(
+                    "ask-call",
+                    "ask_user",
+                    r#"{"question":"Which environment?"}"#,
+                )]),
+            },
+            ChatMessage {
+                role: ProviderRole::Tool,
+                content: MessageContent::Text("production".into()),
+                tool_call_id: Some("ask-call".into()),
+                tool_calls: None,
+            },
+        ];
+
+        let entries = agent.recovery_history_entries().await.unwrap();
+        let answer = entries
+            .iter()
+            .find(|entry| entry.kind == WorkHistoryKind::ToolResult)
+            .expect("in-memory ask_user result");
+        assert_eq!(answer.payload["name"], "ask_user");
+        assert_eq!(answer.payload["success"], true);
+        let handoff = build_auto_handoff_for_window(&entries, "initial", 20_000).unwrap();
+        assert!(handoff.contains("[Latest successful ask_user answer]"));
+        assert!(handoff.contains("production"));
     }
 
     #[tokio::test]

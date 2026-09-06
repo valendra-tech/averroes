@@ -331,10 +331,11 @@ impl ContextController {
             .min(usize::MAX as u64) as usize
     }
 
-    pub fn reminder_fingerprint(&self) -> String {
+    pub fn reminder_fingerprint(&self, model: &str) -> String {
         format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{}",
             self.window_id(),
+            model,
             self.budget().context_window,
             self.budget().reserve_tokens
         )
@@ -350,7 +351,7 @@ impl ContextController {
 
     /// Atomically claims the one automatic reminder allowed for this window
     /// and budget fingerprint. Explicit context actions do not use this path.
-    pub fn claim_automatic_reminder(&self) -> Option<ReminderClaim> {
+    pub fn claim_automatic_reminder(&self, model: &str) -> Option<ReminderClaim> {
         let budget = self.budget();
         if !budget.automatic_enabled() {
             return None;
@@ -360,7 +361,7 @@ impl ContextController {
             return None;
         }
 
-        let fingerprint = self.reminder_fingerprint();
+        let fingerprint = self.reminder_fingerprint(model);
         let mut claimed = self.reminder_fingerprint.write();
         if claimed.as_deref() == Some(fingerprint.as_str()) {
             return None;
@@ -850,7 +851,7 @@ mod tests {
     #[test]
     fn reminder_fingerprint_is_scoped_to_the_active_window() {
         let controller = ContextController::for_test(100_000, 16_384);
-        let fingerprint = controller.reminder_fingerprint();
+        let fingerprint = controller.reminder_fingerprint("test-model");
         assert!(!controller.reminder_matches(&fingerprint));
 
         controller.mark_reminder(fingerprint.clone());
@@ -864,30 +865,44 @@ mod tests {
         let controller = ContextController::for_test(100_000, 16_384);
         controller.record_usage(ContextUsage::from_usage(78_000, 1, 100_000));
 
-        let first = controller.claim_automatic_reminder();
-        let second = controller.claim_automatic_reminder();
+        let first = controller.claim_automatic_reminder("test-model");
+        let second = controller.claim_automatic_reminder("test-model");
 
         assert!(first.is_some());
         assert!(second.is_none());
         assert_eq!(
             first.unwrap().fingerprint,
-            controller.reminder_fingerprint()
+            controller.reminder_fingerprint("test-model")
         );
+    }
+
+    #[test]
+    fn changing_model_allows_a_new_reminder_in_the_same_window() {
+        let controller = ContextController::for_test(100_000, 16_384);
+        controller.record_usage(ContextUsage::from_usage(78_000, 1, 100_000));
+
+        let first = controller.claim_automatic_reminder("model-a").unwrap();
+        assert!(controller.claim_automatic_reminder("model-a").is_none());
+        let second = controller.claim_automatic_reminder("model-b");
+
+        assert!(second.is_some());
+        assert_ne!(first.fingerprint, second.unwrap().fingerprint);
+        assert!(first.fingerprint.contains("model-a"));
     }
 
     #[test]
     fn automatic_reminder_is_never_claimed_below_band_or_when_automatic_is_unsupported() {
         let below_band = ContextController::for_test(100_000, 16_384);
         below_band.record_usage(ContextUsage::from_usage(70_000, 1, 100_000));
-        assert!(below_band.claim_automatic_reminder().is_none());
+        assert!(below_band.claim_automatic_reminder("test-model").is_none());
 
         let disabled = ContextController::new(ContextBudget::new(100_000, 16_384, false));
         disabled.record_usage(ContextUsage::from_usage(78_000, 1, 100_000));
-        assert!(disabled.claim_automatic_reminder().is_none());
+        assert!(disabled.claim_automatic_reminder("test-model").is_none());
 
         let unsupported = ContextController::new(ContextBudget::new(32_000, 24_000, true));
         unsupported.record_usage(ContextUsage::from_usage(8_500, 1, 32_000));
-        assert!(unsupported.claim_automatic_reminder().is_none());
+        assert!(unsupported.claim_automatic_reminder("test-model").is_none());
     }
 
     #[test]
