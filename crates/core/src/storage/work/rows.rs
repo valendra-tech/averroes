@@ -1,4 +1,7 @@
-use super::types::{CheckpointStatus, TaskPriority, TaskStatus, WorkMessage, WorkMessageRole};
+use super::types::{
+    CheckpointStatus, TaskPriority, TaskStatus, WorkHistoryEntry, WorkHistoryKind, WorkMessage,
+    WorkMessageRole, WorkNote,
+};
 use super::{WorkCheckpoint, WorkConversation, WorkDatabaseError, WorkSource, WorkTask};
 use rusqlite::{params, types::Type, Connection, OptionalExtension, Transaction};
 use serde::de::DeserializeOwned;
@@ -8,6 +11,199 @@ fn json_column<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> ru
     serde_json::from_str(&value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
     })
+}
+
+fn history_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkHistoryEntry> {
+    Ok(WorkHistoryEntry {
+        entry_id: row.get(0)?,
+        parent_id: row.get(1)?,
+        thread_id: row.get(2)?,
+        window_id: row.get(3)?,
+        sequence: row.get(4)?,
+        timestamp: row.get(5)?,
+        kind: WorkHistoryKind::parse(&row.get::<_, String>(6)?),
+        text: row.get(7)?,
+        payload: json_column(row, 8)?,
+        images: json_column(row, 9)?,
+    })
+}
+
+pub(super) fn append_history_entries(
+    transaction: &Transaction<'_>,
+    conversation_id: &str,
+    entries: &[WorkHistoryEntry],
+) -> Result<(), WorkDatabaseError> {
+    let mut statement = transaction.prepare(
+        "INSERT OR IGNORE INTO conversation_history
+            (conversation_id, entry_id, parent_id, thread_id, window_id, sequence,
+             timestamp, kind, text, payload_json, images_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )?;
+    for entry in entries {
+        statement.execute(params![
+            conversation_id,
+            entry.entry_id,
+            entry.parent_id,
+            entry.thread_id,
+            entry.window_id,
+            entry.sequence,
+            entry.timestamp,
+            entry.kind.as_str(),
+            entry.text,
+            serde_json::to_string(&entry.payload)?,
+            serde_json::to_string(&entry.images)?,
+        ])?;
+    }
+    Ok(())
+}
+
+pub(super) fn load_history_entries(
+    connection: &Connection,
+    conversation_id: &str,
+) -> Result<Vec<WorkHistoryEntry>, WorkDatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT entry_id, parent_id, thread_id, window_id, sequence, timestamp,
+                kind, text, payload_json, images_json
+         FROM conversation_history
+         WHERE conversation_id = ?1
+         ORDER BY sequence, entry_id",
+    )?;
+    let rows = statement.query_map(params![conversation_id], history_entry_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub(super) fn search_history(
+    connection: &Connection,
+    conversation_id: &str,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<WorkHistoryEntry>, WorkDatabaseError> {
+    if query.trim().is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let pattern = format!("%{}%", escape_like_pattern(query.trim()));
+    let mut statement = connection.prepare(
+        "SELECT entry_id, parent_id, thread_id, window_id, sequence, timestamp,
+                kind, text, payload_json, images_json
+         FROM conversation_history
+         WHERE conversation_id = ?1
+           AND text LIKE ?2 COLLATE NOCASE ESCAPE '\\'
+         ORDER BY sequence, entry_id
+         LIMIT ?3 OFFSET ?4",
+    )?;
+    let rows = statement.query_map(
+        params![conversation_id, pattern, limit as i64, offset as i64],
+        history_entry_from_row,
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+pub(super) fn upsert_note(
+    transaction: &Transaction<'_>,
+    note: &WorkNote,
+) -> Result<(), WorkDatabaseError> {
+    transaction.execute(
+        "INSERT INTO notes (workspace_root, path, content, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(workspace_root, path) DO UPDATE SET
+            content = excluded.content,
+            updated_at = excluded.updated_at",
+        params![
+            note.workspace_root,
+            note.path,
+            note.content,
+            note.created_at,
+            note.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn load_note(
+    connection: &Connection,
+    workspace_root: &str,
+    path: &str,
+) -> Result<Option<WorkNote>, WorkDatabaseError> {
+    connection
+        .query_row(
+            "SELECT workspace_root, path, content, created_at, updated_at
+             FROM notes WHERE workspace_root = ?1 AND path = ?2",
+            params![workspace_root, path],
+            |row| {
+                Ok(WorkNote {
+                    workspace_root: row.get(0)?,
+                    path: row.get(1)?,
+                    content: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+pub(super) fn list_notes(
+    connection: &Connection,
+    workspace_root: &str,
+) -> Result<Vec<WorkNote>, WorkDatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT workspace_root, path, content, created_at, updated_at
+         FROM notes
+         WHERE workspace_root = ?1
+         ORDER BY path COLLATE NOCASE, path",
+    )?;
+    let rows = statement.query_map(params![workspace_root], |row| {
+        Ok(WorkNote {
+            workspace_root: row.get(0)?,
+            path: row.get(1)?,
+            content: row.get(2)?,
+            created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub(super) fn search_notes(
+    connection: &Connection,
+    workspace_root: &str,
+    query: &str,
+) -> Result<Vec<WorkNote>, WorkDatabaseError> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let pattern = format!("%{}%", escape_like_pattern(query.trim()));
+    let mut statement = connection.prepare(
+        "SELECT workspace_root, path, content, created_at, updated_at
+         FROM notes
+         WHERE workspace_root = ?1
+           AND (path LIKE ?2 COLLATE NOCASE ESCAPE '\\'
+                OR content LIKE ?2 COLLATE NOCASE ESCAPE '\\')
+         ORDER BY updated_at DESC, path COLLATE NOCASE, path",
+    )?;
+    let rows = statement.query_map(params![workspace_root, pattern], |row| {
+        Ok(WorkNote {
+            workspace_root: row.get(0)?,
+            path: row.get(1)?,
+            content: row.get(2)?,
+            created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub(super) fn replace_messages(
@@ -115,7 +311,8 @@ pub(super) fn content_equal(
     }
     let stored = connection
         .query_row(
-            "SELECT context_summary, agent_threads_json, agent_thread_transcripts_json
+            "SELECT context_summary, agent_threads_json, agent_thread_transcripts_json,
+                    active_context_json, active_window_id
              FROM conversations WHERE id = ?1",
             params![conversation.id],
             |row| {
@@ -123,18 +320,30 @@ pub(super) fn content_equal(
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             },
         )
         .optional()?;
-    let Some((stored_context, stored_agents, stored_transcripts)) = stored else {
+    let Some((
+        stored_context,
+        stored_agents,
+        stored_transcripts,
+        stored_active_context,
+        stored_active_window,
+    )) = stored
+    else {
         return Ok(false);
     };
     let stored_agents = serde_json::from_str::<serde_json::Value>(&stored_agents)?;
     let stored_transcripts = serde_json::from_str::<serde_json::Value>(&stored_transcripts)?;
+    let stored_active_context = serde_json::from_str::<serde_json::Value>(&stored_active_context)?;
     Ok(stored_context == conversation.context_summary
         && stored_agents == serde_json::to_value(&conversation.agent_threads)?
-        && stored_transcripts == serde_json::to_value(&conversation.agent_thread_transcripts)?)
+        && stored_transcripts == serde_json::to_value(&conversation.agent_thread_transcripts)?
+        && stored_active_context == serde_json::to_value(&conversation.active_context)?
+        && stored_active_window == conversation.active_window_id)
 }
 
 pub(super) fn load_messages(

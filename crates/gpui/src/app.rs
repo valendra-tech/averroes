@@ -1135,6 +1135,9 @@ impl ShellSession {
                     )
                 })
                 .collect(),
+            active_context: Vec::new(),
+            active_window_id: "initial".into(),
+            history_entries: Vec::new(),
         }
     }
 }

@@ -288,6 +288,9 @@ mod tests {
                 sources: Vec::new(),
                 agent_threads: Vec::new(),
                 agent_thread_transcripts: std::collections::HashMap::new(),
+                active_context: Vec::new(),
+                active_window_id: "initial".into(),
+                history_entries: Vec::new(),
             })
             .unwrap();
         let tool = GetDeepMemoryTool::new(database);

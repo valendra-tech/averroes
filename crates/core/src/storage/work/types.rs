@@ -1,6 +1,7 @@
 use crate::agent::orchestration::AgentThreadSnapshot;
 use crate::agent::ContextUsage;
 use crate::connection::{ConnectionId, SessionBinding};
+use crate::provider::types::{ChatMessage, ImageSource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -291,7 +292,90 @@ pub struct WorkSource {
     pub last_used_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkHistoryKind {
+    User,
+    Assistant,
+    ToolCall,
+    ToolResult,
+    ContextWindow,
+    Reminder,
+}
+
+impl WorkHistoryKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+            Self::ContextWindow => "context_window",
+            Self::Reminder => "reminder",
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Self {
+        match value {
+            "assistant" => Self::Assistant,
+            "tool_call" => Self::ToolCall,
+            "tool_result" => Self::ToolResult,
+            "context_window" => Self::ContextWindow,
+            "reminder" => Self::Reminder,
+            _ => Self::User,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkHistoryEntry {
+    pub entry_id: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    pub window_id: String,
+    pub sequence: i64,
+    pub timestamp: i64,
+    pub kind: WorkHistoryKind,
+    pub text: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    #[serde(default)]
+    pub images: Vec<ImageSource>,
+}
+
+impl WorkHistoryEntry {
+    pub fn user(window_id: &str, entry_id: &str, text: &str) -> Self {
+        Self {
+            entry_id: entry_id.into(),
+            parent_id: None,
+            thread_id: None,
+            window_id: window_id.into(),
+            sequence: 0,
+            timestamp: 0,
+            kind: WorkHistoryKind::User,
+            text: text.into(),
+            payload: serde_json::json!({}),
+            images: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkNote {
+    pub workspace_root: String,
+    pub path: String,
+    pub content: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+fn default_active_window_id() -> String {
+    "initial".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkConversation {
     pub id: String,
     pub title: String,
@@ -324,6 +408,14 @@ pub struct WorkConversation {
     pub agent_threads: Vec<AgentThreadSnapshot>,
     #[serde(default)]
     pub agent_thread_transcripts: HashMap<String, Vec<WorkMessage>>,
+    /// The provider-facing context for the current context window. This is
+    /// separate from the complete, user-visible transcript in `messages`.
+    #[serde(default)]
+    pub active_context: Vec<ChatMessage>,
+    #[serde(default = "default_active_window_id")]
+    pub active_window_id: String,
+    #[serde(default)]
+    pub history_entries: Vec<WorkHistoryEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

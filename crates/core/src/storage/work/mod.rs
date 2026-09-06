@@ -401,7 +401,7 @@ impl WorkDatabase {
             .query_row(
                 "SELECT id, title, project_id, pinned, unread, created_at, updated_at, binding_json,
                         context_summary, context_usage_json, agent_threads_json,
-                        agent_thread_transcripts_json
+                        agent_thread_transcripts_json, active_context_json, active_window_id
                  FROM conversations WHERE id = ?1",
                 params![id],
                 |row| {
@@ -418,6 +418,8 @@ impl WorkDatabase {
                         row.get::<_, String>(9)?,
                         row.get::<_, String>(10)?,
                         row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
                     ))
                 },
             )
@@ -435,6 +437,8 @@ impl WorkDatabase {
             context_usage_json,
             agent_threads_json,
             agent_thread_transcripts_json,
+            active_context_json,
+            active_window_id,
         )) = row
         else {
             return Ok(None);
@@ -443,10 +447,12 @@ impl WorkDatabase {
         let context_usage = serde_json::from_str(&context_usage_json)?;
         let agent_threads = serde_json::from_str(&agent_threads_json)?;
         let agent_thread_transcripts = serde_json::from_str(&agent_thread_transcripts_json)?;
+        let active_context = serde_json::from_str(&active_context_json)?;
         let messages = rows::load_messages(&connection, &id)?;
         let checkpoints = rows::load_checkpoints(&connection, &id)?;
         let tasks = rows::load_tasks(&connection, &id)?;
         let sources = rows::load_sources(&connection, &id)?;
+        let history_entries = rows::load_history_entries(&connection, &id)?;
         Ok(Some(WorkConversation {
             id,
             title,
@@ -464,6 +470,9 @@ impl WorkDatabase {
             sources,
             agent_threads,
             agent_thread_transcripts,
+            active_context,
+            active_window_id,
+            history_entries,
         }))
     }
 
@@ -475,6 +484,7 @@ impl WorkDatabase {
         let agent_threads = serde_json::to_string(&conversation.agent_threads)?;
         let agent_thread_transcripts =
             serde_json::to_string(&conversation.agent_thread_transcripts)?;
+        let active_context = serde_json::to_string(&conversation.active_context)?;
         let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
         let existing_updated_at = transaction
@@ -494,8 +504,8 @@ impl WorkDatabase {
             "INSERT INTO conversations
                 (id, title, project_id, pinned, unread, created_at, updated_at, binding_json,
                  context_summary, context_usage_json, agent_threads_json,
-                 agent_thread_transcripts_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 agent_thread_transcripts_json, active_context_json, active_window_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 project_id = excluded.project_id,
@@ -506,7 +516,9 @@ impl WorkDatabase {
                 context_summary = excluded.context_summary,
                 context_usage_json = excluded.context_usage_json,
                 agent_threads_json = excluded.agent_threads_json,
-                agent_thread_transcripts_json = excluded.agent_thread_transcripts_json",
+                agent_thread_transcripts_json = excluded.agent_thread_transcripts_json,
+                active_context_json = excluded.active_context_json,
+                active_window_id = excluded.active_window_id",
             params![
                 conversation.id,
                 conversation.title,
@@ -520,9 +532,16 @@ impl WorkDatabase {
                 serde_json::to_string(&conversation.context_usage)?,
                 agent_threads,
                 agent_thread_transcripts,
+                active_context,
+                conversation.active_window_id,
             ],
         )?;
         rows::replace_messages(&transaction, conversation)?;
+        rows::append_history_entries(
+            &transaction,
+            &conversation.id,
+            &conversation.history_entries,
+        )?;
         for checkpoint in &conversation.checkpoints {
             rows::upsert_checkpoint_tx(&transaction, &conversation.id, checkpoint)?;
         }
@@ -964,6 +983,133 @@ impl WorkDatabase {
         rows::upsert_source_connection(&connection, session_id, source)
     }
 
+    pub fn append_history_entries(
+        &self,
+        conversation_id: &str,
+        entries: &[WorkHistoryEntry],
+    ) -> Result<(), WorkDatabaseError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        rows::append_history_entries(&transaction, conversation_id, entries)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn history_entries(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<WorkHistoryEntry>, WorkDatabaseError> {
+        rows::load_history_entries(&self.connection.lock(), conversation_id)
+    }
+
+    pub fn search_history(
+        &self,
+        conversation_id: &str,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<WorkHistoryEntry>, WorkDatabaseError> {
+        rows::search_history(
+            &self.connection.lock(),
+            conversation_id,
+            query,
+            limit,
+            offset,
+        )
+    }
+
+    pub fn history_entry(
+        &self,
+        conversation_id: &str,
+        entry_id: &str,
+    ) -> Result<Option<WorkHistoryEntry>, WorkDatabaseError> {
+        Ok(self
+            .history_entries(conversation_id)?
+            .into_iter()
+            .find(|entry| entry.entry_id == entry_id))
+    }
+
+    pub fn list_notes(&self, workspace_root: &str) -> Result<Vec<WorkNote>, WorkDatabaseError> {
+        rows::list_notes(&self.connection.lock(), workspace_root)
+    }
+
+    pub fn read_note(
+        &self,
+        workspace_root: &str,
+        path: &str,
+    ) -> Result<Option<String>, WorkDatabaseError> {
+        Ok(
+            rows::load_note(&self.connection.lock(), workspace_root, path)?
+                .map(|note| note.content),
+        )
+    }
+
+    pub fn write_note(
+        &self,
+        workspace_root: &str,
+        path: &str,
+        content: &str,
+    ) -> Result<(), WorkDatabaseError> {
+        let timestamp = now();
+        let note = WorkNote {
+            workspace_root: workspace_root.into(),
+            path: path.into(),
+            content: content.into(),
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        rows::upsert_note(&transaction, &note)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn append_note(
+        &self,
+        workspace_root: &str,
+        path: &str,
+        content: &str,
+    ) -> Result<(), WorkDatabaseError> {
+        if content.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        let existing = rows::load_note(&transaction, workspace_root, path)?;
+        let content = content.trim_end_matches('\n');
+        if content.is_empty() {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let content = match existing.as_ref().map(|note| note.content.as_str()) {
+            None | Some("") => format!("{content}\n"),
+            Some(existing) if existing.ends_with('\n') => format!("{existing}{content}\n"),
+            Some(existing) => format!("{existing}\n{content}\n"),
+        };
+        let timestamp = now();
+        rows::upsert_note(
+            &transaction,
+            &WorkNote {
+                workspace_root: workspace_root.into(),
+                path: path.into(),
+                content,
+                created_at: existing.as_ref().map_or(timestamp, |note| note.created_at),
+                updated_at: timestamp,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn search_notes(
+        &self,
+        workspace_root: &str,
+        query: &str,
+    ) -> Result<Vec<WorkNote>, WorkDatabaseError> {
+        rows::search_notes(&self.connection.lock(), workspace_root, query)
+    }
+
     pub fn last_binding(&self) -> Result<Option<SessionBinding>, WorkDatabaseError> {
         let serialized = self
             .connection
@@ -1210,11 +1356,77 @@ pub enum WorkDatabaseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ContextUsage;
+    use std::collections::HashMap;
 
     fn database() -> (tempfile::TempDir, Arc<WorkDatabase>) {
         let directory = tempfile::tempdir().unwrap();
         let database = WorkDatabase::open_at(directory.path().join("averroes.db")).unwrap();
         (directory, database)
+    }
+
+    fn test_conversation(id: &str) -> WorkConversation {
+        WorkConversation {
+            id: id.into(),
+            title: "test".into(),
+            project_id: None,
+            pinned: false,
+            unread: false,
+            created_at: now(),
+            updated_at: now(),
+            binding: SessionBinding::default(),
+            context_summary: None,
+            context_usage: ContextUsage::default(),
+            messages: Vec::new(),
+            checkpoints: Vec::new(),
+            tasks: Vec::new(),
+            sources: Vec::new(),
+            agent_threads: Vec::new(),
+            agent_thread_transcripts: HashMap::new(),
+            active_context: Vec::new(),
+            active_window_id: "initial".into(),
+            history_entries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn context_snapshot_history_and_notes_round_trip() {
+        let (_directory, database) = database();
+        let conversation = WorkConversation {
+            id: "conversation-1".into(),
+            title: "Context test".into(),
+            created_at: now(),
+            updated_at: now(),
+            binding: SessionBinding::default(),
+            active_context: vec![crate::provider::ChatMessage::user("continue")],
+            active_window_id: "window-2".into(),
+            ..test_conversation("conversation-1")
+        };
+        database.save_conversation(&conversation).unwrap();
+        let history_entry = WorkHistoryEntry::user("window-2", "entry-1", "continue");
+        database
+            .append_history_entries("conversation-1", std::slice::from_ref(&history_entry))
+            .unwrap();
+        database
+            .write_note("/workspace", "state.md", "progress")
+            .unwrap();
+
+        let database_path = database.path().to_path_buf();
+        drop(database);
+        let reopened_database = WorkDatabase::open_at(database_path).unwrap();
+        let restored = reopened_database
+            .conversation("conversation-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.active_window_id, "window-2");
+        assert_eq!(restored.active_context, conversation.active_context);
+        assert_eq!(restored.history_entries, vec![history_entry]);
+        assert_eq!(
+            reopened_database
+                .read_note("/workspace", "state.md")
+                .unwrap(),
+            Some("progress".into())
+        );
     }
 
     #[test]
@@ -1289,6 +1501,9 @@ mod tests {
             sources: Vec::new(),
             agent_threads: Vec::new(),
             agent_thread_transcripts: std::collections::HashMap::new(),
+            active_context: Vec::new(),
+            active_window_id: "initial".into(),
+            history_entries: Vec::new(),
         };
         database.save_conversation(&conversation).unwrap();
 
@@ -1381,6 +1596,9 @@ mod tests {
             }],
             agent_threads: Vec::new(),
             agent_thread_transcripts: std::collections::HashMap::new(),
+            active_context: Vec::new(),
+            active_window_id: "initial".into(),
+            history_entries: Vec::new(),
         };
         database.save_conversation(&conversation).unwrap();
         drop(database);
@@ -1412,6 +1630,9 @@ mod tests {
             sources: Vec::new(),
             agent_threads: Vec::new(),
             agent_thread_transcripts: std::collections::HashMap::new(),
+            active_context: Vec::new(),
+            active_window_id: "initial".into(),
+            history_entries: Vec::new(),
         };
         database.save_conversation(&conversation).unwrap();
         assert!(database.delete_conversation(&conversation.id).unwrap());
@@ -1448,6 +1669,9 @@ mod tests {
             sources: Vec::new(),
             agent_threads: Vec::new(),
             agent_thread_transcripts: std::collections::HashMap::new(),
+            active_context: Vec::new(),
+            active_window_id: "initial".into(),
+            history_entries: Vec::new(),
         };
         database.save_conversation(&conversation).unwrap();
         assert!(database
@@ -1700,6 +1924,9 @@ mod tests {
             sources: Vec::new(),
             agent_threads: Vec::new(),
             agent_thread_transcripts: std::collections::HashMap::new(),
+            active_context: Vec::new(),
+            active_window_id: "initial".into(),
+            history_entries: Vec::new(),
         };
         database.save_conversation(&conversation).unwrap();
 
@@ -1743,6 +1970,9 @@ mod tests {
                     sources: Vec::new(),
                     agent_threads: Vec::new(),
                     agent_thread_transcripts: std::collections::HashMap::new(),
+                    active_context: Vec::new(),
+                    active_window_id: "initial".into(),
+                    history_entries: Vec::new(),
                 })
                 .unwrap();
         }
@@ -1782,6 +2012,9 @@ mod tests {
                     sources: Vec::new(),
                     agent_threads: Vec::new(),
                     agent_thread_transcripts: std::collections::HashMap::new(),
+                    active_context: Vec::new(),
+                    active_window_id: "initial".into(),
+                    history_entries: Vec::new(),
                 })
                 .unwrap();
         }
@@ -1824,6 +2057,9 @@ mod tests {
                 sources: Vec::new(),
                 agent_threads: Vec::new(),
                 agent_thread_transcripts: std::collections::HashMap::new(),
+                active_context: Vec::new(),
+                active_window_id: "initial".into(),
+                history_entries: Vec::new(),
             })
             .unwrap();
 
@@ -1865,6 +2101,9 @@ mod tests {
             sources: Vec::new(),
             agent_threads: Vec::new(),
             agent_thread_transcripts: std::collections::HashMap::new(),
+            active_context: Vec::new(),
+            active_window_id: "initial".into(),
+            history_entries: Vec::new(),
         };
         database.save_conversation(&conversation).unwrap();
         let embedding_config = EmbeddingConfig {
@@ -2026,6 +2265,9 @@ mod tests {
                     expanded_tool_groups: Vec::new(),
                 }],
             )]),
+            active_context: Vec::new(),
+            active_window_id: "initial".into(),
+            history_entries: Vec::new(),
         };
 
         database.save_conversation(&conversation).unwrap();

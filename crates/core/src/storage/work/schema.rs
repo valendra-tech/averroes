@@ -24,7 +24,9 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             context_summary TEXT,
             context_usage_json TEXT NOT NULL DEFAULT '{}',
             agent_threads_json TEXT NOT NULL DEFAULT '[]',
-            agent_thread_transcripts_json TEXT NOT NULL DEFAULT '{}'
+            agent_thread_transcripts_json TEXT NOT NULL DEFAULT '{}',
+            active_context_json TEXT NOT NULL DEFAULT '[]',
+            active_window_id TEXT NOT NULL DEFAULT 'initial'
         );
         CREATE TABLE IF NOT EXISTS conversation_folders (
             id TEXT PRIMARY KEY,
@@ -160,7 +162,36 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY(conversation_id, message_position, chunk_index)
         );
         CREATE INDEX IF NOT EXISTS conversation_embeddings_hash
-            ON conversation_embeddings(content_hash);",
+            ON conversation_embeddings(content_hash);
+        CREATE TABLE IF NOT EXISTS conversation_history (
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            entry_id TEXT NOT NULL,
+            parent_id TEXT,
+            thread_id TEXT,
+            window_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            timestamp INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            text TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            images_json TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY (conversation_id, entry_id),
+            UNIQUE (conversation_id, sequence)
+        );
+        CREATE INDEX IF NOT EXISTS conversation_history_sequence
+            ON conversation_history(conversation_id, sequence);
+        CREATE INDEX IF NOT EXISTS conversation_history_kind_sequence
+            ON conversation_history(conversation_id, kind, sequence);
+        CREATE TABLE IF NOT EXISTS notes (
+            workspace_root TEXT NOT NULL,
+            path TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (workspace_root, path)
+        );
+        CREATE INDEX IF NOT EXISTS notes_workspace_updated
+            ON notes(workspace_root, updated_at DESC, path COLLATE NOCASE);",
     )?;
     if !conversation_has_column(connection, "unread")? {
         connection.execute(
@@ -205,6 +236,18 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
     if !conversation_has_column(connection, "agent_thread_transcripts_json")? {
         connection.execute(
             "ALTER TABLE conversations ADD COLUMN agent_thread_transcripts_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )?;
+    }
+    if !conversation_has_column(connection, "active_context_json")? {
+        connection.execute(
+            "ALTER TABLE conversations ADD COLUMN active_context_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+    if !conversation_has_column(connection, "active_window_id")? {
+        connection.execute(
+            "ALTER TABLE conversations ADD COLUMN active_window_id TEXT NOT NULL DEFAULT 'initial'",
             [],
         )?;
     }
@@ -273,7 +316,7 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX conversation_embeddings_model
              ON conversation_embeddings(connection_id, model_id, conversation_id);",
     )?;
-    connection.pragma_update(None, "user_version", 16)?;
+    connection.pragma_update(None, "user_version", 17)?;
     Ok(())
 }
 
