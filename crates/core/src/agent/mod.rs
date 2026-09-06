@@ -3,6 +3,7 @@ pub mod registry;
 
 mod budget;
 mod context;
+mod context_window;
 mod streaming;
 mod tools;
 
@@ -24,6 +25,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use context::ContextUsage;
+pub use context_window::{
+    ContextBudget, ContextController, ContextRequest, MAX_HANDOFF_CHARS, MAX_RECOVERY_RECORD_CHARS,
+    MIN_PAGE_CHARS, MIN_USABLE_TOKENS, PAGE_MARGIN_TOKENS, REMINDER_BUFFER_TOKENS,
+};
 
 const MAX_AUTO_SKILLS: usize = 3;
 const MAX_AUTO_SKILL_CONTEXT_BYTES: usize = 32 * 1024;

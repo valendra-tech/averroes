@@ -15,6 +15,8 @@ pub mod storage;
 pub mod task;
 pub mod tool;
 
+pub use agent::{ContextBudget, ContextController};
+
 // Compatibility façades for the public API used by the UI and integrations.
 // New code should import the domain modules above.
 pub use auth::{codex, credentials, github};
