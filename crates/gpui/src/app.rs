@@ -1154,6 +1154,14 @@ impl ShellSession {
         }
     }
 
+    fn persistence_snapshot(&self) -> WorkConversation {
+        let mut snapshot = self.snapshot();
+        snapshot.active_context.clear();
+        snapshot.active_window_id = "initial".into();
+        snapshot.history_entries.clear();
+        snapshot
+    }
+
     fn apply_context_history_event(&mut self, event: AgentStreamEvent) {
         match event {
             AgentStreamEvent::ContextSnapshot {
@@ -4435,7 +4443,7 @@ impl AverroesApp {
     fn persist_active(&mut self, cx: &mut Context<Self>) -> bool {
         let session_id = self.active().id.clone();
         self.sync_runtime_agent_threads(&session_id);
-        let snapshot = self.active().snapshot();
+        let snapshot = self.active().persistence_snapshot();
         match self.runtime.database.save_conversation(&snapshot) {
             Ok(()) => {
                 let active_index = self.active_session;
@@ -4462,7 +4470,7 @@ impl AverroesApp {
             return false;
         };
         self.sync_runtime_agent_threads(id);
-        let snapshot = self.sessions[index].snapshot();
+        let snapshot = self.sessions[index].persistence_snapshot();
         let saved = match self.runtime.database.save_conversation(&snapshot) {
             Ok(()) => {
                 self.sessions[index].persisted = true;
@@ -4575,7 +4583,7 @@ impl AverroesApp {
         let Some(index) = self.sessions.iter().position(|session| &session.id == id) else {
             return;
         };
-        let snapshot = self.sessions[index].snapshot();
+        let snapshot = self.sessions[index].persistence_snapshot();
         match self.runtime.database.save_conversation(&snapshot) {
             Ok(()) => self.sessions[index].persisted = true,
             Err(error) => diagnostics::record(
@@ -4608,7 +4616,11 @@ impl AverroesApp {
             {
                 continue;
             }
-            if let Err(error) = self.runtime.database.save_conversation(&session.snapshot()) {
+            if let Err(error) = self
+                .runtime
+                .database
+                .save_conversation(&session.persistence_snapshot())
+            {
                 tracing::error!(
                     conversation_id = %session.id,
                     error = %error,
@@ -6068,7 +6080,7 @@ impl AverroesApp {
             } else {
                 let previous_title =
                     std::mem::replace(&mut self.sessions[index].title, title.into());
-                let snapshot = self.sessions[index].snapshot();
+                let snapshot = self.sessions[index].persistence_snapshot();
                 match self.runtime.database.save_conversation(&snapshot) {
                     Ok(()) => {
                         self.sessions[index].persisted = true;
@@ -6252,7 +6264,7 @@ impl AverroesApp {
                 return false;
             };
             self.sessions[index].pinned = pinned;
-            let snapshot = self.sessions[index].snapshot();
+            let snapshot = self.sessions[index].persistence_snapshot();
             return match self.runtime.database.save_conversation(&snapshot) {
                 Ok(()) => {
                     self.sessions[index].persisted = true;
@@ -18574,6 +18586,28 @@ mod workspace_grouping_tests {
         assert_eq!(restored.active_context, active_context);
         assert_eq!(restored.active_window_id, "window-2");
         assert_eq!(restored.history_entries.len(), 1);
+    }
+
+    #[test]
+    fn persistence_snapshot_excludes_live_agent_context() {
+        let mut session = ShellSession::new(None, SessionBinding::default());
+        session.apply_context_history_event(AgentStreamEvent::ContextSnapshot {
+            window_id: "agent-window".into(),
+            messages: vec![ChatMessage::user("agent context")],
+        });
+        session.apply_context_history_event(AgentStreamEvent::HistoryEntryAppended {
+            entry: WorkHistoryEntry::user("agent-window", "entry-1", "history"),
+        });
+
+        let live = session.snapshot();
+        let persisted = session.persistence_snapshot();
+
+        assert!(!live.active_context.is_empty());
+        assert_eq!(live.active_window_id, "agent-window");
+        assert_eq!(live.history_entries.len(), 1);
+        assert!(persisted.active_context.is_empty());
+        assert_eq!(persisted.active_window_id, "initial");
+        assert!(persisted.history_entries.is_empty());
     }
 
     #[test]

@@ -469,7 +469,7 @@ impl Agent {
     pub async fn emit_snapshot(
         &self,
         events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
-    ) {
+    ) -> Result<()> {
         let messages = self.messages.lock().await.clone();
         let window_id = self.context_controller.window_id();
         if self.config.work_id_prefix.is_none() {
@@ -477,15 +477,7 @@ impl Agent {
                 self.history_database.as_ref(),
                 self.history_conversation_id.as_deref(),
             ) {
-                if let Err(error) =
-                    database.save_active_context(conversation_id, &messages, &window_id)
-                {
-                    crate::observability::diagnostics::record(
-                        crate::observability::diagnostics::DiagnosticLevel::Warning,
-                        "agent.history",
-                        format!("Could not persist active context snapshot: {error}"),
-                    );
-                }
+                database.save_active_context(conversation_id, &messages, &window_id)?;
             }
         }
         if let Some(events) = events {
@@ -494,6 +486,7 @@ impl Agent {
                 messages,
             });
         }
+        Ok(())
     }
 
     fn new_history_entry(
@@ -914,14 +907,18 @@ impl Agent {
             }
             msgs.push(user_message.clone());
         }
-        self.emit_history_entry(
+        if let Err(error) = self.emit_history_entry(
             self.history_entry_for_message(
                 WorkHistoryKind::User,
                 &user_message,
                 json!({"role": "user"}),
             ),
             stream_events.as_ref(),
-        )?;
+        ) {
+            self.set_state(AgentState::Errored);
+            run_state.finish();
+            return Err(error);
+        }
 
         let mut context_retries = 0;
         let mut tool_iterations = 0;
@@ -932,10 +929,13 @@ impl Agent {
                     .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
                     .await
                 {
-                    self.emit_snapshot(stream_events.as_ref()).await;
-                    self.set_state(AgentState::Errored);
-                    run_state.finish();
-                    return Err(error);
+                    return Err(self
+                        .finish_errored_after_snapshot(
+                            stream_events.as_ref(),
+                            &mut run_state,
+                            error,
+                        )
+                        .await);
                 }
             }
 
@@ -967,18 +967,24 @@ impl Agent {
                         .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
                         .await
                     {
-                        self.emit_snapshot(stream_events.as_ref()).await;
-                        self.set_state(AgentState::Errored);
-                        run_state.finish();
-                        return Err(compaction_error);
+                        return Err(self
+                            .finish_errored_after_snapshot(
+                                stream_events.as_ref(),
+                                &mut run_state,
+                                compaction_error,
+                            )
+                            .await);
                     }
                     continue;
                 }
                 Err(error) => {
-                    self.emit_snapshot(stream_events.as_ref()).await;
-                    self.set_state(AgentState::Errored);
-                    run_state.finish();
-                    return Err(error);
+                    return Err(self
+                        .finish_errored_after_snapshot(
+                            stream_events.as_ref(),
+                            &mut run_state,
+                            error,
+                        )
+                        .await);
                 }
             };
 
@@ -989,7 +995,11 @@ impl Agent {
                 generation,
             );
             for entry in self.history_entries_for_provider_message(&response.message) {
-                self.emit_history_entry(entry, stream_events.as_ref())?;
+                if let Err(error) = self.emit_history_entry(entry, stream_events.as_ref()) {
+                    self.set_state(AgentState::Errored);
+                    run_state.finish();
+                    return Err(error);
+                }
             }
 
             if response
@@ -1005,14 +1015,21 @@ impl Agent {
                     match self.execute_tools(&response, stream_events.as_ref()).await {
                         Ok(execution) => execution,
                         Err(error) => {
-                            self.emit_snapshot(stream_events.as_ref()).await;
-                            self.set_state(AgentState::Errored);
-                            run_state.finish();
-                            return Err(error);
+                            return Err(self
+                                .finish_errored_after_snapshot(
+                                    stream_events.as_ref(),
+                                    &mut run_state,
+                                    error,
+                                )
+                                .await);
                         }
                     };
                 for entry in tool_execution.history_entries.iter().cloned() {
-                    self.emit_history_entry(entry, stream_events.as_ref())?;
+                    if let Err(error) = self.emit_history_entry(entry, stream_events.as_ref()) {
+                        self.set_state(AgentState::Errored);
+                        run_state.finish();
+                        return Err(error);
+                    }
                 }
                 let had_failure = tool_execution.had_failure;
                 let context_action = tool_execution.context_action;
@@ -1025,10 +1042,13 @@ impl Agent {
                         .request_context(context_action.handoff)
                     {
                         self.context_controller.clear_pending_request();
-                        self.emit_snapshot(stream_events.as_ref()).await;
-                        self.set_state(AgentState::Errored);
-                        run_state.finish();
-                        return Err(anyhow::Error::msg(error));
+                        return Err(self
+                            .finish_errored_after_snapshot(
+                                stream_events.as_ref(),
+                                &mut run_state,
+                                anyhow::Error::msg(error),
+                            )
+                            .await);
                     }
                 }
                 {
@@ -1036,7 +1056,8 @@ impl Agent {
                     msgs.push(response.message.clone());
                     msgs.extend(messages);
                 }
-                self.emit_snapshot(stream_events.as_ref()).await;
+                self.emit_snapshot_or_fail(stream_events.as_ref(), &mut run_state)
+                    .await?;
 
                 continue;
             }
@@ -1045,7 +1066,8 @@ impl Agent {
                 let mut messages = self.messages.lock().await;
                 messages.push(response.message.clone());
             }
-            self.emit_snapshot(stream_events.as_ref()).await;
+            self.emit_snapshot_or_fail(stream_events.as_ref(), &mut run_state)
+                .await?;
             self.set_state(AgentState::Completed);
             run_state.finish();
             return Ok(message_text(&response.message));
@@ -1065,10 +1087,9 @@ impl Agent {
                 .compact_with_runtime_with_events(&runtime, stream_events.as_ref())
                 .await
             {
-                self.emit_snapshot(stream_events.as_ref()).await;
-                self.set_state(AgentState::Errored);
-                run_state.finish();
-                return Err(error);
+                return Err(self
+                    .finish_errored_after_snapshot(stream_events.as_ref(), &mut run_state, error)
+                    .await);
             }
         }
 
@@ -1097,10 +1118,9 @@ impl Agent {
         let response = match response_result {
             Ok(response) => response,
             Err(error) => {
-                self.emit_snapshot(stream_events.as_ref()).await;
-                self.set_state(AgentState::Errored);
-                run_state.finish();
-                return Err(error);
+                return Err(self
+                    .finish_errored_after_snapshot(stream_events.as_ref(), &mut run_state, error)
+                    .await);
             }
         };
         self.record_context_usage(
@@ -1110,7 +1130,11 @@ impl Agent {
             generation,
         );
         for entry in self.history_entries_for_provider_message(&response.message) {
-            self.emit_history_entry(entry, stream_events.as_ref())?;
+            if let Err(error) = self.emit_history_entry(entry, stream_events.as_ref()) {
+                self.set_state(AgentState::Errored);
+                run_state.finish();
+                return Err(error);
+            }
         }
 
         let mut final_message = response.message;
@@ -1126,7 +1150,8 @@ impl Agent {
             }
         }
         self.messages.lock().await.push(final_message);
-        self.emit_snapshot(stream_events.as_ref()).await;
+        self.emit_snapshot_or_fail(stream_events.as_ref(), &mut run_state)
+            .await?;
         self.set_state(AgentState::Completed);
         run_state.finish();
         Ok(final_text)
@@ -1171,6 +1196,41 @@ impl Agent {
                 });
             }
         }))
+    }
+
+    async fn emit_snapshot_or_fail(
+        &self,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+        run_state: &mut RunStateGuard,
+    ) -> Result<()> {
+        match self.emit_snapshot(events).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.set_state(AgentState::Errored);
+                run_state.finish();
+                Err(error)
+            }
+        }
+    }
+
+    async fn finish_errored_after_snapshot(
+        &self,
+        events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
+        run_state: &mut RunStateGuard,
+        original_error: anyhow::Error,
+    ) -> anyhow::Error {
+        if let Err(snapshot_error) = self.emit_snapshot(events).await {
+            crate::observability::diagnostics::record(
+                crate::observability::diagnostics::DiagnosticLevel::Warning,
+                "agent.history",
+                format!(
+                    "Could not persist context after agent failure; preserving original error: {snapshot_error}"
+                ),
+            );
+        }
+        self.set_state(AgentState::Errored);
+        run_state.finish();
+        original_error
     }
 
     async fn chat_with_governor(
@@ -1307,7 +1367,7 @@ impl Agent {
                 understood_context,
             });
         }
-        self.emit_snapshot(events).await;
+        self.emit_snapshot(events).await?;
         Ok(())
     }
 
@@ -2534,7 +2594,7 @@ mod tests {
             .restore_active_context(vec![ChatMessage::user("child context")])
             .await;
         child.set_active_window_id("child-window");
-        child.emit_snapshot(None).await;
+        child.emit_snapshot(None).await.unwrap();
 
         let restored = database.conversation("parent-session").unwrap().unwrap();
         assert_eq!(restored.active_context, parent.active_context);
@@ -2862,7 +2922,7 @@ mod tests {
             Some("continue from checkpoint".into()),
             false,
         );
-        agent.emit_snapshot(Some(&sender)).await;
+        agent.emit_snapshot(Some(&sender)).await.unwrap();
         let reminder = AgentStreamEvent::ContextReminder {
             window_id: "window-2".into(),
             fingerprint: "window-2:200000:1000".into(),
@@ -2890,6 +2950,27 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| serde_json::to_value(event).is_ok()));
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_does_not_emit_a_success_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("history.db")).unwrap();
+        let agent = Agent::new(
+            AgentConfig {
+                work_conversation_id: Some("missing-snapshot-session".into()),
+                ..test_agent_config()
+            },
+            Arc::new(TestProvider::new(vec![])),
+            history_registry(database),
+            test_governor(),
+            "missing-snapshot-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(agent.emit_snapshot(Some(&sender)).await.is_err());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2974,7 +3055,7 @@ mod tests {
             WorkHistoryEntry::user("initial", "entry-1", "not streamed"),
             None,
         );
-        agent.emit_snapshot(None).await;
+        agent.emit_snapshot(None).await.unwrap();
         agent.emit_context_window_started(None, "initial", "test", None, true);
 
         assert_eq!(agent.run("hello").await.unwrap(), "done");
@@ -3012,6 +3093,26 @@ mod tests {
             receiver.try_recv().unwrap(),
             AgentStreamEvent::HistoryEntryAppended { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn history_persistence_error_marks_run_errored() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("history.db")).unwrap();
+        let agent = Agent::new(
+            AgentConfig {
+                work_conversation_id: Some("missing-history-session".into()),
+                ..test_agent_config()
+            },
+            Arc::new(TestProvider::new(vec![assistant_response("done", 10)])),
+            history_registry(database),
+            test_governor(),
+            "missing-history-session".into(),
+            PathBuf::from("/tmp"),
+        );
+
+        assert!(agent.run("persist history").await.is_err());
+        assert_eq!(agent.state().await, AgentState::Errored);
     }
 
     #[tokio::test]
