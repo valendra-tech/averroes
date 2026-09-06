@@ -1073,14 +1073,18 @@ impl WorkDatabase {
         if content.is_empty() {
             return Ok(());
         }
+        let content = content.trim_end_matches('\n');
+        if content.contains('\n') || content.contains('\r') {
+            return Err(WorkDatabaseError::InvalidNote(
+                "content cannot contain embedded newline characters".into(),
+            ));
+        }
+        if content.is_empty() {
+            return Ok(());
+        }
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = rows::load_note(&transaction, workspace_root, path)?;
-        let content = content.trim_end_matches('\n');
-        if content.is_empty() {
-            transaction.commit()?;
-            return Ok(());
-        }
         let content = match existing.as_ref().map(|note| note.content.as_str()) {
             None | Some("") => format!("{content}\n"),
             Some(existing) if existing.ends_with('\n') => format!("{existing}{content}\n"),
@@ -1107,6 +1111,22 @@ impl WorkDatabase {
         query: &str,
     ) -> Result<Vec<WorkNote>, WorkDatabaseError> {
         rows::search_notes(&self.connection.lock(), workspace_root, query)
+    }
+
+    pub fn search_notes_page(
+        &self,
+        workspace_root: &str,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<WorkNoteSearchPage, WorkDatabaseError> {
+        rows::search_notes_page(
+            &self.connection.lock(),
+            workspace_root,
+            query,
+            limit,
+            offset,
+        )
     }
 
     pub fn last_binding(&self) -> Result<Option<SessionBinding>, WorkDatabaseError> {
@@ -1348,6 +1368,8 @@ pub enum WorkDatabaseError {
     InvalidGlobalMemory(String),
     #[error("invalid conversation folder: {0}")]
     InvalidFolder(String),
+    #[error("invalid note: {0}")]
+    InvalidNote(String),
     #[error("invalid onboarding step: {0}")]
     InvalidOnboardingStep(String),
     #[error("history entry conflict in conversation '{conversation_id}' at sequence {sequence}: entry '{entry_id}' conflicts with existing entry '{existing_entry_id}'")]
@@ -1571,6 +1593,33 @@ mod tests {
             database.read_note("/workspace", "events.md").unwrap(),
             Some("start\nprogress\nprogress\n".into())
         );
+    }
+
+    #[test]
+    fn append_note_rejects_embedded_line_breaks() {
+        let (_directory, database) = database();
+
+        for content in ["first\nsecond", "first\rsecond"] {
+            let error = database
+                .append_note("/workspace", "events.md", content)
+                .unwrap_err();
+            assert!(matches!(error, WorkDatabaseError::InvalidNote(_)));
+        }
+    }
+
+    #[test]
+    fn search_notes_page_returns_only_the_requested_rows_and_total() {
+        let (_directory, database) = database();
+        for path in ["alpha.md", "beta.md", "gamma.md"] {
+            database.write_note("/workspace", path, "needle").unwrap();
+        }
+
+        let page = database
+            .search_notes_page("/workspace", "needle", 1, 1)
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.notes.len(), 1);
+        assert_eq!(page.notes[0].path, "beta.md");
     }
 
     #[test]

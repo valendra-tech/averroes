@@ -1,6 +1,6 @@
 use super::types::{
     CheckpointStatus, TaskPriority, TaskStatus, WorkHistoryEntry, WorkHistoryKind, WorkMessage,
-    WorkMessageRole, WorkNote,
+    WorkMessageRole, WorkNote, WorkNoteSearchPage,
 };
 use super::{WorkCheckpoint, WorkConversation, WorkDatabaseError, WorkSource, WorkTask};
 use rusqlite::{params, types::Type, Connection, OptionalExtension, Transaction};
@@ -272,6 +272,68 @@ pub(super) fn search_notes(
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub(super) fn search_notes_page(
+    connection: &Connection,
+    workspace_root: &str,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<WorkNoteSearchPage, WorkDatabaseError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(WorkNoteSearchPage {
+            notes: Vec::new(),
+            total: 0,
+        });
+    }
+    let pattern = format!("%{}%", escape_like_pattern(query));
+    let total = connection.query_row(
+        "SELECT COUNT(*)
+         FROM notes
+         WHERE workspace_root = ?1
+           AND (path LIKE ?2 COLLATE NOCASE ESCAPE '\\'
+                OR content LIKE ?2 COLLATE NOCASE ESCAPE '\\')",
+        params![workspace_root, pattern],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if limit == 0 {
+        return Ok(WorkNoteSearchPage {
+            notes: Vec::new(),
+            total: total as usize,
+        });
+    }
+    let mut statement = connection.prepare(
+        "SELECT workspace_root, path, content, created_at, updated_at
+         FROM notes
+         WHERE workspace_root = ?1
+           AND (path LIKE ?2 COLLATE NOCASE ESCAPE '\\'
+                OR content LIKE ?2 COLLATE NOCASE ESCAPE '\\')
+         ORDER BY updated_at DESC, path COLLATE NOCASE, path
+         LIMIT ?3 OFFSET ?4",
+    )?;
+    let rows = statement.query_map(
+        params![
+            workspace_root,
+            pattern,
+            i64::try_from(limit).unwrap_or(i64::MAX),
+            i64::try_from(offset).unwrap_or(i64::MAX),
+        ],
+        |row| {
+            Ok(WorkNote {
+                workspace_root: row.get(0)?,
+                path: row.get(1)?,
+                content: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        },
+    )?;
+    Ok(WorkNoteSearchPage {
+        notes: rows.collect::<rusqlite::Result<Vec<_>>>()?,
+        total: total as usize,
+    })
 }
 
 pub(super) fn replace_messages(

@@ -38,8 +38,10 @@ struct NotesParams {
     #[serde(default)]
     query: Option<String>,
     #[serde(default)]
-    offset: usize,
+    offset: Option<usize>,
 }
+
+const SEARCH_RESULT_BUDGET_CHARS: usize = 768;
 
 fn invalid(tool: &str, message: impl Into<String>) -> ToolError {
     ToolError::InvalidParams {
@@ -109,6 +111,44 @@ fn note_path(params: &NotesParams, tool: &str) -> Result<String> {
     normalize_note_path(params.path.as_deref()).map_err(|message| invalid(tool, message))
 }
 
+fn reject_present<T>(value: &Option<T>, field: &str, operation: &str, tool: &str) -> Result<()> {
+    if value.is_some() {
+        return Err(invalid(
+            tool,
+            format!("{field} is not valid for the {operation} operation"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_operation_fields(params: &NotesParams, tool: &str) -> Result<()> {
+    match &params.op {
+        NotesOperation::List => {
+            reject_present(&params.path, "path", "list", tool)?;
+            reject_present(&params.content, "content", "list", tool)?;
+            reject_present(&params.query, "query", "list", tool)?;
+            reject_present(&params.offset, "offset", "list", tool)?;
+        }
+        NotesOperation::Read => {
+            reject_present(&params.content, "content", "read", tool)?;
+            reject_present(&params.query, "query", "read", tool)?;
+        }
+        NotesOperation::Write => {
+            reject_present(&params.query, "query", "write", tool)?;
+            reject_present(&params.offset, "offset", "write", tool)?;
+        }
+        NotesOperation::Append => {
+            reject_present(&params.query, "query", "append", tool)?;
+            reject_present(&params.offset, "offset", "append", tool)?;
+        }
+        NotesOperation::Search => {
+            reject_present(&params.path, "path", "search", tool)?;
+            reject_present(&params.content, "content", "search", tool)?;
+        }
+    }
+    Ok(())
+}
+
 fn workspace_root(ctx: &ToolContext, tool: &str) -> Result<String> {
     let root = ctx.workspace_root.to_string_lossy();
     if root.trim().is_empty() {
@@ -143,6 +183,10 @@ fn note_summary(note: &WorkNote, query: &str) -> String {
     } else {
         format!("{}: {}", note.path, excerpt)
     }
+}
+
+fn search_page_limit(page_chars: usize) -> usize {
+    (page_chars / SEARCH_RESULT_BUDGET_CHARS).max(1)
 }
 
 #[async_trait]
@@ -190,6 +234,7 @@ impl Tool for NotesTool {
     async fn execute(&self, ctx: &ToolContext, params: &Value) -> Result<ToolResult> {
         let params: NotesParams = serde_json::from_value(params.clone())
             .map_err(|error| invalid(self.name(), error.to_string()))?;
+        validate_operation_fields(&params, self.name())?;
         let workspace_root = workspace_root(ctx, self.name())?;
 
         match params.op {
@@ -222,34 +267,32 @@ impl Tool for NotesTool {
                 else {
                     return Ok(ToolResult::error(format!("Note '{path}' does not exist.")));
                 };
+                let offset = params.offset.unwrap_or(0);
                 let total = note.chars().count();
-                if params.offset > total {
+                if offset > total {
                     return Err(invalid(
                         self.name(),
-                        format!(
-                            "offset {} exceeds note length {total} for '{path}'",
-                            params.offset
-                        ),
+                        format!("offset {} exceeds note length {total} for '{path}'", offset),
                     ));
                 }
                 let page_size = ctx
-                    .safe_page_chars(params.offset)
+                    .safe_page_chars(offset)
                     .map_err(|message| invalid(self.name(), message))?;
-                let end = params.offset.saturating_add(page_size).min(total);
-                let page = char_slice(&note, params.offset, end);
+                let end = offset.saturating_add(page_size).min(total);
+                let page = char_slice(&note, offset, end);
                 let has_more = end < total;
                 let continuation = has_more
                     .then(|| format!("; continue with offset {end}"))
                     .unwrap_or_default();
-                let header = format!("[chars {}-{end} of {total}{continuation}]", params.offset);
+                let header = format!("[chars {offset}-{end} of {total}{continuation}]");
                 let content = format!("{header}\n{page}");
                 Ok(ToolResult::ok(content).with_metadata(json!({
                     "op": "read",
                     "path": path,
                     "header": header,
                     "page": page,
-                    "offset": params.offset,
-                    "start": params.offset,
+                    "offset": offset,
+                    "start": offset,
                     "end": end,
                     "total": total,
                     "has_more": has_more,
@@ -297,10 +340,19 @@ impl Tool for NotesTool {
                     .map(str::trim)
                     .filter(|query| !query.is_empty())
                     .ok_or_else(|| invalid(self.name(), "query is required and cannot be empty"))?;
-                let notes = self
+                let offset = params.offset.unwrap_or(0);
+                let page_chars = ctx
+                    .safe_page_chars(offset)
+                    .map_err(|message| invalid(self.name(), message))?;
+                let limit = search_page_limit(page_chars);
+                let page = self
                     .database
-                    .search_notes(&workspace_root, query)
+                    .search_notes_page(&workspace_root, query, limit, offset)
                     .map_err(|error| database_error(self.name(), error))?;
+                let notes = page.notes;
+                let returned = notes.len();
+                let next_offset = offset.saturating_add(returned);
+                let has_more = next_offset < page.total;
                 let content = if notes.is_empty() {
                     format!("no notes matched '{query}'.")
                 } else {
@@ -314,7 +366,11 @@ impl Tool for NotesTool {
                     "op": "search",
                     "query": query,
                     "paths": notes.iter().map(|note| note.path.clone()).collect::<Vec<_>>(),
-                    "count": notes.len(),
+                    "count": returned,
+                    "total": page.total,
+                    "offset": offset,
+                    "has_more": has_more,
+                    "next_offset": has_more.then_some(next_offset),
                 })))
             }
         }
@@ -327,7 +383,7 @@ mod tests {
     use crate::agent::ContextController;
     use crate::storage::work::WorkDatabase;
     use crate::tool::{Tool, ToolActivation, ToolContext, ToolError, ToolRegistry};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -468,6 +524,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notes_reject_fields_that_do_not_belong_to_the_operation() {
+        let (_directory, database) = database();
+        let tool = NotesTool::new(database);
+        let ctx = context("/workspace");
+        let invalid = [
+            json!({"op": "list", "path": "state.md"}),
+            json!({"op": "read", "path": "state.md", "query": "state"}),
+            json!({"op": "write", "path": "state.md", "content": "x", "query": "state"}),
+            json!({"op": "append", "path": "state.md", "content": "x", "offset": 0}),
+            json!({"op": "search", "query": "state", "path": "state.md"}),
+        ];
+
+        for params in invalid {
+            let error = tool.execute(&ctx, &params).await.unwrap_err();
+            assert!(matches!(error, ToolError::InvalidParams { .. }));
+            assert!(error.to_string().contains("not valid"));
+        }
+    }
+
+    #[tokio::test]
     async fn notes_reject_paths_outside_the_relative_note_namespace() {
         let (_directory, database) = database();
         let tool = NotesTool::new(database);
@@ -581,6 +657,75 @@ mod tests {
         assert_eq!(second_metadata["page"], "x".repeat(page_size));
         assert!(second.content.starts_with(&format!("{second_header}\n")));
         assert_eq!(second_metadata["offset"], page_size);
+    }
+
+    #[tokio::test]
+    async fn search_pages_results_with_context_budget_and_preserves_unicode() {
+        let (_directory, database) = database();
+        let context_controller = Arc::new(ContextController::for_test(12_000, 2_000));
+        let tool = NotesTool::new(database);
+        let ctx = context_with_controller("/workspace", context_controller);
+        for (path, content) in [
+            ("alpha.md", "needle café"),
+            ("beta.md", "needle 日本語"),
+            ("gamma.md", "needle 🚀"),
+        ] {
+            tool.execute(
+                &ctx,
+                &json!({"op": "write", "path": path, "content": content}),
+            )
+            .await
+            .unwrap();
+        }
+
+        let first = tool
+            .execute(
+                &ctx,
+                &json!({"op": "search", "query": "needle", "offset": 0}),
+            )
+            .await
+            .unwrap();
+        let first_metadata = first.metadata.as_ref().unwrap();
+        assert_eq!(first_metadata["offset"], 0);
+        assert_eq!(first_metadata["total"], 3);
+        assert_eq!(first_metadata["count"], 1);
+        assert_eq!(first_metadata["has_more"], true);
+        assert_eq!(first_metadata["next_offset"], 1);
+        assert!(!first.content.contains('�'));
+
+        let second = tool
+            .execute(
+                &ctx,
+                &json!({"op": "search", "query": "needle", "offset": 1}),
+            )
+            .await
+            .unwrap();
+        let second_metadata = second.metadata.as_ref().unwrap();
+        assert_eq!(second_metadata["offset"], 1);
+        assert_eq!(second_metadata["total"], 3);
+        assert_eq!(second_metadata["count"], 1);
+        assert_eq!(second_metadata["has_more"], true);
+        assert_eq!(second_metadata["next_offset"], 2);
+        assert!(!second.content.contains('�'));
+
+        let third = tool
+            .execute(
+                &ctx,
+                &json!({"op": "search", "query": "needle", "offset": 2}),
+            )
+            .await
+            .unwrap();
+        let third_metadata = third.metadata.as_ref().unwrap();
+        assert_eq!(third_metadata["offset"], 2);
+        assert_eq!(third_metadata["total"], 3);
+        assert_eq!(third_metadata["count"], 1);
+        assert_eq!(third_metadata["has_more"], false);
+        assert_eq!(third_metadata["next_offset"], Value::Null);
+        assert!(!third.content.contains('�'));
+        let combined = format!("{}\n{}\n{}", first.content, second.content, third.content);
+        assert!(combined.contains("café"));
+        assert!(combined.contains("日本語"));
+        assert!(combined.contains("🚀"));
     }
 
     #[tokio::test]

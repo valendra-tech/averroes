@@ -376,6 +376,12 @@ pub struct WorkNote {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkNoteSearchPage {
+    pub notes: Vec<WorkNote>,
+    pub total: usize,
+}
+
 fn default_active_window_id() -> String {
     "initial".into()
 }
