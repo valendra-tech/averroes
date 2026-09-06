@@ -489,17 +489,18 @@ impl Agent {
             .request_context(context_action.handoff.clone())
         {
             self.context_controller.clear_pending_request();
-            self.set_state(AgentState::Errored);
-            run_state.finish();
-            return Err(anyhow::Error::msg(error));
+            return Err(self
+                .finish_errored_after_snapshot(events, run_state, anyhow::Error::msg(error))
+                .await);
         }
 
         let Some(request) = self.context_controller.take_pending_request() else {
-            self.set_state(AgentState::Errored);
-            run_state.finish();
-            return Err(anyhow::anyhow!(
-                "new_context action completed without a pending context request"
-            ));
+            let error =
+                anyhow::anyhow!("new_context action completed without a pending context request");
+            self.context_controller.clear_pending_request();
+            return Err(self
+                .finish_errored_after_snapshot(events, run_state, error)
+                .await);
         };
         let previous_window_id = self.context_controller.window_id();
         let window_id = uuid::Uuid::new_v4().to_string();
@@ -521,6 +522,13 @@ impl Agent {
             .work_id_prefix
             .is_none()
             .then_some((messages.as_slice(), window_id.as_str()));
+
+        // Keep cancellation snapshots from observing a new durable window with
+        // the old in-memory provider messages. The cancellation callback uses
+        // try_lock, so holding this guard across the SQLite commit and the
+        // synchronous memory/window switch makes the transition atomic from
+        // its point of view for both root and delegated agents.
+        let mut active_messages = self.messages.lock().await;
         let stored_entry = match (
             self.history_database.as_ref(),
             self.history_conversation_id.as_deref(),
@@ -533,15 +541,17 @@ impl Agent {
         let stored_entry = match stored_entry {
             Ok(entry) => entry,
             Err(error) => {
+                drop(active_messages);
                 self.context_controller.clear_pending_request();
-                self.set_state(AgentState::Errored);
-                run_state.finish();
-                return Err(error);
+                return Err(self
+                    .finish_errored_after_snapshot(events, run_state, error)
+                    .await);
             }
         };
 
         let previous_window_id = self.context_controller.begin_window(window_id.clone());
-        *self.messages.lock().await = messages.clone();
+        *active_messages = messages.clone();
+        drop(active_messages);
         self.emit_history_entry_event(stored_entry, events);
         self.emit_context_window_started(
             events,
@@ -1758,6 +1768,7 @@ mod tests {
     use crate::tool::{Tool, ToolContext, ToolResult};
     use async_trait::async_trait;
     use futures::{Stream, StreamExt};
+    use rusqlite::Connection;
     use serde_json::json;
     use std::collections::HashMap;
     use std::pin::Pin;
@@ -4513,24 +4524,98 @@ mod tests {
         assert_eq!(rollover.payload["old_window_id"], "initial");
         assert_eq!(rollover.payload["new_window_id"], stored.active_window_id);
         assert_eq!(rollover.payload["handoff"], "saved handoff");
+        assert_eq!(stored.active_context, agent.active_context_snapshot().await);
+        assert_eq!(
+            stored.active_window_id,
+            agent.context_controller().window_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_snapshot_skips_a_window_switch_while_messages_are_locked() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = WorkDatabase::open_at(directory.path().join("history.db")).unwrap();
+        let conversation_id = "context-rollover-cancellation-race";
+        database
+            .save_conversation(&history_conversation(conversation_id))
+            .unwrap();
+        let registry = ToolRegistry::new();
+        registry.set_work_database(database.clone());
+        let agent = Agent::new(
+            AgentConfig {
+                system_prompt: Some("configured".into()),
+                work_conversation_id: Some(conversation_id.into()),
+                ..Default::default()
+            },
+            Arc::new(TestProvider::new(Vec::new())),
+            Arc::new(registry),
+            test_governor(),
+            conversation_id.into(),
+            PathBuf::from("/tmp"),
+        );
+        let old_context = vec![
+            ChatMessage {
+                role: ProviderRole::System,
+                content: MessageContent::Text("configured".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage::user("old context"),
+        ];
+        database
+            .save_active_context(conversation_id, &old_context, "initial")
+            .unwrap();
+        *agent.messages.lock().await = old_context.clone();
+
+        // This is the only interleaving the rollover lock must exclude:
+        // the controller has advanced, but the in-memory provider messages
+        // have not been assigned yet.
+        let messages_guard = agent.messages.lock().await;
+        agent.context_controller.begin_window("new-window");
+        let cancellation = agent
+            .cancellation_snapshot_callback(None)
+            .expect("root agents persist cancellation snapshots");
+        cancellation();
+        drop(messages_guard);
+
+        let stored = database.conversation(conversation_id).unwrap().unwrap();
+        assert_eq!(stored.active_context, old_context);
+        assert_eq!(stored.active_window_id, "initial");
     }
 
     #[tokio::test]
     async fn rollover_persistence_failure_preserves_old_context_and_clears_pending() {
         let directory = tempfile::tempdir().unwrap();
         let database = WorkDatabase::open_at(directory.path().join("history.db")).unwrap();
+        let conversation_id = "rollover-persistence-failure";
+        let mut persisted = history_conversation(conversation_id);
+        persisted.active_context = vec![ChatMessage::user("stale persisted context")];
+        database.save_conversation(&persisted).unwrap();
+        let connection = Connection::open(database.path()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_context_rollover
+                 BEFORE UPDATE OF active_window_id ON conversations
+                 WHEN NEW.active_window_id <> 'initial'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected rollover persistence failure');
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
         let registry = ToolRegistry::new();
-        registry.set_work_database(database);
+        registry.set_work_database(database.clone());
         let agent = Agent::new(
             AgentConfig {
                 system_prompt: Some("configured".into()),
-                work_conversation_id: Some("missing-conversation".into()),
+                work_conversation_id: Some(conversation_id.into()),
                 ..Default::default()
             },
             Arc::new(TestProvider::new(Vec::new())),
             Arc::new(registry),
             test_governor(),
-            "missing-conversation".into(),
+            conversation_id.into(),
             PathBuf::from("/tmp"),
         );
         let old_context = vec![
@@ -4553,14 +4638,21 @@ mod tests {
         };
         let mut run_state = RunStateGuard::new(agent.state.clone());
 
-        assert!(agent
+        let error = agent
             .commit_context_rollover(&execution, None, &mut run_state)
             .await
-            .is_err());
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected rollover persistence failure"));
         assert_eq!(agent.state().await, AgentState::Errored);
         assert_eq!(agent.context_controller().window_id(), "initial");
         assert!(agent.context_controller().pending_request().is_none());
         assert_eq!(agent.active_context_snapshot().await, old_context);
+
+        let restored = database.conversation(conversation_id).unwrap().unwrap();
+        assert_eq!(restored.active_context, old_context);
+        assert_eq!(restored.active_window_id, "initial");
     }
 
     #[tokio::test]
