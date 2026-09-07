@@ -1063,6 +1063,47 @@ impl ShellSession {
         }
     }
 
+    fn branch_at(&self, message_index: usize, is_private: bool) -> Option<Self> {
+        let selected = self.messages.get(message_index)?;
+        let mut branch = Self::new(None, self.binding.clone(), is_private);
+        branch.project_id = self.project_id.clone();
+        branch.workspace_root = self.workspace_root.clone();
+        branch.messages = self.messages[..=message_index].to_vec();
+        branch.title = short_title(&selected.text);
+        if branch.title == "New conversation" {
+            branch.title = self.messages[..=message_index]
+                .iter()
+                .rev()
+                .find_map(|message| {
+                    (!message.text.trim().is_empty()).then(|| short_title(&message.text))
+                })
+                .unwrap_or_else(|| "New conversation".into());
+        }
+        branch.persisted = false;
+        branch.pinned = false;
+        branch.unread = false;
+        branch.context_summary = None;
+        branch.active_context.clear();
+        branch.active_window_id = "initial".into();
+        branch.history_entries.clear();
+        branch.checkpoints.clear();
+        branch.tasks.clear();
+        branch.sources.clear();
+        branch.agent_threads.clear();
+        branch.agent_thread_transcripts.clear();
+        branch.agent = None;
+        branch.processing = false;
+        branch.task = None;
+        branch.queued_messages.clear();
+        branch.queue_autostart = false;
+        branch.pending_user_question = None;
+        branch.pending_user_question_session_id = None;
+        branch.context_usage = ContextUsage::unknown(0);
+        branch.response_rate = ResponseRate::default();
+        branch.context_busy = false;
+        Some(branch)
+    }
+
     fn from_work(conversation: WorkConversation, projects: &[WorkProject]) -> Self {
         let workspace_root = conversation.project_id.as_ref().and_then(|project_id| {
             projects
@@ -18764,6 +18805,103 @@ mod workspace_grouping_tests {
 
         assert!(restored.snapshot().is_private);
         assert!(restored.persistence_snapshot().is_private);
+    }
+
+    #[test]
+    fn shell_session_branch_copies_prefix_and_inherits_binding_without_live_state() {
+        let binding = SessionBinding {
+            connection_id: Some(ConnectionId("connection".into())),
+            model_id: Some("model".into()),
+            reasoning_effort: Some("high".into()),
+            tools: vec!["tool".into()],
+            approval_policy: Default::default(),
+        };
+        let mut source = ShellSession::new(None, binding.clone(), false);
+        let mut user = ShellMessage::user("question".into());
+        user.attachments = vec![PathBuf::from("/tmp/image.png")];
+        let mut assistant = ShellMessage::assistant();
+        assistant.append_text("answer");
+        assistant.reasoning = "because".into();
+        assistant.reasoning_blocks = vec![ReasoningBlockState {
+            complete: true,
+            expanded: true,
+        }];
+        let group_id = assistant.assign_tool_group(true).expect("tool group");
+        assistant.tool_activities.push(ToolActivity {
+            call_id: Some("call-1".into()),
+            name: "search".into(),
+            text_offset: 0,
+            group_id: Some(group_id),
+            input: "{}".into(),
+            summary: "Search complete".into(),
+            output: "Result".into(),
+            state: ToolActivityState::Completed,
+            started_at: Instant::now(),
+            duration_ms: Some(10),
+            expanded: true,
+            inside_reasoning: true,
+        });
+        assistant.stream_blocks = vec![AgentThreadBlock::Reasoning { block_index: 0 }];
+        assistant.expanded_tool_groups.insert(group_id);
+        source.messages = vec![
+            user.clone(),
+            assistant.clone(),
+            ShellMessage::user("later".into()),
+        ];
+        source.processing = true;
+        source.queued_messages.push(QueuedMessage {
+            text: "queued".into(),
+            attachments: Vec::new(),
+            remote_origin_chat_id: None,
+        });
+        source.pending_user_question = Some(averroes_core::tool::builtin::ask_user::UserQuestion {
+            id: "question".into(),
+            question: "Continue?".into(),
+            options: vec!["Yes".into(), "No".into()],
+        });
+        source.context_summary = Some("live summary".into());
+
+        let branch = source.branch_at(1, true).expect("valid message index");
+        assert!(branch.is_private);
+        assert_eq!(branch.messages.len(), 2);
+        assert_eq!(branch.messages[0].role, user.role);
+        assert_eq!(branch.messages[0].text, user.text);
+        assert_eq!(branch.messages[0].attachments, user.attachments);
+        assert_eq!(branch.messages[1].role, assistant.role);
+        assert_eq!(branch.messages[1].text, assistant.text);
+        assert_eq!(branch.messages[1].reasoning, assistant.reasoning);
+        assert_eq!(
+            branch.messages[1].reasoning_blocks,
+            assistant.reasoning_blocks
+        );
+        assert_eq!(
+            branch.messages[1].tool_activities.len(),
+            assistant.tool_activities.len()
+        );
+        assert_eq!(
+            branch.messages[1].tool_activities[0].group_id,
+            assistant.tool_activities[0].group_id
+        );
+        assert_eq!(branch.messages[1].stream_blocks, assistant.stream_blocks);
+        assert_eq!(
+            branch.messages[1].expanded_tool_groups,
+            assistant.expanded_tool_groups
+        );
+        assert_eq!(
+            branch.messages[1].active_reasoning_tool_group(),
+            assistant.active_reasoning_tool_group()
+        );
+        assert!(branch.messages[1].is_tool_group_expanded(group_id));
+        assert_eq!(branch.binding, binding);
+        assert_eq!(branch.project_id, source.project_id);
+        assert_eq!(branch.workspace_root, source.workspace_root);
+        assert_eq!(branch.title, "answer");
+        assert!(!branch.processing);
+        assert!(branch.agent.is_none());
+        assert!(branch.queued_messages.is_empty());
+        assert!(branch.pending_user_question.is_none());
+        assert!(branch.context_summary.is_none());
+        assert!(!branch.persisted);
     }
 
     #[test]
