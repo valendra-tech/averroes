@@ -343,6 +343,14 @@ struct ComposerMetrics {
     control_gap: f32,
     send_size: f32,
     attachment_radius: f32,
+    empty_logo_size: f32,
+    empty_title_size: f32,
+    empty_brand_gap: f32,
+    empty_composer_gap: f32,
+    footer_text_size: f32,
+    model_width: f32,
+    reasoning_width: f32,
+    security_width: f32,
 }
 
 fn composer_metrics(compact: bool) -> ComposerMetrics {
@@ -356,6 +364,14 @@ fn composer_metrics(compact: bool) -> ComposerMetrics {
         control_gap: 4.0,
         send_size: 28.0,
         attachment_radius: 7.0,
+        empty_logo_size: 96.0,
+        empty_title_size: 24.0,
+        empty_brand_gap: 10.0,
+        empty_composer_gap: 22.0,
+        footer_text_size: if compact { 11.0 } else { 12.0 },
+        model_width: if compact { 132.0 } else { 148.0 },
+        reasoning_width: if compact { 60.0 } else { 68.0 },
+        security_width: if compact { 94.0 } else { 108.0 },
     }
 }
 
@@ -16391,6 +16407,14 @@ mod composer_visual_tests {
         assert_eq!(metrics.control_gap, 4.0);
         assert_eq!(metrics.send_size, 28.0);
         assert_eq!(metrics.attachment_radius, 7.0);
+        assert_eq!(metrics.empty_logo_size, 96.0);
+        assert_eq!(metrics.empty_title_size, 24.0);
+        assert_eq!(metrics.empty_brand_gap, 10.0);
+        assert_eq!(metrics.empty_composer_gap, 22.0);
+        assert_eq!(metrics.footer_text_size, 11.0);
+        assert_eq!(metrics.model_width, 132.0);
+        assert_eq!(metrics.reasoning_width, 60.0);
+        assert_eq!(metrics.security_width, 94.0);
     }
 
     #[test]
@@ -16401,6 +16425,10 @@ mod composer_visual_tests {
         assert_eq!(metrics.surface_radius, 14.0);
         assert_eq!(metrics.footer_height, 42.0);
         assert_eq!(metrics.send_size, 28.0);
+        assert_eq!(metrics.footer_text_size, 12.0);
+        assert_eq!(metrics.model_width, 148.0);
+        assert_eq!(metrics.reasoning_width, 68.0);
+        assert_eq!(metrics.security_width, 108.0);
     }
 }
 
