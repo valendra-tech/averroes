@@ -18816,7 +18816,14 @@ mod workspace_grouping_tests {
             tools: vec!["tool".into()],
             approval_policy: Default::default(),
         };
-        let mut source = ShellSession::new(None, binding.clone(), false);
+        let project = WorkProject {
+            id: "project-1".into(),
+            name: "Project".into(),
+            root: PathBuf::from("/tmp/project-1"),
+            created_at: 1,
+            last_opened_at: 1,
+        };
+        let mut source = ShellSession::new(Some(&project), binding.clone(), false);
         let mut user = ShellMessage::user("question".into());
         user.attachments = vec![PathBuf::from("/tmp/image.png")];
         let mut assistant = ShellMessage::assistant();
@@ -18893,15 +18900,46 @@ mod workspace_grouping_tests {
         );
         assert!(branch.messages[1].is_tool_group_expanded(group_id));
         assert_eq!(branch.binding, binding);
-        assert_eq!(branch.project_id, source.project_id);
-        assert_eq!(branch.workspace_root, source.workspace_root);
+        assert_eq!(branch.project_id, Some("project-1".into()));
+        assert_eq!(branch.workspace_root, Some(PathBuf::from("/tmp/project-1")));
         assert_eq!(branch.title, "answer");
         assert!(!branch.processing);
         assert!(branch.agent.is_none());
         assert!(branch.queued_messages.is_empty());
         assert!(branch.pending_user_question.is_none());
+        assert!(branch.agent_threads.is_empty());
+        assert!(branch.agent_thread_transcripts.is_empty());
+        assert!(branch.active_context.is_empty());
+        assert!(branch.history_entries.is_empty());
+        assert!(branch.checkpoints.is_empty());
+        assert!(branch.tasks.is_empty());
+        assert!(branch.sources.is_empty());
+        assert!(!branch.queue_autostart);
+        assert!(branch.pending_user_question_session_id.is_none());
+        assert_eq!(branch.context_usage, ContextUsage::unknown(0));
+        assert!(branch.response_rate.display_rate(Instant::now()).is_none());
+        assert!(!branch.context_busy);
         assert!(branch.context_summary.is_none());
         assert!(!branch.persisted);
+    }
+
+    #[test]
+    fn shell_session_branch_at_out_of_bounds_returns_none() {
+        let source = ShellSession::new(None, SessionBinding::default(), false);
+
+        assert!(source.branch_at(99, true).is_none());
+    }
+
+    #[test]
+    fn private_message_branch_round_trips_through_work() {
+        let mut source = ShellSession::new(None, SessionBinding::default(), false);
+        source.messages.push(ShellMessage::user("question".into()));
+
+        let branch = source.branch_at(0, true).expect("valid message index");
+        let restored = ShellSession::from_work(branch.snapshot(), &[]);
+
+        assert!(restored.is_private);
+        assert!(restored.persistence_snapshot().is_private);
     }
 
     #[test]
