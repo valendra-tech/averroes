@@ -2917,6 +2917,7 @@ mod tests {
             project_id: None,
             pinned: false,
             unread: false,
+            is_private: false,
             created_at: now(),
             updated_at: now(),
             binding: SessionBinding::default(),

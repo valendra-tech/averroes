@@ -17,6 +17,7 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
             pinned INTEGER NOT NULL DEFAULT 0,
             unread INTEGER NOT NULL DEFAULT 0,
+            is_private INTEGER NOT NULL DEFAULT 0,
             processing INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
@@ -252,6 +253,12 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    if !conversation_has_column(connection, "is_private")? {
+        connection.execute(
+            "ALTER TABLE conversations ADD COLUMN is_private INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     if !table_has_column(connection, "messages", "reasoning_complete")? {
         connection.execute(
             "ALTER TABLE messages ADD COLUMN reasoning_complete INTEGER NOT NULL DEFAULT 1",
@@ -456,7 +463,7 @@ fn migrate_history_fts(connection: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
-    advance_user_version(&transaction, 20)?;
+    advance_user_version(&transaction, 21)?;
     transaction.commit()
 }
 

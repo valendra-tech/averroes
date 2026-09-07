@@ -1132,6 +1132,7 @@ impl ShellSession {
             project_id: self.project_id.clone(),
             pinned: self.pinned,
             unread: self.unread,
+            is_private: false,
             created_at: self.created_at,
             updated_at: timestamp,
             binding: self.binding.clone(),

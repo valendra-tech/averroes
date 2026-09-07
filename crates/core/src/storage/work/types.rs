@@ -400,6 +400,8 @@ pub struct WorkConversation {
     pub pinned: bool,
     #[serde(default)]
     pub unread: bool,
+    #[serde(default)]
+    pub is_private: bool,
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(default)]

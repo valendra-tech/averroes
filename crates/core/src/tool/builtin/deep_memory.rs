@@ -273,6 +273,7 @@ mod tests {
                 project_id: None,
                 pinned: false,
                 unread: false,
+                is_private: false,
                 created_at: 1,
                 updated_at: 1,
                 binding: SessionBinding::default(),

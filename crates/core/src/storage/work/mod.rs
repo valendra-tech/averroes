@@ -60,11 +60,13 @@ impl WorkDatabase {
                 .map_err(|error| WorkDatabaseError::Io(error.to_string()))?;
         }
 
-        Ok(Arc::new(Self {
+        let database = Arc::new(Self {
             path,
             connection: Mutex::new(connection),
             vector_extension_available,
-        }))
+        });
+        database.purge_private_conversations()?;
+        Ok(database)
     }
 
     pub fn path(&self) -> &Path {
@@ -376,6 +378,7 @@ impl WorkDatabase {
         let mut statement = connection.prepare(
             "SELECT id, title, project_id, pinned, unread, updated_at
              FROM conversations
+             WHERE is_private = 0
              ORDER BY updated_at DESC,
                       COALESCE((SELECT MAX(m.id) FROM messages m
                                 WHERE m.conversation_id = conversations.id), 0) DESC,
@@ -399,7 +402,7 @@ impl WorkDatabase {
         let connection = self.connection.lock();
         let row = connection
             .query_row(
-                "SELECT id, title, project_id, pinned, unread, created_at, updated_at, binding_json,
+                "SELECT id, title, project_id, pinned, unread, is_private, created_at, updated_at, binding_json,
                         context_summary, context_usage_json, agent_threads_json,
                         agent_thread_transcripts_json, active_context_json, active_window_id
                  FROM conversations WHERE id = ?1",
@@ -411,15 +414,16 @@ impl WorkDatabase {
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, i64>(3)? != 0,
                         row.get::<_, i64>(4)? != 0,
-                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(5)? != 0,
                         row.get::<_, i64>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, Option<String>>(8)?,
-                        row.get::<_, String>(9)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(9)?,
                         row.get::<_, String>(10)?,
                         row.get::<_, String>(11)?,
                         row.get::<_, String>(12)?,
                         row.get::<_, String>(13)?,
+                        row.get::<_, String>(14)?,
                     ))
                 },
             )
@@ -430,6 +434,7 @@ impl WorkDatabase {
             project_id,
             pinned,
             unread,
+            is_private,
             created_at,
             updated_at,
             binding_json,
@@ -459,6 +464,7 @@ impl WorkDatabase {
             project_id,
             pinned,
             unread,
+            is_private,
             created_at,
             updated_at,
             binding,
@@ -474,6 +480,13 @@ impl WorkDatabase {
             active_window_id,
             history_entries,
         }))
+    }
+
+    pub fn purge_private_conversations(&self) -> Result<usize, WorkDatabaseError> {
+        Ok(self
+            .connection
+            .lock()
+            .execute("DELETE FROM conversations WHERE is_private = 1", [])?)
     }
 
     pub fn save_conversation(
@@ -519,15 +532,16 @@ impl WorkDatabase {
             };
         transaction.execute(
             "INSERT INTO conversations
-                (id, title, project_id, pinned, unread, created_at, updated_at, binding_json,
+                (id, title, project_id, pinned, unread, is_private, created_at, updated_at, binding_json,
                  context_summary, context_usage_json, agent_threads_json,
                  agent_thread_transcripts_json, active_context_json, active_window_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 project_id = excluded.project_id,
                 pinned = excluded.pinned,
                 unread = excluded.unread,
+                is_private = excluded.is_private,
                 updated_at = excluded.updated_at,
                 binding_json = excluded.binding_json,
                 context_summary = excluded.context_summary,
@@ -542,6 +556,7 @@ impl WorkDatabase {
                 conversation.project_id,
                 conversation.pinned as i64,
                 conversation.unread as i64,
+                conversation.is_private as i64,
                 conversation.created_at,
                 updated_at,
                 binding,
@@ -1651,6 +1666,7 @@ mod tests {
             project_id: None,
             pinned: false,
             unread: false,
+            is_private: false,
             created_at: now(),
             updated_at: now(),
             binding: SessionBinding::default(),
@@ -1666,6 +1682,74 @@ mod tests {
             active_window_id: "initial".into(),
             history_entries: Vec::new(),
         }
+    }
+
+    fn private_test_conversation(id: &str) -> WorkConversation {
+        let mut conversation = test_conversation(id);
+        conversation.is_private = true;
+        conversation
+    }
+
+    #[test]
+    fn private_conversations_round_trip_but_stay_out_of_summaries() {
+        let (_directory, database) = database();
+        database
+            .save_conversation(&test_conversation("public"))
+            .unwrap();
+        database
+            .save_conversation(&private_test_conversation("private"))
+            .unwrap();
+
+        assert!(!database.conversation("public").unwrap().unwrap().is_private);
+        assert!(
+            database
+                .conversation("private")
+                .unwrap()
+                .unwrap()
+                .is_private
+        );
+        assert_eq!(
+            database
+                .conversation_summaries(20)
+                .unwrap()
+                .into_iter()
+                .map(|summary| summary.id)
+                .collect::<Vec<_>>(),
+            vec!["public"]
+        );
+    }
+
+    #[test]
+    fn opening_database_purges_private_conversations_and_keeps_public_ones() {
+        let (_directory, database) = database();
+        database
+            .save_conversation(&test_conversation("public"))
+            .unwrap();
+        database
+            .save_conversation(&private_test_conversation("private"))
+            .unwrap();
+        let path = database.path().to_path_buf();
+        drop(database);
+
+        let reopened = WorkDatabase::open_at(path).unwrap();
+        assert!(reopened.conversation("private").unwrap().is_none());
+        assert!(reopened.conversation("public").unwrap().is_some());
+    }
+
+    #[test]
+    fn purging_private_conversations_is_idempotent() {
+        let (_directory, database) = database();
+        database
+            .save_conversation(&test_conversation("public"))
+            .unwrap();
+        database
+            .save_conversation(&private_test_conversation("private"))
+            .unwrap();
+
+        assert_eq!(database.purge_private_conversations().unwrap(), 1);
+        assert_eq!(database.purge_private_conversations().unwrap(), 0);
+        assert!(database.conversation("public").unwrap().is_some());
+        assert!(database.conversation("private").unwrap().is_none());
     }
 
     #[test]
@@ -2173,6 +2257,7 @@ mod tests {
             project_id: Some(first.id.clone()),
             pinned: false,
             unread: false,
+            is_private: false,
             created_at: now(),
             updated_at: now(),
             binding: SessionBinding::default(),
@@ -2219,6 +2304,7 @@ mod tests {
             project_id: None,
             pinned: true,
             unread: true,
+            is_private: false,
             created_at: timestamp,
             updated_at: timestamp,
             binding: SessionBinding {
@@ -2302,6 +2388,7 @@ mod tests {
             project_id: None,
             pinned: false,
             unread: false,
+            is_private: false,
             created_at: timestamp,
             updated_at: timestamp,
             binding: SessionBinding::default(),
@@ -2333,6 +2420,7 @@ mod tests {
             project_id: None,
             pinned: false,
             unread: false,
+            is_private: false,
             created_at: timestamp,
             updated_at: timestamp,
             binding: SessionBinding::default(),
@@ -2577,6 +2665,7 @@ mod tests {
             project_id: None,
             pinned: false,
             unread: false,
+            is_private: false,
             created_at: 1,
             updated_at: 1,
             binding: SessionBinding::default(),
@@ -2634,6 +2723,7 @@ mod tests {
                     project_id: None,
                     pinned: false,
                     unread: false,
+                    is_private: false,
                     created_at: updated_at,
                     updated_at,
                     binding: SessionBinding::default(),
@@ -2676,6 +2766,7 @@ mod tests {
                     project_id: None,
                     pinned: false,
                     unread: false,
+                    is_private: false,
                     created_at: 10,
                     updated_at: 10,
                     binding: SessionBinding::default(),
@@ -2721,6 +2812,7 @@ mod tests {
                 project_id: None,
                 pinned: false,
                 unread: false,
+                is_private: false,
                 created_at: 1,
                 updated_at: 1,
                 binding: SessionBinding::default(),
@@ -2765,6 +2857,7 @@ mod tests {
             project_id: None,
             pinned: false,
             unread: false,
+            is_private: false,
             created_at: 1,
             updated_at: 1,
             binding: SessionBinding::default(),
@@ -2905,6 +2998,7 @@ mod tests {
             project_id: None,
             pinned: false,
             unread: false,
+            is_private: false,
             created_at: timestamp,
             updated_at: timestamp,
             binding: SessionBinding::default(),

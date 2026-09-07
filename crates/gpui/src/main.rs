@@ -77,6 +77,7 @@ fn run_scheduled_task(task_id: &str) -> anyhow::Result<()> {
         project_id: task.project_id.clone(),
         pinned: false,
         unread: false,
+        is_private: false,
         created_at: averroes_core::work::now(),
         updated_at: averroes_core::work::now(),
         binding: task.binding.clone(),
