@@ -210,6 +210,14 @@ pub(super) fn purge_private_vectors(
         return Ok(());
     }
 
+    if !vector_table_has_conversation_id(transaction)? {
+        tracing::warn!(
+            table = VECTOR_TABLE,
+            "optional vector table has no conversation_id column; leaving it untouched during private purge"
+        );
+        return Ok(());
+    }
+
     let result = transaction.execute(
         &format!(
             "DELETE FROM \"{VECTOR_TABLE}\"
@@ -231,6 +239,20 @@ pub(super) fn purge_private_vectors(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn vector_table_has_conversation_id(transaction: &Transaction<'_>) -> rusqlite::Result<bool> {
+    let mut statement = transaction.prepare("PRAGMA table_info(\"conversation_vectors\")")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row
+            .get::<_, String>(1)?
+            .eq_ignore_ascii_case("conversation_id")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(super) fn rebuild_vector_table(

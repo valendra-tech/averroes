@@ -1907,6 +1907,44 @@ mod tests {
     }
 
     #[test]
+    fn opening_database_ignores_an_unusable_optional_vector_table() {
+        let (_directory, database) = database();
+        database
+            .save_conversation(&test_conversation("public"))
+            .unwrap();
+        database
+            .save_conversation(&private_test_conversation("private"))
+            .unwrap();
+        let path = database.path().to_path_buf();
+        drop(database);
+
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE VIRTUAL TABLE conversation_vectors USING fts5(
+                        payload
+                    );
+                    INSERT INTO conversation_vectors (payload)
+                    VALUES ('public-vector');",
+                )
+                .unwrap();
+        }
+
+        let reopened = WorkDatabase::open_at(path).unwrap();
+        assert!(reopened.conversation("private").unwrap().is_none());
+        assert!(reopened.conversation("public").unwrap().is_some());
+
+        let connection = reopened.connection.lock();
+        let payload = connection
+            .query_row("SELECT payload FROM conversation_vectors", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        assert_eq!(payload, "public-vector");
+    }
+
+    #[test]
     fn context_snapshot_history_and_notes_round_trip() {
         let (_directory, database) = database();
         let conversation = WorkConversation {
