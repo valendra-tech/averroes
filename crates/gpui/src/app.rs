@@ -54,7 +54,6 @@ use gpui::{
     SystemNotification, Task, Transformation, Window, WindowBounds,
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
-use gpui_component::checkbox::Checkbox;
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::link::Link;
@@ -372,6 +371,14 @@ fn composer_metrics(compact: bool) -> ComposerMetrics {
         model_width: if compact { 132.0 } else { 148.0 },
         reasoning_width: if compact { 60.0 } else { 68.0 },
         security_width: if compact { 94.0 } else { 108.0 },
+    }
+}
+
+fn private_conversation_icon(is_private: bool) -> IconName {
+    if is_private {
+        IconName::Eye
+    } else {
+        IconName::EyeOff
     }
 }
 
@@ -11321,18 +11328,23 @@ impl AverroesApp {
         };
         let private_selector = if can_select_conversation_privacy(session) {
             let session_id = session.id.clone();
+            let is_private = session.is_private;
             Some(
-                Checkbox::new(SharedString::from(format!(
+                Button::new(SharedString::from(format!(
                     "composer-private-{}",
                     session.id.as_str()
                 )))
-                .checked(session.is_private)
-                .label(i18n::text(cx, "conversation.private"))
-                .on_click(cx.listener(move |this, checked, _, cx| {
+                .ghost()
+                .small()
+                .with_size(px(28.0))
+                .selected(is_private)
+                .icon(private_conversation_icon(is_private))
+                .tooltip(i18n::text(cx, "conversation.private"))
+                .on_click(cx.listener(move |this, _, _, cx| {
                     if this.active().id == session_id
                         && can_select_conversation_privacy(this.active())
                     {
-                        set_conversation_privacy(this.active_mut(), *checked);
+                        set_conversation_privacy(this.active_mut(), !is_private);
                         cx.notify();
                     }
                 }))
@@ -16398,7 +16410,8 @@ async fn load_attachment_content(
 
 #[cfg(test)]
 mod composer_visual_tests {
-    use super::composer_metrics;
+    use super::{composer_metrics, private_conversation_icon};
+    use gpui_component::IconName;
 
     #[test]
     fn compact_composer_matches_reference_geometry() {
@@ -16434,6 +16447,12 @@ mod composer_visual_tests {
         assert_eq!(metrics.model_width, 148.0);
         assert_eq!(metrics.reasoning_width, 68.0);
         assert_eq!(metrics.security_width, 108.0);
+    }
+
+    #[test]
+    fn private_conversation_toggle_uses_eye_icons() {
+        assert!(matches!(private_conversation_icon(true), IconName::Eye));
+        assert!(matches!(private_conversation_icon(false), IconName::EyeOff));
     }
 }
 
