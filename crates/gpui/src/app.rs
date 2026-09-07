@@ -1275,6 +1275,13 @@ fn can_select_conversation_privacy(session: &ShellSession) -> bool {
     !session.persisted && session.messages.is_empty() && !session.processing
 }
 
+fn set_conversation_privacy(session: &mut ShellSession, is_private: bool) {
+    session.is_private = is_private;
+    if is_private {
+        session.pending_conversation_folder_id = None;
+    }
+}
+
 fn active_context_is_usable(messages: &[ChatMessage]) -> bool {
     !messages.is_empty()
 }
@@ -11285,7 +11292,7 @@ impl AverroesApp {
                     if this.active().id == session_id
                         && can_select_conversation_privacy(this.active())
                     {
-                        this.active_mut().is_private = *checked;
+                        set_conversation_privacy(this.active_mut(), *checked);
                         cx.notify();
                     }
                 }))
@@ -18858,7 +18865,10 @@ fn update_dialog_can_retry_open(state: &UpdateState, open_error: Option<&str>) -
 
 #[cfg(test)]
 mod conversation_creation_tests {
-    use super::{can_select_conversation_privacy, NewConversationSeed, ShellMessage, ShellSession};
+    use super::{
+        can_select_conversation_privacy, set_conversation_privacy, NewConversationSeed,
+        ShellMessage, ShellSession,
+    };
     use averroes_core::connection::SessionBinding;
     use averroes_core::work::WorkProject;
     use std::path::PathBuf;
@@ -18919,6 +18929,17 @@ mod conversation_creation_tests {
         assert_eq!(private_session.binding, binding);
         assert!(private_session.pending_conversation_folder_id.is_none());
         assert!(private_session.is_private);
+    }
+
+    #[test]
+    fn selecting_private_clears_pending_conversation_folder() {
+        let mut session = ShellSession::new(None, SessionBinding::default(), false);
+        session.pending_conversation_folder_id = Some("folder-1".into());
+
+        set_conversation_privacy(&mut session, true);
+
+        assert!(session.is_private);
+        assert!(session.pending_conversation_folder_id.is_none());
     }
 }
 
