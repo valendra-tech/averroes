@@ -11400,7 +11400,7 @@ impl AverroesApp {
                     .flex()
                     .items_center()
                     .gap(px(metrics.control_gap))
-                    .text_size(px(12.0))
+                    .text_size(px(metrics.footer_text_size))
                     .text_color(theme.faint)
                     .child(
                         Button::new(if compact {
@@ -11441,7 +11441,7 @@ impl AverroesApp {
                             )
                             .child(
                                 Select::new(&self.model_select)
-                                    .w(px(148.0))
+                                    .w(px(metrics.model_width))
                                     .h(px(28.0))
                                     .small()
                                     .appearance(false)
@@ -11451,7 +11451,7 @@ impl AverroesApp {
                             )
                             .child(
                                 Select::new(&self.reasoning_select)
-                                    .w(px(68.0))
+                                    .w(px(metrics.reasoning_width))
                                     .h(px(28.0))
                                     .small()
                                     .appearance(false)
@@ -11461,7 +11461,7 @@ impl AverroesApp {
                             )
                             .child(
                                 Select::new(&self.security_select)
-                                    .w(px(108.0))
+                                    .w(px(metrics.security_width))
                                     .h(px(28.0))
                                     .small()
                                     .appearance(false)
