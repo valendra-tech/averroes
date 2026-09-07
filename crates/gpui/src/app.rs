@@ -9945,18 +9945,36 @@ impl AverroesApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if &self.active().id != session_id {
-            return;
-        }
-        let Some(branch) = self.active().branch_at(message_index, false) else {
+        let Some(source_index) = self
+            .sessions
+            .iter()
+            .position(|session| &session.id == session_id)
+        else {
             return;
         };
-        let Some(project) = branch.project_id.as_ref().and_then(|project_id| {
-            self.projects
-                .iter()
-                .find(|project| &project.id == project_id)
-                .cloned()
-        }) else {
+        let Some(branch) = self.sessions[source_index].branch_at(message_index, false) else {
+            return;
+        };
+        let project = branch
+            .project_id
+            .as_ref()
+            .and_then(|project_id| {
+                self.projects
+                    .iter()
+                    .find(|project| &project.id == project_id)
+                    .cloned()
+            })
+            .or_else(|| {
+                branch.workspace_root.as_ref().and_then(|root| {
+                    self.projects
+                        .iter()
+                        .find(|project| &project.root == root)
+                        .cloned()
+                })
+            })
+            .or_else(|| self.active_project())
+            .or_else(|| self.projects.first().cloned());
+        let Some(project) = project else {
             self.show_error(i18n::text(cx, "notice.workspace_missing"), cx);
             return;
         };
