@@ -1839,7 +1839,7 @@ mod tests {
     }
 
     #[test]
-    fn purging_private_conversations_skips_virtual_vectors_without_the_extension() {
+    fn purging_private_conversations_cleans_usable_virtual_vectors_without_the_extension() {
         let (_directory, database) = database();
         database
             .save_conversation(&test_conversation("public"))
@@ -1894,20 +1894,63 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(
-            rows,
-            vec![
-                ("private".into(), "private-vector".into()),
-                ("public".into(), "public-vector".into()),
-            ]
-        );
+        assert_eq!(rows, vec![("public".into(), "public-vector".into())]);
         drop(connection);
         assert!(database.conversation("private").unwrap().is_none());
         assert!(database.conversation("public").unwrap().is_some());
     }
 
     #[test]
-    fn opening_database_ignores_an_unusable_optional_vector_table() {
+    fn opening_database_purges_private_and_orphaned_rows_from_usable_virtual_vectors() {
+        let (_directory, database) = database();
+        database
+            .save_conversation(&test_conversation("public"))
+            .unwrap();
+        database
+            .save_conversation(&private_test_conversation("private"))
+            .unwrap();
+        let path = database.path().to_path_buf();
+        drop(database);
+
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE VIRTUAL TABLE conversation_vectors USING fts5(
+                        conversation_id,
+                        payload
+                    );
+                    INSERT INTO conversation_vectors (conversation_id, payload)
+                    VALUES
+                        ('public', 'public-vector'),
+                        ('private', 'private-vector'),
+                        ('orphan', 'orphan-vector');",
+                )
+                .unwrap();
+        }
+
+        let reopened = WorkDatabase::open_at(path).unwrap();
+        assert!(reopened.conversation("private").unwrap().is_none());
+        assert!(reopened.conversation("public").unwrap().is_some());
+
+        let connection = reopened.connection.lock();
+        let rows = connection
+            .prepare(
+                "SELECT conversation_id, payload
+                 FROM conversation_vectors ORDER BY conversation_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows, vec![("public".into(), "public-vector".into())]);
+    }
+
+    #[test]
+    fn opening_database_leaves_a_malformed_virtual_vector_table_untouched() {
         let (_directory, database) = database();
         database
             .save_conversation(&test_conversation("public"))

@@ -201,8 +201,10 @@ pub(super) fn purge_private_vectors(
     let Some(table_sql) = table_sql else {
         return Ok(());
     };
-    let is_virtual_table = table_sql.to_ascii_uppercase().contains("VIRTUAL TABLE");
-    if is_virtual_table && !vector_extension_available {
+    let table_sql = table_sql.to_ascii_uppercase();
+    let is_vector_virtual_table =
+        table_sql.contains("VIRTUAL TABLE") && table_sql.contains("USING VECTOR");
+    if is_vector_virtual_table && !vector_extension_available {
         tracing::warn!(
             table = VECTOR_TABLE,
             "sqlite-vector-rs unavailable; leaving the virtual vector table untouched during private purge"
@@ -223,22 +225,15 @@ pub(super) fn purge_private_vectors(
             "DELETE FROM \"{VECTOR_TABLE}\"
              WHERE conversation_id IN (
                  SELECT id FROM conversations WHERE is_private = 1
-             )"
+             )
+                OR NOT EXISTS (
+                    SELECT 1 FROM conversations
+                    WHERE conversations.id = \"{VECTOR_TABLE}\".conversation_id
+                )"
         ),
         [],
     );
-    match result {
-        Ok(_) => Ok(()),
-        Err(error) if is_virtual_table && !vector_extension_available => {
-            tracing::warn!(
-                table = VECTOR_TABLE,
-                error = %error,
-                "sqlite-vector-rs unavailable; leaving the virtual vector table untouched during private purge"
-            );
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
+    result.map(|_| ()).map_err(Into::into)
 }
 
 fn vector_table_has_conversation_id(transaction: &Transaction<'_>) -> rusqlite::Result<bool> {
