@@ -332,6 +332,33 @@ struct ComposerAttachment {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ComposerMetrics {
+    max_width: f32,
+    surface_radius: f32,
+    text_min_height: f32,
+    footer_height: f32,
+    footer_horizontal_padding: f32,
+    footer_bottom_padding: f32,
+    control_gap: f32,
+    send_size: f32,
+    attachment_radius: f32,
+}
+
+fn composer_metrics(compact: bool) -> ComposerMetrics {
+    ComposerMetrics {
+        max_width: if compact { 680.0 } else { 760.0 },
+        surface_radius: 14.0,
+        text_min_height: 68.0,
+        footer_height: 42.0,
+        footer_horizontal_padding: 10.0,
+        footer_bottom_padding: 7.0,
+        control_gap: 4.0,
+        send_size: 28.0,
+        attachment_radius: 7.0,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueuedMessage {
     text: String,
@@ -16341,6 +16368,35 @@ async fn load_attachment_content(
             );
         }
         Ok((text, MessageContent::Parts(content_parts)))
+    }
+}
+
+#[cfg(test)]
+mod composer_visual_tests {
+    use super::composer_metrics;
+
+    #[test]
+    fn compact_composer_matches_reference_geometry() {
+        let metrics = composer_metrics(true);
+
+        assert_eq!(metrics.max_width, 680.0);
+        assert_eq!(metrics.surface_radius, 14.0);
+        assert_eq!(metrics.text_min_height, 68.0);
+        assert_eq!(metrics.footer_height, 42.0);
+        assert_eq!(metrics.footer_horizontal_padding, 10.0);
+        assert_eq!(metrics.control_gap, 4.0);
+        assert_eq!(metrics.send_size, 28.0);
+        assert_eq!(metrics.attachment_radius, 7.0);
+    }
+
+    #[test]
+    fn open_composer_keeps_the_wider_conversation_width() {
+        let metrics = composer_metrics(false);
+
+        assert_eq!(metrics.max_width, 760.0);
+        assert_eq!(metrics.surface_radius, 14.0);
+        assert_eq!(metrics.footer_height, 42.0);
+        assert_eq!(metrics.send_size, 28.0);
     }
 }
 
