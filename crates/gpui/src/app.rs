@@ -54,6 +54,7 @@ use gpui::{
     SystemNotification, Task, Transformation, Window, WindowBounds,
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::link::Link;
@@ -69,8 +70,10 @@ use gpui_component::{
 use semver::Version;
 use serde_json::json;
 use std::borrow::Borrow;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1026,6 +1029,15 @@ struct ShellSession {
     created_at: i64,
 }
 
+#[derive(Clone)]
+struct NewConversationSeed {
+    project: WorkProject,
+    binding: SessionBinding,
+    messages: Vec<ShellMessage>,
+    title: String,
+    folder_id: Option<String>,
+}
+
 impl ShellSession {
     fn new(project: Option<&WorkProject>, binding: SessionBinding, is_private: bool) -> Self {
         Self {
@@ -1243,6 +1255,24 @@ impl ShellSession {
             _ => {}
         }
     }
+}
+
+impl NewConversationSeed {
+    fn session(&self, is_private: bool) -> ShellSession {
+        let mut session = ShellSession::new(Some(&self.project), self.binding.clone(), is_private);
+        session.messages = self.messages.clone();
+        session.title = self.title.clone();
+        session.pending_conversation_folder_id = if is_private {
+            None
+        } else {
+            self.folder_id.clone()
+        };
+        session
+    }
+}
+
+fn can_select_conversation_privacy(session: &ShellSession) -> bool {
+    !session.persisted && session.messages.is_empty() && !session.processing
 }
 
 fn active_context_is_usable(messages: &[ChatMessage]) -> bool {
@@ -5169,12 +5199,12 @@ impl AverroesApp {
         );
     }
 
-    fn new_session_for_project(
+    fn new_conversation_seed_for_project(
         &mut self,
         project: Option<WorkProject>,
-        window: &mut Window,
+        folder_id: Option<String>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<NewConversationSeed> {
         // The active session is the source of truth while the sidebar is
         // being rebuilt. The selected workspace can briefly lag behind it
         // after opening a workspace or restoring a saved conversation; using
@@ -5206,19 +5236,103 @@ impl AverroesApp {
             .or_else(|| self.projects.first().cloned());
         let Some(project) = project else {
             self.show_error(i18n::text(cx, "notice.workspace_missing"), cx);
-            return;
+            return None;
         };
-        self.active_workspace_id = Some(project.id.clone());
-        self.refresh_conversation_folders();
-        let _ = self.runtime.database.touch_project(&project.id);
-        self.runtime.load_workspace_tools(&project.root);
         let binding = inherited_session_binding(
             &self.active().binding,
             &self.remembered_binding,
             &self.runtime.default_agent_tools(),
         );
-        self.sessions
-            .push(ShellSession::new(Some(&project), binding, false));
+        Some(NewConversationSeed {
+            project,
+            binding,
+            messages: Vec::new(),
+            title: "New conversation".into(),
+            folder_id,
+        })
+    }
+
+    fn open_new_conversation_dialog(
+        &mut self,
+        seed: NewConversationSeed,
+        initially_private: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let private_state = Rc::new(Cell::new(initially_private));
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let state_for_checkbox = private_state.clone();
+            let checkbox = Checkbox::new("new-conversation-private")
+                .checked(private_state.get())
+                .label(i18n::text(cx, "conversation.private"))
+                .on_click(move |checked, _, _| state_for_checkbox.set(*checked));
+            let confirm_view = view.clone();
+            let confirm_seed = seed.clone();
+            let confirm_state = private_state.clone();
+            let confirm = Button::new("new-conversation-confirm")
+                .primary()
+                .label(i18n::text(cx, "dialog.create"))
+                .on_click(move |_, window, cx| {
+                    if confirm_view.update(cx, |app, cx| {
+                        app.create_session_from_seed(
+                            confirm_seed.clone(),
+                            confirm_state.get(),
+                            window,
+                            cx,
+                        )
+                    }) {
+                        window.close_dialog(cx);
+                    }
+                });
+            dialog
+                .title(i18n::text(cx, "dialog.new_conversation_title"))
+                .w(px(420.0))
+                .child(
+                    div().py(px(8.0)).child(checkbox).child(
+                        div()
+                            .mt(px(5.0))
+                            .text_size(px(11.0))
+                            .text_color(UiTheme::current(cx).muted)
+                            .child(i18n::text(cx, "conversation.private_description")),
+                    ),
+                )
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            Button::new("new-conversation-cancel")
+                                .secondary()
+                                .label(i18n::text(cx, "dialog.cancel"))
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(confirm),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(i18n::text(cx, "dialog.create"))
+                        .cancel_text(i18n::text(cx, "dialog.cancel"))
+                        .show_cancel(true),
+                )
+        });
+    }
+
+    fn create_session_from_seed(
+        &mut self,
+        seed: NewConversationSeed,
+        is_private: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let project = seed.project.clone();
+        let session = seed.session(is_private);
+        self.active_workspace_id = Some(project.id.clone());
+        self.refresh_conversation_folders();
+        let _ = self.runtime.database.touch_project(&project.id);
+        self.runtime.load_workspace_tools(&project.root);
+        self.sessions.push(session);
         self.active_session = self.sessions.len() - 1;
         self.route = Route::Chat;
         self.project_settings_open = false;
@@ -5233,6 +5347,19 @@ impl AverroesApp {
             .update(cx, |state, cx| state.focus(window, cx));
         self.persist_window_state();
         cx.notify();
+        true
+    }
+
+    fn new_session_for_project(
+        &mut self,
+        project: Option<WorkProject>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(seed) = self.new_conversation_seed_for_project(project, None, cx) else {
+            return;
+        };
+        self.open_new_conversation_dialog(seed, false, window, cx);
     }
 
     fn new_session_in_conversation_folder(
@@ -5250,9 +5377,11 @@ impl AverroesApp {
             self.show_error(i18n::text(cx, "notice.workspace_missing"), cx);
             return;
         }
-        self.new_session_for_project(project, window, cx);
-        self.active_mut().pending_conversation_folder_id = Some(folder.id);
-        cx.notify();
+        let Some(seed) = self.new_conversation_seed_for_project(project, Some(folder.id), cx)
+        else {
+            return;
+        };
+        self.open_new_conversation_dialog(seed, false, window, cx);
     }
 
     fn select_project(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -11131,6 +11260,28 @@ impl AverroesApp {
             )
             .into_any_element()
         };
+        let private_selector = if can_select_conversation_privacy(session) {
+            let session_id = session.id.clone();
+            Some(
+                Checkbox::new(SharedString::from(format!(
+                    "composer-private-{}",
+                    session.id.as_str()
+                )))
+                .checked(session.is_private)
+                .label(i18n::text(cx, "conversation.private"))
+                .on_click(cx.listener(move |this, checked, _, cx| {
+                    if this.active().id == session_id
+                        && can_select_conversation_privacy(this.active())
+                    {
+                        this.active_mut().is_private = *checked;
+                        cx.notify();
+                    }
+                }))
+                .into_any_element(),
+            )
+        } else {
+            None
+        };
         div()
             .w_full()
             .max_w(if compact { px(700.0) } else { px(760.0) })
@@ -11258,6 +11409,7 @@ impl AverroesApp {
                                     .search_placeholder(i18n::text(cx, "composer.search_security")),
                             ),
                     )
+                    .when_some(private_selector, |footer, selector| footer.child(selector))
                     .child(div().flex_1())
                     .when_some(token_rate_indicator, |footer, indicator| {
                         footer.child(indicator)
@@ -18690,6 +18842,67 @@ fn update_dialog_is_downloading(state: &UpdateState) -> bool {
 
 fn update_dialog_can_retry_open(state: &UpdateState, open_error: Option<&str>) -> bool {
     matches!(state, UpdateState::ReadyToOpen { .. }) && open_error.is_some()
+}
+
+#[cfg(test)]
+mod conversation_creation_tests {
+    use super::{can_select_conversation_privacy, NewConversationSeed, ShellMessage, ShellSession};
+    use averroes_core::connection::SessionBinding;
+    use averroes_core::work::WorkProject;
+    use std::path::PathBuf;
+
+    #[test]
+    fn privacy_selection_is_only_available_for_a_new_empty_idle_session() {
+        let mut session = ShellSession::new(None, SessionBinding::default(), false);
+        assert!(can_select_conversation_privacy(&session));
+
+        session.messages.push(ShellMessage::user("started".into()));
+        assert!(!can_select_conversation_privacy(&session));
+
+        session.messages.clear();
+        session.processing = true;
+        assert!(!can_select_conversation_privacy(&session));
+
+        session.processing = false;
+        session.persisted = true;
+        assert!(!can_select_conversation_privacy(&session));
+    }
+
+    #[test]
+    fn new_conversation_seed_preserves_context_when_building_a_session() {
+        let project = WorkProject {
+            id: "project-1".into(),
+            name: "Project".into(),
+            root: PathBuf::from("/tmp/project-1"),
+            created_at: 1,
+            last_opened_at: 1,
+        };
+        let binding = SessionBinding::default();
+        let messages = vec![ShellMessage::user("inherited context".into())];
+        let seed = NewConversationSeed {
+            project,
+            binding,
+            messages: messages.clone(),
+            title: "Seeded conversation".into(),
+            folder_id: Some("folder-1".into()),
+        };
+
+        let session = seed.session(false);
+
+        assert_eq!(session.project_id.as_deref(), Some("project-1"));
+        assert_eq!(
+            session.workspace_root,
+            Some(PathBuf::from("/tmp/project-1"))
+        );
+        assert_eq!(session.messages.len(), messages.len());
+        assert_eq!(session.messages[0].text, messages[0].text);
+        assert_eq!(session.title, "Seeded conversation");
+        assert_eq!(
+            session.pending_conversation_folder_id.as_deref(),
+            Some("folder-1")
+        );
+        assert!(!session.persisted);
+    }
 }
 
 #[cfg(test)]
