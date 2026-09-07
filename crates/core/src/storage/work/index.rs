@@ -179,6 +179,33 @@ pub(super) fn load_fragments(
 
 const VECTOR_TABLE: &str = "conversation_vectors";
 
+pub(super) fn purge_private_vectors(
+    transaction: &Transaction<'_>,
+) -> Result<(), WorkDatabaseError> {
+    let table_exists = transaction
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![VECTOR_TABLE],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if !table_exists {
+        return Ok(());
+    }
+
+    transaction.execute(
+        &format!(
+            "DELETE FROM \"{VECTOR_TABLE}\"
+             WHERE conversation_id IN (
+                 SELECT id FROM conversations WHERE is_private = 1
+             )"
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
 pub(super) fn rebuild_vector_table(
     connection: &mut Connection,
     config: &EmbeddingConfig,

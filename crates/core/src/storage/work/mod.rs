@@ -483,10 +483,12 @@ impl WorkDatabase {
     }
 
     pub fn purge_private_conversations(&self) -> Result<usize, WorkDatabaseError> {
-        Ok(self
-            .connection
-            .lock()
-            .execute("DELETE FROM conversations WHERE is_private = 1", [])?)
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        index::purge_private_vectors(&transaction)?;
+        let deleted = transaction.execute("DELETE FROM conversations WHERE is_private = 1", [])?;
+        transaction.commit()?;
+        Ok(deleted)
     }
 
     pub fn save_conversation(
@@ -1750,6 +1752,71 @@ mod tests {
         assert_eq!(database.purge_private_conversations().unwrap(), 0);
         assert!(database.conversation("public").unwrap().is_some());
         assert!(database.conversation("private").unwrap().is_none());
+    }
+
+    #[test]
+    fn purging_private_conversations_removes_private_vector_rows() {
+        let (_directory, database) = database();
+        database
+            .save_conversation(&test_conversation("public"))
+            .unwrap();
+        database
+            .save_conversation(&private_test_conversation("private"))
+            .unwrap();
+
+        {
+            let connection = database.connection.lock();
+            let vector_table_exists = connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    ["conversation_vectors"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some();
+            if !vector_table_exists {
+                connection
+                    .execute_batch(
+                        "CREATE TABLE conversation_vectors (
+                            conversation_id TEXT NOT NULL,
+                            payload TEXT NOT NULL
+                        )",
+                    )
+                    .unwrap();
+            }
+            connection
+                .execute(
+                    "INSERT INTO conversation_vectors (conversation_id, payload)
+                     VALUES (?1, ?2)",
+                    params!["public", "public-vector"],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO conversation_vectors (conversation_id, payload)
+                     VALUES (?1, ?2)",
+                    params!["private", "private-vector"],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(database.purge_private_conversations().unwrap(), 1);
+
+        let connection = database.connection.lock();
+        let rows = connection
+            .prepare(
+                "SELECT conversation_id, payload
+                 FROM conversation_vectors ORDER BY conversation_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows, vec![("public".into(), "public-vector".into())]);
     }
 
     #[test]

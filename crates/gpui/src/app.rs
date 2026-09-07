@@ -1005,6 +1005,7 @@ struct ShellSession {
     workspace_root: Option<PathBuf>,
     pinned: bool,
     unread: bool,
+    is_private: bool,
     persisted: bool,
     context_summary: Option<String>,
     active_context: Vec<ChatMessage>,
@@ -1026,7 +1027,7 @@ struct ShellSession {
 }
 
 impl ShellSession {
-    fn new(project: Option<&WorkProject>, binding: SessionBinding) -> Self {
+    fn new(project: Option<&WorkProject>, binding: SessionBinding, is_private: bool) -> Self {
         Self {
             id: SessionId(uuid::Uuid::new_v4().to_string()),
             title: "New conversation".into(),
@@ -1040,6 +1041,7 @@ impl ShellSession {
             workspace_root: project.map(|project| project.root.clone()),
             pinned: false,
             unread: false,
+            is_private,
             persisted: false,
             context_summary: None,
             active_context: Vec::new(),
@@ -1085,6 +1087,7 @@ impl ShellSession {
             workspace_root,
             pinned: conversation.pinned,
             unread: conversation.unread,
+            is_private: conversation.is_private,
             persisted: true,
             context_summary: conversation.context_summary,
             active_context: conversation.active_context,
@@ -1132,7 +1135,7 @@ impl ShellSession {
             project_id: self.project_id.clone(),
             pinned: self.pinned,
             unread: self.unread,
-            is_private: false,
+            is_private: self.is_private,
             created_at: self.created_at,
             updated_at: timestamp,
             binding: self.binding.clone(),
@@ -2091,6 +2094,7 @@ impl AverroesApp {
             restored_sessions.push(ShellSession::new(
                 default_project.as_ref(),
                 remembered_binding.clone(),
+                false,
             ));
         }
         let active_session = window_state
@@ -5173,7 +5177,7 @@ impl AverroesApp {
             &self.runtime.default_agent_tools(),
         );
         self.sessions
-            .push(ShellSession::new(Some(&project), binding));
+            .push(ShellSession::new(Some(&project), binding, false));
         self.active_session = self.sessions.len() - 1;
         self.route = Route::Chat;
         self.project_settings_open = false;
@@ -6335,8 +6339,11 @@ impl AverroesApp {
         if let Some(index) = session_index {
             self.sessions.remove(index);
             if self.sessions.is_empty() {
-                self.sessions
-                    .push(ShellSession::new(None, self.remembered_binding.clone()));
+                self.sessions.push(ShellSession::new(
+                    None,
+                    self.remembered_binding.clone(),
+                    false,
+                ));
                 self.active_session = 0;
                 sync_selectors = true;
             } else if index < self.active_session {
@@ -9763,6 +9770,7 @@ impl AverroesApp {
             self.sessions.push(ShellSession::new(
                 self.projects.first(),
                 self.remembered_binding.clone(),
+                false,
             ));
         }
         self.active_session = self.active_session.min(self.sessions.len() - 1);
@@ -18719,7 +18727,7 @@ mod workspace_grouping_tests {
 
     #[test]
     fn shell_session_round_trips_active_context_window_and_history_events() {
-        let mut session = ShellSession::new(None, SessionBinding::default());
+        let mut session = ShellSession::new(None, SessionBinding::default(), false);
         let active_context = vec![ChatMessage::user("provider context")];
         let entry = WorkHistoryEntry::user("window-2", "entry-1", "durable history");
 
@@ -18749,8 +18757,18 @@ mod workspace_grouping_tests {
     }
 
     #[test]
+    fn private_shell_session_round_trips_through_snapshot_and_work() {
+        let snapshot = ShellSession::new(None, SessionBinding::default(), true).snapshot();
+
+        let restored = ShellSession::from_work(snapshot, &[]);
+
+        assert!(restored.snapshot().is_private);
+        assert!(restored.persistence_snapshot().is_private);
+    }
+
+    #[test]
     fn persistence_snapshot_excludes_live_agent_context() {
-        let mut session = ShellSession::new(None, SessionBinding::default());
+        let mut session = ShellSession::new(None, SessionBinding::default(), false);
         session.apply_context_history_event(AgentStreamEvent::ContextSnapshot {
             window_id: "agent-window".into(),
             messages: vec![ChatMessage::user("agent context")],
@@ -18772,7 +18790,7 @@ mod workspace_grouping_tests {
 
     #[test]
     fn stream_recovery_snapshot_keeps_live_context_and_visible_transcript() {
-        let mut session = ShellSession::new(None, SessionBinding::default());
+        let mut session = ShellSession::new(None, SessionBinding::default(), false);
         let mut assistant = ShellMessage::assistant();
         assistant.append_text("visible answer");
         session.messages = vec![ShellMessage::user("visible question".into()), assistant];
@@ -18853,7 +18871,7 @@ mod workspace_grouping_tests {
 
     #[test]
     fn active_context_restore_uses_live_snapshot_and_falls_back_only_when_empty() {
-        let mut conversation = ShellSession::new(None, SessionBinding::default()).snapshot();
+        let mut conversation = ShellSession::new(None, SessionBinding::default(), false).snapshot();
         conversation.active_context = vec![ChatMessage::user("provider context")];
         conversation.active_window_id = "window-2".into();
 
@@ -18890,7 +18908,7 @@ mod workspace_grouping_tests {
 
     #[test]
     fn context_usage_tracks_reminders_and_resets_for_new_windows() {
-        let mut session = ShellSession::new(None, SessionBinding::default());
+        let mut session = ShellSession::new(None, SessionBinding::default(), false);
         session.context_usage = ContextUsage::from_usage(70_000, 500, 100_000);
         let reminder = AgentStreamEvent::ContextReminder {
             window_id: "window-1".into(),
@@ -18935,7 +18953,7 @@ mod workspace_grouping_tests {
 
     #[test]
     fn patch_history_includes_main_and_delegated_activities() {
-        let mut session = ShellSession::new(None, SessionBinding::default());
+        let mut session = ShellSession::new(None, SessionBinding::default(), false);
         let mut main_message = ShellMessage::assistant();
         main_message
             .tool_activities
