@@ -11176,6 +11176,7 @@ impl AverroesApp {
 
     fn render_composer(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = UiTheme::current(cx);
+        let metrics = composer_metrics(compact);
         let session = self.active();
         let has_connection = session.binding.connection_id.is_some();
         let has_model = session.binding.model_id.is_some();
@@ -11326,13 +11327,13 @@ impl AverroesApp {
         };
         div()
             .w_full()
-            .max_w(if compact { px(700.0) } else { px(760.0) })
+            .max_w(px(metrics.max_width))
             .flex()
             .flex_col()
             .bg(theme.surface)
             .border_1()
             .border_color(theme.border)
-            .rounded(px(12.0))
+            .rounded(px(metrics.surface_radius))
             .overflow_hidden()
             .can_drop(|value, _, _| value.downcast_ref::<ExternalPaths>().is_some())
             .drag_over::<ExternalPaths>(move |style, _, _, _| {
@@ -11360,7 +11361,7 @@ impl AverroesApp {
                     })
                     .child(
                         div()
-                            .min_h(px(66.0))
+                            .min_h(px(metrics.text_min_height))
                             .px(px(14.0))
                             .py(px(10.0))
                             .flex()
