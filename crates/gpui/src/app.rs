@@ -19328,6 +19328,9 @@ mod workspace_grouping_tests {
             "tool.context_window",
             "tool.context_window_started",
             "tool.context_window_automatic",
+            "chat.copy_message",
+            "chat.branch",
+            "conversation.private",
         ];
         let catalogs = [
             include_str!("../locales/en.json"),
