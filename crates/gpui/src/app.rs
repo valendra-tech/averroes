@@ -9938,6 +9938,38 @@ impl AverroesApp {
         self.submit_message(window, cx);
     }
 
+    fn open_branch_dialog(
+        &mut self,
+        session_id: &SessionId,
+        message_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if &self.active().id != session_id {
+            return;
+        }
+        let Some(branch) = self.active().branch_at(message_index, false) else {
+            return;
+        };
+        let Some(project) = branch.project_id.as_ref().and_then(|project_id| {
+            self.projects
+                .iter()
+                .find(|project| &project.id == project_id)
+                .cloned()
+        }) else {
+            self.show_error(i18n::text(cx, "notice.workspace_missing"), cx);
+            return;
+        };
+        let seed = NewConversationSeed {
+            project,
+            binding: branch.binding,
+            messages: branch.messages,
+            title: branch.title,
+            folder_id: None,
+        };
+        self.open_new_conversation_dialog(seed, false, window, cx);
+    }
+
     fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.new_session_for_project(None, window, cx);
     }
@@ -18436,6 +18468,69 @@ fn render_ordered_message_content(
     elements
 }
 
+fn message_action_id(action: &str, session_id: &SessionId, index: usize) -> String {
+    format!("{action}-message-{}-{index}", session_id.as_str())
+}
+
+fn render_message_actions(
+    session_id: &SessionId,
+    index: usize,
+    message: &ShellMessage,
+    processing: bool,
+    theme: UiTheme,
+    cx: &mut Context<AverroesApp>,
+) -> AnyElement {
+    let assistant = message.role == MessageRole::Assistant;
+    let copy_button = if message.text.is_empty() {
+        None
+    } else {
+        let copy_text = message.text.clone();
+        Some(
+            Button::new(message_action_id("copy", session_id, index))
+                .ghost()
+                .small()
+                .icon(IconName::Copy)
+                .tooltip(i18n::text(cx, "chat.copy_message"))
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                })
+                .into_any_element(),
+        )
+    };
+    let retry_session_id = session_id.clone();
+    let branch_session_id = session_id.clone();
+    div()
+        .flex()
+        .items_center()
+        .gap(px(2.0))
+        .text_color(theme.faint)
+        .when_some(copy_button, |actions, copy| actions.child(copy))
+        .when(assistant, |actions| {
+            actions.child(
+                Button::new(message_action_id("regenerate", session_id, index))
+                    .ghost()
+                    .small()
+                    .icon(IconName::Redo2)
+                    .tooltip(i18n::text(cx, "chat.regenerate"))
+                    .disabled(processing)
+                    .on_click(cx.listener(move |app, _, window, cx| {
+                        app.regenerate_assistant_message(&retry_session_id, index, window, cx)
+                    })),
+            )
+        })
+        .child(
+            Button::new(message_action_id("branch", session_id, index))
+                .ghost()
+                .small()
+                .icon(IconName::ExternalLink)
+                .tooltip(i18n::text(cx, "chat.branch"))
+                .on_click(cx.listener(move |app, _, window, cx| {
+                    app.open_branch_dialog(&branch_session_id, index, window, cx)
+                })),
+        )
+        .into_any_element()
+}
+
 fn render_message(
     session_id: &SessionId,
     index: usize,
@@ -18458,7 +18553,9 @@ fn render_message(
         let has_images = !image_attachments.is_empty();
         return div()
             .flex()
-            .justify_end()
+            .flex_col()
+            .items_end()
+            .gap(px(2.0))
             .child(
                 div()
                     .max_w(px(620.0))
@@ -18480,14 +18577,14 @@ fn render_message(
                             .children(image_attachments),
                     ),
             )
+            .child(render_message_actions(
+                session_id, index, message, processing, theme, cx,
+            ))
             .into_any_element();
     }
 
     let error = message.role == MessageRole::Error;
     let assistant = message.role == MessageRole::Assistant;
-    let copy_text = message.text.clone();
-    let copy_disabled = copy_text.is_empty();
-    let retry_session_id = session_id.clone();
     let content_elements = if assistant
         && (!body.is_empty()
             || !message.reasoning.is_empty()
@@ -18557,47 +18654,9 @@ fn render_message(
         .children(content_elements)
         .when_some(user_question_element, |this, question| this.child(question))
         .when_some(source_summary_element, |this, sources| this.child(sources))
-        .when(assistant, |this| {
-            this.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(2.0))
-                    .text_color(theme.faint)
-                    .child(
-                        Button::new(format!("copy-message-{}-{index}", session_id.as_str()))
-                            .ghost()
-                            .small()
-                            .icon(IconName::Copy)
-                            .tooltip(i18n::text(cx, "chat.copy_response"))
-                            .disabled(copy_disabled)
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
-                            }),
-                    )
-                    .child(
-                        Button::new(format!(
-                            "regenerate-message-{}-{index}",
-                            session_id.as_str()
-                        ))
-                        .ghost()
-                        .small()
-                        .icon(IconName::Redo2)
-                        .tooltip(i18n::text(cx, "chat.regenerate"))
-                        .disabled(processing)
-                        .on_click(cx.listener(
-                            move |app, _, window, cx| {
-                                app.regenerate_assistant_message(
-                                    &retry_session_id,
-                                    index,
-                                    window,
-                                    cx,
-                                )
-                            },
-                        )),
-                    ),
-            )
-        });
+        .child(render_message_actions(
+            session_id, index, message, processing, theme, cx,
+        ));
 
     // Animate only the assistant message while it is receiving content. The
     // stable element id lets GPUI continue the same one-shot animation across
