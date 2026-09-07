@@ -9971,9 +9971,7 @@ impl AverroesApp {
                         .find(|project| &project.root == root)
                         .cloned()
                 })
-            })
-            .or_else(|| self.active_project())
-            .or_else(|| self.projects.first().cloned());
+            });
         let Some(project) = project else {
             self.show_error(i18n::text(cx, "notice.workspace_missing"), cx);
             return;
@@ -18499,7 +18497,8 @@ fn render_message_actions(
     cx: &mut Context<AverroesApp>,
 ) -> AnyElement {
     let assistant = message.role == MessageRole::Assistant;
-    let copy_button = if message.text.is_empty() && !assistant {
+    let copy_disabled = message.text.trim().is_empty();
+    let copy_button = if copy_disabled && !assistant {
         None
     } else {
         let copy_text = message.text.clone();
@@ -18509,7 +18508,7 @@ fn render_message_actions(
                 .small()
                 .icon(IconName::Copy)
                 .tooltip(i18n::text(cx, "chat.copy_message"))
-                .disabled(copy_text.is_empty())
+                .disabled(copy_disabled)
                 .on_click(move |_, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
                 })
@@ -18944,8 +18943,8 @@ fn update_dialog_can_retry_open(state: &UpdateState, open_error: Option<&str>) -
 #[cfg(test)]
 mod conversation_creation_tests {
     use super::{
-        can_select_conversation_privacy, set_conversation_privacy, NewConversationSeed,
-        ShellMessage, ShellSession,
+        can_select_conversation_privacy, message_action_id, set_conversation_privacy,
+        NewConversationSeed, SessionId, ShellMessage, ShellSession,
     };
     use averroes_core::connection::SessionBinding;
     use averroes_core::work::WorkProject;
@@ -19018,6 +19017,20 @@ mod conversation_creation_tests {
 
         assert!(session.is_private);
         assert!(session.pending_conversation_folder_id.is_none());
+    }
+
+    #[test]
+    fn message_action_ids_are_stable_and_namespaced() {
+        let session_id = SessionId("session-1".into());
+
+        assert_eq!(
+            message_action_id("copy", &session_id, 3),
+            "copy-message-session-1-3"
+        );
+        assert_eq!(
+            message_action_id("branch", &session_id, 3),
+            "branch-message-session-1-3"
+        );
     }
 }
 
