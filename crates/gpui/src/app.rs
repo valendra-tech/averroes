@@ -1201,9 +1201,7 @@ impl ShellSession {
 }
 
 fn active_context_is_usable(messages: &[ChatMessage]) -> bool {
-    messages
-        .iter()
-        .any(|message| matches!(message.role, Role::User | Role::Assistant | Role::Tool))
+    !messages.is_empty()
 }
 
 fn restorable_active_context(conversation: &WorkConversation) -> Option<(&[ChatMessage], &str)> {
@@ -1211,6 +1209,26 @@ fn restorable_active_context(conversation: &WorkConversation) -> Option<(&[ChatM
         conversation.active_context.as_slice(),
         conversation.active_window_id.as_str(),
     ))
+}
+
+fn apply_context_usage_event(session: &mut ShellSession, event: &AgentStreamEvent) {
+    match event {
+        AgentStreamEvent::ContextReminder {
+            remaining_tokens: Some(remaining_tokens),
+            rollover_at,
+            ..
+        } => {
+            let mut usage = session.context_usage;
+            usage.input_tokens = Some(rollover_at.saturating_sub(*remaining_tokens));
+            usage.context_limit = usage.context_limit.max(*rollover_at);
+            session.context_usage = usage;
+        }
+        AgentStreamEvent::ContextWindowStarted { .. } => {
+            let context_limit = session.context_usage.context_limit as usize;
+            session.context_usage = ContextUsage::unknown(context_limit);
+        }
+        _ => {}
+    }
 }
 
 fn context_activity_spec(event: &AgentStreamEvent) -> Option<ContextActivitySpec> {
@@ -7566,6 +7584,13 @@ impl AverroesApp {
                 self.refresh_remote_live_reply(session_id, true, cx);
             }
             event @ AgentStreamEvent::ContextReminder { .. } => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| &session.id == session_id)
+                {
+                    apply_context_usage_event(session, &event);
+                }
                 self.append_context_activity(session_id, &event, cx);
                 self.refresh_remote_live_reply(session_id, true, cx);
             }
@@ -7576,6 +7601,7 @@ impl AverroesApp {
                     .iter_mut()
                     .find(|session| &session.id == session_id)
                 {
+                    apply_context_usage_event(session, &event);
                     session.apply_context_history_event(event);
                 }
                 self.refresh_remote_live_reply(session_id, true, cx);
@@ -18825,7 +18851,7 @@ mod workspace_grouping_tests {
     }
 
     #[test]
-    fn active_context_restore_uses_live_snapshot_and_falls_back_for_legacy_data() {
+    fn active_context_restore_uses_live_snapshot_and_falls_back_only_when_empty() {
         let mut conversation = ShellSession::new(None, SessionBinding::default()).snapshot();
         conversation.active_context = vec![ChatMessage::user("provider context")];
         conversation.active_window_id = "window-2".into();
@@ -18843,11 +18869,11 @@ mod workspace_grouping_tests {
             tool_call_id: None,
             tool_calls: None,
         }];
-        assert!(restorable_active_context(&conversation).is_none());
+        assert!(restorable_active_context(&conversation).is_some());
     }
 
     #[test]
-    fn active_context_is_unusable_when_sanitization_keeps_only_system() {
+    fn active_context_restore_accepts_system_only_rollover_snapshot() {
         let system = ChatMessage {
             role: Role::System,
             content: MessageContent::Text("configured".into()),
@@ -18855,10 +18881,38 @@ mod workspace_grouping_tests {
             tool_calls: None,
         };
 
-        assert!(!active_context_is_usable(&[system]));
+        assert!(active_context_is_usable(&[system]));
         assert!(active_context_is_usable(&[ChatMessage::user(
             "visible fallback"
         )]));
+    }
+
+    #[test]
+    fn context_usage_tracks_reminders_and_resets_for_new_windows() {
+        let mut session = ShellSession::new(None, SessionBinding::default());
+        session.context_usage = ContextUsage::from_usage(70_000, 500, 100_000);
+        let reminder = AgentStreamEvent::ContextReminder {
+            window_id: "window-1".into(),
+            fingerprint: "window-1:90000:1000".into(),
+            remaining_tokens: Some(5_000),
+            rollover_at: 90_000,
+        };
+
+        apply_context_usage_event(&mut session, &reminder);
+
+        assert_eq!(session.context_usage.input_tokens, Some(85_000));
+        assert_eq!(session.context_usage.context_limit, 100_000);
+
+        let rollover = AgentStreamEvent::ContextWindowStarted {
+            previous_window_id: "window-1".into(),
+            window_id: "window-2".into(),
+            reason: "automatic context rollover".into(),
+            handoff: None,
+            automatic: true,
+        };
+        apply_context_usage_event(&mut session, &rollover);
+
+        assert_eq!(session.context_usage, ContextUsage::unknown(100_000));
     }
 
     fn patch_activity(input: &str) -> ToolActivity {
