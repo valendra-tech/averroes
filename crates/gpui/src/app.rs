@@ -5263,13 +5263,20 @@ impl AverroesApp {
         let view = cx.entity();
         window.open_dialog(cx, move |dialog, _window, cx| {
             let state_for_checkbox = private_state.clone();
+            let checkbox_view = view.clone();
             let checkbox = Checkbox::new("new-conversation-private")
                 .checked(private_state.get())
                 .label(i18n::text(cx, "conversation.private"))
-                .on_click(move |checked, _, _| state_for_checkbox.set(*checked));
+                .on_click(move |checked, _, cx| {
+                    state_for_checkbox.set(*checked);
+                    checkbox_view.update(cx, |_, cx| cx.notify());
+                });
             let confirm_view = view.clone();
             let confirm_seed = seed.clone();
             let confirm_state = private_state.clone();
+            let ok_view = view.clone();
+            let ok_seed = seed.clone();
+            let ok_state = private_state.clone();
             let confirm = Button::new("new-conversation-confirm")
                 .primary()
                 .label(i18n::text(cx, "dialog.create"))
@@ -5316,6 +5323,11 @@ impl AverroesApp {
                         .cancel_text(i18n::text(cx, "dialog.cancel"))
                         .show_cancel(true),
                 )
+                .on_ok(move |_, window, cx| {
+                    ok_view.update(cx, |app, cx| {
+                        app.create_session_from_seed(ok_seed.clone(), ok_state.get(), window, cx)
+                    })
+                })
         });
     }
 
@@ -18881,7 +18893,7 @@ mod conversation_creation_tests {
         let messages = vec![ShellMessage::user("inherited context".into())];
         let seed = NewConversationSeed {
             project,
-            binding,
+            binding: binding.clone(),
             messages: messages.clone(),
             title: "Seeded conversation".into(),
             folder_id: Some("folder-1".into()),
@@ -18902,6 +18914,11 @@ mod conversation_creation_tests {
             Some("folder-1")
         );
         assert!(!session.persisted);
+
+        let private_session = seed.session(true);
+        assert_eq!(private_session.binding, binding);
+        assert!(private_session.pending_conversation_folder_id.is_none());
+        assert!(private_session.is_private);
     }
 }
 
