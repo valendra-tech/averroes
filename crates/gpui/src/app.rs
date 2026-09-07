@@ -18481,7 +18481,7 @@ fn render_message_actions(
     cx: &mut Context<AverroesApp>,
 ) -> AnyElement {
     let assistant = message.role == MessageRole::Assistant;
-    let copy_button = if message.text.is_empty() {
+    let copy_button = if message.text.is_empty() && !assistant {
         None
     } else {
         let copy_text = message.text.clone();
@@ -18491,6 +18491,7 @@ fn render_message_actions(
                 .small()
                 .icon(IconName::Copy)
                 .tooltip(i18n::text(cx, "chat.copy_message"))
+                .disabled(copy_text.is_empty())
                 .on_click(move |_, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
                 })
