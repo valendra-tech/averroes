@@ -9,8 +9,11 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 pub(super) fn load_documents(
     connection: &Connection,
 ) -> Result<Vec<super::ConversationDocument>, WorkDatabaseError> {
-    let mut statement = connection
-        .prepare("SELECT id, context_summary FROM conversations ORDER BY updated_at DESC")?;
+    let mut statement = connection.prepare(
+        "SELECT id, context_summary FROM conversations
+             WHERE is_private = 0
+             ORDER BY updated_at DESC",
+    )?;
     let ids = statement
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
@@ -25,7 +28,8 @@ pub(super) fn load_pending_documents(
 ) -> Result<Vec<super::ConversationDocument>, WorkDatabaseError> {
     let mut statement = connection.prepare(
         "SELECT c.id, c.context_summary FROM conversations c
-         WHERE NOT EXISTS (
+         WHERE c.is_private = 0
+           AND NOT EXISTS (
              SELECT 1 FROM conversation_embeddings e
              WHERE e.conversation_id = c.id
                AND e.connection_id = ?1
@@ -54,7 +58,8 @@ pub(super) fn pending_document_count(
 ) -> Result<usize, WorkDatabaseError> {
     Ok(connection.query_row(
         "SELECT COUNT(*) FROM conversations c
-         WHERE NOT EXISTS (
+         WHERE c.is_private = 0
+           AND NOT EXISTS (
              SELECT 1 FROM conversation_embeddings e
              WHERE e.conversation_id = c.id
                AND e.connection_id = ?1
@@ -157,7 +162,9 @@ pub(super) fn load_fragments(
                 e.text, e.content_hash, e.connection_id, e.embedding
          FROM conversation_embeddings e
          JOIN conversations c ON c.id = e.conversation_id
-         WHERE e.connection_id = ?1 AND e.model_id = ?2
+         WHERE c.is_private = 0
+           AND e.connection_id = ?1
+           AND e.model_id = ?2
          ORDER BY c.updated_at DESC, e.message_position, e.chunk_index",
     )?;
     let rows = statement.query_map(params![connection_id, model_id], |row| {
@@ -181,20 +188,29 @@ const VECTOR_TABLE: &str = "conversation_vectors";
 
 pub(super) fn purge_private_vectors(
     transaction: &Transaction<'_>,
+    vector_extension_available: bool,
 ) -> Result<(), WorkDatabaseError> {
-    let table_exists = transaction
+    let table_sql = transaction
         .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
             params![VECTOR_TABLE],
-            |row| row.get::<_, i64>(0),
+            |row| row.get::<_, Option<String>>(0),
         )
         .optional()?
-        .is_some();
-    if !table_exists {
+        .flatten();
+    let Some(table_sql) = table_sql else {
+        return Ok(());
+    };
+    let is_virtual_table = table_sql.to_ascii_uppercase().contains("VIRTUAL TABLE");
+    if is_virtual_table && !vector_extension_available {
+        tracing::warn!(
+            table = VECTOR_TABLE,
+            "sqlite-vector-rs unavailable; leaving the virtual vector table untouched during private purge"
+        );
         return Ok(());
     }
 
-    transaction.execute(
+    let result = transaction.execute(
         &format!(
             "DELETE FROM \"{VECTOR_TABLE}\"
              WHERE conversation_id IN (
@@ -202,8 +218,19 @@ pub(super) fn purge_private_vectors(
              )"
         ),
         [],
-    )?;
-    Ok(())
+    );
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if is_virtual_table && !vector_extension_available => {
+            tracing::warn!(
+                table = VECTOR_TABLE,
+                error = %error,
+                "sqlite-vector-rs unavailable; leaving the virtual vector table untouched during private purge"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub(super) fn rebuild_vector_table(
@@ -297,7 +324,8 @@ pub(super) fn vector_search(
           AND e.content_hash = v.content_hash
           AND e.connection_id = v.connection_id
           AND e.model_id = v.model_id
-         WHERE knn_match(v.distance, vector_from_json(?1, 'float4'))
+         WHERE c.is_private = 0
+           AND knn_match(v.distance, vector_from_json(?1, 'float4'))
            AND v.connection_id = ?2
            AND v.model_id = ?3
          ORDER BY v.distance ASC
@@ -344,13 +372,14 @@ pub(super) fn text_search(
                     c.title
                 )
          FROM conversations c
-         WHERE c.title LIKE ?1 COLLATE NOCASE ESCAPE '\\'
-            OR EXISTS (SELECT 1 FROM messages m
-                      WHERE m.conversation_id = c.id
-                        AND m.text LIKE ?1 COLLATE NOCASE ESCAPE '\\')
-            OR EXISTS (SELECT 1 FROM conversation_embeddings e
-                      WHERE e.conversation_id = c.id
-                        AND e.text LIKE ?1 COLLATE NOCASE ESCAPE '\\')
+         WHERE c.is_private = 0
+           AND (c.title LIKE ?1 COLLATE NOCASE ESCAPE '\\'
+             OR EXISTS (SELECT 1 FROM messages m
+                       WHERE m.conversation_id = c.id
+                         AND m.text LIKE ?1 COLLATE NOCASE ESCAPE '\\')
+             OR EXISTS (SELECT 1 FROM conversation_embeddings e
+                       WHERE e.conversation_id = c.id
+                         AND e.text LIKE ?1 COLLATE NOCASE ESCAPE '\\'))
          ORDER BY c.updated_at DESC,
                   COALESCE((SELECT MAX(m.id) FROM messages m
                             WHERE m.conversation_id = c.id), 0) DESC,
@@ -385,21 +414,30 @@ pub(super) fn status(
     connection: &Connection,
     config: Option<EmbeddingConfig>,
 ) -> Result<EmbeddingIndexStatus, WorkDatabaseError> {
-    let total_conversations =
-        connection.query_row("SELECT COUNT(*) FROM conversations", [], |row| {
-            row.get::<_, i64>(0)
-        })? as usize;
+    let total_conversations = connection.query_row(
+        "SELECT COUNT(*) FROM conversations WHERE is_private = 0",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? as usize;
     let (indexed_conversations, indexed_fragments) = match config.as_ref() {
         Some(config) => (
             connection.query_row(
-                "SELECT COUNT(DISTINCT conversation_id) FROM conversation_embeddings
-                 WHERE connection_id = ?1 AND model_id = ?2",
+                "SELECT COUNT(DISTINCT e.conversation_id)
+                 FROM conversation_embeddings e
+                 JOIN conversations c ON c.id = e.conversation_id
+                 WHERE c.is_private = 0
+                   AND e.connection_id = ?1
+                   AND e.model_id = ?2",
                 params![&config.connection_id.0, config.model_id],
                 |row| row.get::<_, i64>(0),
             )? as usize,
             connection.query_row(
-                "SELECT COUNT(*) FROM conversation_embeddings
-                 WHERE connection_id = ?1 AND model_id = ?2",
+                "SELECT COUNT(*)
+                 FROM conversation_embeddings e
+                 JOIN conversations c ON c.id = e.conversation_id
+                 WHERE c.is_private = 0
+                   AND e.connection_id = ?1
+                   AND e.model_id = ?2",
                 params![&config.connection_id.0, config.model_id],
                 |row| row.get::<_, i64>(0),
             )? as usize,

@@ -276,7 +276,9 @@ impl WorkDatabase {
             "SELECT members.conversation_id, members.folder_id
              FROM conversation_folder_members members
              JOIN conversation_folders folders ON folders.id = members.folder_id
-             WHERE folders.workspace_id = ?1",
+             JOIN conversations ON conversations.id = members.conversation_id
+             WHERE folders.workspace_id = ?1
+               AND conversations.is_private = 0",
         )?;
         let rows = statement.query_map(params![workspace_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -335,7 +337,9 @@ impl WorkDatabase {
                          SELECT 1 FROM conversations conversations
                          JOIN conversation_folders folders
                            ON folders.workspace_id = conversations.project_id
-                         WHERE conversations.id = ?1 AND folders.id = ?2
+                         WHERE conversations.id = ?1
+                           AND conversations.is_private = 0
+                           AND folders.id = ?2
                      )",
                     params![conversation_id, folder_id],
                     |row| row.get::<_, i64>(0),
@@ -485,7 +489,7 @@ impl WorkDatabase {
     pub fn purge_private_conversations(&self) -> Result<usize, WorkDatabaseError> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction()?;
-        index::purge_private_vectors(&transaction)?;
+        index::purge_private_vectors(&transaction, self.vector_extension_available)?;
         let deleted = transaction.execute("DELETE FROM conversations WHERE is_private = 1", [])?;
         transaction.commit()?;
         Ok(deleted)
@@ -1692,6 +1696,21 @@ mod tests {
         conversation
     }
 
+    fn conversation_with_message(id: &str, title: &str, text: &str) -> WorkConversation {
+        let mut conversation = test_conversation(id);
+        conversation.title = title.into();
+        conversation.messages = vec![WorkMessage {
+            role: WorkMessageRole::User,
+            text: text.into(),
+            reasoning: String::new(),
+            reasoning_complete: true,
+            reasoning_expanded: false,
+            tool_activities: Vec::new(),
+            expanded_tool_groups: Vec::new(),
+        }];
+        conversation
+    }
+
     #[test]
     fn private_conversations_round_trip_but_stay_out_of_summaries() {
         let (_directory, database) = database();
@@ -1817,6 +1836,74 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(rows, vec![("public".into(), "public-vector".into())]);
+    }
+
+    #[test]
+    fn purging_private_conversations_skips_virtual_vectors_without_the_extension() {
+        let (_directory, database) = database();
+        database
+            .save_conversation(&test_conversation("public"))
+            .unwrap();
+        database
+            .save_conversation(&private_test_conversation("private"))
+            .unwrap();
+
+        {
+            let connection = database.connection.lock();
+            connection
+                .execute_batch(
+                    "CREATE VIRTUAL TABLE conversation_vectors USING fts5(
+                        conversation_id,
+                        payload
+                    )",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO conversation_vectors (conversation_id, payload)
+                     VALUES (?1, ?2), (?3, ?4)",
+                    params!["public", "public-vector", "private", "private-vector"],
+                )
+                .unwrap();
+        }
+
+        let mut connection = database.connection.lock();
+        let transaction = connection.transaction().unwrap();
+        index::purge_private_vectors(&transaction, false).unwrap();
+        assert_eq!(
+            transaction
+                .execute("DELETE FROM conversations WHERE is_private = 1", [])
+                .unwrap(),
+            1
+        );
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let connection = database.connection.lock();
+        let rows = connection
+            .prepare(
+                "SELECT conversation_id, payload
+                 FROM conversation_vectors
+                 WHERE conversation_id IN ('public', 'private')
+                 ORDER BY conversation_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("private".into(), "private-vector".into()),
+                ("public".into(), "public-vector".into()),
+            ]
+        );
+        drop(connection);
+        assert!(database.conversation("private").unwrap().is_none());
+        assert!(database.conversation("public").unwrap().is_some());
     }
 
     #[test]
@@ -2359,6 +2446,75 @@ mod tests {
             .conversation_folder_ids(&first.id)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn private_conversations_are_excluded_from_folders_search_and_embedding_documents() {
+        let (_directory, database) = database();
+        let workspace_root = _directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = database.open_project(&workspace_root).unwrap();
+
+        let mut public =
+            conversation_with_message("public-secret", "Public secret", "public secret message");
+        public.project_id = Some(workspace.id.clone());
+        database.save_conversation(&public).unwrap();
+
+        let mut private =
+            conversation_with_message("private-secret", "Private secret", "private secret message");
+        private.is_private = true;
+        private.project_id = Some(workspace.id.clone());
+        database.save_conversation(&private).unwrap();
+
+        let public_folder = database
+            .create_conversation_folder(&workspace.id, "Visible")
+            .unwrap();
+        database
+            .set_conversation_folder("public-secret", Some(&public_folder.id))
+            .unwrap();
+        assert!(database
+            .set_conversation_folder("private-secret", Some(&public_folder.id))
+            .is_err());
+        assert_eq!(
+            database.conversation_folder_ids(&workspace.id).unwrap(),
+            HashMap::from([(String::from("public-secret"), public_folder.id.clone())])
+        );
+
+        let text_ids = database
+            .search_conversations_text("secret", 20)
+            .unwrap()
+            .into_iter()
+            .map(|result| result.conversation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(text_ids, vec!["public-secret"]);
+
+        assert_eq!(
+            database
+                .conversation_documents()
+                .unwrap()
+                .into_iter()
+                .map(|document| document.id)
+                .collect::<Vec<_>>(),
+            vec!["public-secret"]
+        );
+
+        let embedding_config = EmbeddingConfig {
+            connection_id: ConnectionId("openai".into()),
+            model_id: "text-embedding-test".into(),
+        };
+        assert_eq!(
+            database
+                .pending_conversation_documents(&embedding_config)
+                .unwrap()
+                .into_iter()
+                .map(|document| document.id)
+                .collect::<Vec<_>>(),
+            vec!["public-secret"]
+        );
+        assert_eq!(
+            database.pending_embedding_count(&embedding_config).unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -2949,6 +3105,13 @@ mod tests {
             history_entries: Vec::new(),
         };
         database.save_conversation(&conversation).unwrap();
+        let mut private = conversation_with_message(
+            "private-indexed",
+            "Private indexed conversation",
+            "Private indexed decision",
+        );
+        private.is_private = true;
+        database.save_conversation(&private).unwrap();
         let embedding_config = EmbeddingConfig {
             connection_id: ConnectionId("openai".into()),
             model_id: "text-embedding-test".into(),
@@ -2969,9 +3132,34 @@ mod tests {
                 &[vec![1.0, 0.0]],
             )
             .unwrap();
+        let private_fragments = vec![crate::memory::ConversationFragment {
+            message_position: 0,
+            chunk_index: 0,
+            text: "User: Private indexed decision".into(),
+            content_hash: crate::memory::content_hash("User: Private indexed decision"),
+        }];
+        database
+            .replace_conversation_embeddings(
+                "private-indexed",
+                &ConnectionId("openai".into()),
+                "text-embedding-test",
+                &private_fragments,
+                &[vec![0.0, 1.0]],
+            )
+            .unwrap();
         let status = database.embedding_index_status().unwrap();
+        assert_eq!(status.total_conversations, 1);
         assert_eq!(status.indexed_conversations, 1);
         assert_eq!(status.indexed_fragments, 1);
+        assert_eq!(
+            database
+                .indexed_fragments(&ConnectionId("openai".into()), "text-embedding-test")
+                .unwrap()
+                .into_iter()
+                .map(|fragment| fragment.conversation_id)
+                .collect::<Vec<_>>(),
+            vec!["indexed"]
+        );
         if database.vector_index_available() {
             assert_eq!(database.rebuild_vector_index(&embedding_config).unwrap(), 1);
             let hits = database
