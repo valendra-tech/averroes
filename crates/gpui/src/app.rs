@@ -290,6 +290,14 @@ struct ToolActivity {
     inside_reasoning: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContextActivitySpec {
+    name: &'static str,
+    title_key: &'static str,
+    summary_key: &'static str,
+    remaining_tokens: Option<u64>,
+}
+
 #[derive(Clone)]
 struct ShellMessage {
     role: MessageRole,
@@ -1162,6 +1170,10 @@ impl ShellSession {
         snapshot
     }
 
+    fn stream_recovery_snapshot(&self) -> WorkConversation {
+        self.snapshot()
+    }
+
     fn apply_context_history_event(&mut self, event: AgentStreamEvent) {
         match event {
             AgentStreamEvent::ContextSnapshot {
@@ -1192,6 +1204,80 @@ fn active_context_is_usable(messages: &[ChatMessage]) -> bool {
     messages
         .iter()
         .any(|message| matches!(message.role, Role::User | Role::Assistant | Role::Tool))
+}
+
+fn restorable_active_context(conversation: &WorkConversation) -> Option<(&[ChatMessage], &str)> {
+    active_context_is_usable(&conversation.active_context).then_some((
+        conversation.active_context.as_slice(),
+        conversation.active_window_id.as_str(),
+    ))
+}
+
+fn context_activity_spec(event: &AgentStreamEvent) -> Option<ContextActivitySpec> {
+    match event {
+        AgentStreamEvent::ContextReminder {
+            remaining_tokens, ..
+        } => Some(ContextActivitySpec {
+            name: "context_reminder",
+            title_key: "tool.context_reminder",
+            summary_key: "tool.context_reminder_summary",
+            remaining_tokens: *remaining_tokens,
+        }),
+        AgentStreamEvent::ContextWindowStarted { automatic, .. } => Some(ContextActivitySpec {
+            name: "context_window",
+            title_key: "tool.context_window",
+            summary_key: if *automatic {
+                "tool.context_window_automatic"
+            } else {
+                "tool.context_window_started"
+            },
+            remaining_tokens: None,
+        }),
+        _ => None,
+    }
+}
+
+fn context_activity_from_event(
+    cx: &App,
+    event: &AgentStreamEvent,
+    text_offset: usize,
+) -> Option<ToolActivity> {
+    let spec = context_activity_spec(event)?;
+    let summary = if spec.name == "context_reminder" {
+        i18n::format(
+            cx,
+            spec.summary_key,
+            &[("remaining", format_context_tokens(spec.remaining_tokens))],
+        )
+    } else {
+        i18n::text(cx, spec.summary_key).to_string()
+    };
+    Some(ToolActivity {
+        call_id: None,
+        name: spec.name.into(),
+        text_offset,
+        group_id: None,
+        input: String::new(),
+        summary,
+        output: String::new(),
+        state: ToolActivityState::Completed,
+        started_at: Instant::now(),
+        duration_ms: Some(0),
+        expanded: false,
+        inside_reasoning: false,
+    })
+}
+
+fn append_context_activity_to_message(
+    message: &mut ShellMessage,
+    event: &AgentStreamEvent,
+    cx: &App,
+) {
+    let Some(mut activity) = context_activity_from_event(cx, event, message.text.len()) else {
+        return;
+    };
+    activity.group_id = message.assign_tool_group(false);
+    message.push_tool_activity(activity);
 }
 
 #[derive(Clone)]
@@ -4565,7 +4651,12 @@ impl AverroesApp {
     /// Keep an in-flight transcript recoverable without writing every small
     /// text delta to SQLite. Lifecycle events are durable immediately; plain
     /// text and reasoning are checkpointed at most once per second.
-    fn persist_stream_recovery_checkpoint(&mut self, id: &SessionId, force: bool) {
+    fn persist_stream_recovery_checkpoint(
+        &mut self,
+        id: &SessionId,
+        force: bool,
+        preserve_live_context: bool,
+    ) {
         let checkpoint_at = Instant::now();
         if !force
             && self
@@ -4583,7 +4674,11 @@ impl AverroesApp {
         let Some(index) = self.sessions.iter().position(|session| &session.id == id) else {
             return;
         };
-        let snapshot = self.sessions[index].persistence_snapshot();
+        let snapshot = if preserve_live_context {
+            self.sessions[index].stream_recovery_snapshot()
+        } else {
+            self.sessions[index].persistence_snapshot()
+        };
         match self.runtime.database.save_conversation(&snapshot) {
             Ok(()) => self.sessions[index].persisted = true,
             Err(error) => diagnostics::record(
@@ -6492,6 +6587,28 @@ impl AverroesApp {
         }
     }
 
+    fn append_context_activity(
+        &mut self,
+        session_id: &SessionId,
+        event: &AgentStreamEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| &session.id == session_id)
+        {
+            if let Some(message) = session
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|message| message.role == MessageRole::Assistant)
+            {
+                append_context_activity_to_message(message, event, cx);
+            }
+        }
+    }
+
     fn record_web_sources(
         &mut self,
         session_id: &SessionId,
@@ -7090,9 +7207,11 @@ impl AverroesApp {
                         }
                     }
                     AgentStreamEvent::ContextUpdated { .. } => {}
-                    AgentStreamEvent::ContextReminder { .. } => {}
-                    AgentStreamEvent::ContextWindowStarted { .. }
-                    | AgentStreamEvent::ContextSnapshot { .. }
+                    event @ AgentStreamEvent::ContextReminder { .. }
+                    | event @ AgentStreamEvent::ContextWindowStarted { .. } => {
+                        append_context_activity_to_message(message, &event, cx);
+                    }
+                    AgentStreamEvent::ContextSnapshot { .. }
                     | AgentStreamEvent::HistoryEntryAppended { .. } => {}
                     AgentStreamEvent::DelegatedAgentStarted { .. }
                     | AgentStreamEvent::DelegatedAgentEvent { .. } => unreachable!(),
@@ -7446,9 +7565,22 @@ impl AverroesApp {
                 }
                 self.refresh_remote_live_reply(session_id, true, cx);
             }
-            AgentStreamEvent::ContextReminder { .. } => {}
-            event @ (AgentStreamEvent::ContextWindowStarted { .. }
-            | AgentStreamEvent::ContextSnapshot { .. }
+            event @ AgentStreamEvent::ContextReminder { .. } => {
+                self.append_context_activity(session_id, &event, cx);
+                self.refresh_remote_live_reply(session_id, true, cx);
+            }
+            event @ AgentStreamEvent::ContextWindowStarted { .. } => {
+                self.append_context_activity(session_id, &event, cx);
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| &session.id == session_id)
+                {
+                    session.apply_context_history_event(event);
+                }
+                self.refresh_remote_live_reply(session_id, true, cx);
+            }
+            event @ (AgentStreamEvent::ContextSnapshot { .. }
             | AgentStreamEvent::HistoryEntryAppended { .. }) => {
                 if let Some(session) = self
                     .sessions
@@ -8875,18 +9007,13 @@ impl AverroesApp {
                             )
                             .await?;
                         if let Some(conversation) = persisted_conversation {
-                            if conversation.active_context.is_empty() {
-                                agent.restore_conversation_history(agent_history).await;
+                            if let Some((active_context, active_window_id)) =
+                                restorable_active_context(&conversation)
+                            {
+                                agent.restore_active_context(active_context.to_vec()).await;
+                                agent.set_active_window_id(active_window_id);
                             } else {
-                                agent
-                                    .restore_active_context(conversation.active_context)
-                                    .await;
-                                if active_context_is_usable(&agent.active_context_snapshot().await)
-                                {
-                                    agent.set_active_window_id(conversation.active_window_id);
-                                } else {
-                                    agent.restore_conversation_history(agent_history).await;
-                                }
+                                agent.restore_conversation_history(agent_history).await;
                             }
                         } else {
                             agent.restore_conversation_history(agent_history).await;
@@ -9024,12 +9151,16 @@ impl AverroesApp {
                 _ = this.update(cx, |app, cx| {
                     let force_recovery_checkpoint =
                         events.iter().any(stream_event_requires_immediate_flush);
+                    let preserve_live_context = events
+                        .iter()
+                        .any(|event| matches!(event, AgentStreamEvent::ContextSnapshot { .. }));
                     for event in events {
                         app.apply_agent_stream_event(&stream_session_id, event, cx);
                     }
                     app.persist_stream_recovery_checkpoint(
                         &stream_session_id,
                         force_recovery_checkpoint,
+                        preserve_live_context,
                     );
                     cx.notify();
                 });
@@ -15627,6 +15758,8 @@ fn localized_tool_display_name(cx: &App, name: &str) -> SharedString {
         "list_agents" => Some("tool.list_agents"),
         "call_agents" | "call_agent" => Some("tool.call_agent"),
         "compact_conversation" => Some("tool.compact_conversation"),
+        "context_reminder" => Some("tool.context_reminder"),
+        "context_window" => Some("tool.context_window"),
         _ => None,
     };
     key.map(|key| i18n::text(cx, key))
@@ -18608,6 +18741,109 @@ mod workspace_grouping_tests {
         assert!(persisted.active_context.is_empty());
         assert_eq!(persisted.active_window_id, "initial");
         assert!(persisted.history_entries.is_empty());
+    }
+
+    #[test]
+    fn stream_recovery_snapshot_keeps_live_context_and_visible_transcript() {
+        let mut session = ShellSession::new(None, SessionBinding::default());
+        let mut assistant = ShellMessage::assistant();
+        assistant.append_text("visible answer");
+        session.messages = vec![ShellMessage::user("visible question".into()), assistant];
+        session.apply_context_history_event(AgentStreamEvent::ContextSnapshot {
+            window_id: "agent-window".into(),
+            messages: vec![ChatMessage::user("agent context")],
+        });
+        session.apply_context_history_event(AgentStreamEvent::HistoryEntryAppended {
+            entry: WorkHistoryEntry::user("agent-window", "entry-1", "history"),
+        });
+
+        let checkpoint = session.stream_recovery_snapshot();
+
+        assert_eq!(checkpoint.active_context, session.active_context);
+        assert_eq!(checkpoint.active_window_id, "agent-window");
+        assert_eq!(checkpoint.history_entries, session.history_entries);
+        assert_eq!(checkpoint.messages[1].text, "visible answer");
+    }
+
+    #[test]
+    fn context_lifecycle_activity_specs_are_localizable_without_provider_payload() {
+        let reminder = AgentStreamEvent::ContextReminder {
+            window_id: "window-1".into(),
+            fingerprint: "secret-fingerprint".into(),
+            remaining_tokens: Some(42),
+            rollover_at: 100,
+        };
+        let automatic_rollover = AgentStreamEvent::ContextWindowStarted {
+            previous_window_id: "window-1".into(),
+            window_id: "window-2".into(),
+            reason: "automatic context rollover".into(),
+            handoff: Some("private handoff".into()),
+            automatic: true,
+        };
+        let snapshot = AgentStreamEvent::ContextSnapshot {
+            window_id: "window-2".into(),
+            messages: vec![ChatMessage::user("provider context")],
+        };
+
+        let reminder_spec = context_activity_spec(&reminder).expect("reminder activity");
+        assert_eq!(reminder_spec.name, "context_reminder");
+        assert_eq!(reminder_spec.title_key, "tool.context_reminder");
+        assert_eq!(reminder_spec.summary_key, "tool.context_reminder_summary");
+        assert_eq!(reminder_spec.remaining_tokens, Some(42));
+
+        let rollover_spec = context_activity_spec(&automatic_rollover).expect("rollover activity");
+        assert_eq!(rollover_spec.name, "context_window");
+        assert_eq!(rollover_spec.title_key, "tool.context_window");
+        assert_eq!(rollover_spec.summary_key, "tool.context_window_automatic");
+        assert_eq!(rollover_spec.remaining_tokens, None);
+        assert!(context_activity_spec(&snapshot).is_none());
+    }
+
+    #[test]
+    fn context_activity_locale_keys_exist_in_english_and_spanish() {
+        let expected = [
+            "tool.context_reminder",
+            "tool.context_reminder_summary",
+            "tool.context_window",
+            "tool.context_window_started",
+            "tool.context_window_automatic",
+        ];
+        let catalogs = [
+            include_str!("../locales/en.json"),
+            include_str!("../locales/es.json"),
+        ];
+
+        for catalog in catalogs {
+            let messages = serde_json::from_str::<HashMap<String, String>>(catalog).unwrap();
+            for key in expected {
+                assert!(
+                    messages.get(key).is_some_and(|value| !value.is_empty()),
+                    "{key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn active_context_restore_uses_live_snapshot_and_falls_back_for_legacy_data() {
+        let mut conversation = ShellSession::new(None, SessionBinding::default()).snapshot();
+        conversation.active_context = vec![ChatMessage::user("provider context")];
+        conversation.active_window_id = "window-2".into();
+
+        let (messages, window_id) = restorable_active_context(&conversation).expect("live context");
+        assert_eq!(messages, conversation.active_context.as_slice());
+        assert_eq!(window_id, "window-2");
+
+        conversation.active_context.clear();
+        assert!(restorable_active_context(&conversation).is_none());
+
+        conversation.active_context = vec![ChatMessage {
+            role: Role::System,
+            content: MessageContent::Text("system only".into()),
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+        assert!(restorable_active_context(&conversation).is_none());
     }
 
     #[test]
