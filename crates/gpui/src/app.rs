@@ -11229,7 +11229,7 @@ impl AverroesApp {
                     .flex()
                     .items_center()
                     .gap(px(5.0))
-                    .rounded(px(6.0))
+                    .rounded(px(metrics.attachment_radius))
                     .bg(theme.surface_subtle)
                     .text_size(px(11.0))
                     .child(Icon::new(IconName::File).size(px(13.0)))
@@ -11253,7 +11253,7 @@ impl AverroesApp {
         // request is running, so keep the button interactive.
         let send_button = Button::new(if compact { "send-new" } else { "send-open" })
             .primary()
-            .with_size(px(28.0))
+            .with_size(px(metrics.send_size))
             .rounded(px(14.0))
             .tooltip(if session.processing {
                 i18n::text(cx, "composer.stop")
@@ -11274,7 +11274,7 @@ impl AverroesApp {
             send_button
                 // A custom stop glyph avoids the double ring produced by a
                 // CircleX icon inside an already circular button.
-                .size(px(28.0))
+                .size(px(metrics.send_size))
                 .p_0()
                 .child(
                     div()
@@ -11378,12 +11378,12 @@ impl AverroesApp {
             )
             .child(
                 div()
-                    .h(px(40.0))
-                    .px(px(9.0))
-                    .pb(px(8.0))
+                    .h(px(metrics.footer_height))
+                    .px(px(metrics.footer_horizontal_padding))
+                    .pb(px(metrics.footer_bottom_padding))
                     .flex()
                     .items_center()
-                    .gap(px(3.0))
+                    .gap(px(metrics.control_gap))
                     .text_size(px(12.0))
                     .text_color(theme.faint)
                     .child(
@@ -11394,6 +11394,7 @@ impl AverroesApp {
                         })
                         .ghost()
                         .with_size(px(28.0))
+                        .mr(px(3.0))
                         .icon(IconName::Plus)
                         .tooltip(i18n::text(cx, "composer.attach_files"))
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -11452,7 +11453,9 @@ impl AverroesApp {
                                     .search_placeholder(i18n::text(cx, "composer.search_security")),
                             ),
                     )
-                    .when_some(private_selector, |footer, selector| footer.child(selector))
+                    .when_some(private_selector, |footer, selector| {
+                        footer.child(div().ml(px(6.0)).flex_none().child(selector))
+                    })
                     .child(div().flex_1())
                     .when_some(token_rate_indicator, |footer, indicator| {
                         footer.child(indicator)
