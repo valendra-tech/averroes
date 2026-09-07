@@ -12362,6 +12362,7 @@ impl AverroesApp {
         let patch_count = patch_history.len().to_string();
 
         if is_empty {
+            let empty_metrics = composer_metrics(true);
             return div()
                 .flex()
                 .flex_col()
@@ -12376,16 +12377,20 @@ impl AverroesApp {
                             .flex()
                             .flex_col()
                             .items_center()
-                            .gap(px(26.0))
+                            .gap(px(empty_metrics.empty_composer_gap))
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
                                     .items_center()
-                                    .gap(px(12.0))
-                                    .child(img(brand_asset).size(px(112.0)).flex_none())
-                                    .text_size(px(27.0))
-                                    .font_weight(FontWeight::NORMAL)
+                                    .gap(px(empty_metrics.empty_brand_gap))
+                                    .child(
+                                        img(brand_asset)
+                                            .size(px(empty_metrics.empty_logo_size))
+                                            .flex_none(),
+                                    )
+                                    .text_size(px(empty_metrics.empty_title_size))
+                                    .font_weight(FontWeight::MEDIUM)
                                     .child(i18n::text(cx, "chat.ready")),
                             )
                             .child(self.render_composer_stack(true, cx)),
