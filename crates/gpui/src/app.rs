@@ -350,6 +350,7 @@ struct ComposerMetrics {
     model_width: f32,
     reasoning_width: f32,
     security_width: f32,
+    privacy_icon_size: f32,
 }
 
 fn composer_metrics(compact: bool) -> ComposerMetrics {
@@ -371,6 +372,7 @@ fn composer_metrics(compact: bool) -> ComposerMetrics {
         model_width: if compact { 132.0 } else { 148.0 },
         reasoning_width: if compact { 60.0 } else { 68.0 },
         security_width: if compact { 94.0 } else { 108.0 },
+        privacy_icon_size: 16.0,
     }
 }
 
@@ -11338,7 +11340,15 @@ impl AverroesApp {
                 .small()
                 .with_size(px(28.0))
                 .selected(is_private)
-                .icon(private_conversation_icon(is_private))
+                .child(
+                    Icon::new(private_conversation_icon(is_private))
+                        .size(px(metrics.privacy_icon_size))
+                        .text_color(if is_private {
+                            theme.foreground
+                        } else {
+                            theme.muted
+                        }),
+                )
                 .tooltip(i18n::text(cx, "conversation.private"))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.active().id == session_id
@@ -16433,6 +16443,7 @@ mod composer_visual_tests {
         assert_eq!(metrics.model_width, 132.0);
         assert_eq!(metrics.reasoning_width, 60.0);
         assert_eq!(metrics.security_width, 94.0);
+        assert_eq!(metrics.privacy_icon_size, 16.0);
     }
 
     #[test]
