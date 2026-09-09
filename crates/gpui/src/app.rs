@@ -49,9 +49,10 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     div, img, list, px, Anchor, Animation, AnimationExt as _, AnyElement, App, AppContext,
     ClipboardItem, Context, Entity, ExternalPaths, FollowMode, FontWeight, FutureExt as _,
-    InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription,
-    SystemNotification, Task, Transformation, Window, WindowBounds,
+    HighlightStyle, InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled,
+    StyledImage, StyledText, Subscription, SystemNotification, Task, Transformation, Window,
+    WindowBounds,
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::dialog::DialogButtonProps;
@@ -1537,6 +1538,7 @@ pub struct AverroesApp {
     conversation_folders: Vec<WorkConversationFolder>,
     conversation_folder_ids: HashMap<String, String>,
     expanded_conversation_folders: HashSet<String>,
+    collapsed_task_panels: HashSet<String>,
     folder_name_input: Entity<InputState>,
     /// The workspace whose conversations are currently shown. `None` is the
     /// welcome screen; a chat session always has a concrete workspace.
@@ -2328,6 +2330,7 @@ impl AverroesApp {
             conversation_folders: Vec::new(),
             conversation_folder_ids: HashMap::new(),
             expanded_conversation_folders: HashSet::new(),
+            collapsed_task_panels: HashSet::new(),
             folder_name_input,
             active_workspace_id,
             projects_expanded: true,
@@ -8808,6 +8811,14 @@ impl AverroesApp {
         cx.notify();
     }
 
+    fn toggle_task_progress_panel(&mut self, session_id: &SessionId, cx: &mut Context<Self>) {
+        let key = session_id.to_string();
+        if !self.collapsed_task_panels.remove(&key) {
+            self.collapsed_task_panels.insert(key);
+        }
+        cx.notify();
+    }
+
     fn select_agent_thread(&mut self, thread_id: String, cx: &mut Context<Self>) {
         self.open_agent_thread(thread_id, cx);
     }
@@ -10213,13 +10224,213 @@ impl AverroesApp {
             .into_any_element()
     }
 
-    fn render_composer_stack(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_task_progress_panel(
+        &self,
+        tasks: &[WorkTask],
+        session_id: &SessionId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let (completed, total) = task_progress_counts(tasks);
+        let collapsed = self.collapsed_task_panels.contains(session_id.as_str());
+        let session_key = session_id.to_string();
+        let header_id = SharedString::from(format!("task-progress-header-{session_key}"));
+        let toggle_id = SharedString::from(format!("task-progress-toggle-{session_key}"));
+        let progress = i18n::format(
+            cx,
+            "chat.task_progress",
+            &[
+                ("completed", completed.to_string()),
+                ("total", total.to_string()),
+            ],
+        );
+        let toggle_tooltip = if collapsed {
+            i18n::text(cx, "chat.tasks_expand")
+        } else {
+            i18n::text(cx, "chat.tasks_collapse")
+        };
+
+        let header_session_id = session_id.clone();
+        let toggle_session_id = session_id.clone();
+        let header = div()
+            .id(header_id)
+            .w_full()
+            .px(px(10.0))
+            .py(px(6.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.surface_hover))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .child(progress),
+            )
+            .child(
+                Button::new(toggle_id)
+                    .ghost()
+                    .small()
+                    .icon(if collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .tooltip(toggle_tooltip)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_task_progress_panel(&toggle_session_id, cx);
+                    })),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_task_progress_panel(&header_session_id, cx);
+            }));
+
+        let rows = tasks
+            .iter()
+            .map(|task| {
+                let status = task.status;
+                let title = task.title.clone();
+                let task_id = task.id.clone();
+                let mut tooltip = format!("{} [{}]", title, task.priority.as_str());
+                if let Some(description) = &task.description {
+                    tooltip.push('\n');
+                    tooltip.push_str(description);
+                }
+                let color = match status {
+                    TaskStatus::Done => theme.success,
+                    TaskStatus::InProgress => theme.warning,
+                    TaskStatus::Blocked => theme.destructive,
+                    TaskStatus::Cancelled | TaskStatus::Pending => theme.faint,
+                };
+                let icon = match task_progress_icon(status) {
+                    TaskProgressIcon::Check => Icon::new(IconName::Check)
+                        .size(px(14.0))
+                        .text_color(color)
+                        .into_any_element(),
+                    TaskProgressIcon::Loader => Icon::new(IconName::Loader)
+                        .size(px(14.0))
+                        .text_color(color)
+                        .with_animation(
+                            format!("task-progress-spinner-{session_key}-{task_id}"),
+                            Animation::new(Duration::from_millis(800)).repeat(),
+                            |icon, delta| {
+                                icon.transform(Transformation::rotate(gpui::percentage(delta)))
+                            },
+                        )
+                        .into_any_element(),
+                    TaskProgressIcon::Circle => div()
+                        .flex_none()
+                        .size(px(14.0))
+                        .border_1()
+                        .border_color(color)
+                        .rounded_full()
+                        .into_any_element(),
+                    TaskProgressIcon::CircleX => Icon::new(IconName::CircleX)
+                        .size(px(14.0))
+                        .text_color(color)
+                        .into_any_element(),
+                };
+                let title = if status == TaskStatus::Done {
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(12.0))
+                        .child(StyledText::new(title.clone()).with_highlights([(
+                            0..title.len(),
+                            HighlightStyle {
+                                color: Some(theme.faint.into()),
+                                strikethrough: Some(StrikethroughStyle {
+                                    thickness: px(1.0),
+                                    color: Some(theme.faint.into()),
+                                }),
+                                ..Default::default()
+                            },
+                        )]))
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(12.0))
+                        .text_color(color)
+                        .child(title)
+                        .into_any_element()
+                };
+
+                Button::new(SharedString::from(format!(
+                    "task-progress-row-{session_key}-{task_id}"
+                )))
+                .text()
+                .w_full()
+                .justify_start()
+                .tooltip(tooltip)
+                .child(
+                    div()
+                        .w_full()
+                        .px(px(10.0))
+                        .py(px(3.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(icon)
+                        .child(title),
+                )
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        let mut panel = div()
+            .w_full()
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(px(10.0))
+            .overflow_hidden()
+            .child(header);
+        if !collapsed {
+            panel = panel.child(
+                div()
+                    .w_full()
+                    .max_h(px(190.0))
+                    .overflow_y_scrollbar()
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            );
+        }
+        panel.into_any_element()
+    }
+
+    fn render_composer_stack(
+        &self,
+        compact: bool,
+        tasks: &[WorkTask],
+        session_id: &SessionId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         div()
             .w_full()
             .max_w(if compact { px(700.0) } else { px(760.0) })
             .flex()
             .flex_col()
             .gap(px(8.0))
+            .when(!tasks.is_empty(), |this| {
+                this.child(self.render_task_progress_panel(tasks, session_id, cx))
+            })
             .child(self.render_queued_messages(cx))
             .child(self.render_remote_agent_banner(cx))
             .child(self.render_composer(compact, cx))
@@ -12419,7 +12630,7 @@ impl AverroesApp {
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(i18n::text(cx, "chat.ready")),
                             )
-                            .child(self.render_composer_stack(true, cx)),
+                            .child(self.render_composer_stack(true, &tasks, &session_id, cx)),
                     ),
                 )
                 .into_any_element();
@@ -12478,58 +12689,8 @@ impl AverroesApp {
                     }))
                     .into_any_element()
             })
-            .chain(tasks.iter().map(|task| {
-                let task_id = task.id.clone();
-                let (icon, color) = match task.status {
-                    TaskStatus::Done => (IconName::CircleCheck, theme.success),
-                    TaskStatus::InProgress => (IconName::Loader, theme.warning),
-                    TaskStatus::Blocked => (IconName::CircleX, theme.destructive),
-                    TaskStatus::Cancelled => (IconName::CircleX, theme.faint),
-                    TaskStatus::Pending => (IconName::Ellipsis, theme.faint),
-                };
-                let mut tooltip = format!("{} [{}]", task.title, task.priority.as_str());
-                if let Some(description) = &task.description {
-                    tooltip.push('\n');
-                    tooltip.push_str(description);
-                }
-                let marker = Button::new(SharedString::from(format!(
-                    "task-marker-{}-{task_id}",
-                    session_id.as_str()
-                )))
-                .ghost()
-                .small()
-                .text_color(color);
-                let marker = if task.status == TaskStatus::InProgress {
-                    marker.child(Icon::new(icon).with_animation(
-                        format!("task-spinner-{}-{task_id}", session_id.as_str()),
-                        Animation::new(Duration::from_millis(800)).repeat(),
-                        |icon, delta| {
-                            icon.transform(Transformation::rotate(gpui::percentage(delta)))
-                        },
-                    ))
-                } else {
-                    marker.child(
-                        fade_in(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_color(color)
-                                .child(Icon::new(icon)),
-                            format!(
-                                "task-state-{}-{task_id}-{:?}",
-                                session_id.as_str(),
-                                task.status
-                            ),
-                            STATE_FADE_DURATION,
-                        )
-                        .into_any_element(),
-                    )
-                };
-                marker.tooltip(tooltip).into_any_element()
-            }))
             .collect::<Vec<_>>();
-        let has_work_markers = !work_rail_markers.is_empty();
+        let has_work_markers = !checkpoints.is_empty();
         let header_actions = conversation_actions_button(
             session_id.to_string(),
             format!("header-conversation-actions-{}", session_id.as_str()),
@@ -12724,7 +12885,12 @@ impl AverroesApp {
                                     .pb(px(14.0))
                                     .flex()
                                     .justify_center()
-                                    .child(self.render_composer_stack(false, cx)),
+                                    .child(self.render_composer_stack(
+                                        false,
+                                        &tasks,
+                                        &session_id,
+                                        cx,
+                                    )),
                             ),
                     )
                     .when(has_work_markers, |this| {
@@ -15415,6 +15581,23 @@ fn task_progress_counts(tasks: &[WorkTask]) -> (usize, usize) {
     (completed, tasks.len())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskProgressIcon {
+    Check,
+    Loader,
+    Circle,
+    CircleX,
+}
+
+fn task_progress_icon(status: TaskStatus) -> TaskProgressIcon {
+    match status {
+        TaskStatus::Done => TaskProgressIcon::Check,
+        TaskStatus::InProgress => TaskProgressIcon::Loader,
+        TaskStatus::Pending => TaskProgressIcon::Circle,
+        TaskStatus::Blocked | TaskStatus::Cancelled => TaskProgressIcon::CircleX,
+    }
+}
+
 impl Render for AverroesApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = UiTheme::current(cx);
@@ -16464,6 +16647,30 @@ mod task_progress_tests {
         ];
 
         assert_eq!(task_progress_counts(&tasks), (1, 5));
+    }
+
+    #[test]
+    fn task_progress_status_icons_match_rendering_contract() {
+        assert_eq!(
+            task_progress_icon(TaskStatus::Done),
+            TaskProgressIcon::Check
+        );
+        assert_eq!(
+            task_progress_icon(TaskStatus::InProgress),
+            TaskProgressIcon::Loader
+        );
+        assert_eq!(
+            task_progress_icon(TaskStatus::Pending),
+            TaskProgressIcon::Circle
+        );
+        assert_eq!(
+            task_progress_icon(TaskStatus::Blocked),
+            TaskProgressIcon::CircleX
+        );
+        assert_eq!(
+            task_progress_icon(TaskStatus::Cancelled),
+            TaskProgressIcon::CircleX
+        );
     }
 }
 
