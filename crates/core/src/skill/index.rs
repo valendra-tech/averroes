@@ -93,9 +93,7 @@ impl SkillIndex {
         let mut index = 0;
 
         while index < chars.len() {
-            if chars[index] != '$'
-                || (index > 0 && is_skill_mention_char(chars[index - 1]))
-            {
+            if chars[index] != '$' || (index > 0 && is_skill_mention_char(chars[index - 1])) {
                 index += 1;
                 continue;
             }
@@ -410,10 +408,7 @@ mod tests {
     fn test_trigger_matching_uses_word_boundaries() {
         let (dir, index) = setup_temp_skills(
             "trigger-boundary",
-            &[(
-                "art.md",
-                "# Art\n\n## Triggers\n- art\n",
-            )],
+            &[("art.md", "# Art\n\n## Triggers\n- art\n")],
         );
 
         assert!(index.find_by_trigger("article").is_empty());
@@ -424,10 +419,8 @@ mod tests {
 
     #[test]
     fn test_explicit_skill_mentions_are_deduplicated_and_strip_punctuation() {
-        let (dir, index) = setup_temp_skills(
-            "explicit-mentions",
-            &[("daily-work.md", "# Daily work\n")],
-        );
+        let (dir, index) =
+            setup_temp_skills("explicit-mentions", &[("daily-work.md", "# Daily work\n")]);
 
         assert_eq!(
             index.explicit_skill_mentions("Use $daily-work, then $daily-work. Ignore $100."),
@@ -439,10 +432,8 @@ mod tests {
 
     #[test]
     fn test_resolve_accepts_case_and_separator_variants() {
-        let (dir, index) = setup_temp_skills(
-            "resolve-normalized",
-            &[("daily-work.md", "# Daily work\n")],
-        );
+        let (dir, index) =
+            setup_temp_skills("resolve-normalized", &[("daily-work.md", "# Daily work\n")]);
 
         assert_eq!(index.resolve("DAILY WORK").unwrap().name, "daily-work");
 
