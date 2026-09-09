@@ -40,7 +40,7 @@ impl Tool for ListSkillsTool {
                 "query": {
                     "type": "string",
                     "maxLength": MAX_QUERY_CHARS,
-                    "description": "Optional text matched against skill names and descriptions."
+                    "description": "Optional text matched against skill names, descriptions, and trigger phrases."
                 },
                 "limit": {
                     "type": "integer",

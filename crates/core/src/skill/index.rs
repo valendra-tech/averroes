@@ -111,7 +111,7 @@ impl SkillIndex {
             if mention
                 .chars()
                 .next()
-                .is_some_and(|character| character.is_ascii_alphabetic())
+                .is_some_and(|character| character.is_alphabetic())
             {
                 let key = normalize_identifier(&mention);
                 if seen.insert(key) {
@@ -146,8 +146,7 @@ impl SkillIndex {
                 .then_with(|| {
                     self.skills[*left_index]
                         .name
-                        .to_ascii_lowercase()
-                        .cmp(&self.skills[*right_index].name.to_ascii_lowercase())
+                        .cmp(&self.skills[*right_index].name)
                 })
                 .then_with(|| {
                     self.skills[*left_index]
@@ -279,12 +278,13 @@ fn normalize_terms(value: &str) -> String {
         .chars()
         .map(|character| {
             if character.is_alphanumeric() {
-                character.to_ascii_lowercase()
+                character.to_lowercase().collect::<String>()
             } else {
-                ' '
+                " ".to_string()
             }
         })
-        .collect::<String>()
+        .collect::<Vec<_>>()
+        .concat()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -431,6 +431,16 @@ mod tests {
     }
 
     #[test]
+    fn test_unicode_skill_names_resolve_and_parse_explicit_mentions() {
+        let (dir, index) = setup_temp_skills("unicode-name", &[("árbol.md", "# Árbol\n")]);
+
+        assert_eq!(index.resolve("ÁRBOL").unwrap().name, "árbol");
+        assert_eq!(index.explicit_skill_mentions("Use $ÁRBOL."), vec!["ÁRBOL"]);
+
+        cleanup(&dir);
+    }
+
+    #[test]
     fn test_resolve_accepts_case_and_separator_variants() {
         let (dir, index) =
             setup_temp_skills("resolve-normalized", &[("daily-work.md", "# Daily work\n")]);
@@ -484,6 +494,27 @@ mod tests {
         assert_eq!(index.search("PDF")[0].name, "pdf");
         assert_eq!(index.search("commit")[0].name, "git");
         assert_eq!(index.search("documents")[0].name, "pdf");
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_search_prefers_trigger_matches_over_description_matches() {
+        let (dir, index) = setup_temp_skills(
+            "search-precedence",
+            &[
+                (
+                    "trigger-only.md",
+                    "---\nname: trigger-only\ndescription: General notes.\n---\n\n## Triggers\n- archive\n",
+                ),
+                (
+                    "description-only.md",
+                    "---\nname: description-only\ndescription: Archive documents.\n---\n",
+                ),
+            ],
+        );
+
+        assert_eq!(index.search("archive")[0].name, "trigger-only");
 
         cleanup(&dir);
     }

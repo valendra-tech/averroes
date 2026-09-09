@@ -32,7 +32,7 @@ use averroes_core::provider::{
     EmbeddingRequest, ModelDiscovery, ModelInfo, Provider, ProviderRegistry,
 };
 use averroes_core::runtime::{ResourceGovernor, SleepInhibitor, SleepInhibitorGuard};
-use averroes_core::skill::{SkillIndex, SkillLoader};
+use averroes_core::skill::{SkillError, SkillIndex, SkillLoader};
 use averroes_core::task::launchd::LaunchdManager;
 use averroes_core::task::scheduled::{ScheduledTask, ScheduledTaskService};
 use averroes_core::tool::builtin::ask_user::{AskUserBroker, AskUserParams, UserQuestion};
@@ -1595,8 +1595,14 @@ impl AppRuntime {
         let Some(index) = self.refresh_workspace_skills(workspace_root) else {
             return Ok(false);
         };
-        let Some(skill) = index.get(name) else {
-            return Ok(false);
+        let skill = match index.resolve(name) {
+            Ok(skill) => skill,
+            Err(SkillError::NotFound(_)) => return Ok(false),
+            Err(error) => {
+                return Err(RuntimeError::Runtime(format!(
+                    "cannot delete skill '{name}': {error}"
+                )))
+            }
         };
         let roots = project_skill_roots(workspace_root);
         if !roots.iter().any(|root| skill.path.starts_with(root)) {

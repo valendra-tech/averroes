@@ -129,7 +129,7 @@ impl Tool for InstallSkillTool {
             .join("skills")
             .join(&installed_slug);
         Ok(ToolResult::ok(format!(
-            "Installed skill '{}' in {}. Use load_skill with name '{}' to inspect it.",
+            "Installed skill '{}' in {}. Mention '${}' in the user's request before loading it.",
             skill.name,
             path.display(),
             installed_slug,
