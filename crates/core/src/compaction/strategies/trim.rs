@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 
-use crate::compaction::{CompactedContext, CompactionConfig, CompactionStrategy, Result};
-use crate::provider::types::ChatMessage;
+use crate::compaction::{
+    sanitize_tool_history, CompactedContext, CompactionConfig, CompactionStrategy, Result,
+};
+use crate::provider::types::{ChatMessage, Role};
 
 pub struct TrimStrategy;
 
@@ -16,8 +18,24 @@ impl CompactionStrategy for TrimStrategy {
         _model: &str,
     ) -> Result<CompactedContext> {
         let original_count = messages.len();
-        let keep = config.keep_last.min(messages.len());
-        let compacted: Vec<ChatMessage> = messages[messages.len() - keep..].to_vec();
+        let system_messages = messages
+            .iter()
+            .filter(|message| message.role == Role::System)
+            .cloned()
+            .collect::<Vec<_>>();
+        let recent_messages = messages
+            .iter()
+            .filter(|message| message.role != Role::System)
+            .cloned()
+            .collect::<Vec<_>>();
+        let keep = config.keep_last.min(recent_messages.len());
+        let mut start = recent_messages.len().saturating_sub(keep);
+        while start > 0 && recent_messages[start].role == Role::Tool {
+            start -= 1;
+        }
+        let mut compacted = system_messages;
+        compacted.extend(recent_messages[start..].iter().cloned());
+        let compacted = sanitize_tool_history(compacted);
 
         Ok(CompactedContext {
             compacted_count: compacted.len(),
@@ -60,6 +78,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.original_count, 51);
-        assert_eq!(result.compacted_count, 5);
+            assert_eq!(result.compacted_count, 6);
+            assert!(result.messages.iter().any(|message| {
+                matches!(&message.content, MessageContent::Text(text) if text == "You are a helpful assistant.")
+            }));
     }
 }

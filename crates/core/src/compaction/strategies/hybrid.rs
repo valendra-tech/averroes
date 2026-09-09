@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::compaction::strategies::{SummaryStrategy, TrimStrategy};
+use crate::compaction::strategies::SummaryStrategy;
 use crate::compaction::{CompactedContext, CompactionConfig, CompactionStrategy, Result};
 use crate::provider::types::ChatMessage;
 use crate::provider::Provider;
@@ -17,30 +17,9 @@ impl CompactionStrategy for HybridStrategy {
         provider: Option<&dyn Provider>,
         model: &str,
     ) -> Result<CompactedContext> {
-        let original_count = messages.len();
-
-        if messages.len() <= config.keep_last + 2 {
-            return TrimStrategy
-                .compact(messages, context_limit, config, provider, model)
-                .await;
-        }
-
-        let split_idx = messages.len() - config.keep_last;
-        let old = &messages[..split_idx];
-        let recent = &messages[split_idx..];
-
-        let summary_result = SummaryStrategy
-            .compact(old, context_limit, config, provider, model)
-            .await?;
-
-        let mut compacted = summary_result.messages;
-        compacted.extend(recent.iter().cloned());
-
-        Ok(CompactedContext {
-            compacted_count: compacted.len(),
-            messages: compacted,
-            original_count,
-        })
+        SummaryStrategy
+            .compact(messages, context_limit, config, provider, model)
+            .await
     }
 }
 
@@ -77,5 +56,45 @@ mod tests {
             .unwrap();
 
         assert!(result.compacted_count < result.original_count);
+    }
+
+    #[test]
+    fn test_hybrid_summarizes_short_history_without_losing_system_prompt() {
+        let messages = vec![
+            make_message(Role::System, "You are a helpful assistant."),
+            make_message(Role::User, "first request"),
+            make_message(Role::Assistant, "first answer"),
+            make_message(Role::User, "latest request"),
+        ];
+        let strategy = HybridStrategy;
+        let config = CompactionConfig {
+            keep_last: 2,
+            ..Default::default()
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt
+            .block_on(strategy.compact(&messages, 100_000, &config, None, "test-model"))
+            .unwrap();
+
+        assert!(result
+            .messages
+            .iter()
+            .any(|message| message_text(message) == "You are a helpful assistant."));
+        assert_eq!(
+            result
+                .messages
+                .iter()
+                .filter(|message| message_text(message).starts_with("[Previous conversation summary]"))
+                .count(),
+            1
+        );
+    }
+
+    fn message_text(message: &ChatMessage) -> String {
+        match &message.content {
+            MessageContent::Text(text) => text.clone(),
+            MessageContent::Parts(_) => String::new(),
+        }
     }
 }
