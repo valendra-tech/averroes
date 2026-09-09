@@ -8897,6 +8897,7 @@ impl AverroesApp {
         cx.notify();
 
         let runtime = self.runtime.clone();
+        let task_sleep_guard = self.runtime.acquire_task_sleep_guard();
         let request = runtime.spawn_background(async move {
             let original_messages = agent.message_count().await;
             let result = agent.force_compact().await;
@@ -8910,6 +8911,7 @@ impl AverroesApp {
             )
         });
         cx.spawn(async move |this, cx| {
+            let _task_sleep_guard = task_sleep_guard;
             let result = request
                 .await
                 .map_err(|error| anyhow::anyhow!(error.to_string()));
