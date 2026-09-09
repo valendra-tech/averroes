@@ -1224,13 +1224,18 @@ Use it only as state and verify it through `history`.\n\n\
 
             let mut context = String::from(concat!(
                 "## Workspace Skills\n\n",
-                "Available skill names are listed compactly below. Compare them with the user's request. ",
-                "When a skill clearly applies, load that exact skill directly and follow it for this turn. ",
-                "Use the filtered skill listing only when the names are not enough to decide.\n\n",
+                "Available workspace skills are listed below with lightweight metadata. ",
+                "Use `$skill-name` when the user explicitly selects a skill. For ordinary requests, ",
+                "use the filtered skill listing and load the exact skill only after deciding it applies.\n\n",
             ));
             let mut catalog_count = 0;
             for skill in index.list() {
-                let entry = format!("- `{}`\n", skill.name);
+                let description = skill.description.split_whitespace().collect::<Vec<_>>().join(" ");
+                let entry = if description.is_empty() || description.chars().count() > 160 {
+                    format!("- `{}`\n", skill.name)
+                } else {
+                    format!("- `{}` — {description}\n", skill.name)
+                };
                 if context.len().saturating_add(entry.len()) > MAX_SKILL_CATALOG_BYTES {
                     break;
                 }
@@ -1238,10 +1243,24 @@ Use it only as state and verify it through `history`.\n\n\
                 catalog_count += 1;
             }
 
-            let matches = index.find_relevant(&user_input);
             let mut loaded = Vec::new();
 
-            for skill in matches.into_iter().take(MAX_AUTO_SKILLS) {
+            for mention in index
+                .explicit_skill_mentions(&user_input)
+                .into_iter()
+                .take(MAX_AUTO_SKILLS)
+            {
+                let skill = match index.resolve(&mention) {
+                    Ok(skill) => skill,
+                    Err(error) => {
+                        crate::observability::diagnostics::record(
+                            crate::observability::diagnostics::DiagnosticLevel::Warning,
+                            "skills.resolution",
+                            format!("Could not resolve explicitly mentioned skill '{mention}': {error}."),
+                        );
+                        continue;
+                    }
+                };
                 let name = skill.name.clone();
                 let description = skill.description.clone();
                 let content = match index.load(&name) {
@@ -6166,11 +6185,44 @@ mod tests {
         assert!(definitions.iter().any(|tool| tool.name == "list_skills"));
         assert!(definitions.iter().any(|tool| tool.name == "load_skill"));
         let context = agent
-            .resolve_skill_context("Please use the release skill for this task.")
+            .resolve_skill_context("Please use $release for this task.")
             .await
             .unwrap();
         assert!(context.contains("release"));
         assert!(context.contains("Always verify the changelog"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_requests_expose_skill_catalog_without_loading_matches() {
+        let workspace = tempfile::tempdir().unwrap();
+        let skills = workspace.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(
+            skills.join("focus.md"),
+            "# Focus workflow\n\n## Triggers\n- focus\n\nAlways define one next action.\n",
+        )
+        .unwrap();
+        let index = Arc::new(
+            crate::skill::SkillIndex::build(crate::skill::SkillLoader::new(vec![skills])).unwrap(),
+        );
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "catalog-only-skill-context".into(),
+            workspace.path().to_path_buf(),
+        );
+        agent.set_skill_index(Some(index));
+
+        let context = agent
+            .resolve_skill_context("Please focus on the next action.")
+            .await
+            .unwrap();
+
+        assert!(context.contains("`focus`"));
+        assert!(!context.contains("Loaded skill: focus"));
+        assert!(!context.contains("Always define one next action"));
     }
 
     #[tokio::test]
@@ -6181,11 +6233,18 @@ mod tests {
         for index in 0..30 {
             std::fs::write(
                 skills.join(format!("a-{index:02}.md")),
-                format!("# {}\n", "verbose description ".repeat(35)),
+                format!(
+                    "# {}\n\n## Triggers\n- focus\n",
+                    "verbose description ".repeat(35)
+                ),
             )
             .unwrap();
         }
-        std::fs::write(skills.join("z-daily-work.md"), "# Daily work\n").unwrap();
+        std::fs::write(
+            skills.join("z-daily-work.md"),
+            "# Daily work\n\n## Triggers\n- focus\n",
+        )
+        .unwrap();
         let index = Arc::new(
             crate::skill::SkillIndex::build(crate::skill::SkillLoader::new(vec![skills])).unwrap(),
         );
@@ -6207,6 +6266,7 @@ mod tests {
         assert!(context.contains("`z-daily-work`"));
         assert!(context.len() <= MAX_SKILL_CATALOG_BYTES);
         assert!(!context.contains("verbose description"));
+        assert!(!context.contains("Loaded skill:"));
     }
 
     #[tokio::test]
