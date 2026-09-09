@@ -1548,6 +1548,45 @@ impl AppRuntime {
             .collect()
     }
 
+    /// Returns project-owned skills ranked by the shared core search. Path
+    /// matches are appended as a lower-priority fallback for settings users
+    /// who search by the visible filesystem location.
+    pub fn project_skills_search(
+        &self,
+        workspace_root: &Path,
+        query: &str,
+    ) -> Vec<averroes_core::skill::SkillMeta> {
+        let Some(index) = self.workspace_skill_index(workspace_root) else {
+            return Vec::new();
+        };
+        let roots = project_skill_roots(workspace_root);
+        let is_project_skill = |skill: &&averroes_core::skill::SkillMeta| {
+            roots.iter().any(|root| skill.path.starts_with(root))
+        };
+        let mut ranked = index
+            .search(query)
+            .into_iter()
+            .filter(is_project_skill)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let query_terms = normalize_skill_search_text(query)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if !query_terms.is_empty() {
+            for skill in index.list().into_iter().filter(is_project_skill) {
+                let path = normalize_skill_search_text(&skill.path.to_string_lossy());
+                if query_terms.iter().all(|term| path.contains(term))
+                    && !ranked.iter().any(|matched| matched.path == skill.path)
+                {
+                    ranked.push(skill.clone());
+                }
+            }
+        }
+        ranked
+    }
+
     pub fn delete_project_skill(
         &self,
         workspace_root: &Path,
@@ -3137,6 +3176,20 @@ fn project_skill_roots(workspace_root: &Path) -> Vec<PathBuf> {
         workspace_root.join(".claude").join("skills"),
         workspace_root.join("skills"),
     ]
+}
+
+fn normalize_skill_search_text(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect()
 }
 
 fn is_well_known_skill_domain(source: &str) -> bool {

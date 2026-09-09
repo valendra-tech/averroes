@@ -75,8 +75,6 @@ impl Tool for ListSkillsTool {
                 message: format!("query cannot exceed {MAX_QUERY_CHARS} characters"),
             });
         }
-        let normalized_query = normalize_search_text(query);
-        let query_terms = normalized_query.split_whitespace().collect::<Vec<_>>();
         let limit = params.limit.unwrap_or(12);
         if !(1..=25).contains(&limit) {
             return Err(crate::tool::ToolError::InvalidParams {
@@ -85,20 +83,7 @@ impl Tool for ListSkillsTool {
             });
         }
         let offset = params.offset.unwrap_or(0);
-        let matching = self
-            .index
-            .list()
-            .into_iter()
-            .filter(|skill| {
-                let searchable =
-                    normalize_search_text(&format!("{} {}", skill.name, skill.description));
-                query_terms.iter().all(|term| {
-                    searchable
-                        .split_whitespace()
-                        .any(|word| word.contains(term))
-                })
-            })
-            .collect::<Vec<_>>();
+        let matching = self.index.search(query);
         let total = matching.len();
         let skills = matching
             .into_iter()
@@ -154,6 +139,7 @@ fn concise_description(description: &str) -> String {
     concise
 }
 
+#[cfg(test)]
 fn normalize_search_text(value: &str) -> String {
     value
         .to_lowercase()
@@ -202,6 +188,28 @@ mod tests {
         ))
     }
 
+    fn ranked_tool() -> (tempfile::TempDir, ListSkillsTool) {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("pdf.md"),
+            "---\nname: pdf\ndescription: Create documents and reports.\n---\n\n# PDF\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("git.md"),
+            "---\nname: git\ndescription: Version control workflow.\n---\n\n## Triggers\n- commit\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("writing.md"),
+            "---\nname: writing\ndescription: Create polished documents.\n---\n\n# Writing\n",
+        )
+        .unwrap();
+        let index =
+            SkillIndex::build(SkillLoader::new(vec![workspace.path().to_path_buf()])).unwrap();
+        (workspace, ListSkillsTool::new(Arc::new(index)))
+    }
+
     #[test]
     fn descriptions_are_single_line_and_bounded() {
         let description = format!("first\n\n{}", "word ".repeat(80));
@@ -220,6 +228,23 @@ mod tests {
         assert!(query
             .split_whitespace()
             .all(|term| skill.split_whitespace().any(|word| word.contains(term))));
+    }
+
+    #[tokio::test]
+    async fn search_uses_ranked_index_results_and_trigger_metadata() {
+        let (_workspace, tool) = ranked_tool();
+
+        let trigger_result = tool
+            .execute(&context(), &json!({"query": "commit", "limit": 1}))
+            .await
+            .unwrap();
+        assert!(trigger_result.content.starts_with("- **git**:"));
+
+        let description_result = tool
+            .execute(&context(), &json!({"query": "documents", "limit": 1}))
+            .await
+            .unwrap();
+        assert!(description_result.content.starts_with("- **pdf**:"));
     }
 
     #[tokio::test]

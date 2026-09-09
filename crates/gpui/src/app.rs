@@ -12449,18 +12449,8 @@ impl AverroesApp {
         let has_query = !query.is_empty();
         let skills = self
             .runtime
-            .project_skills(&project.root)
-            .into_iter()
-            .filter(|skill| {
-                query.is_empty()
-                    || skill.name.to_ascii_lowercase().contains(&query)
-                    || skill.description.to_ascii_lowercase().contains(&query)
-                    || skill
-                        .path
-                        .to_string_lossy()
-                        .to_ascii_lowercase()
-                        .contains(&query)
-            });
+            .project_skills_search(&project.root, &query)
+            .into_iter();
         let rows = skills
             .into_iter()
             .map(|skill| {
