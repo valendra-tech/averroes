@@ -33,12 +33,17 @@ fn summary_message_text(message: &ChatMessage) -> String {
             .iter()
             .filter_map(|part| match part {
                 ContentPart::Text { text } => Some(text.clone()),
-                ContentPart::ToolResult { content, .. } => Some(content.clone()),
+                ContentPart::ToolResult {
+                    tool_use_id,
+                    content,
+                } => Some(format!(
+                    "tool_result tool_use_id={tool_use_id} content={content}"
+                )),
                 ContentPart::Image { source } => {
                     Some(format!("[image omitted: media_type={}]", source.media_type))
                 }
-                ContentPart::ToolUse { name, input, .. } => {
-                    Some(format!("tool_use name={name} input={input}"))
+                ContentPart::ToolUse { id, name, input } => {
+                    Some(format!("tool_use id={id} name={name} input={input}"))
                 }
             })
             .collect::<Vec<_>>()
@@ -47,11 +52,11 @@ fn summary_message_text(message: &ChatMessage) -> String {
 }
 
 fn is_summary_message(message: &ChatMessage) -> bool {
-    message_text(message).starts_with(SUMMARY_MARKER)
+    message.role == Role::System && message_text(message).starts_with(SUMMARY_MARKER)
 }
 
 fn is_understood_context_message(message: &ChatMessage) -> bool {
-    message_text(message).starts_with(UNDERSTOOD_CONTEXT_MARKER)
+    message.role == Role::System && message_text(message).starts_with(UNDERSTOOD_CONTEXT_MARKER)
 }
 
 fn format_summary_message(index: usize, message: &ChatMessage) -> String {
@@ -152,7 +157,7 @@ async fn generate_summary(
     };
 
     let response = provider.chat(request).await?;
-    Ok(message_text(&response.message))
+    Ok(message_text(&response.message).trim().to_owned())
 }
 
 #[async_trait]
@@ -195,10 +200,11 @@ impl CompactionStrategy for SummaryStrategy {
             .cloned()
             .collect::<Vec<_>>();
         if conversation.len() <= 1 {
+            let compacted = crate::compaction::sanitize_tool_history(messages.to_vec());
             return Ok(CompactedContext {
-                messages: messages.to_vec(),
+                compacted_count: compacted.len(),
+                messages: compacted,
                 original_count,
-                compacted_count: messages.len(),
             });
         }
         let keep_last = _config
@@ -216,17 +222,24 @@ impl CompactionStrategy for SummaryStrategy {
         let older = &conversation[..split_idx];
         let recent = &conversation[split_idx..];
         if older.is_empty() {
+            let compacted = crate::compaction::sanitize_tool_history(messages.to_vec());
             return Ok(CompactedContext {
-                messages: messages.to_vec(),
+                compacted_count: compacted.len(),
+                messages: compacted,
                 original_count,
-                compacted_count: messages.len(),
             });
         }
         let previous_context =
             (!previous_context.is_empty()).then(|| previous_context.join("\n\n"));
 
         let summary_text = if let Some(provider) = provider {
-            generate_summary(provider, model, older, previous_context.as_deref()).await?
+            let generated =
+                generate_summary(provider, model, older, previous_context.as_deref()).await?;
+            if generated.is_empty() {
+                bounded_summary_input(older, previous_context.as_deref())
+            } else {
+                generated
+            }
         } else {
             bounded_summary_input(older, previous_context.as_deref())
         };
@@ -260,18 +273,26 @@ fn bounded_summary_output(summary: &str) -> String {
     if summary.chars().count() <= MAX_SUMMARY_OUTPUT_CHARS {
         return summary.to_owned();
     }
+    let marker = "\n[…context summary truncated…]";
+    let marker_len = marker.chars().count();
+    if MAX_SUMMARY_OUTPUT_CHARS <= marker_len {
+        return summary
+            .chars()
+            .take(MAX_SUMMARY_OUTPUT_CHARS)
+            .collect::<String>();
+    }
     let mut output = summary
         .chars()
-        .take(MAX_SUMMARY_OUTPUT_CHARS)
+        .take(MAX_SUMMARY_OUTPUT_CHARS - marker_len)
         .collect::<String>();
-    output.push_str("\n[…context summary truncated…]");
+    output.push_str(marker);
     output
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::types::{FunctionCall, ToolCall};
+    use crate::provider::types::{ContentPart, FunctionCall, ImageSource, ToolCall};
     use crate::provider::{ChatResponse, ChatStream, ProviderError};
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
@@ -279,6 +300,7 @@ mod tests {
     struct CapturingProvider {
         requested_model: Arc<Mutex<Option<String>>>,
         requested_prompt: Arc<Mutex<Option<String>>>,
+        response_text: String,
     }
 
     #[async_trait]
@@ -292,7 +314,7 @@ mod tests {
             Ok(ChatResponse {
                 message: ChatMessage {
                     role: Role::Assistant,
-                    content: MessageContent::Text("summary".into()),
+                    content: MessageContent::Text(self.response_text.clone()),
                     tool_call_id: None,
                     tool_calls: None,
                 },
@@ -325,6 +347,7 @@ mod tests {
         let provider = CapturingProvider {
             requested_model: requested_model.clone(),
             requested_prompt: Arc::new(Mutex::new(None)),
+            response_text: "summary".into(),
         };
         let messages = vec![
             ChatMessage {
@@ -373,6 +396,7 @@ mod tests {
         let provider = CapturingProvider {
             requested_model: Arc::new(Mutex::new(None)),
             requested_prompt: requested_prompt.clone(),
+            response_text: "summary".into(),
         };
         let messages = vec![
             ChatMessage {
@@ -408,6 +432,36 @@ mod tests {
             },
             ChatMessage {
                 role: Role::Assistant,
+                content: MessageContent::Parts(vec![ContentPart::ToolUse {
+                    id: "part-call-1".into(),
+                    name: "list_dir".into(),
+                    input: serde_json::json!({"path": "."}),
+                }]),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: Role::Tool,
+                content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                    tool_use_id: "part-call-1".into(),
+                    content: "native result".into(),
+                }]),
+                tool_call_id: Some("part-call-1".into()),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: Role::User,
+                content: MessageContent::Parts(vec![ContentPart::Image {
+                    source: ImageSource {
+                        media_type: "image/png".into(),
+                        data: "sensitive-image-bytes".into(),
+                    },
+                }]),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: Role::Assistant,
                 content: MessageContent::Text("The project uses Rust".into()),
                 tool_call_id: None,
                 tool_calls: None,
@@ -435,6 +489,78 @@ mod tests {
         assert!(prompt.contains(r#"arguments={"path":"README.md"}"#));
         assert!(prompt.contains("role=tool tool_call_id=call-1"));
         assert!(prompt.contains("README contents"));
+        assert!(prompt.contains("tool_use id=part-call-1 name=list_dir"));
+        assert!(prompt.contains("tool_result tool_use_id=part-call-1"));
+        assert!(prompt.contains("[image omitted: media_type=image/png]"));
+        assert!(!prompt.contains("sensitive-image-bytes"));
+    }
+
+    #[tokio::test]
+    async fn empty_provider_summary_falls_back_to_structured_context() {
+        let provider = CapturingProvider {
+            requested_model: Arc::new(Mutex::new(None)),
+            requested_prompt: Arc::new(Mutex::new(None)),
+            response_text: String::new(),
+        };
+        let messages = vec![
+            make_message(Role::System, "system"),
+            make_message(Role::User, "old objective"),
+            make_message(Role::Assistant, "old progress"),
+            make_message(Role::User, "latest request"),
+        ];
+
+        let result = SummaryStrategy
+            .compact(
+                &messages,
+                100_000,
+                &CompactionConfig {
+                    keep_last: 1,
+                    ..Default::default()
+                },
+                Some(&provider),
+                "test-model",
+            )
+            .await
+            .unwrap();
+        let summary = result
+            .messages
+            .iter()
+            .find(|message| message_text(message).starts_with(SUMMARY_MARKER))
+            .map(message_text)
+            .unwrap();
+
+        assert!(summary.contains("old objective"));
+        assert!(summary.contains("old progress"));
+    }
+
+    #[tokio::test]
+    async fn short_history_still_sanitizes_tool_messages() {
+        let messages = vec![
+            make_message(Role::System, "system"),
+            make_message(Role::User, "latest request"),
+            ChatMessage {
+                role: Role::Tool,
+                content: MessageContent::Text("orphan result".into()),
+                tool_call_id: Some("orphan".into()),
+                tool_calls: None,
+            },
+        ];
+
+        let result = SummaryStrategy
+            .compact(
+                &messages,
+                100_000,
+                &CompactionConfig::default(),
+                None,
+                "test-model",
+            )
+            .await
+            .unwrap();
+
+        assert!(!result
+            .messages
+            .iter()
+            .any(|message| message.tool_call_id.as_deref() == Some("orphan")));
     }
 
     fn make_message(role: Role, text: &str) -> ChatMessage {
