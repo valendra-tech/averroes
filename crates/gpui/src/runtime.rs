@@ -31,7 +31,7 @@ use averroes_core::provider::types::MessageContent;
 use averroes_core::provider::{
     EmbeddingRequest, ModelDiscovery, ModelInfo, Provider, ProviderRegistry,
 };
-use averroes_core::runtime::ResourceGovernor;
+use averroes_core::runtime::{ResourceGovernor, SleepInhibitor, SleepInhibitorGuard};
 use averroes_core::skill::{SkillIndex, SkillLoader};
 use averroes_core::task::launchd::LaunchdManager;
 use averroes_core::task::scheduled::{ScheduledTask, ScheduledTaskService};
@@ -75,6 +75,7 @@ pub struct AppRuntime {
     pub tools: Arc<ToolRegistry>,
     pub governor: Arc<ResourceGovernor>,
     pub runtime: Arc<tokio::runtime::Runtime>,
+    sleep_inhibitor: Arc<SleepInhibitor>,
     pub database: Arc<WorkDatabase>,
     pub scheduled_tasks: Arc<ScheduledTaskService>,
     pub model_registry: Arc<ModelRegistry>,
@@ -1117,6 +1118,7 @@ impl AppRuntime {
                 token_budget_per_minute,
             )),
             runtime,
+            sleep_inhibitor: Arc::new(SleepInhibitor::new()),
             database,
             scheduled_tasks,
             model_registry,
@@ -1130,6 +1132,10 @@ impl AppRuntime {
             agent_threads,
             user_questions,
         })
+    }
+
+    pub fn acquire_task_sleep_guard(&self) -> SleepInhibitorGuard {
+        self.sleep_inhibitor.acquire()
     }
 
     pub fn config(&self) -> AppConfig {

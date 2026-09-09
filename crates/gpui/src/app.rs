@@ -9151,7 +9151,9 @@ impl AverroesApp {
 
         let runtime = self.runtime.clone();
         let stream_session_id = session_id.clone();
+        let task_sleep_guard = self.runtime.acquire_task_sleep_guard();
         let task = cx.spawn_in(window, async move |this, cx| {
+            let _task_sleep_guard = task_sleep_guard;
             let request_content = if attachment_paths.is_empty() {
                 Ok::<(String, Option<MessageContent>), anyhow::Error>((text.clone(), None))
             } else {
