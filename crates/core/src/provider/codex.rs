@@ -181,7 +181,11 @@ impl Provider for ChatGptCodexProvider {
                 }
                 StreamEvent::Error { message } => return Err(ProviderError::Other(message)),
                 StreamEvent::ReasoningDelta { text: delta } => reasoning.push_str(&delta),
-                StreamEvent::ToolCallEnd { .. } | StreamEvent::MessageStart { .. } => {}
+                StreamEvent::ToolCallEnd { .. }
+                | StreamEvent::MessageStart { .. }
+                | StreamEvent::ReasoningSummaryPartAdded => {}
+                StreamEvent::ReasoningSummaryDelta { text: delta }
+                | StreamEvent::ReasoningContentDelta { text: delta } => reasoning.push_str(&delta),
             }
         }
 

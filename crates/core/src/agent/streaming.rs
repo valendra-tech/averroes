@@ -61,6 +61,24 @@ impl Agent {
                     }
                     let _ = events.send(AgentStreamEvent::ReasoningDelta { text: delta });
                 }
+                StreamEvent::ReasoningSummaryPartAdded => {
+                    reasoning_started = true;
+                    let _ = events.send(AgentStreamEvent::ReasoningSummaryPartAdded);
+                }
+                StreamEvent::ReasoningSummaryDelta { text: delta } => {
+                    if !delta.is_empty() {
+                        reasoning_started = true;
+                        reasoning.push_str(&delta);
+                    }
+                    let _ = events.send(AgentStreamEvent::ReasoningSummaryDelta { text: delta });
+                }
+                StreamEvent::ReasoningContentDelta { text: delta } => {
+                    if !delta.is_empty() {
+                        reasoning_started = true;
+                        reasoning.push_str(&delta);
+                    }
+                    let _ = events.send(AgentStreamEvent::ReasoningContentDelta { text: delta });
+                }
                 StreamEvent::ToolCallDelta {
                     id,
                     name,
@@ -202,7 +220,11 @@ async fn open_stream_with_first_event(
 
 fn stream_event_is_response_progress(event: &StreamEvent) -> bool {
     match event {
-        StreamEvent::TextDelta { text } | StreamEvent::ReasoningDelta { text } => !text.is_empty(),
+        StreamEvent::TextDelta { text }
+        | StreamEvent::ReasoningDelta { text }
+        | StreamEvent::ReasoningSummaryDelta { text }
+        | StreamEvent::ReasoningContentDelta { text } => !text.is_empty(),
+        StreamEvent::ReasoningSummaryPartAdded => true,
         StreamEvent::ToolCallDelta { .. } | StreamEvent::Error { .. } => true,
         StreamEvent::ToolCallEnd { .. }
         | StreamEvent::MessageStart { .. }

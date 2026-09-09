@@ -138,6 +138,13 @@ pub enum AgentStreamEvent {
     ReasoningDelta {
         text: String,
     },
+    ReasoningSummaryPartAdded,
+    ReasoningSummaryDelta {
+        text: String,
+    },
+    ReasoningContentDelta {
+        text: String,
+    },
     ReasoningFinished,
     /// A provider has announced a tool call while its response is still
     /// streaming. The UI can show the call immediately and update it when
@@ -2190,6 +2197,7 @@ mod tests {
 
     struct StreamProvider {
         with_reasoning: bool,
+        structured_reasoning: bool,
     }
 
     struct ReasoningToolStreamProvider {
@@ -2273,7 +2281,17 @@ mod tests {
 
     impl StreamProvider {
         fn new(with_reasoning: bool) -> Self {
-            Self { with_reasoning }
+            Self {
+                with_reasoning,
+                structured_reasoning: false,
+            }
+        }
+
+        fn structured_reasoning() -> Self {
+            Self {
+                with_reasoning: false,
+                structured_reasoning: true,
+            }
         }
     }
 
@@ -2486,6 +2504,17 @@ mod tests {
             _r: ChatRequest,
         ) -> crate::provider::Result<crate::provider::ChatStream> {
             let mut events = Vec::new();
+            if self.structured_reasoning {
+                events.extend([
+                    Ok(StreamEvent::ReasoningSummaryPartAdded),
+                    Ok(StreamEvent::ReasoningSummaryDelta {
+                        text: "Planning".into(),
+                    }),
+                    Ok(StreamEvent::ReasoningContentDelta {
+                        text: "Details".into(),
+                    }),
+                ]);
+            }
             if self.with_reasoning {
                 events.push(Ok(StreamEvent::ReasoningDelta {
                     text:
@@ -4407,6 +4436,53 @@ mod tests {
             AgentStreamEvent::ContextUpdated { usage }
                 if usage.input_tokens == Some(2) && usage.output_tokens == Some(3)
         )));
+    }
+
+    #[tokio::test]
+    async fn run_streaming_emits_reasoning_parts() {
+        let agent = Agent::new(
+            AgentConfig {
+                tools: Vec::new(),
+                ..Default::default()
+            },
+            Arc::new(StreamProvider::structured_reasoning()),
+            test_tool_registry(),
+            test_governor(),
+            "structured-reasoning-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        agent.run_streaming("hello", sender).await.unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        let reasoning_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentStreamEvent::ReasoningSummaryPartAdded
+                        | AgentStreamEvent::ReasoningSummaryDelta { .. }
+                        | AgentStreamEvent::ReasoningContentDelta { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(reasoning_events.len(), 3);
+        assert!(matches!(
+            reasoning_events[0],
+            AgentStreamEvent::ReasoningSummaryPartAdded
+        ));
+        assert!(matches!(
+            reasoning_events[1],
+            AgentStreamEvent::ReasoningSummaryDelta { text } if text == "Planning"
+        ));
+        assert!(matches!(
+            reasoning_events[2],
+            AgentStreamEvent::ReasoningContentDelta { text } if text == "Details"
+        ));
     }
 
     #[tokio::test]

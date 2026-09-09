@@ -167,6 +167,13 @@ pub enum StreamEvent {
     ReasoningDelta {
         text: String,
     },
+    ReasoningSummaryPartAdded,
+    ReasoningSummaryDelta {
+        text: String,
+    },
+    ReasoningContentDelta {
+        text: String,
+    },
     ToolCallDelta {
         id: String,
         name: String,
