@@ -1,10 +1,12 @@
 pub mod environment;
 pub mod governor;
 pub mod pool;
+mod sleep_inhibitor;
 
 pub use environment::SystemEnvironment;
 pub use governor::{CallPermit, ResourceGovernor, TokenReservation};
 use pool::ProviderConnectionPool;
+pub use sleep_inhibitor::{SleepInhibitor, SleepInhibitorGuard};
 use std::sync::Arc;
 use tokio::runtime::Runtime as TokioRuntime;
 
