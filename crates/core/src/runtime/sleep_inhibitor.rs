@@ -9,7 +9,7 @@ trait AssertionBackend: Send + Sync {
 
 #[derive(Default)]
 struct InhibitorState {
-    active_tasks: usize,
+    active_guards: usize,
     assertion_id: Option<u32>,
 }
 
@@ -38,7 +38,7 @@ impl SleepInhibitor {
     pub fn acquire(&self) -> SleepInhibitorGuard {
         let mut state = self.state.lock();
 
-        if state.active_tasks == 0 {
+        if state.active_guards == 0 {
             match self.backend.create() {
                 Ok(assertion_id) => state.assertion_id = Some(assertion_id),
                 Err(error) => {
@@ -48,30 +48,24 @@ impl SleepInhibitor {
             }
         }
 
-        state.active_tasks += 1;
+        state.active_guards += 1;
         SleepInhibitorGuard {
             inhibitor: Some(self.clone()),
         }
     }
 
     fn release(&self) {
-        let assertion_id = {
-            let mut state = self.state.lock();
-            if state.active_tasks == 0 {
-                return;
-            }
+        let mut state = self.state.lock();
+        if state.active_guards == 0 {
+            return;
+        }
 
-            state.active_tasks -= 1;
-            if state.active_tasks == 0 {
-                state.assertion_id.take()
-            } else {
-                None
-            }
-        };
-
-        if let Some(assertion_id) = assertion_id {
-            if let Err(error) = self.backend.release(assertion_id) {
-                tracing::warn!(%error, "failed to release system sleep inhibitor");
+        state.active_guards -= 1;
+        if state.active_guards == 0 {
+            if let Some(assertion_id) = state.assertion_id.take() {
+                if let Err(error) = self.backend.release(assertion_id) {
+                    tracing::warn!(assertion_id, %error, "failed to release system sleep inhibitor");
+                }
             }
         }
     }
@@ -177,6 +171,9 @@ mod tests {
         next_id: AtomicU32,
         release_calls: parking_lot::Mutex<Vec<u32>>,
         fail_creation: AtomicBool,
+        fail_release: AtomicBool,
+        watched_state: parking_lot::Mutex<Option<Arc<Mutex<InhibitorState>>>>,
+        release_saw_unlocked: AtomicBool,
     }
 
     impl RecordingBackend {
@@ -186,6 +183,14 @@ mod tests {
 
         fn released(&self) -> Vec<u32> {
             self.release_calls.lock().clone()
+        }
+
+        fn watch_state(&self, state: Arc<Mutex<InhibitorState>>) {
+            *self.watched_state.lock() = Some(state);
+        }
+
+        fn release_saw_unlocked(&self) -> bool {
+            self.release_saw_unlocked.load(Ordering::SeqCst)
         }
     }
 
@@ -201,6 +206,14 @@ mod tests {
 
         fn release(&self, id: u32) -> Result<(), String> {
             self.release_calls.lock().push(id);
+            if let Some(state) = self.watched_state.lock().clone() {
+                if state.try_lock().is_some() {
+                    self.release_saw_unlocked.store(true, Ordering::SeqCst);
+                }
+            }
+            if self.fail_release.load(Ordering::SeqCst) {
+                return Err("simulated release failure".into());
+            }
             Ok(())
         }
     }
@@ -226,15 +239,42 @@ mod tests {
     fn concurrent_guards_share_one_assertion_until_the_last_guard_drops() {
         let backend = Arc::new(RecordingBackend::default());
         let inhibitor = inhibitor(backend.clone());
+        let start = Arc::new(std::sync::Barrier::new(3));
 
-        let first = inhibitor.acquire();
-        let second = inhibitor.acquire();
+        let first_inhibitor = inhibitor.clone();
+        let first_start = start.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_start.wait();
+            first_inhibitor.acquire()
+        });
+        let second_inhibitor = inhibitor.clone();
+        let second_start = start.clone();
+        let second_thread = std::thread::spawn(move || {
+            second_start.wait();
+            second_inhibitor.acquire()
+        });
+        start.wait();
+        let first = first_thread.join().unwrap();
+        let second = second_thread.join().unwrap();
         assert_eq!(backend.created(), 1);
 
         drop(first);
         assert!(backend.released().is_empty());
 
         drop(second);
+        assert_eq!(backend.released(), vec![1]);
+    }
+
+    #[test]
+    fn native_release_is_serialized_with_acquisition() {
+        let backend = Arc::new(RecordingBackend::default());
+        let inhibitor = inhibitor(backend.clone());
+        backend.watch_state(inhibitor.state.clone());
+
+        let guard = inhibitor.acquire();
+        drop(guard);
+
+        assert!(!backend.release_saw_unlocked());
         assert_eq!(backend.released(), vec![1]);
     }
 
@@ -254,5 +294,23 @@ mod tests {
         assert_eq!(backend.created(), 2);
         drop(retry);
         assert_eq!(backend.released(), vec![2]);
+    }
+
+    #[test]
+    fn failed_release_is_non_fatal_and_allows_a_later_lifecycle() {
+        let backend = Arc::new(RecordingBackend::default());
+        backend.fail_release.store(true, Ordering::SeqCst);
+        let inhibitor = inhibitor(backend.clone());
+
+        let failed = inhibitor.acquire();
+        drop(failed);
+        assert_eq!(backend.created(), 1);
+        assert_eq!(backend.released(), vec![1]);
+
+        backend.fail_release.store(false, Ordering::SeqCst);
+        let retry = inhibitor.acquire();
+        assert_eq!(backend.created(), 2);
+        drop(retry);
+        assert_eq!(backend.released(), vec![1, 2]);
     }
 }
