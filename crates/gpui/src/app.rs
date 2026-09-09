@@ -675,7 +675,7 @@ impl ShellMessage {
             .push(AgentThreadBlock::Tool { activity_index });
     }
 
-    fn begin_reasoning(&mut self) -> usize {
+    fn begin_reasoning(&mut self, content_arrived: bool) -> usize {
         let starts_new_block = match self.reasoning_blocks.last() {
             None => true,
             Some(block) if !block.complete => false,
@@ -697,7 +697,7 @@ impl ShellMessage {
             }
             self.reasoning_blocks.push(ReasoningBlockState {
                 complete: false,
-                expanded: true,
+                expanded: content_arrived,
             });
             self.tool_groups.apply(ToolGroupEvent::Reasoning);
         }
@@ -713,10 +713,14 @@ impl ShellMessage {
         }
         if let Some(block) = self.reasoning_blocks.last_mut() {
             block.complete = false;
-            block.expanded = true;
+            if content_arrived {
+                block.expanded = true;
+            }
         }
         self.reasoning_complete = false;
-        self.reasoning_expanded = true;
+        if content_arrived {
+            self.reasoning_expanded = true;
+        }
         block_index
     }
 
@@ -724,7 +728,7 @@ impl ShellMessage {
         if text.is_empty() {
             return;
         }
-        let block_index = self.begin_reasoning();
+        let block_index = self.begin_reasoning(!is_summary);
         let starts_new_part = self.reasoning_parts.last().is_none_or(|part| {
             part.block_index != block_index || (is_summary && self.pending_reasoning_summary_part)
         });
@@ -17700,7 +17704,6 @@ fn render_reasoning_block(
                         format!("{text_id_prefix}-content-{part_index}"),
                         &part.content,
                         streaming && !state.complete,
-                        theme,
                     ));
                 }
             }
@@ -17720,7 +17723,6 @@ fn render_reasoning_block(
                             format!("{text_id_prefix}-{start}"),
                             segment,
                             streaming && !state.complete && end == block_text.len(),
-                            theme,
                         )
                     })
                 }
@@ -18161,6 +18163,30 @@ mod agent_thread_render_tests {
         );
         assert_eq!(message.latest_reasoning_summary(0), Some("Verifying"));
         assert_eq!(message.reasoning_summary_count(0), 2);
+    }
+
+    #[test]
+    fn summary_only_reasoning_stays_collapsed_until_content_arrives() {
+        let mut message = ShellMessage::assistant();
+        message.append_reasoning_summary("Planning");
+
+        assert_eq!(
+            message.reasoning_blocks,
+            vec![ReasoningBlockState {
+                complete: false,
+                expanded: false,
+            }]
+        );
+
+        message.append_reasoning_content("Details");
+
+        assert_eq!(
+            message.reasoning_blocks,
+            vec![ReasoningBlockState {
+                complete: false,
+                expanded: true,
+            }]
+        );
     }
 
     #[test]
@@ -18890,47 +18916,28 @@ fn render_assistant_text_segment(
     }
 }
 
-fn render_reasoning_text_segment(
-    id: String,
-    text: &str,
-    streaming: bool,
-    theme: UiTheme,
-) -> AnyElement {
+fn render_reasoning_text_segment(id: String, text: &str, streaming: bool) -> AnyElement {
     let text = normalize_reasoning_for_display(text);
+    let markdown = TextView::markdown(id.clone(), text.into_owned())
+        .selectable(true)
+        .text_size(px(12.0));
     if streaming {
-        fade_in(
-            render_streaming_markdown(theme, text.as_ref()).text_size(px(12.0)),
-            format!("{id}-content"),
-            STREAM_TEXT_FADE_DURATION,
-        )
-        .into_any_element()
+        fade_in(markdown, format!("{id}-content"), STREAM_TEXT_FADE_DURATION).into_any_element()
     } else {
         // Keep the parsed document behind a stable key. The variable-height
         // conversation list requests a visible message again while scrolling;
         // unchanged reasoning must not be reparsed on each wheel event.
-        TextView::markdown(id, text.into_owned())
-            .selectable(true)
-            .text_size(px(12.0))
-            .into_any_element()
+        markdown.into_any_element()
     }
 }
 
 fn render_reasoning_summary_segment(id: String, text: &str, theme: UiTheme) -> AnyElement {
     let text = normalize_reasoning_for_display(text);
-    div()
-        .id(id)
-        .w_full()
-        .min_w(px(0.0))
+    TextView::markdown(id, text.into_owned())
+        .selectable(true)
         .text_size(px(12.0))
         .font_weight(FontWeight::BOLD)
         .text_color(theme.foreground)
-        .children(text.lines().map(|line| {
-            div()
-                .w_full()
-                .min_w(px(0.0))
-                .whitespace_normal()
-                .child(line.trim_end_matches('\r').to_string())
-        }))
         .into_any_element()
 }
 
