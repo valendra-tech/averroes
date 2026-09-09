@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
@@ -28,6 +28,12 @@ impl SleepInhibitor {
         Self::with_backend(Arc::new(platform::Backend))
     }
 
+    pub fn global() -> Arc<Self> {
+        static GLOBAL: OnceLock<Arc<SleepInhibitor>> = OnceLock::new();
+
+        GLOBAL.get_or_init(|| Arc::new(Self::new())).clone()
+    }
+
     fn with_backend(backend: Arc<dyn AssertionBackend>) -> Self {
         Self {
             state: Arc::new(Mutex::new(InhibitorState::default())),
@@ -39,6 +45,18 @@ impl SleepInhibitor {
         let mut state = self.state.lock();
 
         if state.active_guards == 0 {
+            if let Some(assertion_id) = state.assertion_id {
+                if let Err(error) = self.backend.release(assertion_id) {
+                    tracing::warn!(
+                        assertion_id,
+                        %error,
+                        "failed to release stale system sleep inhibitor before retry"
+                    );
+                    return SleepInhibitorGuard { inhibitor: None };
+                }
+                state.assertion_id = None;
+            }
+
             match self.backend.create() {
                 Ok(assertion_id) => state.assertion_id = Some(assertion_id),
                 Err(error) => {
@@ -62,9 +80,16 @@ impl SleepInhibitor {
 
         state.active_guards -= 1;
         if state.active_guards == 0 {
-            if let Some(assertion_id) = state.assertion_id.take() {
-                if let Err(error) = self.backend.release(assertion_id) {
-                    tracing::warn!(assertion_id, %error, "failed to release system sleep inhibitor");
+            if let Some(assertion_id) = state.assertion_id {
+                match self.backend.release(assertion_id) {
+                    Ok(()) => state.assertion_id = None,
+                    Err(error) => {
+                        tracing::warn!(
+                            assertion_id,
+                            %error,
+                            "failed to release system sleep inhibitor"
+                        );
+                    }
                 }
             }
         }
@@ -311,6 +336,14 @@ mod tests {
         let retry = inhibitor.acquire();
         assert_eq!(backend.created(), 2);
         drop(retry);
-        assert_eq!(backend.released(), vec![1, 2]);
+        assert_eq!(backend.released(), vec![1, 1, 2]);
+    }
+
+    #[test]
+    fn global_inhibitor_is_shared_across_callers() {
+        let first = SleepInhibitor::global();
+        let second = SleepInhibitor::global();
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }

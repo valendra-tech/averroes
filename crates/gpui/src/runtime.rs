@@ -1118,7 +1118,7 @@ impl AppRuntime {
                 token_budget_per_minute,
             )),
             runtime,
-            sleep_inhibitor: Arc::new(SleepInhibitor::new()),
+            sleep_inhibitor: SleepInhibitor::global(),
             database,
             scheduled_tasks,
             model_registry,
