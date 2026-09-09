@@ -843,7 +843,7 @@ impl Agent {
         };
         let reminder = context_window::truncate_utf8(
             &format!(
-                "[Context reminder] This window is near automatic rollover. Continue the current task and preserve any durable progress before the next request. Approximately {} tokens remain until the automatic rollover line.",
+                "[Context reminder] This window is near automatic rollover. Before the next request, use the notes tool to save durable progress: goal, progress, decisions, constraints, open questions, and next steps. Continue the current task; the next window can recover only history and notes that already exist. Approximately {} tokens remain until the automatic rollover line.",
                 claim.remaining_tokens
             ),
             MAX_REMINDER_CHARS,
@@ -5145,6 +5145,15 @@ mod tests {
                 .count(),
             1
         );
+        let reminder = requests[1]
+            .messages
+            .iter()
+            .find(|message| message_text(message).contains("[Context reminder]"))
+            .map(message_text)
+            .unwrap();
+        for required in ["notes", "goal", "progress", "decisions", "next steps"] {
+            assert!(reminder.contains(required), "reminder missing {required}");
+        }
         let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
         assert_eq!(
             events
