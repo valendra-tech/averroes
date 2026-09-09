@@ -295,10 +295,7 @@ where
                                 }
                             }
                             "response.reasoning_summary_part.added" => {
-                                if tx
-                                    .send(Ok(StreamEvent::ReasoningSummaryPartAdded))
-                                    .is_err()
-                                {
+                                if tx.send(Ok(StreamEvent::ReasoningSummaryPartAdded)).is_err() {
                                     return;
                                 }
                             }

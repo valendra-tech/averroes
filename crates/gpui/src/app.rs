@@ -726,8 +726,7 @@ impl ShellMessage {
         }
         let block_index = self.begin_reasoning();
         let starts_new_part = self.reasoning_parts.last().is_none_or(|part| {
-            part.block_index != block_index
-                || (is_summary && self.pending_reasoning_summary_part)
+            part.block_index != block_index || (is_summary && self.pending_reasoning_summary_part)
         });
         if starts_new_part {
             self.reasoning_parts.push(ReasoningSummaryPart {
@@ -17592,6 +17591,43 @@ enum ReasoningRenderTarget {
     },
 }
 
+fn reasoning_label(
+    generic_label: &str,
+    block_index: usize,
+    block_count: usize,
+    message: &ShellMessage,
+) -> String {
+    if let Some(summary) = message.latest_reasoning_summary(block_index) {
+        let summary = normalize_reasoning_for_display(summary);
+        let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+        let summary = truncate_reasoning_label(&summary);
+        let additional_count = message
+            .reasoning_summary_count(block_index)
+            .saturating_sub(1);
+        if additional_count > 0 {
+            format!("{generic_label} · {summary} · +{additional_count}")
+        } else {
+            format!("{generic_label} · {summary}")
+        }
+    } else if block_count > 1 {
+        format!("{generic_label} {}", block_index + 1)
+    } else {
+        generic_label.to_owned()
+    }
+}
+
+fn truncate_reasoning_label(summary: &str) -> String {
+    const MAX_REASONING_LABEL_CHARS: usize = 96;
+    let mut truncated = summary
+        .chars()
+        .take(MAX_REASONING_LABEL_CHARS)
+        .collect::<String>();
+    if summary.chars().count() > MAX_REASONING_LABEL_CHARS {
+        truncated.push('…');
+    }
+    truncated
+}
+
 fn render_reasoning_block(
     target: ReasoningRenderTarget,
     block_index: usize,
@@ -17640,66 +17676,101 @@ fn render_reasoning_block(
             message_index,
         } => format!("agent-thread-reasoning-text-{thread_id}-{message_index}-{block_index}"),
     };
+    let structured_parts = message
+        .reasoning_parts
+        .iter()
+        .filter(|part| part.block_index == block_index)
+        .collect::<Vec<_>>();
+    let has_structured_summary = structured_parts
+        .iter()
+        .any(|part| !part.summary.trim().is_empty());
     let reasoning_content = if state.expanded {
-        tool_group_stream_blocks(
-            block_text,
-            reasoning_groups,
-            &message.tool_activities,
-            start,
-        )
-        .into_iter()
-        .filter_map(|block| match block {
-            ToolStreamBlock::Text { start, end } => block_text.get(start..end).map(|segment| {
-                render_reasoning_text_segment(
-                    format!("{text_id_prefix}-{start}"),
-                    segment,
-                    streaming && !state.complete && end == block_text.len(),
-                    theme,
-                )
-            }),
-            ToolStreamBlock::Group {
-                group_id,
-                activity_indices,
-            } => Some(match &target {
-                ReasoningRenderTarget::Session {
-                    session_id,
-                    message_index,
-                } => render_tool_group(
-                    session_id,
-                    *message_index,
+        let mut content = Vec::new();
+        if has_structured_summary {
+            for (part_index, part) in structured_parts.iter().enumerate() {
+                if !part.summary.trim().is_empty() {
+                    content.push(render_reasoning_summary_segment(
+                        format!("{text_id_prefix}-summary-{part_index}"),
+                        &part.summary,
+                        theme,
+                    ));
+                }
+                if !part.content.is_empty() {
+                    content.push(render_reasoning_text_segment(
+                        format!("{text_id_prefix}-content-{part_index}"),
+                        &part.content,
+                        streaming && !state.complete,
+                        theme,
+                    ));
+                }
+            }
+        }
+        content.extend(
+            tool_group_stream_blocks(
+                block_text,
+                reasoning_groups,
+                &message.tool_activities,
+                start,
+            )
+            .into_iter()
+            .filter_map(|block| match block {
+                ToolStreamBlock::Text { start, end } if !has_structured_summary => {
+                    block_text.get(start..end).map(|segment| {
+                        render_reasoning_text_segment(
+                            format!("{text_id_prefix}-{start}"),
+                            segment,
+                            streaming && !state.complete && end == block_text.len(),
+                            theme,
+                        )
+                    })
+                }
+                ToolStreamBlock::Text { .. } => None,
+                ToolStreamBlock::Group {
                     group_id,
-                    &activity_indices,
-                    &message.tool_activities,
-                    active_reasoning_group_id,
-                    message.is_tool_group_expanded(group_id),
-                    theme,
-                    cx,
-                ),
-                ReasoningRenderTarget::AgentThread {
-                    thread_id,
-                    message_index,
-                } => render_agent_thread_tool_group(
-                    thread_id,
-                    *message_index,
-                    group_id,
-                    &activity_indices,
-                    &message.tool_activities,
-                    active_reasoning_group_id,
-                    message.is_tool_group_expanded(group_id),
-                    theme,
-                    cx,
-                ),
-            }),
-        })
-        .collect::<Vec<_>>()
+                    activity_indices,
+                } => Some(match &target {
+                    ReasoningRenderTarget::Session {
+                        session_id,
+                        message_index,
+                    } => render_tool_group(
+                        session_id,
+                        *message_index,
+                        group_id,
+                        &activity_indices,
+                        &message.tool_activities,
+                        active_reasoning_group_id,
+                        message.is_tool_group_expanded(group_id),
+                        theme,
+                        cx,
+                    ),
+                    ReasoningRenderTarget::AgentThread {
+                        thread_id,
+                        message_index,
+                    } => render_agent_thread_tool_group(
+                        thread_id,
+                        *message_index,
+                        group_id,
+                        &activity_indices,
+                        &message.tool_activities,
+                        active_reasoning_group_id,
+                        message.is_tool_group_expanded(group_id),
+                        theme,
+                        cx,
+                    ),
+                }),
+            })
+            .collect::<Vec<_>>(),
+        );
+        content
     } else {
         Vec::new()
     };
-    let reasoning_label = if block_count > 1 {
-        format!("{} {}", i18n::text(cx, "chat.reasoning"), block_index + 1)
-    } else {
-        i18n::text(cx, "chat.reasoning").to_string()
-    };
+    let reasoning_label = reasoning_label(
+        &i18n::text(cx, "chat.reasoning"),
+        block_index,
+        block_count,
+        message,
+    );
     let reasoning_complete = state.complete || (!streaming && message.reasoning_complete);
     let (panel_id, toggle_id) = match &target {
         ReasoningRenderTarget::Session {
@@ -17828,7 +17899,7 @@ fn render_agent_thread_reasoning(
 mod agent_thread_render_tests {
     use super::{
         agent_thread_blocks, reasoning_block_ranges, reasoning_block_ranges_for_message,
-        reasoning_block_states, reasoning_tool_activity_groups,
+        reasoning_block_states, reasoning_label, reasoning_tool_activity_groups,
         reasoning_tool_activity_groups_for_block, tool_activity_groups_for_location,
         tool_group_stream_blocks, AgentThreadBlock, ReasoningBlockState, ShellMessage,
         ToolActivity, ToolActivityState, ToolStreamBlock, LEGACY_REASONING_TOOL_GROUP_ID,
@@ -18084,9 +18155,32 @@ mod agent_thread_render_tests {
         assert_eq!(message.reasoning_parts[1].content, "Second details");
 
         message.append_reasoning("Legacy details");
-        assert_eq!(message.reasoning_parts[1].content, "Second detailsLegacy details");
+        assert_eq!(
+            message.reasoning_parts[1].content,
+            "Second detailsLegacy details"
+        );
         assert_eq!(message.latest_reasoning_summary(0), Some("Verifying"));
         assert_eq!(message.reasoning_summary_count(0), 2);
+    }
+
+    #[test]
+    fn reasoning_label_uses_latest_summary_and_additional_count() {
+        let mut message = ShellMessage::assistant();
+        message.append_reasoning_summary("Inspecting");
+        message.finish_reasoning_summary_part();
+        message.append_reasoning_summary("Verifying");
+
+        assert_eq!(
+            reasoning_label("Reasoning", 0, 1, &message),
+            "Reasoning · Verifying · +1"
+        );
+    }
+
+    #[test]
+    fn reasoning_label_falls_back_to_generic_text_without_summary() {
+        let message = ShellMessage::assistant();
+
+        assert_eq!(reasoning_label("Reasoning", 0, 1, &message), "Reasoning");
     }
 
     #[test]
@@ -18819,6 +18913,25 @@ fn render_reasoning_text_segment(
             .text_size(px(12.0))
             .into_any_element()
     }
+}
+
+fn render_reasoning_summary_segment(id: String, text: &str, theme: UiTheme) -> AnyElement {
+    let text = normalize_reasoning_for_display(text);
+    div()
+        .id(id)
+        .w_full()
+        .min_w(px(0.0))
+        .text_size(px(12.0))
+        .font_weight(FontWeight::BOLD)
+        .text_color(theme.foreground)
+        .children(text.lines().map(|line| {
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .whitespace_normal()
+                .child(line.trim_end_matches('\r').to_string())
+        }))
+        .into_any_element()
 }
 
 fn render_image_attachments(
