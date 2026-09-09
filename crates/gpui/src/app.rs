@@ -6527,6 +6527,7 @@ impl AverroesApp {
             }
         }
 
+        self.collapsed_task_panels.remove(conversation_id);
         let mut sync_selectors = false;
         if let Some(index) = session_index {
             self.sessions.remove(index);
@@ -10017,6 +10018,8 @@ impl AverroesApp {
             .retain(|_, mapped_session| mapped_session != &closing_session_id);
         self.remote_agent_live_replies.remove(&closing_session_id);
         self.stream_recovery_checkpoints.remove(&closing_session_id);
+        self.collapsed_task_panels
+            .remove(closing_session_id.as_str());
         self.sessions.remove(self.active_session);
         if self.sessions.is_empty() {
             self.sessions.push(ShellSession::new(
