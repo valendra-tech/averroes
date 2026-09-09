@@ -67,6 +67,9 @@ use gpui_component::text::TextView;
 use gpui_component::{
     Disableable, Icon, IconName, Root as ComponentRoot, Selectable, Sizable, WindowExt as _,
 };
+use pulldown_cmark::{
+    Event as MarkdownEvent, Options as MarkdownOptions, Parser as MarkdownParser,
+};
 use semver::Version;
 use serde_json::json;
 use std::borrow::Borrow;
@@ -17602,8 +17605,7 @@ fn reasoning_label(
     message: &ShellMessage,
 ) -> String {
     if let Some(summary) = message.latest_reasoning_summary(block_index) {
-        let summary = normalize_reasoning_for_display(summary);
-        let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+        let summary = reasoning_summary_label_text(summary);
         let summary = truncate_reasoning_label(&summary);
         let additional_count = message
             .reasoning_summary_count(block_index)
@@ -17618,6 +17620,34 @@ fn reasoning_label(
     } else {
         generic_label.to_owned()
     }
+}
+
+fn reasoning_summary_label_text(summary: &str) -> String {
+    let summary = normalize_reasoning_for_display(summary);
+    let mut options = MarkdownOptions::empty();
+    options.insert(MarkdownOptions::ENABLE_STRIKETHROUGH);
+    options.insert(MarkdownOptions::ENABLE_TASKLISTS);
+    let mut text = String::with_capacity(summary.len());
+
+    for event in MarkdownParser::new_ext(summary.as_ref(), options) {
+        match event {
+            MarkdownEvent::Text(value)
+            | MarkdownEvent::Code(value)
+            | MarkdownEvent::FootnoteReference(value)
+            | MarkdownEvent::InlineMath(value)
+            | MarkdownEvent::DisplayMath(value) => text.push_str(&value),
+            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak | MarkdownEvent::Rule => {
+                text.push(' ');
+            }
+            MarkdownEvent::TaskListMarker(_) => text.push(' '),
+            MarkdownEvent::Start(_)
+            | MarkdownEvent::End(_)
+            | MarkdownEvent::Html(_)
+            | MarkdownEvent::InlineHtml(_) => {}
+        }
+    }
+
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn truncate_reasoning_label(summary: &str) -> String {
@@ -18199,6 +18229,20 @@ mod agent_thread_render_tests {
         assert_eq!(
             reasoning_label("Reasoning", 0, 1, &message),
             "Reasoning · Verifying · +1"
+        );
+    }
+
+    #[test]
+    fn reasoning_label_parses_markdown_summary_text() {
+        let mut message = ShellMessage::assistant();
+        for _ in 0..3 {
+            message.append_reasoning_summary("**Summarizing log update and resource usage**");
+            message.finish_reasoning_summary_part();
+        }
+
+        assert_eq!(
+            reasoning_label("Reasoning", 0, 1, &message),
+            "Reasoning · Summarizing log update and resource usage · +2"
         );
     }
 
