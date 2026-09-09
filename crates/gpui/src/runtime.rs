@@ -2739,6 +2739,20 @@ impl AppRuntime {
     {
         self.runtime.spawn(future)
     }
+
+    /// Keeps the system-awake guard owned by the Tokio task until it completes
+    /// or the runtime aborts it, even if the caller drops its join handle.
+    pub fn spawn_user_task_background<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let sleep_guard = self.acquire_task_sleep_guard();
+        self.runtime.spawn(async move {
+            let _sleep_guard = sleep_guard;
+            future.await
+        })
+    }
 }
 
 fn remote_agent_credential_ref() -> CredentialRef {

@@ -8898,7 +8898,7 @@ impl AverroesApp {
 
         let runtime = self.runtime.clone();
         let task_sleep_guard = self.runtime.acquire_task_sleep_guard();
-        let request = runtime.spawn_background(async move {
+        let request = runtime.spawn_user_task_background(async move {
             let original_messages = agent.message_count().await;
             let result = agent.force_compact().await;
             let retained_messages = agent.message_count().await;
@@ -9160,7 +9160,7 @@ impl AverroesApp {
                 Ok::<(String, Option<MessageContent>), anyhow::Error>((text.clone(), None))
             } else {
                 match runtime
-                    .spawn_background(load_attachment_content(text, attachment_paths))
+                    .spawn_user_task_background(load_attachment_content(text, attachment_paths))
                     .await
                 {
                     Ok(result) => result.map(|(text, content)| (text, Some(content))),
@@ -9222,7 +9222,7 @@ impl AverroesApp {
                     let agent_history = restored_history.clone();
                     let agent_context = restored_context.clone();
                     let agent_usage = restored_usage;
-                    let request = runtime.spawn_background(async move {
+                    let request = runtime.spawn_user_task_background(async move {
                         let persisted_conversation = task_runtime
                             .database
                             .conversation(agent_session_id.as_str())?;
@@ -9309,7 +9309,7 @@ impl AverroesApp {
                     let refresh_runtime = runtime.clone();
                     let refresh_agent = agent.clone();
                     let refresh_root = workspace_root.to_path_buf();
-                    let refresh = runtime.spawn_background(async move {
+                    let refresh = runtime.spawn_user_task_background(async move {
                         refresh_runtime.refresh_agent_skills(&refresh_agent, &refresh_root);
                     });
                     if let Err(error) = refresh.await {
