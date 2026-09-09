@@ -10369,7 +10369,7 @@ impl AverroesApp {
                         .whitespace_nowrap()
                         .text_ellipsis()
                         .text_size(px(12.0))
-                        .text_color(color)
+                        .text_color(theme.foreground)
                         .child(title)
                         .into_any_element()
                 };
