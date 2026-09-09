@@ -15407,6 +15407,14 @@ impl AverroesApp {
     }
 }
 
+fn task_progress_counts(tasks: &[WorkTask]) -> (usize, usize) {
+    let completed = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Done)
+        .count();
+    (completed, tasks.len())
+}
+
 impl Render for AverroesApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = UiTheme::current(cx);
@@ -16419,6 +16427,43 @@ async fn load_attachment_content(
             );
         }
         Ok((text, MessageContent::Parts(content_parts)))
+    }
+}
+
+#[cfg(test)]
+mod task_progress_tests {
+    use super::*;
+
+    fn task(id: &str, status: TaskStatus) -> WorkTask {
+        WorkTask {
+            id: id.into(),
+            title: id.into(),
+            description: None,
+            parent_task_id: None,
+            depends_on: Vec::new(),
+            priority: Default::default(),
+            status,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn empty_task_list_has_zero_total_and_zero_completed() {
+        assert_eq!(task_progress_counts(&[]), (0, 0));
+    }
+
+    #[test]
+    fn progress_counts_only_done_tasks_as_completed() {
+        let tasks = vec![
+            task("pending", TaskStatus::Pending),
+            task("active", TaskStatus::InProgress),
+            task("done", TaskStatus::Done),
+            task("blocked", TaskStatus::Blocked),
+            task("cancelled", TaskStatus::Cancelled),
+        ];
+
+        assert_eq!(task_progress_counts(&tasks), (1, 5));
     }
 }
 
