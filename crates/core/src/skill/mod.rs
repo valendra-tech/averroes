@@ -20,6 +20,8 @@ pub struct SkillMeta {
 pub enum SkillError {
     #[error("Skill '{0}' not found")]
     NotFound(String),
+    #[error("Skill '{name}' is ambiguous; matching paths: {paths:?}")]
+    Ambiguous { name: String, paths: Vec<PathBuf> },
     #[error("I/O error reading {path}: {source}")]
     Io {
         path: PathBuf,

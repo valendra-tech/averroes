@@ -1,10 +1,11 @@
 use super::{Result, SkillError, SkillMeta};
 use crate::observability::diagnostics::{self, DiagnosticLevel};
 use crate::skill::loader::SkillLoader;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct SkillIndex {
-    skills: HashMap<String, SkillMeta>,
+    skills: Vec<SkillMeta>,
+    name_indices: HashMap<String, Vec<usize>>,
     loader: SkillLoader,
 }
 
@@ -16,44 +17,149 @@ impl SkillIndex {
             "Building the skill index from discovered files.",
         );
         let discovered = loader.discover_skills()?;
-        let mut skills = HashMap::new();
+        let mut skills = Vec::new();
+        let mut name_indices = HashMap::<String, Vec<usize>>::new();
         for skill in discovered {
-            if skills.contains_key(&skill.name) {
+            let name_key = normalize_identifier(&skill.name);
+            if let Some(existing) = name_indices.get(&name_key) {
                 diagnostics::record(
                     DiagnosticLevel::Warning,
                     "skills.index",
                     format!(
-                        "Duplicate skill name '{}' found at {}; replacing the previous entry.",
+                        "Duplicate skill name '{}' found at {}; keeping all {} matching entries.",
                         skill.name,
-                        skill.path.display()
+                        skill.path.display(),
+                        existing.len() + 1
                     ),
                 );
             }
-            skills.insert(skill.name.clone(), skill);
+            let index = skills.len();
+            skills.push(skill);
+            name_indices.entry(name_key).or_default().push(index);
         }
         diagnostics::record(
             DiagnosticLevel::Success,
             "skills.index",
             format!("Skill index ready with {} skill(s).", skills.len()),
         );
-        Ok(Self { skills, loader })
+        Ok(Self {
+            skills,
+            name_indices,
+            loader,
+        })
     }
 
     pub fn list(&self) -> Vec<&SkillMeta> {
-        let mut skills = self.skills.values().collect::<Vec<_>>();
-        skills.sort_by(|left, right| left.name.cmp(&right.name));
-        skills
+        self.skills.iter().collect()
     }
 
     pub fn get(&self, name: &str) -> Option<&SkillMeta> {
-        self.skills.get(name)
+        self.matching_indices(name)
+            .first()
+            .and_then(|index| self.skills.get(*index))
+    }
+
+    pub fn resolve(&self, name: &str) -> Result<&SkillMeta> {
+        let matches = self.matching_indices(name);
+        match matches.as_slice() {
+            [] => Err(SkillError::NotFound(name.trim().to_string())),
+            [index] => Ok(&self.skills[*index]),
+            _ => Err(SkillError::Ambiguous {
+                name: name.trim().to_string(),
+                paths: matches
+                    .iter()
+                    .map(|index| self.skills[*index].path.clone())
+                    .collect(),
+            }),
+        }
     }
 
     pub fn find_by_trigger(&self, text: &str) -> Vec<&SkillMeta> {
-        let lower = text.to_lowercase();
         self.skills
-            .values()
-            .filter(|s| s.triggers.iter().any(|t| lower.contains(&t.to_lowercase())))
+            .iter()
+            .filter(|skill| {
+                skill
+                    .triggers
+                    .iter()
+                    .any(|trigger| contains_normalized_phrase(text, trigger))
+            })
+            .collect()
+    }
+
+    pub fn explicit_skill_mentions(&self, text: &str) -> Vec<String> {
+        let chars = text.chars().collect::<Vec<_>>();
+        let mut mentions = Vec::new();
+        let mut seen = HashSet::new();
+        let mut index = 0;
+
+        while index < chars.len() {
+            if chars[index] != '$'
+                || (index > 0 && is_skill_mention_char(chars[index - 1]))
+            {
+                index += 1;
+                continue;
+            }
+
+            let start = index + 1;
+            let mut end = start;
+            while end < chars.len() && is_skill_mention_char(chars[end]) {
+                end += 1;
+            }
+            let mention = chars[start..end]
+                .iter()
+                .collect::<String>()
+                .trim_matches(|character: char| ".,;:!?)]}".contains(character))
+                .to_string();
+            if mention
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphabetic())
+            {
+                let key = normalize_identifier(&mention);
+                if seen.insert(key) {
+                    mentions.push(mention);
+                }
+            }
+            index = end.max(index + 1);
+        }
+
+        mentions
+    }
+
+    pub fn search(&self, query: &str) -> Vec<&SkillMeta> {
+        let normalized_query = normalize_terms(query);
+        let query_terms = normalized_query.split_whitespace().collect::<Vec<_>>();
+        if query_terms.is_empty() {
+            return self.list();
+        }
+
+        let mut matches = self
+            .skills
+            .iter()
+            .enumerate()
+            .filter_map(|(index, skill)| {
+                skill_search_score(skill, &normalized_query, &query_terms)
+                    .map(|score| (index, score))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|(left_index, left_score), (right_index, right_score)| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| {
+                    self.skills[*left_index]
+                        .name
+                        .to_ascii_lowercase()
+                        .cmp(&self.skills[*right_index].name.to_ascii_lowercase())
+                })
+                .then_with(|| {
+                    self.skills[*left_index]
+                        .path
+                        .cmp(&self.skills[*right_index].path)
+                })
+        });
+        matches
+            .into_iter()
+            .map(|(index, _)| &self.skills[index])
             .collect()
     }
 
@@ -64,7 +170,7 @@ impl SkillIndex {
         let normalized_text = normalize_terms(text);
         let padded_text = format!(" {normalized_text} ");
         let mut matches = self.find_by_trigger(text);
-        for skill in self.skills.values() {
+        for skill in &self.skills {
             let name = normalize_terms(&skill.name);
             if name.is_empty()
                 || !padded_text.contains(&format!(" {name} "))
@@ -79,13 +185,16 @@ impl SkillIndex {
     }
 
     pub fn load(&self, name: &str) -> Result<String> {
-        let Some(meta) = self.get(name) else {
-            diagnostics::record(
-                DiagnosticLevel::Warning,
-                "skills.index",
-                format!("Requested skill '{name}' is not present in the index."),
-            );
-            return Err(SkillError::NotFound(name.to_string()));
+        let meta = match self.resolve(name) {
+            Ok(meta) => meta,
+            Err(error) => {
+                diagnostics::record(
+                    DiagnosticLevel::Warning,
+                    "skills.index",
+                    format!("Could not resolve requested skill '{name}': {error}."),
+                );
+                return Err(error);
+            }
         };
         self.loader.load_content(meta)
     }
@@ -97,6 +206,74 @@ impl SkillIndex {
     pub fn is_empty(&self) -> bool {
         self.skills.is_empty()
     }
+
+    fn matching_indices(&self, name: &str) -> Vec<usize> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        if let Some(indices) = self.name_indices.get(trimmed) {
+            return indices.clone();
+        }
+        self.name_indices
+            .get(&normalize_identifier(trimmed))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn is_skill_mention_char(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '-' | '_' | '.' | '/')
+}
+
+fn normalize_identifier(value: &str) -> String {
+    normalize_terms(value).replace(' ', "-")
+}
+
+fn contains_normalized_phrase(value: &str, phrase: &str) -> bool {
+    let value = normalize_terms(value);
+    let phrase = normalize_terms(phrase);
+    !phrase.is_empty() && format!(" {value} ").contains(&format!(" {phrase} "))
+}
+
+fn all_query_terms_match(value: &str, query_terms: &[&str]) -> bool {
+    let tokens = normalize_terms(value);
+    let tokens = tokens.split_whitespace().collect::<Vec<_>>();
+    query_terms
+        .iter()
+        .all(|term| tokens.iter().any(|token| token.contains(term)))
+}
+
+fn skill_search_score(
+    skill: &SkillMeta,
+    normalized_query: &str,
+    query_terms: &[&str],
+) -> Option<u8> {
+    let name = normalize_terms(&skill.name);
+    if name == normalized_query {
+        return Some(0);
+    }
+    if name.starts_with(normalized_query) {
+        return Some(1);
+    }
+    if all_query_terms_match(&name, query_terms) {
+        return Some(2);
+    }
+    if skill
+        .triggers
+        .iter()
+        .any(|trigger| contains_normalized_phrase(trigger, normalized_query))
+        || skill
+            .triggers
+            .iter()
+            .any(|trigger| all_query_terms_match(trigger, query_terms))
+    {
+        return Some(3);
+    }
+    if all_query_terms_match(&skill.description, query_terms) {
+        return Some(4);
+    }
+    None
 }
 
 fn normalize_terms(value: &str) -> String {
@@ -225,6 +402,97 @@ mod tests {
 
         let matches = index.find_by_trigger("it");
         assert_eq!(matches.len(), 0);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_trigger_matching_uses_word_boundaries() {
+        let (dir, index) = setup_temp_skills(
+            "trigger-boundary",
+            &[(
+                "art.md",
+                "# Art\n\n## Triggers\n- art\n",
+            )],
+        );
+
+        assert!(index.find_by_trigger("article").is_empty());
+        assert_eq!(index.find_by_trigger("make art")[0].name, "art");
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_explicit_skill_mentions_are_deduplicated_and_strip_punctuation() {
+        let (dir, index) = setup_temp_skills(
+            "explicit-mentions",
+            &[("daily-work.md", "# Daily work\n")],
+        );
+
+        assert_eq!(
+            index.explicit_skill_mentions("Use $daily-work, then $daily-work. Ignore $100."),
+            vec!["daily-work"]
+        );
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_resolve_accepts_case_and_separator_variants() {
+        let (dir, index) = setup_temp_skills(
+            "resolve-normalized",
+            &[("daily-work.md", "# Daily work\n")],
+        );
+
+        assert_eq!(index.resolve("DAILY WORK").unwrap().name, "daily-work");
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_resolve_reports_duplicate_names_as_ambiguous() {
+        let root = std::env::temp_dir().join("averroes-skill-test-ambiguous");
+        let first = root.join("first");
+        let second = root.join("second");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("shared.md"), "# First shared\n").unwrap();
+        std::fs::write(second.join("shared.md"), "# Second shared\n").unwrap();
+
+        let index = SkillIndex::build(SkillLoader::new(vec![first, second])).unwrap();
+
+        assert!(matches!(
+            index.resolve("shared"),
+            Err(SkillError::Ambiguous { .. })
+        ));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn test_search_ranks_name_trigger_and_description_matches() {
+        let (dir, index) = setup_temp_skills(
+            "search-ranking",
+            &[
+                (
+                    "pdf.md",
+                    "---\nname: pdf\ndescription: Create documents and reports.\n---\n\n# PDF\n",
+                ),
+                (
+                    "git.md",
+                    "---\nname: git\ndescription: Version control workflow.\n---\n\n## Triggers\n- commit\n",
+                ),
+                (
+                    "writing.md",
+                    "---\nname: writing\ndescription: Create polished documents.\n---\n\n# Writing\n",
+                ),
+            ],
+        );
+
+        assert_eq!(index.search("PDF")[0].name, "pdf");
+        assert_eq!(index.search("commit")[0].name, "git");
+        assert_eq!(index.search("documents")[0].name, "pdf");
 
         cleanup(&dir);
     }
