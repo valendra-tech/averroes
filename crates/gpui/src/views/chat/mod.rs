@@ -851,13 +851,16 @@ impl ChatView {
             let mut stream = factory.spawn_agent_stream(agent, text);
             while let Some(event) = stream.next_event().await {
                 match event {
-                    AgentStreamEvent::ReasoningDelta { text } => {
+                    AgentStreamEvent::ReasoningDelta { text }
+                    | AgentStreamEvent::ReasoningSummaryDelta { text }
+                    | AgentStreamEvent::ReasoningContentDelta { text } => {
                         _ = this.update(cx, |chat, cx| {
                             chat.pending_reasoning.push_str(&text);
                             chat.append_stream_text_with_reasoning("", Some(&text));
                             cx.notify();
                         });
                     }
+                    AgentStreamEvent::ReasoningSummaryPartAdded => {}
                     AgentStreamEvent::TextDelta { text } => {
                         _ = this.update(cx, |chat, cx| {
                             chat.append_stream_text(&text);

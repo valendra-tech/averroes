@@ -189,6 +189,7 @@ fn stream_event_requires_immediate_flush(event: &AgentStreamEvent) -> bool {
             | AgentStreamEvent::ToolConfirmationResolved { .. }
             | AgentStreamEvent::ToolFinished { .. }
             | AgentStreamEvent::ReasoningFinished
+            | AgentStreamEvent::ReasoningSummaryPartAdded
             | AgentStreamEvent::ContextUpdated { .. }
             | AgentStreamEvent::CompactionStarted { .. }
             | AgentStreamEvent::CompactionFinished { .. }
@@ -275,6 +276,13 @@ struct ReasoningBlockState {
     expanded: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReasoningSummaryPart {
+    summary: String,
+    content: String,
+    block_index: usize,
+}
+
 #[derive(Debug, Clone)]
 struct ToolActivity {
     call_id: Option<String>,
@@ -305,6 +313,8 @@ struct ShellMessage {
     text: String,
     attachments: Vec<PathBuf>,
     reasoning: String,
+    reasoning_parts: Vec<ReasoningSummaryPart>,
+    pending_reasoning_summary_part: bool,
     reasoning_blocks: Vec<ReasoningBlockState>,
     reasoning_complete: bool,
     reasoning_expanded: bool,
@@ -564,6 +574,8 @@ impl ShellMessage {
             text,
             attachments,
             reasoning: String::new(),
+            reasoning_parts: Vec::new(),
+            pending_reasoning_summary_part: false,
             reasoning_blocks: Vec::new(),
             reasoning_complete: true,
             reasoning_expanded: false,
@@ -581,6 +593,8 @@ impl ShellMessage {
             text: String::new(),
             attachments: Vec::new(),
             reasoning: String::new(),
+            reasoning_parts: Vec::new(),
+            pending_reasoning_summary_part: false,
             reasoning_blocks: Vec::new(),
             reasoning_complete: false,
             reasoning_expanded: false,
@@ -598,6 +612,8 @@ impl ShellMessage {
             text: text.into(),
             attachments: Vec::new(),
             reasoning: String::new(),
+            reasoning_parts: Vec::new(),
+            pending_reasoning_summary_part: false,
             reasoning_blocks: Vec::new(),
             reasoning_complete: true,
             reasoning_expanded: false,
@@ -659,10 +675,7 @@ impl ShellMessage {
             .push(AgentThreadBlock::Tool { activity_index });
     }
 
-    fn append_reasoning(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
+    fn begin_reasoning(&mut self) -> usize {
         let starts_new_block = match self.reasoning_blocks.last() {
             None => true,
             Some(block) if !block.complete => false,
@@ -698,13 +711,77 @@ impl ShellMessage {
             self.stream_blocks
                 .push(AgentThreadBlock::Reasoning { block_index });
         }
-        self.reasoning.push_str(text);
         if let Some(block) = self.reasoning_blocks.last_mut() {
             block.complete = false;
             block.expanded = true;
         }
         self.reasoning_complete = false;
         self.reasoning_expanded = true;
+        block_index
+    }
+
+    fn append_reasoning_part_text(&mut self, text: &str, is_summary: bool) {
+        if text.is_empty() {
+            return;
+        }
+        let block_index = self.begin_reasoning();
+        let starts_new_part = self.reasoning_parts.last().is_none_or(|part| {
+            part.block_index != block_index
+                || (is_summary && self.pending_reasoning_summary_part)
+        });
+        if starts_new_part {
+            self.reasoning_parts.push(ReasoningSummaryPart {
+                summary: String::new(),
+                content: String::new(),
+                block_index,
+            });
+        }
+        self.reasoning.push_str(text);
+        let part = self
+            .reasoning_parts
+            .last_mut()
+            .expect("reasoning part created before appending text");
+        if is_summary {
+            part.summary.push_str(text);
+        } else {
+            part.content.push_str(text);
+        }
+        self.pending_reasoning_summary_part = false;
+    }
+
+    fn append_reasoning(&mut self, text: &str) {
+        self.append_reasoning_part_text(text, false);
+    }
+
+    fn append_reasoning_summary(&mut self, text: &str) {
+        self.append_reasoning_part_text(text, true);
+    }
+
+    fn append_reasoning_content(&mut self, text: &str) {
+        self.append_reasoning_part_text(text, false);
+    }
+
+    fn finish_reasoning_summary_part(&mut self) {
+        self.pending_reasoning_summary_part = true;
+    }
+
+    fn latest_reasoning_summary(&self, block_index: usize) -> Option<&str> {
+        self.reasoning_parts
+            .iter()
+            .filter(|part| part.block_index == block_index)
+            .filter_map(|part| {
+                let summary = part.summary.trim();
+                (!summary.is_empty()).then_some(summary)
+            })
+            .last()
+    }
+
+    fn reasoning_summary_count(&self, block_index: usize) -> usize {
+        self.reasoning_parts
+            .iter()
+            .filter(|part| part.block_index == block_index)
+            .filter(|part| !part.summary.trim().is_empty())
+            .count()
     }
 
     fn finish_reasoning(&mut self) {
@@ -712,6 +789,7 @@ impl ShellMessage {
             block.complete = true;
             block.expanded = false;
         }
+        self.pending_reasoning_summary_part = false;
         self.reasoning_complete = true;
         self.reasoning_expanded = false;
     }
@@ -936,6 +1014,8 @@ fn shell_message_from_work(message: WorkMessage) -> ShellMessage {
         text: message.text,
         attachments: Vec::new(),
         reasoning: message.reasoning,
+        reasoning_parts: Vec::new(),
+        pending_reasoning_summary_part: false,
         reasoning_blocks,
         reasoning_complete: message.reasoning_complete,
         reasoning_expanded: message.reasoning_expanded,
@@ -7224,6 +7304,15 @@ impl AverroesApp {
                     AgentStreamEvent::ReasoningDelta { text } => {
                         message.append_reasoning(&text);
                     }
+                    AgentStreamEvent::ReasoningSummaryPartAdded => {
+                        message.finish_reasoning_summary_part();
+                    }
+                    AgentStreamEvent::ReasoningSummaryDelta { text } => {
+                        message.append_reasoning_summary(&text);
+                    }
+                    AgentStreamEvent::ReasoningContentDelta { text } => {
+                        message.append_reasoning_content(&text);
+                    }
                     AgentStreamEvent::ReasoningFinished => {
                         message.finish_reasoning();
                     }
@@ -7521,6 +7610,46 @@ impl AverroesApp {
                 session.response_rate.record_delta(&text, Instant::now());
                 if let Some(message) = session.messages.last_mut() {
                     message.append_reasoning(&text);
+                }
+                self.refresh_remote_live_reply(session_id, false, cx);
+            }
+            AgentStreamEvent::ReasoningSummaryPartAdded => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| &session.id == session_id)
+                {
+                    if let Some(message) = session.messages.last_mut() {
+                        message.finish_reasoning_summary_part();
+                    }
+                }
+                self.refresh_remote_live_reply(session_id, true, cx);
+            }
+            AgentStreamEvent::ReasoningSummaryDelta { text } => {
+                let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| &session.id == session_id)
+                else {
+                    return;
+                };
+                session.response_rate.record_delta(&text, Instant::now());
+                if let Some(message) = session.messages.last_mut() {
+                    message.append_reasoning_summary(&text);
+                }
+                self.refresh_remote_live_reply(session_id, false, cx);
+            }
+            AgentStreamEvent::ReasoningContentDelta { text } => {
+                let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| &session.id == session_id)
+                else {
+                    return;
+                };
+                session.response_rate.record_delta(&text, Instant::now());
+                if let Some(message) = session.messages.last_mut() {
+                    message.append_reasoning_content(&text);
                 }
                 self.refresh_remote_live_reply(session_id, false, cx);
             }
@@ -17937,6 +18066,27 @@ mod agent_thread_render_tests {
         );
         assert!(!message.reasoning_complete);
         assert!(message.reasoning_expanded);
+    }
+
+    #[test]
+    fn structured_reasoning_parts_keep_summaries_above_their_content() {
+        let mut message = ShellMessage::assistant();
+        message.append_reasoning_summary("Inspecting");
+        message.append_reasoning_content("First details");
+        message.finish_reasoning_summary_part();
+        message.append_reasoning_summary("Verifying");
+        message.append_reasoning_content("Second details");
+
+        assert_eq!(message.reasoning_parts.len(), 2);
+        assert_eq!(message.reasoning_parts[0].summary, "Inspecting");
+        assert_eq!(message.reasoning_parts[0].content, "First details");
+        assert_eq!(message.reasoning_parts[1].summary, "Verifying");
+        assert_eq!(message.reasoning_parts[1].content, "Second details");
+
+        message.append_reasoning("Legacy details");
+        assert_eq!(message.reasoning_parts[1].content, "Second detailsLegacy details");
+        assert_eq!(message.latest_reasoning_summary(0), Some("Verifying"));
+        assert_eq!(message.reasoning_summary_count(0), 2);
     }
 
     #[test]
