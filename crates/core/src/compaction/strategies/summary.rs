@@ -10,6 +10,7 @@ const MAX_SUMMARY_INPUT_CHARS: usize = 64_000;
 const MAX_SUMMARY_OUTPUT_CHARS: usize = 8_000;
 const SUMMARY_TRUNCATION_MARKER: &str = "\n[…older context omitted from summary input…]\n";
 pub(crate) const SUMMARY_MARKER: &str = "[Previous conversation summary]";
+const UNDERSTOOD_CONTEXT_MARKER: &str = "[Understood conversation context]";
 
 fn message_text(msg: &ChatMessage) -> String {
     match &msg.content {
@@ -47,6 +48,10 @@ fn summary_message_text(message: &ChatMessage) -> String {
 
 fn is_summary_message(message: &ChatMessage) -> bool {
     message_text(message).starts_with(SUMMARY_MARKER)
+}
+
+fn is_understood_context_message(message: &ChatMessage) -> bool {
+    message_text(message).starts_with(UNDERSTOOD_CONTEXT_MARKER)
 }
 
 fn format_summary_message(index: usize, message: &ChatMessage) -> String {
@@ -163,15 +168,21 @@ impl CompactionStrategy for SummaryStrategy {
         let original_count = messages.len();
         let system_messages = messages
             .iter()
-            .filter(|message| message.role == Role::System && !is_summary_message(message))
+            .filter(|message| {
+                message.role == Role::System
+                    && !is_summary_message(message)
+                    && !is_understood_context_message(message)
+            })
             .cloned()
             .collect::<Vec<_>>();
         let previous_context = messages
             .iter()
-            .filter(|message| is_summary_message(message))
+            .filter(|message| is_summary_message(message) || is_understood_context_message(message))
             .map(|message| {
-                message_text(message)
-                    .strip_prefix(SUMMARY_MARKER)
+                let text = message_text(message);
+                [SUMMARY_MARKER, UNDERSTOOD_CONTEXT_MARKER]
+                    .iter()
+                    .find_map(|marker| text.strip_prefix(marker))
                     .unwrap_or_default()
                     .trim()
                     .to_owned()
@@ -183,17 +194,23 @@ impl CompactionStrategy for SummaryStrategy {
             .filter(|message| message.role != Role::System)
             .cloned()
             .collect::<Vec<_>>();
-        let keep_last = _config.keep_last.min(conversation.len());
-        if conversation.len() <= keep_last {
+        if conversation.len() <= 1 {
             return Ok(CompactedContext {
                 messages: messages.to_vec(),
                 original_count,
                 compacted_count: messages.len(),
             });
         }
+        let keep_last = _config
+            .keep_last
+            .min(conversation.len().saturating_sub(1))
+            .max(1);
 
         let mut split_idx = conversation.len() - keep_last;
-        while split_idx > 0 && conversation[split_idx].role == Role::Tool {
+        while split_idx > 0
+            && split_idx < conversation.len()
+            && conversation[split_idx].role == Role::Tool
+        {
             split_idx -= 1;
         }
         let older = &conversation[..split_idx];
@@ -437,6 +454,10 @@ mod tests {
                 Role::System,
                 "[Previous conversation summary]\n\nold objective",
             ),
+            make_message(
+                Role::System,
+                "[Understood conversation context]\n\nlegacy objective",
+            ),
             make_message(Role::User, "old request"),
             make_message(Role::Assistant, "old answer"),
             make_message(Role::User, "latest request"),
@@ -472,6 +493,14 @@ mod tests {
             .messages
             .iter()
             .any(|message| message_text(message) == "system"));
+        assert!(result
+            .messages
+            .iter()
+            .all(|message| !message_text(message).starts_with(UNDERSTOOD_CONTEXT_MARKER)));
+        assert!(result
+            .messages
+            .iter()
+            .any(|message| { message_text(message).contains("legacy objective") }));
     }
 
     #[tokio::test]

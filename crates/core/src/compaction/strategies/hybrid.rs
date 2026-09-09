@@ -67,10 +67,7 @@ mod tests {
             make_message(Role::User, "latest request"),
         ];
         let strategy = HybridStrategy;
-        let config = CompactionConfig {
-            keep_last: 2,
-            ..Default::default()
-        };
+        let config = CompactionConfig::default();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt
