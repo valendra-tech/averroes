@@ -1816,8 +1816,10 @@ Use it only as state and verify it through `history`.\n\n\
 
         let (compaction_result, original_messages) = {
             let mut msgs = self.messages.lock().await.clone();
-            if let Some(context) = self.understood_context.read().unwrap().clone() {
-                insert_understood_context(&mut msgs, &context);
+            if !has_first_class_compaction_summary(&msgs) {
+                if let Some(context) = self.understood_context.read().unwrap().clone() {
+                    insert_understood_context(&mut msgs, &context);
+                }
             }
             let msgs = compact_tool_outputs(msgs);
             let original_messages = msgs.len();
@@ -1843,8 +1845,10 @@ Use it only as state and verify it through `history`.\n\n\
                     ),
                 );
                 let mut msgs = self.messages.lock().await.clone();
-                if let Some(context) = self.understood_context.read().unwrap().clone() {
-                    insert_understood_context(&mut msgs, &context);
+                if !has_first_class_compaction_summary(&msgs) {
+                    if let Some(context) = self.understood_context.read().unwrap().clone() {
+                        insert_understood_context(&mut msgs, &context);
+                    }
                 }
                 let msgs = compact_tool_outputs(msgs);
                 TrimStrategy
@@ -1863,9 +1867,6 @@ Use it only as state and verify it through `history`.\n\n\
         compacted.messages = compact_tool_outputs(sanitize_tool_history(compacted.messages));
 
         let understood_context = extract_understood_context(&compacted.messages);
-        compacted.messages.retain(|message| {
-            !message_text(message).starts_with("[Previous conversation summary]")
-        });
         compacted.compacted_count = compacted.messages.len();
         if understood_context.is_some() {
             *self.understood_context.write().unwrap() = understood_context.clone();
@@ -1986,8 +1987,10 @@ Use it only as state and verify it through `history`.\n\n\
             self.config.project_instructions_root.as_deref(),
             &current_dir,
         );
-        if let Some(context) = self.understood_context.read().unwrap().clone() {
-            insert_understood_context(&mut messages, &context);
+        if !has_first_class_compaction_summary(&messages) {
+            if let Some(context) = self.understood_context.read().unwrap().clone() {
+                insert_understood_context(&mut messages, &context);
+            }
         }
         if let Some(global_memory) = self.global_memory_prompt.read().unwrap().clone() {
             insert_system_context(&mut messages, global_memory);
@@ -2122,6 +2125,12 @@ fn insert_understood_context(messages: &mut Vec<ChatMessage>, context: &str) {
         messages,
         format!("[Understood conversation context]\n\n{context}"),
     );
+}
+
+fn has_first_class_compaction_summary(messages: &[ChatMessage]) -> bool {
+    messages
+        .iter()
+        .any(|message| message_text(message).starts_with("[Previous conversation summary]"))
 }
 
 fn extract_understood_context(messages: &[ChatMessage]) -> Option<String> {
@@ -4941,7 +4950,15 @@ mod tests {
         agent.compact_with_runtime(&runtime).await.unwrap();
 
         let compacted = agent.messages.lock().await.clone();
-        assert_eq!(compacted.len(), 2);
+        assert_eq!(compacted.len(), 3);
+        assert_eq!(
+            compacted
+                .iter()
+                .filter(|message| message_text(message)
+                    .starts_with("[Previous conversation summary]"))
+                .count(),
+            1
+        );
         assert_eq!(agent.understood_context().as_deref(), Some("fallback"));
     }
 
@@ -6442,5 +6459,65 @@ mod tests {
             &request.messages[1].content,
             MessageContent::Text(content) if content.contains("Understood conversation context")
         ));
+    }
+
+    #[test]
+    fn build_request_does_not_duplicate_first_class_compaction_summary() {
+        let agent = Agent::new(
+            test_agent_config(),
+            Arc::new(TestProvider::new(vec![])),
+            test_tool_registry(),
+            test_governor(),
+            "first-class-summary-session".into(),
+            PathBuf::from("/tmp"),
+        );
+        agent.set_understood_context(Some("Objective: keep the release moving.".into()));
+        let request = agent.build_request(
+            vec![
+                ChatMessage {
+                    role: ProviderRole::System,
+                    content: MessageContent::Text("Base instructions".into()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                ChatMessage {
+                    role: ProviderRole::System,
+                    content: MessageContent::Text(
+                        "[Previous conversation summary]\n\nObjective: keep the release moving."
+                            .into(),
+                    ),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+            ],
+            "test-model".into(),
+            None,
+        );
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .filter(|message| message_text(message).contains("Understood conversation context"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn extract_understood_context_reads_first_class_compaction_summary() {
+        let messages = vec![ChatMessage {
+            role: ProviderRole::System,
+            content: MessageContent::Text(
+                "[Previous conversation summary]\n\nObjective: continue the release."
+                    .into(),
+            ),
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        assert_eq!(
+            extract_understood_context(&messages).as_deref(),
+            Some("Objective: continue the release.")
+        );
     }
 }
