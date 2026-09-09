@@ -78,8 +78,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.original_count, 51);
-            assert_eq!(result.compacted_count, 6);
-            assert!(result.messages.iter().any(|message| {
+        assert_eq!(result.compacted_count, 6);
+        assert!(result.messages.iter().any(|message| {
                 matches!(&message.content, MessageContent::Text(text) if text == "You are a helpful assistant.")
             }));
     }

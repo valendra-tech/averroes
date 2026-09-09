@@ -82,7 +82,9 @@ fn format_summary_message(index: usize, message: &ChatMessage) -> String {
 fn bounded_summary_input(messages: &[ChatMessage], previous_context: Option<&str>) -> String {
     let mut sections = Vec::new();
     if let Some(previous_context) = previous_context.filter(|context| !context.is_empty()) {
-        sections.push(format!("[existing compacted context]\n{previous_context}\n"));
+        sections.push(format!(
+            "[existing compacted context]\n{previous_context}\n"
+        ));
     }
     sections.extend(
         messages
@@ -203,7 +205,8 @@ impl CompactionStrategy for SummaryStrategy {
                 compacted_count: messages.len(),
             });
         }
-        let previous_context = (!previous_context.is_empty()).then(|| previous_context.join("\n\n"));
+        let previous_context =
+            (!previous_context.is_empty()).then(|| previous_context.join("\n\n"));
 
         let summary_text = if let Some(provider) = provider {
             generate_summary(provider, model, older, previous_context.as_deref()).await?
@@ -251,8 +254,8 @@ fn bounded_summary_output(summary: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{ChatResponse, ChatStream, ProviderError};
     use crate::provider::types::{FunctionCall, ToolCall};
+    use crate::provider::{ChatResponse, ChatStream, ProviderError};
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -510,9 +513,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.messages.iter().any(|message| {
-            message.role == Role::Assistant && message.tool_calls.is_some()
-        }));
+        assert!(result
+            .messages
+            .iter()
+            .any(|message| { message.role == Role::Assistant && message.tool_calls.is_some() }));
         assert!(result.messages.iter().any(|message| {
             message.role == Role::Tool && message.tool_call_id.as_deref() == Some("call-1")
         }));

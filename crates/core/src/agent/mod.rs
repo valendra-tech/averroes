@@ -4954,8 +4954,9 @@ mod tests {
         assert_eq!(
             compacted
                 .iter()
-                .filter(|message| message_text(message)
-                    .starts_with("[Previous conversation summary]"))
+                .filter(
+                    |message| message_text(message).starts_with("[Previous conversation summary]")
+                )
                 .count(),
             1
         );
@@ -6517,8 +6518,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: ProviderRole::System,
             content: MessageContent::Text(
-                "[Previous conversation summary]\n\nObjective: continue the release."
-                    .into(),
+                "[Previous conversation summary]\n\nObjective: continue the release.".into(),
             ),
             tool_call_id: None,
             tool_calls: None,

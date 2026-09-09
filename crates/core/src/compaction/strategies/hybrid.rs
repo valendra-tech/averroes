@@ -85,7 +85,9 @@ mod tests {
             result
                 .messages
                 .iter()
-                .filter(|message| message_text(message).starts_with("[Previous conversation summary]"))
+                .filter(
+                    |message| message_text(message).starts_with("[Previous conversation summary]")
+                )
                 .count(),
             1
         );
