@@ -152,7 +152,7 @@ pub(super) fn build_responses_body(request: &ChatRequest, stream: bool) -> Value
         .as_deref()
         .filter(|effort| !effort.is_empty())
     {
-        body["reasoning"] = json!({"effort": effort, "summary": "auto"});
+        body["reasoning"] = json!({"effort": effort, "summary": "detailed"});
     }
 
     if let Some(system) = request.system.as_deref().filter(|text| !text.is_empty()) {

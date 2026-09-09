@@ -1059,4 +1059,46 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn responses_request_asks_for_detailed_reasoning_summaries() {
+        let request = ChatRequest {
+            model: "gpt-5.6-luna".into(),
+            messages: vec![],
+            tools: vec![],
+            temperature: None,
+            system: None,
+            reasoning_effort: Some("high".into()),
+        };
+
+        let body = OpenAiProvider::build_responses_request(&request, true);
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+    }
+
+    #[tokio::test]
+    async fn responses_stream_emits_summary_boundaries_and_content() {
+        let byte_stream = futures::stream::iter(vec![Ok(Bytes::from(concat!(
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"summary_index\":0}\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Verifying artifact retention\"}\n",
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"The retained artifact must remain addressable.\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n",
+        )))]) ;
+        let (receiver, producer) = spawn_responses_stream_producer(byte_stream);
+        let events = OpenAiStream::new(receiver, producer)
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                Ok(StreamEvent::ReasoningSummaryPartAdded),
+                Ok(StreamEvent::ReasoningSummaryDelta { text }),
+                Ok(StreamEvent::ReasoningContentDelta { text: content }),
+                Ok(StreamEvent::MessageEnd { .. }),
+            ] if text == "Verifying artifact retention"
+                && content == "The retained artifact must remain addressable."
+        ));
+    }
 }

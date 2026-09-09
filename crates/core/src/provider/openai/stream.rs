@@ -294,11 +294,33 @@ where
                                     }
                                 }
                             }
+                            "response.reasoning_summary_part.added" => {
+                                if tx
+                                    .send(Ok(StreamEvent::ReasoningSummaryPartAdded))
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                             "response.reasoning_summary_text.delta" => {
                                 if let Some(delta) = json["delta"].as_str() {
                                     if !delta.is_empty() {
                                         if tx
-                                            .send(Ok(StreamEvent::ReasoningDelta {
+                                            .send(Ok(StreamEvent::ReasoningSummaryDelta {
+                                                text: delta.to_string(),
+                                            }))
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            "response.reasoning_text.delta" => {
+                                if let Some(delta) = json["delta"].as_str() {
+                                    if !delta.is_empty() {
+                                        if tx
+                                            .send(Ok(StreamEvent::ReasoningContentDelta {
                                                 text: delta.to_string(),
                                             }))
                                             .is_err()
