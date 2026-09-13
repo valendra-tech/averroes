@@ -67,7 +67,7 @@ pub fn render_streaming_markdown(theme: UiTheme, content: &str) -> Div {
     div()
         .w_full()
         .min_w(px(0.0))
-        .text_sm()
+        .text_size(px(crate::ui::tokens::TEXT_BODY))
         .text_color(theme.foreground)
         .children(content.split('\n').map(|line| {
             div()

@@ -119,8 +119,8 @@ pub(crate) fn render_patch_diff(
     let height = tool_detail_viewport_height(patch, ToolDetailSection::Arguments, text_size);
     let rows = patch.lines().enumerate().map(|(index, line)| {
         let (background, color) = match classify_patch_line(line) {
-            PatchLineKind::Added => (theme.success_soft, theme.success),
-            PatchLineKind::Removed => (theme.destructive_soft, theme.destructive),
+            PatchLineKind::Added => (theme.success_soft, theme.success_text),
+            PatchLineKind::Removed => (theme.destructive_soft, theme.destructive_text),
             PatchLineKind::Header => (theme.surface_hover, theme.faint),
             PatchLineKind::Context => (theme.surface, theme.muted),
         };
@@ -128,7 +128,7 @@ pub(crate) fn render_patch_diff(
             .id(SharedString::from(format!("{id_prefix}-line-{index}")))
             .w_full()
             .min_w(px(0.0))
-            .px(px(6.0))
+            .px(px(crate::ui::tokens::SPACE_6))
             .bg(background)
             .text_color(color)
             .whitespace_normal()

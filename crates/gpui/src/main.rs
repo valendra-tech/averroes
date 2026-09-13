@@ -21,9 +21,9 @@ use app::AverroesApp;
 use averroes_core::config::ConfigPaths;
 use averroes_core::work::{WorkDatabase, WorkWindowMode, WorkWindowState};
 use gpui::{
-    div, img, point, px, size, App, AppContext, AssetSource, Bounds, Context, FontWeight,
-    IntoElement, Menu, MenuItem, ParentElement, Render, SharedString, Styled, TitlebarOptions,
-    Window, WindowBounds, WindowOptions,
+    div, img, point, px, size, App, AppContext, AssetSource, Bounds, Context, IntoElement, Menu,
+    MenuItem, ParentElement, Render, SharedString, Styled, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::Root as ComponentRoot;
@@ -310,25 +310,25 @@ impl Render for RootView {
             .child(
                 div()
                     .w(px(560.0))
-                    .p(px(28.0))
-                    .rounded(px(16.0))
+                    .p(px(ui::tokens::SPACE_24))
+                    .rounded(px(ui::tokens::RADIUS_SHEET))
                     .bg(theme.surface)
                     .border_1()
-                    .border_color(theme.border)
-                    .shadow_lg()
+                    .border_color(theme.hairline)
                     .child(img(brand_asset).size(px(56.0)))
                     .child(
                         div()
-                            .mt(px(12.0))
+                            .mt(px(ui::tokens::SPACE_12))
                             .font(UiTheme::display_font())
-                            .text_size(px(22.0))
-                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(ui::tokens::TEXT_TITLE1))
+                            .font_weight(ui::tokens::WEIGHT_SEMIBOLD)
                             .child(i18n::text(cx, "app.needs_attention")),
                     )
                     .child(
                         div()
-                            .mt(px(8.0))
-                            .mb(px(18.0))
+                            .mt(px(ui::tokens::SPACE_8))
+                            .mb(px(ui::tokens::SPACE_16))
+                            .text_size(px(ui::tokens::TEXT_BODY))
                             .text_color(theme.muted)
                             .child(message),
                     )
@@ -550,6 +550,7 @@ fn open_averroes_window(cx: &mut App, restored: Option<WorkWindowState>) -> anyh
         WindowOptions {
             window_bounds: Some(window_bounds),
             window_min_size: Some(size(px(980.0), px(680.0))),
+            window_background: WindowBackgroundAppearance::Blurred,
             titlebar: Some(TitlebarOptions {
                 title: Some("Averroes".into()),
                 appears_transparent: true,

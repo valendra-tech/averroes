@@ -21,8 +21,12 @@ use crate::ui::{
         fade_in, ATTACHMENT_FADE_DURATION, MESSAGE_FADE_DURATION, STATE_FADE_DURATION,
         STREAM_TEXT_FADE_DURATION,
     },
+    components::{
+        badge, card, composer_metrics, empty_state, field_hint, field_label, section_header,
+        segmented_tab, status_bar_surface, toolbar_surface, SidebarRow,
+    },
     markdown::{normalize_reasoning_for_display, render_streaming_markdown},
-    provider_logo, tool_icon, UiTheme,
+    provider_logo, tokens, tool_icon, UiTheme,
 };
 use crate::update::{open_installer, UpdateClient, UpdateInfo, UpdateState};
 use crate::version::APP_VERSION;
@@ -48,11 +52,10 @@ use base64::Engine as _;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     div, img, list, px, Anchor, Animation, AnimationExt as _, AnyElement, App, AppContext,
-    ClipboardItem, Context, Entity, ExternalPaths, FollowMode, FontWeight, FutureExt as _,
-    HighlightStyle, InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled,
-    StyledImage, StyledText, Subscription, SystemNotification, Task, Transformation, Window,
-    WindowBounds,
+    ClipboardItem, Context, Entity, ExternalPaths, FollowMode, FutureExt as _, HighlightStyle,
+    InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled, StyledImage, StyledText,
+    Subscription, SystemNotification, Task, Transformation, Window, WindowBounds,
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::dialog::DialogButtonProps;
@@ -90,11 +93,10 @@ const STREAM_RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 const REMOTE_LIVE_EDIT_INTERVAL: Duration = Duration::from_millis(750);
 const REMOTE_QUESTION_CALLBACK_PREFIX: &str = "ask-answer";
 const CONVERSATION_SEARCH_DEBOUNCE: Duration = Duration::from_millis(280);
-const SIDEBAR_WIDTH: f32 = 352.0;
-const SIDEBAR_GUTTER: f32 = 12.0;
-const SIDEBAR_ROW_HEIGHT: f32 = 34.0;
-const SIDEBAR_NAV_HEIGHT: f32 = 38.0;
-const SIDEBAR_RADIUS: f32 = 10.0;
+const SIDEBAR_WIDTH: f32 = tokens::SIDEBAR_WIDTH;
+const SIDEBAR_GUTTER: f32 = tokens::SIDEBAR_GUTTER;
+const SIDEBAR_NAV_HEIGHT: f32 = tokens::NAV_HEIGHT;
+const SIDEBAR_RADIUS: f32 = tokens::RADIUS_CARD;
 const WORK_RAIL_TRIGGER_WIDTH: f32 = 36.0;
 const ONBOARDING_INTRODUCTION: &str = "welcome_introduction";
 const ONBOARDING_ACTIVE_CONNECTION: &str = "active_connection";
@@ -345,51 +347,6 @@ struct ComposerAttachment {
     path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct ComposerMetrics {
-    max_width: f32,
-    surface_radius: f32,
-    text_min_height: f32,
-    footer_height: f32,
-    footer_horizontal_padding: f32,
-    footer_bottom_padding: f32,
-    control_gap: f32,
-    send_size: f32,
-    attachment_radius: f32,
-    empty_logo_size: f32,
-    empty_title_size: f32,
-    empty_brand_gap: f32,
-    empty_composer_gap: f32,
-    footer_text_size: f32,
-    model_width: f32,
-    reasoning_width: f32,
-    security_width: f32,
-    privacy_icon_size: f32,
-}
-
-fn composer_metrics(compact: bool) -> ComposerMetrics {
-    ComposerMetrics {
-        max_width: if compact { 680.0 } else { 760.0 },
-        surface_radius: 14.0,
-        text_min_height: 68.0,
-        footer_height: 42.0,
-        footer_horizontal_padding: 10.0,
-        footer_bottom_padding: 7.0,
-        control_gap: 4.0,
-        send_size: 28.0,
-        attachment_radius: 7.0,
-        empty_logo_size: 96.0,
-        empty_title_size: 24.0,
-        empty_brand_gap: 10.0,
-        empty_composer_gap: 22.0,
-        footer_text_size: if compact { 11.0 } else { 12.0 },
-        model_width: if compact { 132.0 } else { 148.0 },
-        reasoning_width: if compact { 60.0 } else { 68.0 },
-        security_width: if compact { 94.0 } else { 108.0 },
-        privacy_icon_size: 16.0,
-    }
-}
-
 fn private_conversation_icon(is_private: bool) -> IconName {
     if is_private {
         IconName::Eye
@@ -492,7 +449,7 @@ impl SelectItem for ModelChoice {
                 .min_w(px(0.0))
                 .overflow_hidden()
                 .items_center()
-                .gap(px(6.0))
+                .gap(px(tokens::SPACE_6))
                 .child(provider_logo(self.connection_kind, 14.0))
                 .child(
                     div()
@@ -1688,8 +1645,8 @@ impl AverroesApp {
                     .id(SharedString::from(format!("scheduled-task-{task_id}")))
                     .flex()
                     .items_center()
-                    .gap(px(12.0))
-                    .p(px(14.0))
+                    .gap(px(tokens::SPACE_12))
+                    .p(px(tokens::SPACE_12))
                     .bg(theme.surface)
                     .border_1()
                     .border_color(theme.border)
@@ -1710,10 +1667,10 @@ impl AverroesApp {
                     .child(
                         div()
                             .flex_1()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                            .child(div().font_weight(tokens::WEIGHT_SEMIBOLD).child(title))
                             .child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(px(tokens::TEXT_CAPTION))
                                     .text_color(theme.muted)
                                     .child(schedule),
                             ),
@@ -1759,19 +1716,19 @@ impl AverroesApp {
             .flex_col()
             .flex_1()
             .min_w(px(0.0))
-            .p(px(40.0))
-            .gap(px(18.0))
+            .p(px(tokens::SPACE_32))
+            .gap(px(tokens::SPACE_16))
             .overflow_y_scrollbar()
             .bg(theme.background)
             .child(
                 div()
-                    .text_2xl()
-                    .font_weight(FontWeight::BOLD)
+                    .text_size(px(tokens::TEXT_TITLE1))
+                    .font_weight(tokens::WEIGHT_SEMIBOLD)
                     .child(i18n::text(cx, "scheduled.title")),
             )
             .child(
                 div()
-                    .text_sm()
+                    .text_size(px(tokens::TEXT_BODY))
                     .text_color(theme.muted)
                     .child(i18n::text(cx, "scheduled.description")),
             )
@@ -1779,8 +1736,8 @@ impl AverroesApp {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(8.0))
-                    .p(px(16.0))
+                    .gap(px(tokens::SPACE_8))
+                    .p(px(tokens::SPACE_16))
                     .bg(theme.surface)
                     .border_1()
                     .border_color(theme.border)
@@ -1857,15 +1814,19 @@ impl AverroesApp {
             .when(active_workspace.is_none(), |this| {
                 this.child(
                     div()
-                        .text_sm()
-                        .text_color(theme.warning)
+                        .rounded(px(tokens::RADIUS_CONTROL))
+                        .bg(theme.warning_soft)
+                        .px(px(tokens::SPACE_12))
+                        .py(px(tokens::SPACE_8))
+                        .text_size(px(tokens::TEXT_BODY))
+                        .text_color(theme.warning_text)
                         .child(i18n::text(cx, "scheduled.workspace_required")),
                 )
             })
             .when(rows.is_empty(), |this| {
                 this.child(
                     div()
-                        .p(px(20.0))
+                        .p(px(tokens::SPACE_20))
                         .bg(theme.surface)
                         .rounded(px(UiTheme::RADIUS))
                         .child(i18n::text(cx, "scheduled.empty")),
@@ -2629,7 +2590,7 @@ impl AverroesApp {
                 info.version
             );
 
-            let mut body = div().flex().flex_col().gap(px(10.0));
+            let mut body = div().flex().flex_col().gap(px(tokens::SPACE_8));
             if downloading || opening {
                 body = body.child(localization.text(if opening {
                     "update.opening"
@@ -2653,7 +2614,7 @@ impl AverroesApp {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(4.0))
+                            .gap(px(tokens::SPACE_4))
                             .child(localization.text("update.release_notes"))
                             .child(
                                 div()
@@ -2661,7 +2622,7 @@ impl AverroesApp {
                                     .overflow_y_scrollbar()
                                     .w_full()
                                     .min_w(px(0.0))
-                                    .pr(px(8.0))
+                                    .pr(px(tokens::SPACE_8))
                                     .child(
                                         TextView::markdown(
                                             format!("update-release-notes-{}", info.version),
@@ -2693,7 +2654,7 @@ impl AverroesApp {
                 );
             }
 
-            let mut footer = div().flex().justify_end().gap(px(8.0));
+            let mut footer = div().flex().justify_end().gap(px(tokens::SPACE_8));
             if downloading || opening {
                 // Keep the dialog open while the request runs so the user gets
                 // immediate state feedback and can retry if opening fails.
@@ -3268,12 +3229,16 @@ impl AverroesApp {
             dialog
                 .title(i18n::text(cx, "folder.create_title"))
                 .w(px(420.0))
-                .child(div().py(px(8.0)).child(Input::new(&input).w_full()))
+                .child(
+                    div()
+                        .py(px(tokens::SPACE_8))
+                        .child(Input::new(&input).w_full()),
+                )
                 .footer(
                     div()
                         .flex()
                         .justify_end()
-                        .gap(px(8.0))
+                        .gap(px(tokens::SPACE_8))
                         .child(
                             Button::new("folder-create-cancel")
                                 .secondary()
@@ -5674,7 +5639,7 @@ impl AverroesApp {
             let mut body = div()
                 .flex()
                 .flex_col()
-                .gap(px(12.0))
+                .gap(px(tokens::SPACE_12))
                 .child(form_label(
                     i18n::text(cx, "project.server_name"),
                     UiTheme::current(cx),
@@ -5684,7 +5649,12 @@ impl AverroesApp {
                     i18n::text(cx, "project.transport"),
                     UiTheme::current(cx),
                 ))
-                .child(div().flex().gap(px(6.0)).children(transport_buttons));
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(tokens::SPACE_6))
+                        .children(transport_buttons),
+                );
             if transport == McpTransport::Stdio {
                 body = body
                     .child(form_label(
@@ -5711,7 +5681,7 @@ impl AverroesApp {
                         i18n::text(cx, "project.authentication"),
                         UiTheme::current(cx),
                     ))
-                    .child(div().flex().gap(px(6.0)).children(auth_buttons));
+                    .child(div().flex().gap(px(tokens::SPACE_6)).children(auth_buttons));
             }
             if auth_type != McpAuthType::None && transport != McpTransport::WebMcp {
                 if auth_type == McpAuthType::OAuth {
@@ -5740,7 +5710,7 @@ impl AverroesApp {
                     .child(Input::new(&project_mcp_token_input).w_full().mask_toggle())
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(UiTheme::current(cx).muted)
                             .child(i18n::text(cx, "project.oauth_keychain_note")),
                     );
@@ -5753,7 +5723,7 @@ impl AverroesApp {
                     div()
                         .flex()
                         .justify_end()
-                        .gap(px(8.0))
+                        .gap(px(tokens::SPACE_8))
                         .child(
                             Button::new("project-mcp-cancel")
                                 .secondary()
@@ -5985,28 +5955,28 @@ impl AverroesApp {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(10.0))
-                        .p(px(10.0))
-                        .rounded(px(8.0))
+                        .gap(px(tokens::SPACE_8))
+                        .p(px(tokens::SPACE_8))
+                        .rounded(px(tokens::RADIUS_CONTROL))
                         .bg(UiTheme::current(cx).surface_subtle)
                         .child(
                             div()
                                 .flex_1()
                                 .min_w(px(0.0))
-                                .child(div().font_weight(FontWeight::SEMIBOLD).child(skill.name))
+                                .child(div().font_weight(tokens::WEIGHT_SEMIBOLD).child(skill.name))
                                 .when_some(description, |this, description| {
                                     this.child(
                                         div()
-                                            .mt(px(3.0))
-                                            .text_size(px(11.0))
+                                            .mt(px(tokens::SPACE_2))
+                                            .text_size(px(tokens::TEXT_CAPTION))
                                             .text_color(UiTheme::current(cx).foreground)
                                             .child(description),
                                     )
                                 })
                                 .child(
                                     div()
-                                        .mt(px(4.0))
-                                        .text_size(px(11.0))
+                                        .mt(px(tokens::SPACE_4))
+                                        .text_size(px(tokens::TEXT_CAPTION))
                                         .text_color(UiTheme::current(cx).muted)
                                         .child(format!(
                                             "{} · {} installs",
@@ -6067,33 +6037,33 @@ impl AverroesApp {
                 .child(
                     div()
                         .flex()
-                        .gap(px(8.0))
+                        .gap(px(tokens::SPACE_8))
                         .child(Input::new(&query).flex_1())
                         .child(search),
                 )
                 .when_some(error, |this, error| {
                     this.child(
                         div()
-                            .mt(px(10.0))
-                            .text_size(px(11.0))
+                            .mt(px(tokens::SPACE_8))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(UiTheme::current(cx).destructive)
                             .child(error),
                     )
                 })
                 .child(
                     div()
-                        .mt(px(12.0))
+                        .mt(px(tokens::SPACE_12))
                         .id("skill-marketplace-results")
                         .flex_none()
                         .h(px(380.0))
                         .overflow_y_scrollbar()
                         .flex()
                         .flex_col()
-                        .gap(px(7.0))
+                        .gap(px(tokens::SPACE_8))
                         .when(result_rows.is_empty(), |this| {
                             this.child(
                                 div()
-                                    .py(px(24.0))
+                                    .py(px(tokens::SPACE_24))
                                     .text_center()
                                     .text_color(UiTheme::current(cx).muted)
                                     .child(if busy {
@@ -6419,12 +6389,16 @@ impl AverroesApp {
             dialog
                 .title(i18n::text(cx, "dialog.rename_title"))
                 .w(px(420.0))
-                .child(div().py(px(8.0)).child(Input::new(&rename_input).w_full()))
+                .child(
+                    div()
+                        .py(px(tokens::SPACE_8))
+                        .child(Input::new(&rename_input).w_full()),
+                )
                 .footer(
                     div()
                         .flex()
                         .justify_end()
-                        .gap(px(8.0))
+                        .gap(px(tokens::SPACE_8))
                         .child(cancel_button)
                         .child(confirm_button),
                 )
@@ -6571,7 +6545,7 @@ impl AverroesApp {
                     div()
                         .flex()
                         .justify_end()
-                        .gap(px(8.0))
+                        .gap(px(tokens::SPACE_8))
                         .child(cancel_button)
                         .child(confirm_button),
                 )
@@ -10305,17 +10279,17 @@ impl AverroesApp {
                     .w_full()
                     .min_w(px(0.0))
                     .h(px(30.0))
-                    .px(px(9.0))
+                    .px(px(tokens::SPACE_8))
                     .flex()
                     .items_center()
-                    .gap(px(7.0))
-                    .rounded(px(7.0))
+                    .gap(px(tokens::SPACE_8))
+                    .rounded(px(tokens::RADIUS_CONTROL))
                     .bg(theme.surface_subtle)
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .text_size(px(11.0))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.muted)
                             .whitespace_nowrap()
                             .overflow_hidden()
@@ -10350,11 +10324,11 @@ impl AverroesApp {
             .w_full()
             .flex()
             .flex_col()
-            .gap(px(4.0))
+            .gap(px(tokens::SPACE_4))
             .child(
                 div()
-                    .px(px(4.0))
-                    .text_size(px(10.0))
+                    .px(px(tokens::SPACE_4))
+                    .text_size(px(tokens::TEXT_CAPTION))
                     .text_color(theme.faint)
                     .child(i18n::text(cx, "composer.queued_messages")),
             )
@@ -10393,8 +10367,8 @@ impl AverroesApp {
         let header = div()
             .id(header_id)
             .w_full()
-            .px(px(10.0))
-            .py(px(6.0))
+            .px(px(tokens::SPACE_8))
+            .py(px(tokens::SPACE_6))
             .flex()
             .items_center()
             .justify_between()
@@ -10407,8 +10381,8 @@ impl AverroesApp {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .text_size(px(12.0))
-                    .font_weight(FontWeight::MEDIUM)
+                    .text_size(px(tokens::TEXT_SMALL))
+                    .font_weight(tokens::WEIGHT_MEDIUM)
                     .text_color(theme.foreground)
                     .child(progress),
             )
@@ -10483,7 +10457,7 @@ impl AverroesApp {
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
-                        .text_size(px(12.0))
+                        .text_size(px(tokens::TEXT_SMALL))
                         .child(StyledText::new(title.clone()).with_highlights([(
                             0..title.len(),
                             HighlightStyle {
@@ -10503,7 +10477,7 @@ impl AverroesApp {
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
-                        .text_size(px(12.0))
+                        .text_size(px(tokens::TEXT_SMALL))
                         .text_color(theme.foreground)
                         .child(title)
                         .into_any_element()
@@ -10519,11 +10493,11 @@ impl AverroesApp {
                 .child(
                     div()
                         .w_full()
-                        .px(px(10.0))
-                        .py(px(3.0))
+                        .px(px(tokens::SPACE_8))
+                        .py(px(tokens::SPACE_2))
                         .flex()
                         .items_center()
-                        .gap(px(8.0))
+                        .gap(px(tokens::SPACE_8))
                         .child(icon)
                         .child(title),
                 )
@@ -10536,7 +10510,7 @@ impl AverroesApp {
             .bg(theme.surface)
             .border_1()
             .border_color(theme.border)
-            .rounded(px(10.0))
+            .rounded(px(tokens::RADIUS_CARD))
             .overflow_hidden()
             .child(header);
         if !collapsed {
@@ -10565,7 +10539,7 @@ impl AverroesApp {
             .max_w(if compact { px(700.0) } else { px(760.0) })
             .flex()
             .flex_col()
-            .gap(px(8.0))
+            .gap(px(tokens::SPACE_8))
             .when(!tasks.is_empty(), |this| {
                 this.child(self.render_task_progress_panel(tasks, session_id, cx))
             })
@@ -10585,10 +10559,10 @@ impl AverroesApp {
             .w_full()
             .flex()
             .items_center()
-            .gap(px(9.0))
-            .px(px(12.0))
-            .py(px(9.0))
-            .rounded(px(10.0))
+            .gap(px(tokens::SPACE_8))
+            .px(px(tokens::SPACE_12))
+            .py(px(tokens::SPACE_8))
+            .rounded(px(tokens::RADIUS_CARD))
             .bg(theme.success_soft)
             .border_1()
             .border_color(theme.success.opacity(0.28))
@@ -10598,10 +10572,10 @@ impl AverroesApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(8.0))
+                    .rounded(px(tokens::RADIUS_CONTROL))
                     .bg(theme.success)
-                    .text_color(theme.background)
-                    .child(Icon::new(IconName::Bot).size(px(15.0))),
+                    .text_color(gpui::rgba(0x1C1C1EFF))
+                    .child(Icon::new(IconName::Bot).size(px(tokens::ICON_SIZE))),
             )
             .child(
                 div()
@@ -10609,15 +10583,15 @@ impl AverroesApp {
                     .min_w(px(0.0))
                     .child(
                         div()
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.success)
+                            .text_size(px(tokens::TEXT_SMALL))
+                            .font_weight(tokens::WEIGHT_SEMIBOLD)
+                            .text_color(theme.success_text)
                             .child(i18n::text(cx, "remote_agent.active_title")),
                     )
                     .child(
                         div()
-                            .mt(px(2.0))
-                            .text_size(px(10.5))
+                            .mt(px(tokens::SPACE_2))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.muted)
                             .child(i18n::text(cx, "remote_agent.active_description")),
                     ),
@@ -10664,43 +10638,27 @@ impl AverroesApp {
             self.conversation_folders.clone(),
             cx,
         );
-        div()
-            .id(SharedString::from(format!(
-                "workspace-conversation-{conversation_id}"
-            )))
-            .flex_none()
-            .w_full()
-            .h(px(SIDEBAR_ROW_HEIGHT))
-            .pl(if indented { px(30.0) } else { px(10.0) })
-            .pr(px(8.0))
-            .flex()
-            .items_center()
-            .rounded(px(SIDEBAR_RADIUS))
-            .overflow_hidden()
-            .cursor_pointer()
-            .group(group)
-            .text_size(px(14.0))
-            .text_color(theme.foreground)
-            .when(selected, |row| {
-                row.bg(theme.surface_hover)
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.foreground)
-            })
-            .hover(|style| style.bg(theme.surface_hover))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(conversation.title),
-            )
-            .child(actions)
-            .on_click(cx.listener(move |this, _, window, cx| {
+        SidebarRow::new(
+            SharedString::from(format!("workspace-conversation-{conversation_id}")),
+            conversation.title,
+        )
+        .indent(if indented {
+            tokens::SPACE_32
+        } else {
+            tokens::SPACE_8
+        })
+        .accessory(actions)
+        .selected(selected)
+        .unread(unread)
+        .processing(processing)
+        .render(theme)
+        .group(group)
+        .on_click(
+            cx.listener(move |this, _, window, cx| {
                 this.select_conversation(&select_id, window, cx)
-            }))
-            .into_any_element()
+            }),
+        )
+        .into_any_element()
     }
 
     fn render_attention_conversation_row(
@@ -10730,45 +10688,23 @@ impl AverroesApp {
             self.conversation_folders.clone(),
             cx,
         );
-        div()
-            .id(SharedString::from(format!(
-                "attention-conversation-{conversation_id}"
-            )))
-            .flex_none()
-            .w_full()
-            .h(px(SIDEBAR_ROW_HEIGHT))
-            .px(px(10.0))
-            .flex()
-            .items_center()
-            .gap(px(9.0))
-            .rounded(px(SIDEBAR_RADIUS))
-            .overflow_hidden()
-            .cursor_pointer()
-            .group(group)
-            .text_size(px(14.0))
-            .when(selected, |row| {
-                row.bg(theme.surface_hover).font_weight(FontWeight::MEDIUM)
-            })
-            .hover(|style| style.bg(theme.surface_hover))
-            .child(
-                Icon::new(IconName::Bell)
-                    .size(px(14.0))
-                    .text_color(theme.muted),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(conversation.title),
-            )
-            .child(actions)
-            .on_click(cx.listener(move |this, _, window, cx| {
+        SidebarRow::new(
+            SharedString::from(format!("attention-conversation-{conversation_id}")),
+            conversation.title,
+        )
+        .icon(IconName::Bell)
+        .accessory(actions)
+        .selected(selected)
+        .unread(unread)
+        .processing(processing)
+        .render(theme)
+        .group(group)
+        .on_click(
+            cx.listener(move |this, _, window, cx| {
                 this.select_conversation(&select_id, window, cx)
-            }))
-            .into_any_element()
+            }),
+        )
+        .into_any_element()
     }
 
     fn render_rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -10852,44 +10788,21 @@ impl AverroesApp {
                 self.conversation_folders.clone(),
                 cx,
             );
-            let row = div()
-                .id(SharedString::from(format!("conversation-{id}")))
-                .flex_none()
-                .w_full()
-                .h(px(SIDEBAR_ROW_HEIGHT))
-                .px(px(10.0))
-                .flex()
-                .items_center()
-                .gap(px(9.0))
-                .rounded(px(SIDEBAR_RADIUS))
-                .overflow_hidden()
-                .cursor_pointer()
-                .group(group)
-                .text_size(px(14.0))
-                .when(selected, |row| {
-                    row.bg(theme.surface_hover).font_weight(FontWeight::MEDIUM)
-                })
-                .hover(|style| style.bg(theme.surface_hover))
-                .child(
-                    Icon::default()
-                        .path("icons/pin.svg")
-                        .size(px(14.0))
-                        .text_color(theme.muted),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(conversation.title),
-                )
-                .child(actions)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.select_conversation(&select_id, window, cx)
-                }))
-                .into_any_element();
+            let row = SidebarRow::new(
+                SharedString::from(format!("conversation-{id}")),
+                conversation.title,
+            )
+            .icon_path("icons/pin.svg")
+            .accessory(actions)
+            .selected(selected)
+            .unread(unread)
+            .processing(processing)
+            .render(theme)
+            .group(group)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_conversation(&select_id, window, cx)
+            }))
+            .into_any_element();
             pinned_rows.push(row);
         }
         let attention_rows = attention_conversations
@@ -10936,7 +10849,7 @@ impl AverroesApp {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(10.0))
+                .text_size(px(tokens::TEXT_CAPTION))
                 .text_color(theme.faint)
                 .when(conversation_count == 0, |this| this.opacity(0.0))
                 .group_hover(project_group.clone(), |style| style.opacity(0.0))
@@ -10946,7 +10859,7 @@ impl AverroesApp {
             )))
             .ghost()
             .small()
-            .with_size(px(24.0))
+            .with_size(px(tokens::CONTROL_SMALL))
             .icon(IconName::Plus)
             .tooltip(i18n::text(cx, "sidebar.new_workspace_conversation"))
             .absolute()
@@ -10962,33 +10875,9 @@ impl AverroesApp {
                     continue;
                 }
                 project_rows.push(
-                    div()
-                        .id(SharedString::from(format!("project-{id}")))
-                        .flex_none()
-                        .w_full()
-                        .h(px(SIDEBAR_ROW_HEIGHT))
-                        .px(px(10.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(9.0))
-                        .rounded(px(SIDEBAR_RADIUS))
-                        .cursor_pointer()
-                        .group(project_group)
-                        .text_size(px(14.0))
-                        .hover(|style| style.bg(theme.surface_hover))
-                        .child(
-                            Icon::new(IconName::FolderClosed)
-                                .size(px(15.0))
-                                .text_color(theme.muted),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .overflow_hidden()
-                                .child(project.name),
-                        )
-                        .child(
+                    SidebarRow::new(SharedString::from(format!("project-{id}")), project.name)
+                        .icon(IconName::FolderClosed)
+                        .accessory(
                             div()
                                 .relative()
                                 .flex_none()
@@ -10996,6 +10885,8 @@ impl AverroesApp {
                                 .child(project_conversation_count)
                                 .child(new_conversation_button),
                         )
+                        .render(theme)
+                        .group(project_group)
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.select_project(&new_work_project_id, window, cx)
                         }))
@@ -11030,7 +10921,7 @@ impl AverroesApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(10.0))
+                    .text_size(px(tokens::TEXT_CAPTION))
                     .text_color(theme.faint)
                     .when(folder_conversations.is_empty(), |this| this.opacity(0.0))
                     .group_hover(folder_group_for_hover.clone(), |style| style.opacity(0.0))
@@ -11040,7 +10931,7 @@ impl AverroesApp {
                 )))
                 .ghost()
                 .small()
-                .with_size(px(24.0))
+                .with_size(px(tokens::CONTROL_SMALL))
                 .icon(IconName::Plus)
                 .tooltip(i18n::text(cx, "folder.new_conversation"))
                 .absolute()
@@ -11057,68 +10948,54 @@ impl AverroesApp {
                 }));
                 if self.projects_expanded {
                     project_rows.push(
-                        div()
-                            .id(SharedString::from(format!(
-                                "conversation-folder-{folder_id}"
-                            )))
-                            .flex_none()
-                            .w_full()
-                            .h(px(SIDEBAR_ROW_HEIGHT))
-                            .px(px(10.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(7.0))
-                            .rounded(px(SIDEBAR_RADIUS))
-                            .cursor_pointer()
-                            .group(folder_group)
-                            .text_size(px(14.0))
-                            .text_color(theme.foreground)
-                            .hover(|style| style.bg(theme.surface_hover))
-                            .child(
-                                Icon::new(if expanded {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                })
-                                .size(px(11.0))
-                                .text_color(theme.faint),
-                            )
-                            .child(
-                                Icon::new(if expanded {
-                                    IconName::FolderOpen
-                                } else {
-                                    IconName::FolderClosed
-                                })
-                                .size(px(15.0))
-                                .text_color(theme.muted),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(folder.name),
-                            )
-                            .child(
-                                div()
-                                    .relative()
-                                    .flex_none()
-                                    .size(px(24.0))
-                                    .child(folder_count)
-                                    .child(new_conversation_button),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let folder_toggle_id = folder_toggle_id.clone();
-                                if expanded {
-                                    this.expanded_conversation_folders.remove(&folder_toggle_id);
-                                } else {
-                                    this.expanded_conversation_folders.insert(folder_toggle_id);
-                                }
-                                cx.notify();
-                            }))
-                            .into_any_element(),
+                        SidebarRow::new(
+                            SharedString::from(format!("conversation-folder-{folder_id}")),
+                            folder.name,
+                        )
+                        .leading(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(tokens::SPACE_4))
+                                .child(
+                                    Icon::new(if expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .size(px(tokens::ICON_SMALL))
+                                    .text_color(theme.faint),
+                                )
+                                .child(
+                                    Icon::new(if expanded {
+                                        IconName::FolderOpen
+                                    } else {
+                                        IconName::FolderClosed
+                                    })
+                                    .size(px(tokens::ICON_SIZE))
+                                    .text_color(theme.muted),
+                                ),
+                        )
+                        .accessory(
+                            div()
+                                .relative()
+                                .flex_none()
+                                .size(px(24.0))
+                                .child(folder_count)
+                                .child(new_conversation_button),
+                        )
+                        .render(theme)
+                        .group(folder_group)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let folder_toggle_id = folder_toggle_id.clone();
+                            if expanded {
+                                this.expanded_conversation_folders.remove(&folder_toggle_id);
+                            } else {
+                                this.expanded_conversation_folders.insert(folder_toggle_id);
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element(),
                     );
                     if expanded {
                         for conversation in folder_conversations {
@@ -11156,14 +11033,14 @@ impl AverroesApp {
                         result.conversation_id
                     )))
                     .w_full()
-                    .px(px(10.0))
-                    .py(px(8.0))
+                    .px(px(tokens::SPACE_8))
+                    .py(px(tokens::SPACE_8))
                     .rounded(px(SIDEBAR_RADIUS))
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.surface_hover))
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(px(tokens::TEXT_BODY))
                             .text_color(theme.foreground)
                             .whitespace_nowrap()
                             .overflow_hidden()
@@ -11172,8 +11049,8 @@ impl AverroesApp {
                     )
                     .child(
                         div()
-                            .mt(px(2.0))
-                            .text_size(px(10.0))
+                            .mt(px(tokens::SPACE_2))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.faint)
                             .whitespace_nowrap()
                             .overflow_hidden()
@@ -11191,7 +11068,7 @@ impl AverroesApp {
             div()
                 .flex_none()
                 .px(px(SIDEBAR_GUTTER))
-                .pb(px(10.0))
+                .pb(px(tokens::SPACE_8))
                 .child(
                     Input::new(&self.conversation_search)
                         .prefix(IconName::Search)
@@ -11199,7 +11076,7 @@ impl AverroesApp {
                 )
                 .child(
                     div()
-                        .mt(px(5.0))
+                        .mt(px(tokens::SPACE_4))
                         .when(search_rows.is_empty() && search_query.is_empty(), |this| {
                             this.child(sidebar_empty(i18n::text(cx, "sidebar.search_all"), theme))
                         })
@@ -11230,16 +11107,16 @@ impl AverroesApp {
                     .border_t_1()
                     .border_color(theme.border.opacity(0.72))
                     .px(px(SIDEBAR_GUTTER))
-                    .py(px(10.0))
+                    .py(px(tokens::SPACE_12))
                     .child(
                         div()
                             .id("active-project-footer-row")
                             .h(px(48.0))
                             .w_full()
-                            .px(px(8.0))
+                            .px(px(tokens::SPACE_12))
                             .flex()
                             .items_center()
-                            .gap(px(10.0))
+                            .gap(px(tokens::SPACE_8))
                             .rounded(px(SIDEBAR_RADIUS))
                             .child(
                                 div()
@@ -11248,7 +11125,7 @@ impl AverroesApp {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .rounded(px(9.0))
+                                    .rounded(px(tokens::RADIUS_CARD))
                                     .bg(theme.surface_hover)
                                     .child(
                                         Icon::new(IconName::FolderOpen)
@@ -11262,8 +11139,8 @@ impl AverroesApp {
                                     .min_w(px(0.0))
                                     .child(
                                         div()
-                                            .text_size(px(13.5))
-                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_size(px(tokens::TEXT_BODY))
+                                            .font_weight(tokens::WEIGHT_MEDIUM)
                                             .text_color(theme.foreground)
                                             .whitespace_nowrap()
                                             .overflow_hidden()
@@ -11272,8 +11149,8 @@ impl AverroesApp {
                                     )
                                     .child(
                                         div()
-                                            .mt(px(1.0))
-                                            .text_size(px(11.0))
+                                            .mt(px(tokens::SPACE_2))
+                                            .text_size(px(tokens::TEXT_CAPTION))
                                             .text_color(theme.faint)
                                             .child(i18n::text(cx, "sidebar.current_project")),
                                     ),
@@ -11298,18 +11175,18 @@ impl AverroesApp {
             .bg(theme.rail)
             .border_r_1()
             .border_color(theme.border.opacity(0.72))
-            .pt(px(24.0))
+            .pt(px(tokens::SPACE_24))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .h(px(52.0))
-                    .px(px(18.0))
+                    .px(px(tokens::SPACE_16))
                     .child(
                         div().flex().items_center().child(
                             div()
-                                .text_size(px(18.0))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(px(tokens::TEXT_TITLE2))
+                                .font_weight(tokens::WEIGHT_SEMIBOLD)
                                 .child(i18n::text(cx, "sidebar.brand")),
                         ),
                     )
@@ -11318,7 +11195,7 @@ impl AverroesApp {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(2.0))
+                            .gap(px(tokens::SPACE_2))
                             .child(
                                 Button::new("search-conversations")
                                     .ghost()
@@ -11358,92 +11235,60 @@ impl AverroesApp {
             )
             .child(search_panel)
             .child(
-                div().flex_none().px(px(SIDEBAR_GUTTER)).pb(px(2.0)).child(
-                    div()
-                        .id("new-work")
-                        .h(px(SIDEBAR_NAV_HEIGHT))
-                        .px(px(10.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(10.0))
-                        .rounded(px(SIDEBAR_RADIUS))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme.surface_hover))
-                        .text_size(px(14.5))
-                        .font_weight(FontWeight::NORMAL)
-                        .child(
-                            Icon::default()
-                                .path("icons/square-pen.svg")
-                                .size(px(16.0))
-                                .text_color(theme.foreground),
-                        )
-                        .child(i18n::text(cx, "sidebar.new_work"))
-                        .on_click(cx.listener(|this, _, window, cx| this.new_session(window, cx))),
-                ),
+                div()
+                    .flex_none()
+                    .px(px(SIDEBAR_GUTTER))
+                    .pb(px(tokens::SPACE_2))
+                    .child(
+                        SidebarRow::new("new-work", i18n::text(cx, "sidebar.new_work"))
+                            .icon_path("icons/square-pen.svg")
+                            .icon_color(theme.foreground)
+                            .render(theme)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.new_session(window, cx)),
+                            ),
+                    ),
             )
             .child(
-                div().flex_none().px(px(SIDEBAR_GUTTER)).pb(px(12.0)).child(
-                    div()
-                        .id("open-complements-nav")
-                        .h(px(SIDEBAR_NAV_HEIGHT))
-                        .px(px(10.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(10.0))
-                        .rounded(px(SIDEBAR_RADIUS))
-                        .cursor_pointer()
-                        .text_size(px(14.5))
-                        .font_weight(FontWeight::NORMAL)
-                        .text_color(theme.foreground)
-                        .when(complements_open, |this| {
-                            this.bg(theme.surface_hover).font_weight(FontWeight::MEDIUM)
-                        })
-                        .hover(|style| style.bg(theme.surface_hover).text_color(theme.foreground))
-                        .child(
-                            Icon::default()
-                                .path("tools/skills.svg")
-                                .size(px(16.0))
-                                .text_color(if complements_open {
-                                    theme.foreground
-                                } else {
-                                    theme.muted
-                                }),
+                div()
+                    .flex_none()
+                    .px(px(SIDEBAR_GUTTER))
+                    .pb(px(tokens::SPACE_12))
+                    .child(
+                        SidebarRow::new(
+                            "open-complements-nav",
+                            i18n::text(cx, "sidebar.complements"),
                         )
-                        .child(i18n::text(cx, "sidebar.complements"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_project_settings(window, cx)
-                        })),
-                ),
+                        .icon_path("tools/skills.svg")
+                        .selected(complements_open)
+                        .render(theme)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.open_project_settings(window, cx)
+                            }),
+                        ),
+                    ),
             )
             .child(
-                div().flex_none().px(px(SIDEBAR_GUTTER)).pb(px(12.0)).child(
-                    div()
-                        .id("open-scheduled-tasks-nav")
-                        .h(px(SIDEBAR_NAV_HEIGHT))
-                        .px(px(10.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(10.0))
-                        .rounded(px(SIDEBAR_RADIUS))
-                        .cursor_pointer()
-                        .text_size(px(14.5))
-                        .when(self.route == Route::ScheduledTasks, |this| {
-                            this.bg(theme.surface_hover).font_weight(FontWeight::MEDIUM)
-                        })
-                        .hover(|style| style.bg(theme.surface_hover))
-                        .child(
-                            Icon::new(IconName::Calendar)
-                                .size(px(16.0))
-                                .text_color(theme.muted),
+                div()
+                    .flex_none()
+                    .px(px(SIDEBAR_GUTTER))
+                    .pb(px(tokens::SPACE_12))
+                    .child(
+                        SidebarRow::new(
+                            "open-scheduled-tasks-nav",
+                            i18n::text(cx, "sidebar.scheduled_tasks"),
                         )
-                        .child(i18n::text(cx, "sidebar.scheduled_tasks"))
+                        .icon(IconName::Calendar)
+                        .selected(self.route == Route::ScheduledTasks)
+                        .render(theme)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.project_settings_open = false;
                             this.refresh_scheduled_tasks();
                             this.route = Route::ScheduledTasks;
                             cx.notify();
                         })),
-                ),
+                    ),
             )
             .child(
                 div()
@@ -11452,31 +11297,31 @@ impl AverroesApp {
                     .overflow_y_scrollbar()
                     .px(px(SIDEBAR_GUTTER))
                     .when(!pinned_rows.is_empty(), |this| {
-                        this.child(sidebar_heading(
-                            i18n::text(cx, "sidebar.pinned"),
+                        this.child(section_header(
                             theme,
-                            14.0,
+                            i18n::text(cx, "sidebar.pinned"),
+                            tokens::SPACE_16,
                         ))
                         .children(pinned_rows)
                     })
                     .when(!attention_rows.is_empty(), |this| {
-                        this.child(sidebar_heading(
-                            i18n::text(cx, "sidebar.attention"),
+                        this.child(section_header(
                             theme,
-                            14.0,
+                            i18n::text(cx, "sidebar.attention"),
+                            tokens::SPACE_16,
                         ))
                         .children(attention_rows)
                     })
                     .child(
                         div()
-                            .mt(px(8.0))
-                            .h(px(36.0))
-                            .pl(px(10.0))
-                            .pr(px(3.0))
+                            .mt(px(tokens::SPACE_8))
+                            .h(px(SIDEBAR_NAV_HEIGHT))
+                            .pl(px(tokens::SPACE_8))
+                            .pr(px(tokens::SPACE_2))
                             .flex()
                             .items_center()
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::MEDIUM)
+                            .text_size(px(tokens::TEXT_BODY))
+                            .font_weight(tokens::WEIGHT_MEDIUM)
                             .text_color(theme.muted)
                             .child(
                                 div()
@@ -11485,7 +11330,7 @@ impl AverroesApp {
                                     .h_full()
                                     .flex()
                                     .items_center()
-                                    .gap(px(4.0))
+                                    .gap(px(tokens::SPACE_4))
                                     .cursor_pointer()
                                     .child(i18n::text(
                                         cx,
@@ -11540,10 +11385,10 @@ impl AverroesApp {
                     )
                     .children(project_rows)
                     .when(!recent_rows.is_empty(), |this| {
-                        this.child(sidebar_heading(
-                            i18n::text(cx, "sidebar.recents"),
+                        this.child(section_header(
                             theme,
-                            16.0,
+                            i18n::text(cx, "sidebar.recents"),
+                            tokens::SPACE_20,
                         ))
                         .children(recent_rows)
                     }),
@@ -11603,13 +11448,13 @@ impl AverroesApp {
                     .id(SharedString::from(format!("attachment-{index}")))
                     .max_w(px(220.0))
                     .h(px(27.0))
-                    .px(px(7.0))
+                    .px(px(tokens::SPACE_8))
                     .flex()
                     .items_center()
-                    .gap(px(5.0))
+                    .gap(px(tokens::SPACE_4))
                     .rounded(px(metrics.attachment_radius))
                     .bg(theme.surface_subtle)
-                    .text_size(px(11.0))
+                    .text_size(px(tokens::TEXT_CAPTION))
                     .child(Icon::new(IconName::File).size(px(13.0)))
                     .child(div().min_w(px(0.0)).truncate().child(name))
                     .child(
@@ -11632,7 +11477,7 @@ impl AverroesApp {
         let send_button = Button::new(if compact { "send-new" } else { "send-open" })
             .primary()
             .with_size(px(metrics.send_size))
-            .rounded(px(14.0))
+            .rounded(px(tokens::RADIUS_SHEET))
             .tooltip(if session.processing {
                 i18n::text(cx, "composer.stop")
             } else {
@@ -11656,21 +11501,9 @@ impl AverroesApp {
                 .p_0()
                 .child(
                     div()
-                        .size(px(8.0))
-                        .rounded(px(2.0))
-                        .bg(theme.background)
-                        .with_animation(
-                            format!("composer-stop-pulse-{}", session.id.as_str()),
-                            Animation::new(Duration::from_millis(900)).repeat(),
-                            |stop, delta| {
-                                let wave = if delta < 0.5 {
-                                    delta * 2.0
-                                } else {
-                                    (1.0 - delta) * 2.0
-                                };
-                                stop.opacity(0.68 + wave * 0.32)
-                            },
-                        ),
+                        .size(px(tokens::SPACE_8))
+                        .rounded(px(tokens::SPACE_2))
+                        .bg(gpui::rgba(0xFFFFFFFF)),
                 )
                 .into_any_element()
         } else {
@@ -11740,11 +11573,11 @@ impl AverroesApp {
                     .when(has_attachments, |this| {
                         this.child(
                             div()
-                                .px(px(14.0))
-                                .pt(px(9.0))
+                                .px(px(tokens::SPACE_12))
+                                .pt(px(tokens::SPACE_8))
                                 .flex()
                                 .flex_wrap()
-                                .gap(px(6.0))
+                                .gap(px(tokens::SPACE_6))
                                 .max_h(px(58.0))
                                 .overflow_y_scrollbar()
                                 .children(attachment_chips),
@@ -11753,8 +11586,8 @@ impl AverroesApp {
                     .child(
                         div()
                             .min_h(px(metrics.text_min_height))
-                            .px(px(14.0))
-                            .py(px(10.0))
+                            .px(px(tokens::SPACE_12))
+                            .py(px(tokens::SPACE_8))
                             .flex()
                             .items_start()
                             .child(
@@ -11785,7 +11618,7 @@ impl AverroesApp {
                         })
                         .ghost()
                         .with_size(px(28.0))
-                        .mr(px(3.0))
+                        .mr(px(tokens::SPACE_2))
                         .icon(IconName::Plus)
                         .tooltip(i18n::text(cx, "composer.attach_files"))
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -11796,7 +11629,7 @@ impl AverroesApp {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(4.0))
+                            .gap(px(tokens::SPACE_4))
                             .flex_none()
                             .child(
                                 Button::new("remote-agent-compose")
@@ -11845,7 +11678,7 @@ impl AverroesApp {
                             ),
                     )
                     .when_some(private_selector, |footer, selector| {
-                        footer.child(div().ml(px(6.0)).flex_none().child(selector))
+                        footer.child(div().ml(px(tokens::SPACE_6)).flex_none().child(selector))
                     })
                     .child(div().flex_1())
                     .when_some(token_rate_indicator, |footer, indicator| {
@@ -11897,8 +11730,12 @@ impl AverroesApp {
                         session_id.as_str()
                     )))
                     .w_full()
-                    .pt(if index == 0 { px(28.0) } else { px(0.0) })
-                    .pb(px(26.0))
+                    .pt(if index == 0 {
+                        px(tokens::SPACE_32)
+                    } else {
+                        px(0.0)
+                    })
+                    .pb(px(tokens::SPACE_32))
                     .flex()
                     .justify_center()
                     .child(div().w_full().max_w(px(820.0)).child(render_message(
@@ -11920,8 +11757,8 @@ impl AverroesApp {
         )
         .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
         .size_full()
-        .px(px(30.0))
-        .pb(px(22.0))
+        .px(px(tokens::SPACE_32))
+        .pb(px(tokens::SPACE_32))
     }
 
     fn render_welcome_step(
@@ -11938,12 +11775,12 @@ impl AverroesApp {
         div()
             .id(SharedString::from(format!("welcome-step-{step_id}")))
             .w_full()
-            .px(px(16.0))
-            .py(px(14.0))
+            .px(px(tokens::SPACE_16))
+            .py(px(tokens::SPACE_16))
             .flex()
             .items_center()
-            .gap(px(13.0))
-            .rounded(px(11.0))
+            .gap(px(tokens::SPACE_16))
+            .rounded(px(tokens::RADIUS_CARD))
             .border_1()
             .border_color(theme.border)
             .bg(theme.surface)
@@ -11958,8 +11795,8 @@ impl AverroesApp {
                     .justify_center()
                     .rounded_full()
                     .bg(theme.accent_soft)
-                    .text_size(px(11.0))
-                    .font_weight(FontWeight::BOLD)
+                    .text_size(px(tokens::TEXT_CAPTION))
+                    .font_weight(tokens::WEIGHT_SEMIBOLD)
                     .text_color(theme.foreground)
                     .child(number),
             )
@@ -11969,16 +11806,16 @@ impl AverroesApp {
                     .min_w(px(0.0))
                     .flex()
                     .flex_col()
-                    .gap(px(3.0))
+                    .gap(px(tokens::SPACE_2))
                     .child(
                         div()
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(tokens::TEXT_BODY))
+                            .font_weight(tokens::WEIGHT_SEMIBOLD)
                             .child(title),
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(px(tokens::TEXT_SMALL))
                             .text_color(theme.muted)
                             .child(description),
                     ),
@@ -11986,14 +11823,14 @@ impl AverroesApp {
             .child(
                 div()
                     .flex_none()
-                    .px(px(10.0))
-                    .py(px(6.0))
-                    .rounded(px(7.0))
+                    .px(px(tokens::SPACE_8))
+                    .py(px(tokens::SPACE_6))
+                    .rounded(px(tokens::RADIUS_CONTROL))
                     .bg(theme.surface_subtle)
                     .border_1()
                     .border_color(theme.border)
-                    .text_size(px(12.0))
-                    .font_weight(FontWeight::MEDIUM)
+                    .text_size(px(tokens::TEXT_SMALL))
+                    .font_weight(tokens::WEIGHT_MEDIUM)
                     .child(action_label),
             )
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -12093,23 +11930,17 @@ impl AverroesApp {
             .into_iter()
             .map(|project| {
                 let project_id = project.id.clone();
-                div()
+                card(theme, tokens::SPACE_16)
                     .id(SharedString::from(format!("home-project-{}", project.id)))
                     .w_full()
-                    .px(px(14.0))
-                    .py(px(12.0))
                     .flex()
                     .items_center()
-                    .gap(px(11.0))
-                    .rounded(px(9.0))
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.surface)
+                    .gap(px(tokens::SPACE_12))
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.surface_hover))
                     .child(
                         Icon::new(IconName::Folder)
-                            .size(px(16.0))
+                            .size(px(tokens::ICON_SIZE))
                             .text_color(theme.muted),
                     )
                     .child(
@@ -12118,14 +11949,14 @@ impl AverroesApp {
                             .min_w(px(0.0))
                             .child(
                                 div()
-                                    .text_size(px(13.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(px(tokens::TEXT_BODY))
+                                    .font_weight(tokens::WEIGHT_SEMIBOLD)
                                     .child(project.name),
                             )
                             .child(
                                 div()
-                                    .mt(px(2.0))
-                                    .text_size(px(11.0))
+                                    .mt(px(tokens::SPACE_2))
+                                    .text_size(px(tokens::TEXT_CAPTION))
                                     .text_color(theme.faint)
                                     .whitespace_nowrap()
                                     .overflow_hidden()
@@ -12147,11 +11978,11 @@ impl AverroesApp {
 
         let setup_panel = div()
             .w_full()
-            .p(px(18.0))
+            .p(px(tokens::SPACE_16))
             .flex()
             .flex_col()
-            .gap(px(12.0))
-            .rounded(px(14.0))
+            .gap(px(tokens::SPACE_12))
+            .rounded(px(tokens::RADIUS_SHEET))
             .border_1()
             .border_color(theme.border)
             .bg(theme.surface_subtle)
@@ -12159,33 +11990,38 @@ impl AverroesApp {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(3.0))
+                    .gap(px(tokens::SPACE_2))
                     .child(
                         div()
-                            .text_size(px(14.0))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(tokens::TEXT_BODY))
+                            .font_weight(tokens::WEIGHT_SEMIBOLD)
                             .child(i18n::text(cx, "home.setup_title")),
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(px(tokens::TEXT_SMALL))
                             .text_color(theme.muted)
                             .child(progress_label),
                     ),
             )
-            .child(div().w_full().h(px(4.0)).flex().gap(px(4.0)).children(
-                (0..ONBOARDING_STEP_COUNT).map(|index| {
-                    div()
-                        .flex_1()
-                        .h_full()
-                        .rounded_full()
-                        .bg(if index < completed_steps {
-                            theme.success
-                        } else {
-                            theme.border
-                        })
-                }),
-            ))
+            .child(
+                div()
+                    .w_full()
+                    .h(px(4.0))
+                    .flex()
+                    .gap(px(tokens::SPACE_4))
+                    .children((0..ONBOARDING_STEP_COUNT).map(|index| {
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .rounded_full()
+                            .bg(if index < completed_steps {
+                                theme.success
+                            } else {
+                                theme.border
+                            })
+                    })),
+            )
             .children(pending_steps);
 
         div()
@@ -12199,32 +12035,32 @@ impl AverroesApp {
                 div()
                     .w_full()
                     .max_w(px(820.0))
-                    .px(px(28.0))
-                    .py(px(46.0))
+                    .px(px(tokens::SPACE_32))
+                    .py(px(tokens::SPACE_32))
                     .flex()
                     .flex_col()
-                    .gap(px(26.0))
+                    .gap(px(tokens::SPACE_24))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(16.0))
+                            .gap(px(tokens::SPACE_16))
                             .child(img(averroes_logo_asset(cx)).size(px(64.0)))
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .gap(px(5.0))
+                                    .gap(px(tokens::SPACE_4))
                                     .child(
                                         div()
-                                            .text_size(px(28.0))
-                                            .font_weight(FontWeight::BOLD)
+                                            .text_size(px(tokens::TEXT_LARGE))
+                                            .font_weight(tokens::WEIGHT_SEMIBOLD)
                                             .child(i18n::text(cx, "home.title")),
                                     )
                                     .child(
                                         div()
                                             .max_w(px(620.0))
-                                            .text_size(px(14.0))
+                                            .text_size(px(tokens::TEXT_BODY))
                                             .text_color(theme.muted)
                                             .child(i18n::text(cx, "home.subtitle")),
                                     ),
@@ -12235,7 +12071,7 @@ impl AverroesApp {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(10.0))
+                            .gap(px(tokens::SPACE_8))
                             .child(
                                 div()
                                     .flex()
@@ -12243,22 +12079,22 @@ impl AverroesApp {
                                     .justify_between()
                                     .child(
                                         div()
-                                            .text_size(px(14.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_size(px(tokens::TEXT_BODY))
+                                            .font_weight(tokens::WEIGHT_SEMIBOLD)
                                             .child(i18n::text(cx, "home.recent_workspaces")),
                                     )
                                     .child(
                                         div()
                                             .flex()
                                             .items_center()
-                                            .gap(px(8.0))
+                                            .gap(px(tokens::SPACE_8))
                                             .child(
                                                 div()
-                                                    .px(px(8.0))
-                                                    .py(px(3.0))
+                                                    .px(px(tokens::SPACE_8))
+                                                    .py(px(tokens::SPACE_2))
                                                     .rounded_full()
                                                     .bg(theme.surface_subtle)
-                                                    .text_size(px(11.0))
+                                                    .text_size(px(tokens::TEXT_CAPTION))
                                                     .text_color(theme.muted)
                                                     .child(self.projects.len().to_string()),
                                             )
@@ -12284,7 +12120,7 @@ impl AverroesApp {
                             .children(project_cards)
                             .when(!self.projects.is_empty(), |workspaces| {
                                 workspaces.child(
-                                    div().mt(px(2.0)).flex().justify_end().child(
+                                    div().mt(px(tokens::SPACE_2)).flex().justify_end().child(
                                         Button::new("home-new-conversation")
                                             .primary()
                                             .label(i18n::text(cx, "home.new_conversation"))
@@ -12313,10 +12149,10 @@ impl AverroesApp {
         let tab_bar = div()
             .flex_none()
             .h(px(46.0))
-            .px(px(32.0))
+            .px(px(tokens::SPACE_32))
             .flex()
             .items_center()
-            .gap(px(4.0))
+            .gap(px(tokens::SPACE_4))
             .border_b_1()
             .border_color(theme.border)
             .children(tabs.into_iter().map(|(tab, label, key)| {
@@ -12324,12 +12160,12 @@ impl AverroesApp {
                 div()
                     .id(SharedString::from(format!("project-settings-tab-{key}")))
                     .h(px(32.0))
-                    .px(px(12.0))
+                    .px(px(tokens::SPACE_12))
                     .flex()
                     .items_center()
-                    .rounded(px(7.0))
+                    .rounded(px(tokens::RADIUS_CONTROL))
                     .cursor_pointer()
-                    .text_size(px(12.0))
+                    .text_size(px(tokens::TEXT_SMALL))
                     .text_color(if selected {
                         theme.foreground
                     } else {
@@ -12359,10 +12195,10 @@ impl AverroesApp {
             .child(
                 div()
                     .h(px(72.0))
-                    .px(px(32.0))
+                    .px(px(tokens::SPACE_32))
                     .flex()
                     .items_center()
-                    .gap(px(12.0))
+                    .gap(px(tokens::SPACE_12))
                     .child(
                         Button::new("project-settings-back")
                             .secondary()
@@ -12375,13 +12211,13 @@ impl AverroesApp {
                     .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(px(16.0))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(tokens::TEXT_TITLE3))
+                            .font_weight(tokens::WEIGHT_SEMIBOLD)
                             .child(project_name),
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(px(tokens::TEXT_SMALL))
                             .text_color(theme.muted)
                             .child(i18n::text(cx, "sidebar.complements")),
                     ),
@@ -12442,19 +12278,19 @@ impl AverroesApp {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(12.0))
-                    .p(px(14.0))
-                    .rounded(px(11.0))
+                    .gap(px(tokens::SPACE_12))
+                    .p(px(tokens::SPACE_12))
+                    .rounded(px(tokens::RADIUS_CARD))
                     .bg(theme.surface_subtle)
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
+                            .child(div().font_weight(tokens::WEIGHT_SEMIBOLD).child(name))
                             .child(
                                 div()
-                                    .mt(px(4.0))
-                                    .text_size(px(11.0))
+                                    .mt(px(tokens::SPACE_4))
+                                    .text_size(px(tokens::TEXT_CAPTION))
                                     .text_color(theme.muted)
                                     .whitespace_nowrap()
                                     .overflow_hidden()
@@ -12510,8 +12346,8 @@ impl AverroesApp {
                     .mx_auto()
                     .w_full()
                     .max_w(px(900.0))
-                    .px(px(32.0))
-                    .py(px(28.0))
+                    .px(px(tokens::SPACE_32))
+                    .py(px(tokens::SPACE_24))
                     .child(settings_page_title(
                         i18n::text(cx, "project.mcp_title"),
                         i18n::text(cx, "project.mcp_description"),
@@ -12519,8 +12355,8 @@ impl AverroesApp {
                     ))
                     .child(
                         div()
-                            .mt(px(12.0))
-                            .text_size(px(11.0))
+                            .mt(px(tokens::SPACE_12))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.faint)
                             .child(format!(
                                 "{}: {}",
@@ -12530,24 +12366,24 @@ impl AverroesApp {
                     )
                     .child(
                         div()
-                            .mt(px(16.0))
+                            .mt(px(tokens::SPACE_16))
                             .child(Input::new(&self.project_mcp_search).prefix(IconName::Search)),
                     )
                     .child(
                         div()
-                            .mt(px(18.0))
+                            .mt(px(tokens::SPACE_16))
                             .flex()
-                            .gap(px(8.0))
+                            .gap(px(tokens::SPACE_8))
                             .child(add_local)
                             .child(add_http)
                             .child(add_webmcp),
                     )
                     .child(
                         div()
-                            .mt(px(14.0))
+                            .mt(px(tokens::SPACE_12))
                             .flex()
                             .flex_col()
-                            .gap(px(8.0))
+                            .gap(px(tokens::SPACE_8))
                             .when(rows.is_empty(), |this| {
                                 this.child(if has_query {
                                     settings_empty_state(
@@ -12593,28 +12429,28 @@ impl AverroesApp {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(12.0))
-                    .p(px(14.0))
-                    .rounded(px(11.0))
+                    .gap(px(tokens::SPACE_12))
+                    .p(px(tokens::SPACE_12))
+                    .rounded(px(tokens::RADIUS_CARD))
                     .bg(theme.surface_subtle)
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(skill.name))
+                            .child(div().font_weight(tokens::WEIGHT_SEMIBOLD).child(skill.name))
                             .when(!skill.description.trim().is_empty(), |this| {
                                 this.child(
                                     div()
-                                        .mt(px(4.0))
-                                        .text_size(px(11.0))
+                                        .mt(px(tokens::SPACE_4))
+                                        .text_size(px(tokens::TEXT_CAPTION))
                                         .text_color(theme.muted)
                                         .child(skill.description),
                                 )
                             })
                             .child(
                                 div()
-                                    .mt(px(4.0))
-                                    .text_size(px(10.0))
+                                    .mt(px(tokens::SPACE_4))
+                                    .text_size(px(tokens::TEXT_CAPTION))
                                     .text_color(theme.faint)
                                     .child(skill.path.display().to_string()),
                             ),
@@ -12641,15 +12477,15 @@ impl AverroesApp {
                     .mx_auto()
                     .w_full()
                     .max_w(px(900.0))
-                    .px(px(32.0))
-                    .py(px(28.0))
+                    .px(px(tokens::SPACE_32))
+                    .py(px(tokens::SPACE_24))
                     .child(settings_page_title(
                         i18n::text(cx, "project.skills_title"),
                         i18n::text(cx, "project.skills_description"),
                         theme,
                     ))
                     .child(
-                        div().mt(px(18.0)).flex().justify_end().child(
+                        div().mt(px(tokens::SPACE_16)).flex().justify_end().child(
                             Button::new("open-skill-marketplace")
                                 .primary()
                                 .icon(IconName::Plus)
@@ -12661,15 +12497,15 @@ impl AverroesApp {
                     )
                     .child(
                         div()
-                            .mt(px(16.0))
+                            .mt(px(tokens::SPACE_16))
                             .child(Input::new(&self.project_skill_search).prefix(IconName::Search)),
                     )
                     .child(
                         div()
-                            .mt(px(14.0))
+                            .mt(px(tokens::SPACE_12))
                             .flex()
                             .flex_col()
-                            .gap(px(8.0))
+                            .gap(px(tokens::SPACE_8))
                             .when(rows.is_empty(), |this| {
                                 this.child(if has_query {
                                     settings_empty_state(
@@ -12738,7 +12574,7 @@ impl AverroesApp {
                         div()
                             .w_full()
                             .max_w(px(690.0))
-                            .px(px(15.0))
+                            .px(px(tokens::SPACE_16))
                             .flex()
                             .flex_col()
                             .items_center()
@@ -12755,7 +12591,7 @@ impl AverroesApp {
                                             .flex_none(),
                                     )
                                     .text_size(px(empty_metrics.empty_title_size))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .font_weight(tokens::WEIGHT_MEDIUM)
                                     .child(i18n::text(cx, "chat.ready")),
                             )
                             .child(self.render_composer_stack(true, &tasks, &session_id, cx)),
@@ -12843,7 +12679,7 @@ impl AverroesApp {
                 div()
                     .flex_none()
                     .h(px(46.0))
-                    .px(px(18.0))
+                    .px(px(tokens::SPACE_16))
                     .flex()
                     .items_center()
                     .child(
@@ -12852,9 +12688,9 @@ impl AverroesApp {
                             .min_w(px(0.0))
                             .flex()
                             .items_center()
-                            .gap(px(2.0))
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::MEDIUM)
+                            .gap(px(tokens::SPACE_2))
+                            .text_size(px(tokens::TEXT_BODY))
+                            .font_weight(tokens::WEIGHT_MEDIUM)
                             .child(
                                 div()
                                     .min_w(px(0.0))
@@ -12890,9 +12726,9 @@ impl AverroesApp {
                             .id("context-usage-button")
                             .flex_none()
                             .h(px(30.0))
-                            .px(px(9.0))
-                            .gap(px(6.0))
-                            .rounded(px(9.0))
+                            .px(px(tokens::SPACE_8))
+                            .gap(px(tokens::SPACE_6))
+                            .rounded(px(tokens::RADIUS_CARD))
                             .border_1()
                             .border_color(if self.show_context {
                                 theme.focus_ring
@@ -12911,7 +12747,7 @@ impl AverroesApp {
                             .hover(|style| {
                                 style.bg(theme.accent_soft).border_color(theme.focus_ring)
                             })
-                            .text_size(px(11.0))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.muted)
                             .child(
                                 Icon::new(if self.show_context {
@@ -12924,7 +12760,7 @@ impl AverroesApp {
                             )
                             .child(
                                 div()
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .font_weight(tokens::WEIGHT_MEDIUM)
                                     .child(i18n::text(cx, "chat.context")),
                             )
                             .child(if context_busy {
@@ -12942,12 +12778,12 @@ impl AverroesApp {
                     .child(
                         div()
                             .id("patch-history-button")
-                            .ml(px(6.0))
+                            .ml(px(tokens::SPACE_6))
                             .flex_none()
                             .h(px(30.0))
-                            .px(px(9.0))
-                            .gap(px(6.0))
-                            .rounded(px(9.0))
+                            .px(px(tokens::SPACE_8))
+                            .gap(px(tokens::SPACE_6))
+                            .rounded(px(tokens::RADIUS_CARD))
                             .border_1()
                             .border_color(if self.show_patches {
                                 theme.focus_ring
@@ -12966,7 +12802,7 @@ impl AverroesApp {
                             .hover(|style| {
                                 style.bg(theme.accent_soft).border_color(theme.focus_ring)
                             })
-                            .text_size(px(11.0))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.muted)
                             .child(
                                 Icon::new(IconName::File)
@@ -12975,7 +12811,7 @@ impl AverroesApp {
                             )
                             .child(
                                 div()
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .font_weight(tokens::WEIGHT_MEDIUM)
                                     .child(i18n::text(cx, "chat.patches")),
                             )
                             .child(patch_count.clone())
@@ -13009,8 +12845,8 @@ impl AverroesApp {
                             .child(
                                 div()
                                     .flex_none()
-                                    .px(px(22.0))
-                                    .pb(px(14.0))
+                                    .px(px(tokens::SPACE_24))
+                                    .pb(px(tokens::SPACE_16))
                                     .flex()
                                     .justify_center()
                                     .child(self.render_composer_stack(
@@ -13039,12 +12875,12 @@ impl AverroesApp {
                                         .left(px(4.0))
                                         .top(px(20.0))
                                         .max_h(px(220.0))
-                                        .px(px(2.0))
-                                        .py(px(4.0))
+                                        .px(px(tokens::SPACE_2))
+                                        .py(px(tokens::SPACE_4))
                                         .flex()
                                         .flex_col()
                                         .items_center()
-                                        .gap(px(6.0))
+                                        .gap(px(tokens::SPACE_6))
                                         .rounded_full()
                                         .border_1()
                                         .border_color(theme.border)
@@ -13149,7 +12985,7 @@ impl AverroesApp {
             render_activity_indicator(format!("agent-thread-status-{thread_id}"), theme, 3.0)
         } else {
             div()
-                .text_size(px(11.0))
+                .text_size(px(tokens::TEXT_CAPTION))
                 .text_color(agent_thread_status_color(thread.status, theme))
                 .child(agent_thread_status_label(thread.status))
                 .into_any_element()
@@ -13164,7 +13000,7 @@ impl AverroesApp {
                 div()
                     .flex_none()
                     .h(px(46.0))
-                    .px(px(18.0))
+                    .px(px(tokens::SPACE_16))
                     .flex()
                     .items_center()
                     .border_b_1()
@@ -13181,11 +13017,11 @@ impl AverroesApp {
                     )
                     .child(
                         div()
-                            .ml(px(10.0))
+                            .ml(px(tokens::SPACE_8))
                             .flex_1()
                             .min_w(px(0.0))
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::MEDIUM)
+                            .text_size(px(tokens::TEXT_BODY))
+                            .font_weight(tokens::WEIGHT_MEDIUM)
                             .whitespace_nowrap()
                             .overflow_hidden()
                             .text_ellipsis()
@@ -13204,16 +13040,16 @@ impl AverroesApp {
                             .w_full()
                             .max_w(px(820.0))
                             .mx_auto()
-                            .px(px(30.0))
-                            .py(px(22.0))
+                            .px(px(tokens::SPACE_32))
+                            .py(px(tokens::SPACE_24))
                             .child(transcript),
                     ),
             )
             .child(
                 div()
                     .flex_none()
-                    .px(px(22.0))
-                    .pb(px(14.0))
+                    .px(px(tokens::SPACE_24))
+                    .pb(px(tokens::SPACE_12))
                     .flex()
                     .justify_center()
                     .child(
@@ -13266,10 +13102,10 @@ impl AverroesApp {
                     .id(SharedString::from(activity_id.clone()))
                     .flex()
                     .flex_col()
-                    .gap(px(8.0))
+                    .gap(px(tokens::SPACE_8))
                     .w_full()
-                    .p(px(11.0))
-                    .rounded(px(10.0))
+                    .p(px(tokens::SPACE_12))
+                    .rounded(px(tokens::RADIUS_CARD))
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.surface_subtle)
@@ -13277,26 +13113,26 @@ impl AverroesApp {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(7.0))
+                            .gap(px(tokens::SPACE_8))
                             .child(tool_icon("patch", 15.0).text_color(theme.muted))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w(px(0.0))
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(tokens::TEXT_SMALL))
+                                    .font_weight(tokens::WEIGHT_MEDIUM)
                                     .text_color(theme.foreground)
                                     .child(localized_tool_display_name(cx, "patch")),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.0))
+                                    .text_size(px(tokens::TEXT_CAPTION))
                                     .text_color(state_color)
                                     .child(state_label),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.0))
+                                    .text_size(px(tokens::TEXT_CAPTION))
                                     .text_color(theme.faint)
                                     .child(duration),
                             ),
@@ -13304,7 +13140,7 @@ impl AverroesApp {
                     .when_some(agent_title, |this, agent_title| {
                         this.child(
                             div()
-                                .text_size(px(10.0))
+                                .text_size(px(tokens::TEXT_CAPTION))
                                 .text_color(theme.faint)
                                 .child(agent_title),
                         )
@@ -13314,16 +13150,16 @@ impl AverroesApp {
                             div()
                                 .flex()
                                 .flex_col()
-                                .gap(px(3.0))
+                                .gap(px(tokens::SPACE_2))
                                 .child(
                                     div()
-                                        .text_size(px(10.0))
+                                        .text_size(px(tokens::TEXT_CAPTION))
                                         .text_color(theme.faint)
                                         .child(i18n::text(cx, "chat.patch_summary")),
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(11.0))
+                                        .text_size(px(tokens::TEXT_CAPTION))
                                         .text_color(theme.muted)
                                         .child(summary),
                                 ),
@@ -13331,7 +13167,7 @@ impl AverroesApp {
                     })
                     .child(
                         div()
-                            .text_size(px(10.0))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.faint)
                             .child(i18n::text(cx, "tool.arguments")),
                     )
@@ -13340,11 +13176,11 @@ impl AverroesApp {
                         &activity.name,
                         &input,
                         theme,
-                        10.0,
+                        tokens::TEXT_CAPTION,
                     ))
                     .child(
                         div()
-                            .text_size(px(10.0))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.faint)
                             .child(i18n::text(cx, "tool.result")),
                     )
@@ -13361,7 +13197,7 @@ impl AverroesApp {
                         } else {
                             theme.muted
                         },
-                        10.0,
+                        tokens::TEXT_CAPTION,
                     ))
                     .into_any_element()
             })
@@ -13379,8 +13215,8 @@ impl AverroesApp {
             .bg(theme.background)
             .border_l_1()
             .border_color(theme.border)
-            .px(px(18.0))
-            .py(px(15.0))
+            .px(px(tokens::SPACE_16))
+            .py(px(tokens::SPACE_16))
             .overflow_y_scrollbar()
             .child(
                 div()
@@ -13392,9 +13228,9 @@ impl AverroesApp {
                             .flex_1()
                             .flex()
                             .items_center()
-                            .gap(px(7.0))
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .gap(px(tokens::SPACE_8))
+                            .text_size(px(tokens::TEXT_BODY))
+                            .font_weight(tokens::WEIGHT_SEMIBOLD)
                             .child(
                                 Icon::new(IconName::File)
                                     .size(px(14.0))
@@ -13414,16 +13250,16 @@ impl AverroesApp {
             )
             .child(
                 div()
-                    .mt(px(10.0))
-                    .text_size(px(10.0))
+                    .mt(px(tokens::SPACE_8))
+                    .text_size(px(tokens::TEXT_CAPTION))
                     .text_color(theme.faint)
                     .child(count),
             )
             .when(entries.is_empty(), |this| {
                 this.child(
                     div()
-                        .mt(px(24.0))
-                        .text_size(px(12.0))
+                        .mt(px(tokens::SPACE_24))
+                        .text_size(px(tokens::TEXT_SMALL))
                         .text_color(theme.muted)
                         .child(i18n::text(cx, "chat.no_patches")),
                 )
@@ -13494,11 +13330,11 @@ impl AverroesApp {
                     )))
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(tokens::SPACE_8))
                     .w_full()
-                    .px(px(8.0))
-                    .py(px(7.0))
-                    .rounded(px(7.0))
+                    .px(px(tokens::SPACE_8))
+                    .py(px(tokens::SPACE_8))
+                    .rounded(px(tokens::RADIUS_CONTROL))
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.surface_hover))
                     .child(
@@ -13511,13 +13347,13 @@ impl AverroesApp {
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .text_size(px(12.0))
+                            .text_size(px(tokens::TEXT_SMALL))
                             .overflow_hidden()
                             .child(thread.title.clone()),
                     )
                     .child(
                         div()
-                            .text_size(px(10.0))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.faint)
                             .child(agent_thread_status_label(thread.status)),
                     )
@@ -13547,8 +13383,8 @@ impl AverroesApp {
                     )
                 });
             div()
-                .mt(px(14.0))
-                .pt(px(14.0))
+                .mt(px(tokens::SPACE_12))
+                .pt(px(tokens::SPACE_12))
                 .border_t_1()
                 .border_color(theme.border)
                 .child(
@@ -13558,8 +13394,8 @@ impl AverroesApp {
                         .child(
                             div()
                                 .flex_1()
-                                .text_size(px(12.0))
-                                .font_weight(FontWeight::MEDIUM)
+                                .text_size(px(tokens::TEXT_SMALL))
+                                .font_weight(tokens::WEIGHT_MEDIUM)
                                 .child(thread.title.clone()),
                         )
                         .child(
@@ -13575,8 +13411,8 @@ impl AverroesApp {
                 )
                 .child(
                     div()
-                        .mt(px(8.0))
-                        .text_size(px(10.0))
+                        .mt(px(tokens::SPACE_8))
+                        .text_size(px(tokens::TEXT_CAPTION))
                         .text_color(theme.faint)
                         .child(format!(
                             "{} · {}",
@@ -13586,22 +13422,22 @@ impl AverroesApp {
                 )
                 .child(
                     div()
-                        .mt(px(12.0))
-                        .text_size(px(11.0))
+                        .mt(px(tokens::SPACE_12))
+                        .text_size(px(tokens::TEXT_CAPTION))
                         .text_color(theme.muted)
                         .child(i18n::text(cx, "chat.prompt")),
                 )
                 .child(
                     div()
-                        .mt(px(4.0))
-                        .text_size(px(12.0))
+                        .mt(px(tokens::SPACE_4))
+                        .text_size(px(tokens::TEXT_SMALL))
                         .child(thread.prompt.clone()),
                 )
                 .when_some(transcript, |this, transcript| {
                     this.child(
                         div()
-                            .mt(px(12.0))
-                            .text_size(px(11.0))
+                            .mt(px(tokens::SPACE_12))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.muted)
                             .child(i18n::text(cx, "chat.output")),
                     )
@@ -13610,15 +13446,15 @@ impl AverroesApp {
                 .when(!has_selected_transcript, |this| {
                     this.child(
                         div()
-                            .mt(px(12.0))
-                            .text_size(px(11.0))
+                            .mt(px(tokens::SPACE_12))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.muted)
                             .child(i18n::text(cx, "chat.output")),
                     )
                     .child(
                         div()
-                            .mt(px(4.0))
-                            .text_size(px(12.0))
+                            .mt(px(tokens::SPACE_4))
+                            .text_size(px(tokens::TEXT_SMALL))
                             .text_color(theme.foreground)
                             .child(output),
                     )
@@ -13632,8 +13468,8 @@ impl AverroesApp {
             .bg(theme.background)
             .border_l_1()
             .border_color(theme.border)
-            .px(px(18.0))
-            .py(px(15.0))
+            .px(px(tokens::SPACE_16))
+            .py(px(tokens::SPACE_16))
             .overflow_y_scrollbar()
             .child(
                 div()
@@ -13645,9 +13481,9 @@ impl AverroesApp {
                             .flex_1()
                             .flex()
                             .items_center()
-                            .gap(px(7.0))
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .gap(px(tokens::SPACE_8))
+                            .text_size(px(tokens::TEXT_BODY))
+                            .font_weight(tokens::WEIGHT_SEMIBOLD)
                             .child(
                                 Icon::new(IconName::PanelRightClose)
                                     .size(px(14.0))
@@ -13667,9 +13503,9 @@ impl AverroesApp {
             )
             .child(
                 div()
-                    .mt(px(12.0))
-                    .p(px(14.0))
-                    .rounded(px(12.0))
+                    .mt(px(tokens::SPACE_12))
+                    .p(px(tokens::SPACE_12))
+                    .rounded(px(tokens::RADIUS_CARD))
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.surface)
@@ -13680,19 +13516,19 @@ impl AverroesApp {
                             .child(
                                 div()
                                     .flex_1()
-                                    .text_size(px(11.0))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(tokens::TEXT_CAPTION))
+                                    .font_weight(tokens::WEIGHT_MEDIUM)
                                     .text_color(theme.muted)
                                     .child(i18n::text(cx, "chat.latest_usage")),
                             )
                             .child(
                                 div()
-                                    .px(px(7.0))
-                                    .py(px(3.0))
+                                    .px(px(tokens::SPACE_8))
+                                    .py(px(tokens::SPACE_2))
                                     .rounded_full()
                                     .bg(theme.surface_subtle)
-                                    .text_size(px(10.0))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(tokens::TEXT_CAPTION))
+                                    .font_weight(tokens::WEIGHT_MEDIUM)
                                     .text_color(theme.faint)
                                     .child(
                                         percentage
@@ -13703,10 +13539,10 @@ impl AverroesApp {
                     )
                     .child(
                         div()
-                            .mt(px(14.0))
+                            .mt(px(tokens::SPACE_12))
                             .flex()
                             .justify_between()
-                            .text_size(px(11.0))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .child(
                                 div()
                                     .text_color(theme.muted)
@@ -13716,10 +13552,10 @@ impl AverroesApp {
                     )
                     .child(
                         div()
-                            .mt(px(8.0))
+                            .mt(px(tokens::SPACE_8))
                             .flex()
                             .justify_between()
-                            .text_size(px(11.0))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .child(
                                 div()
                                     .text_color(theme.muted)
@@ -13730,10 +13566,10 @@ impl AverroesApp {
                     .when_some(cached_input_tokens, |this, cached_input_tokens| {
                         this.child(
                             div()
-                                .mt(px(8.0))
+                                .mt(px(tokens::SPACE_8))
                                 .flex()
                                 .justify_between()
-                                .text_size(px(11.0))
+                                .text_size(px(tokens::TEXT_CAPTION))
                                 .child(
                                     div()
                                         .text_color(theme.muted)
@@ -13745,10 +13581,10 @@ impl AverroesApp {
                     .when_some(cache_write_tokens, |this, cache_write_tokens| {
                         this.child(
                             div()
-                                .mt(px(8.0))
+                                .mt(px(tokens::SPACE_8))
                                 .flex()
                                 .justify_between()
-                                .text_size(px(11.0))
+                                .text_size(px(tokens::TEXT_CAPTION))
                                 .child(
                                     div()
                                         .text_color(theme.muted)
@@ -13760,10 +13596,10 @@ impl AverroesApp {
                     .when_some(reasoning_tokens, |this, reasoning_tokens| {
                         this.child(
                             div()
-                                .mt(px(8.0))
+                                .mt(px(tokens::SPACE_8))
                                 .flex()
                                 .justify_between()
-                                .text_size(px(11.0))
+                                .text_size(px(tokens::TEXT_CAPTION))
                                 .child(
                                     div()
                                         .text_color(theme.muted)
@@ -13774,10 +13610,10 @@ impl AverroesApp {
                     })
                     .child(
                         div()
-                            .mt(px(8.0))
+                            .mt(px(tokens::SPACE_8))
                             .flex()
                             .justify_between()
-                            .text_size(px(11.0))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .child(
                                 div()
                                     .text_color(theme.muted)
@@ -13788,7 +13624,7 @@ impl AverroesApp {
                     .when_some(progress, |this, progress| {
                         this.child(
                             div()
-                                .mt(px(14.0))
+                                .mt(px(tokens::SPACE_12))
                                 .h(px(6.0))
                                 .w_full()
                                 .rounded_full()
@@ -13798,8 +13634,8 @@ impl AverroesApp {
                     })
                     .child(
                         div()
-                            .mt(px(9.0))
-                            .text_size(px(10.0))
+                            .mt(px(tokens::SPACE_8))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.faint)
                             .child(if percentage.is_some() {
                                 i18n::text(cx, "chat.measured_usage")
@@ -13809,7 +13645,7 @@ impl AverroesApp {
                     ),
             )
             .child(
-                div().mt(px(12.0)).child(
+                div().mt(px(tokens::SPACE_12)).child(
                     Button::new("force-context-compaction")
                         .w_full()
                         .secondary()
@@ -13828,8 +13664,8 @@ impl AverroesApp {
             .when(!agent_threads.is_empty(), |this| {
                 this.child(
                     div()
-                        .mt(px(18.0))
-                        .text_size(px(11.0))
+                        .mt(px(tokens::SPACE_16))
+                        .text_size(px(tokens::TEXT_CAPTION))
                         .text_color(theme.faint)
                         .child(i18n::text(cx, "chat.delegated_agents")),
                 )
@@ -13852,7 +13688,7 @@ impl AverroesApp {
             .child(
                 div()
                     .h(px(72.0))
-                    .px(px(32.0))
+                    .px(px(tokens::SPACE_32))
                     .flex()
                     .items_center()
                     .child(
@@ -13861,12 +13697,18 @@ impl AverroesApp {
                             .child(
                                 div()
                                     .font(UiTheme::display_font())
-                                    .font_weight(FontWeight::BOLD)
+                                    .font_weight(tokens::WEIGHT_SEMIBOLD)
                                     .child(i18n::text(cx, "settings.title")),
                             )
-                            .child(div().text_size(px(11.0)).text_color(theme.faint).child(
-                                i18n::text(cx, settings_tab_description(self.settings_tab)),
-                            )),
+                            .child(
+                                div()
+                                    .text_size(px(tokens::TEXT_CAPTION))
+                                    .text_color(theme.faint)
+                                    .child(i18n::text(
+                                        cx,
+                                        settings_tab_description(self.settings_tab),
+                                    )),
+                            ),
                     )
                     .child(
                         Button::new("back-to-chat")
@@ -13919,39 +13761,19 @@ impl AverroesApp {
             (SettingsTab::Storage, "settings.storage", "storage"),
             (SettingsTab::About, "settings.about", "about"),
         ];
-        div()
-            .flex_none()
-            .h(px(46.0))
-            .px(px(32.0))
-            .flex()
-            .items_center()
-            .gap(px(4.0))
-            .border_b_1()
-            .border_color(theme.border)
+        toolbar_surface(theme)
             .children(tabs.into_iter().map(|(tab, label, key)| {
                 let selected = self.settings_tab == tab;
-                div()
-                    .id(SharedString::from(format!("settings-tab-{key}")))
-                    .h(px(32.0))
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .rounded(px(7.0))
-                    .cursor_pointer()
-                    .text_size(px(12.0))
-                    .text_color(if selected {
-                        theme.foreground
-                    } else {
-                        theme.muted
-                    })
-                    .when(selected, |this| this.bg(theme.surface))
-                    .hover(|style| style.bg(theme.surface))
-                    .child(i18n::text(cx, label))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings_tab = tab;
-                        cx.notify();
-                    }))
-                    .into_any_element()
+                segmented_tab(
+                    theme,
+                    SharedString::from(format!("settings-tab-{key}")),
+                    i18n::text(cx, label),
+                    selected,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings_tab = tab;
+                    cx.notify();
+                }))
             }))
             .into_any_element()
     }
@@ -13992,20 +13814,20 @@ impl AverroesApp {
         };
         let notice = self.notice.clone().map(|notice| {
             div()
-                .mt(px(14.0))
-                .p(px(10.0))
-                .rounded(px(8.0))
+                .mt(px(tokens::SPACE_12))
+                .p(px(tokens::SPACE_8))
+                .rounded(px(tokens::RADIUS_CONTROL))
                 .bg(if notice.success {
                     theme.success_soft
                 } else {
                     theme.destructive_soft
                 })
                 .text_color(if notice.success {
-                    theme.success
+                    theme.success_text
                 } else {
-                    theme.destructive
+                    theme.destructive_text
                 })
-                .text_size(px(11.0))
+                .text_size(px(tokens::TEXT_CAPTION))
                 .child(notice.text)
                 .into_any_element()
         });
@@ -14014,10 +13836,10 @@ impl AverroesApp {
             div()
                 .flex()
                 .items_center()
-                .gap(px(12.0))
-                .px(px(14.0))
-                .py(px(12.0))
-                .rounded(px(10.0))
+                .gap(px(tokens::SPACE_12))
+                .px(px(tokens::SPACE_12))
+                .py(px(tokens::SPACE_12))
+                .rounded(px(tokens::RADIUS_CARD))
                 .bg(theme.surface)
                 .child(
                     div()
@@ -14025,7 +13847,7 @@ impl AverroesApp {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded(px(9.0))
+                        .rounded(px(tokens::RADIUS_CARD))
                         .bg(theme.accent_soft)
                         .child(Icon::new(icon).size(px(16.0)).text_color(theme.foreground)),
                 )
@@ -14034,14 +13856,14 @@ impl AverroesApp {
                         .flex_1()
                         .child(
                             div()
-                                .text_size(px(12.0))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(px(tokens::TEXT_SMALL))
+                                .font_weight(tokens::WEIGHT_SEMIBOLD)
                                 .child(title),
                         )
                         .child(
                             div()
-                                .mt(px(3.0))
-                                .text_size(px(11.0))
+                                .mt(px(tokens::SPACE_2))
+                                .text_size(px(tokens::TEXT_CAPTION))
                                 .text_color(theme.muted)
                                 .child(description),
                         ),
@@ -14059,10 +13881,10 @@ impl AverroesApp {
                     .w_full()
                     .max_w(px(1100.0))
                     .h_full()
-                    .px(px(32.0))
-                    .py(px(30.0))
+                    .px(px(tokens::SPACE_32))
+                    .py(px(tokens::SPACE_32))
                     .flex()
-                    .gap(px(24.0))
+                    .gap(px(tokens::SPACE_24))
                     .child(
                         div()
                             .flex()
@@ -14077,22 +13899,22 @@ impl AverroesApp {
                             ))
                             .child(
                                 div()
-                                    .mt(px(22.0))
-                                    .p(px(18.0))
-                                    .rounded(px(12.0))
+                                    .mt(px(tokens::SPACE_24))
+                                    .p(px(tokens::SPACE_16))
+                                    .rounded(px(tokens::RADIUS_CARD))
                                     .bg(theme.surface_subtle)
                                     .child(
                                         div()
                                             .flex()
                                             .items_center()
-                                            .gap(px(11.0))
+                                            .gap(px(tokens::SPACE_12))
                                             .child(
                                                 div()
                                                     .size(px(34.0))
                                                     .flex()
                                                     .items_center()
                                                     .justify_center()
-                                                    .rounded(px(9.0))
+                                                    .rounded(px(tokens::RADIUS_CARD))
                                                     .bg(theme.accent_soft)
                                                     .text_color(theme.foreground)
                                                     .child(Icon::new(IconName::Bot).size(px(17.0))),
@@ -14102,7 +13924,7 @@ impl AverroesApp {
                                                     .flex_1()
                                                     .child(
                                                         div()
-                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .font_weight(tokens::WEIGHT_SEMIBOLD)
                                                             .child(i18n::text(
                                                                 cx,
                                                                 "settings.remote_agent_relay_title",
@@ -14110,8 +13932,8 @@ impl AverroesApp {
                                                     )
                                                     .child(
                                                         div()
-                                                            .mt(px(3.0))
-                                                            .text_size(px(11.0))
+                                                            .mt(px(tokens::SPACE_2))
+                                                            .text_size(px(tokens::TEXT_CAPTION))
                                                             .text_color(theme.muted)
                                                             .child(i18n::text(
                                                                 cx,
@@ -14122,23 +13944,23 @@ impl AverroesApp {
                                             .child(
                                                 div()
                                                     .flex_none()
-                                                    .px(px(9.0))
-                                                    .py(px(4.0))
+                                                    .px(px(tokens::SPACE_8))
+                                                    .py(px(tokens::SPACE_4))
                                                     .rounded_full()
                                                     .bg(status_background)
-                                                    .text_size(px(10.0))
-                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_size(px(tokens::TEXT_CAPTION))
+                                                    .font_weight(tokens::WEIGHT_SEMIBOLD)
                                                     .text_color(status_color)
                                                     .child(status_label),
                                             ),
                                     )
                                     .child(
                                         div()
-                                            .mt(px(14.0))
+                                            .mt(px(tokens::SPACE_12))
                                             .flex()
                                             .items_center()
-                                            .gap(px(14.0))
-                                            .text_size(px(11.0))
+                                            .gap(px(tokens::SPACE_12))
+                                            .text_size(px(tokens::TEXT_CAPTION))
                                             .text_color(theme.muted)
                                             .child(
                                                 div()
@@ -14173,28 +13995,28 @@ impl AverroesApp {
                             )
                             .child(
                                 div()
-                                    .mt(px(22.0))
+                                    .mt(px(tokens::SPACE_24))
                                     .flex_none()
                                     .flex()
                                     .items_center()
                                     .justify_between()
                                     .child(
                                         div()
-                                            .text_size(px(12.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_size(px(tokens::TEXT_SMALL))
+                                            .font_weight(tokens::WEIGHT_SEMIBOLD)
                                             .child(i18n::text(cx, "settings.remote_agent_flow_title")),
                                     ),
                             )
                             .child(
                                 div()
                                     .id("remote-agent-details-scroll")
-                                    .mt(px(10.0))
+                                    .mt(px(tokens::SPACE_8))
                                     .flex_1()
                                     .min_h(px(0.0))
                                     .overflow_y_scrollbar()
                                     .flex()
                                     .flex_col()
-                                    .gap(px(9.0))
+                                    .gap(px(tokens::SPACE_8))
                                     .child(detail_row(
                                         IconName::Bot,
                                         i18n::text(cx, "settings.remote_agent_live_title"),
@@ -14212,11 +14034,11 @@ impl AverroesApp {
                                     ))
                                     .child(
                                         div()
-                                            .mt(px(5.0))
-                                            .p(px(14.0))
-                                            .rounded(px(10.0))
+                                            .mt(px(tokens::SPACE_4))
+                                            .p(px(tokens::SPACE_12))
+                                            .rounded(px(tokens::RADIUS_CARD))
                                             .bg(theme.surface)
-                                            .text_size(px(11.0))
+                                            .text_size(px(tokens::TEXT_CAPTION))
                                             .line_height(px(17.0))
                                             .text_color(theme.muted)
                                             .child(i18n::text(
@@ -14235,21 +14057,21 @@ impl AverroesApp {
                             .flex()
                             .flex_col()
                             .overflow_y_scrollbar()
-                            .p(px(18.0))
-                            .rounded(px(12.0))
+                            .p(px(tokens::SPACE_16))
+                            .rounded(px(tokens::RADIUS_CARD))
                             .bg(theme.surface_subtle)
                             .child(
                                 div()
                                     .font(UiTheme::display_font())
-                                    .text_size(px(17.0))
-                                    .font_weight(FontWeight::BOLD)
+                                    .text_size(px(tokens::TEXT_TITLE2))
+                                    .font_weight(tokens::WEIGHT_SEMIBOLD)
                                     .child(i18n::text(cx, "settings.remote_agent_connect_title")),
                             )
                             .child(
                                 div()
-                                    .mt(px(5.0))
-                                    .mb(px(16.0))
-                                    .text_size(px(11.0))
+                                    .mt(px(tokens::SPACE_4))
+                                    .mb(px(tokens::SPACE_16))
+                                    .text_size(px(tokens::TEXT_CAPTION))
                                     .text_color(theme.muted)
                                     .child(i18n::text(cx, "settings.remote_agent_connect_description")),
                             )
@@ -14257,8 +14079,8 @@ impl AverroesApp {
                             .child(Input::new(&self.remote_agent_token_input).w_full().mask_toggle())
                             .child(
                                 div()
-                                    .mt(px(7.0))
-                                    .text_size(px(10.5))
+                                    .mt(px(tokens::SPACE_8))
+                                    .text_size(px(tokens::TEXT_CAPTION))
                                     .text_color(theme.faint)
                                     .child(i18n::text(cx, "settings.remote_agent_token_help")),
                             )
@@ -14267,12 +14089,12 @@ impl AverroesApp {
                                     i18n::text(cx, "settings.remote_agent_pairing_title"),
                                     theme,
                                 )
-                                .mt(px(18.0)),
+                                .mt(px(tokens::SPACE_16)),
                             )
                             .child(
                                 div()
-                                    .mt(px(7.0))
-                                    .text_size(px(10.5))
+                                    .mt(px(tokens::SPACE_8))
+                                    .text_size(px(tokens::TEXT_CAPTION))
                                     .text_color(theme.faint)
                                     .child(i18n::text(
                                         cx,
@@ -14281,17 +14103,17 @@ impl AverroesApp {
                             )
                             .child(
                                 div()
-                                    .mt(px(9.0))
+                                    .mt(px(tokens::SPACE_8))
                                     .flex()
                                     .flex_col()
-                                    .gap(px(6.0))
+                                    .gap(px(tokens::SPACE_6))
                                     .when(pending_requests.is_empty(), |this| {
                                         this.child(
                                             div()
-                                                .p(px(10.0))
-                                                .rounded(px(8.0))
+                                                .p(px(tokens::SPACE_8))
+                                                .rounded(px(tokens::RADIUS_CONTROL))
                                                 .bg(theme.surface)
-                                                .text_size(px(10.5))
+                                                .text_size(px(tokens::TEXT_CAPTION))
                                                 .text_color(theme.muted)
                                                 .child(i18n::text(
                                                     cx,
@@ -14307,20 +14129,20 @@ impl AverroesApp {
                                                 .id(SharedString::from(format!(
                                                     "remote-agent-pending-{user_id}"
                                                 )))
-                                                .p(px(10.0))
-                                                .rounded(px(8.0))
+                                                .p(px(tokens::SPACE_8))
+                                                .rounded(px(tokens::RADIUS_CONTROL))
                                                 .bg(theme.surface)
                                                 .child(
                                                     div()
-                                                        .text_size(px(11.0))
-                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_size(px(tokens::TEXT_CAPTION))
+                                                        .font_weight(tokens::WEIGHT_SEMIBOLD)
                                                         .child(request.label),
                                                 )
                                                 .child(
                                                     div()
-                                                        .mt(px(8.0))
+                                                        .mt(px(tokens::SPACE_8))
                                                         .flex()
-                                                        .gap(px(6.0))
+                                                        .gap(px(tokens::SPACE_6))
                                                         .child(
                                                             Button::new(format!(
                                                                 "approve-remote-access-{approve_user_id}"
@@ -14367,21 +14189,21 @@ impl AverroesApp {
                                     i18n::text(cx, "settings.remote_agent_allowed_users"),
                                     theme,
                                 )
-                                .mt(px(16.0)),
+                                .mt(px(tokens::SPACE_16)),
                             )
                             .child(
                                 div()
-                                    .mt(px(7.0))
+                                    .mt(px(tokens::SPACE_8))
                                     .flex()
                                     .flex_col()
-                                    .gap(px(6.0))
+                                    .gap(px(tokens::SPACE_6))
                                     .when(approved_users.is_empty(), |this| {
                                         this.child(
                                             div()
-                                                .p(px(10.0))
-                                                .rounded(px(8.0))
+                                                .p(px(tokens::SPACE_8))
+                                                .rounded(px(tokens::RADIUS_CONTROL))
                                                 .bg(theme.surface)
-                                                .text_size(px(10.5))
+                                                .text_size(px(tokens::TEXT_CAPTION))
                                                 .text_color(theme.muted)
                                                 .child(i18n::text(
                                                     cx,
@@ -14395,18 +14217,18 @@ impl AverroesApp {
                                             .id(SharedString::from(format!(
                                                 "remote-agent-approved-{user_id}"
                                             )))
-                                            .px(px(10.0))
-                                            .py(px(8.0))
-                                            .rounded(px(8.0))
+                                            .px(px(tokens::SPACE_8))
+                                            .py(px(tokens::SPACE_8))
+                                            .rounded(px(tokens::RADIUS_CONTROL))
                                             .bg(theme.surface)
                                             .flex()
                                             .items_center()
                                             .justify_between()
-                                            .gap(px(8.0))
+                                            .gap(px(tokens::SPACE_8))
                                             .child(
                                                 div()
                                                     .min_w(px(0.0))
-                                                    .text_size(px(11.0))
+                                                    .text_size(px(tokens::TEXT_CAPTION))
                                                     .text_color(theme.foreground)
                                                     .child(user_id),
                                             )
@@ -14433,11 +14255,11 @@ impl AverroesApp {
                             )
                             .child(
                                 div()
-                                    .mt(px(18.0))
-                                    .p(px(11.0))
-                                    .rounded(px(9.0))
+                                    .mt(px(tokens::SPACE_16))
+                                    .p(px(tokens::SPACE_12))
+                                    .rounded(px(tokens::RADIUS_CARD))
                                     .bg(theme.surface)
-                                    .text_size(px(11.0))
+                                    .text_size(px(tokens::TEXT_CAPTION))
                                     .text_color(theme.muted)
                                     .child(i18n::format(
                                         cx,
@@ -14463,9 +14285,9 @@ impl AverroesApp {
                             .when_some(notice, |this, notice| this.child(notice))
                             .child(
                                 div()
-                                    .mt(px(18.0))
+                                    .mt(px(tokens::SPACE_16))
                                     .flex()
-                                    .gap(px(8.0))
+                                    .gap(px(tokens::SPACE_8))
                                     .child(
                                         Button::new("save-remote-agent")
                                             .primary()
@@ -14506,28 +14328,32 @@ impl AverroesApp {
         };
         let has_provider = self.embedding_connection_id.is_some();
         let has_model = self.embedding_model_id.is_some();
-        div()
-            .mt(px(22.0))
-            .p(px(18.0))
-            .bg(theme.surface_subtle)
-            .rounded(px(12.0))
+        card(theme, tokens::SPACE_16)
+            .mt(px(tokens::SPACE_24))
             .child(
                 div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(i18n::text(cx, "settings.memory_title")),
+                    .flex()
+                    .items_center()
+                    .gap(px(tokens::SPACE_8))
+                    .child(
+                        div()
+                            .font_weight(tokens::WEIGHT_SEMIBOLD)
+                            .child(i18n::text(cx, "settings.memory_title")),
+                    )
+                    .child(badge(theme, status_text.clone())),
             )
             .child(
                 div()
-                    .mt(px(6.0))
-                    .text_size(px(12.0))
+                    .mt(px(tokens::SPACE_6))
+                    .text_size(px(tokens::TEXT_SMALL))
                     .text_color(theme.muted)
                     .child(i18n::text(cx, "settings.memory_description")),
             )
             .child(
                 div()
-                    .mt(px(15.0))
+                    .mt(px(tokens::SPACE_16))
                     .flex()
-                    .gap(px(8.0))
+                    .gap(px(tokens::SPACE_8))
                     .child(
                         div()
                             .flex_1()
@@ -14565,14 +14391,14 @@ impl AverroesApp {
             )
             .child(
                 div()
-                    .mt(px(12.0))
+                    .mt(px(tokens::SPACE_12))
                     .flex()
                     .items_center()
-                    .gap(px(10.0))
+                    .gap(px(tokens::SPACE_8))
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(11.0))
+                            .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.faint)
                             .child(status_text),
                     )
@@ -14622,18 +14448,18 @@ impl AverroesApp {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(12.0))
-                    .px(px(16.0))
-                    .py(px(13.0))
+                    .gap(px(tokens::SPACE_12))
+                    .px(px(tokens::SPACE_16))
+                    .py(px(tokens::SPACE_12))
                     .bg(theme.surface_subtle)
-                    .rounded(px(10.0))
+                    .rounded(px(tokens::RADIUS_CARD))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .justify_center()
                             .size(px(34.0))
-                            .rounded(px(9.0))
+                            .rounded(px(tokens::RADIUS_CARD))
                             .bg(gpui::rgb(0xf3f4f6))
                             .child(provider_logo(profile.kind, 18.0)),
                     )
@@ -14641,11 +14467,15 @@ impl AverroesApp {
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(profile.name))
                             .child(
                                 div()
-                                    .mt(px(3.0))
-                                    .text_size(px(11.0))
+                                    .font_weight(tokens::WEIGHT_SEMIBOLD)
+                                    .child(profile.name),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(tokens::SPACE_2))
+                                    .text_size(px(tokens::TEXT_CAPTION))
                                     .text_color(theme.muted)
                                     .child(format!(
                                         "{} · {}",
@@ -14656,7 +14486,7 @@ impl AverroesApp {
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(px(tokens::TEXT_SMALL))
                             .text_color(if model_count == 0 {
                                 theme.faint
                             } else {
@@ -14714,10 +14544,10 @@ impl AverroesApp {
                     .max_w(px(1100.0))
                     .flex_1()
                     .min_h(px(0.0))
-                    .px(px(32.0))
-                    .py(px(30.0))
+                    .px(px(tokens::SPACE_32))
+                    .py(px(tokens::SPACE_32))
                     .flex()
-                    .gap(px(24.0))
+                    .gap(px(tokens::SPACE_24))
                     .child(
                         div()
                             .flex()
@@ -14733,15 +14563,15 @@ impl AverroesApp {
                             .child(self.render_embedding_settings_card(theme, cx))
                             .child(
                                 div()
-                                    .mt(px(22.0))
+                                    .mt(px(tokens::SPACE_24))
                                     .flex_none()
                                     .flex()
                                     .items_center()
                                     .justify_between()
                                     .child(
                                         div()
-                                            .text_size(px(13.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_size(px(tokens::TEXT_BODY))
+                                            .font_weight(tokens::WEIGHT_SEMIBOLD)
                                             .child(i18n::text(cx, "settings.connected_providers")),
                                     )
                                     .child(
@@ -14758,13 +14588,13 @@ impl AverroesApp {
                             .child(
                                 div()
                                     .id("connected-providers-scroll")
-                                    .mt(px(10.0))
+                                    .mt(px(tokens::SPACE_8))
                                     .flex_1()
                                     .min_h(px(0.0))
                                     .overflow_y_scrollbar()
                                     .flex()
                                     .flex_col()
-                                    .gap(px(9.0))
+                                    .gap(px(tokens::SPACE_8))
                                     .when(rows.is_empty(), |this| {
                                         this.child(settings_empty_state(
                                             i18n::text(cx, "settings.no_providers"),
@@ -14793,9 +14623,9 @@ impl AverroesApp {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(12.0))
-                    .p(px(14.0))
-                    .rounded(px(11.0))
+                    .gap(px(tokens::SPACE_12))
+                    .p(px(tokens::SPACE_12))
+                    .rounded(px(tokens::RADIUS_CARD))
                     .bg(theme.surface_subtle)
                     .child(
                         div()
@@ -14803,21 +14633,21 @@ impl AverroesApp {
                             .min_w(px(0.0))
                             .child(
                                 div()
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(tokens::WEIGHT_SEMIBOLD)
                                     .child(agent.name.clone()),
                             )
                             .child(
                                 div()
-                                    .mt(px(3.0))
-                                    .text_size(px(11.0))
+                                    .mt(px(tokens::SPACE_2))
+                                    .text_size(px(tokens::TEXT_CAPTION))
                                     .text_color(theme.muted)
                                     .child(format!("{} · {}", agent.connection_id, agent.model_id)),
                             )
                             .when(!agent.description.trim().is_empty(), |this| {
                                 this.child(
                                     div()
-                                        .mt(px(4.0))
-                                        .text_size(px(11.0))
+                                        .mt(px(tokens::SPACE_4))
+                                        .text_size(px(tokens::TEXT_CAPTION))
                                         .text_color(theme.faint)
                                         .child(agent.description.clone()),
                                 )
@@ -14850,20 +14680,20 @@ impl AverroesApp {
         let model_selected = self.agent_form_model_id.is_some();
         let notice = self.notice.clone().map(|notice| {
             div()
-                .mt(px(12.0))
-                .p(px(10.0))
-                .rounded(px(8.0))
+                .mt(px(tokens::SPACE_12))
+                .p(px(tokens::SPACE_8))
+                .rounded(px(tokens::RADIUS_CONTROL))
                 .bg(if notice.success {
                     theme.success_soft
                 } else {
                     theme.destructive_soft
                 })
                 .text_color(if notice.success {
-                    theme.success
+                    theme.success_text
                 } else {
-                    theme.destructive
+                    theme.destructive_text
                 })
-                .text_size(px(11.0))
+                .text_size(px(tokens::TEXT_CAPTION))
                 .child(notice.text)
                 .into_any_element()
         });
@@ -14878,10 +14708,10 @@ impl AverroesApp {
                     .w_full()
                     .max_w(px(1100.0))
                     .h_full()
-                    .px(px(32.0))
-                    .py(px(30.0))
+                    .px(px(tokens::SPACE_32))
+                    .py(px(tokens::SPACE_32))
                     .flex()
-                    .gap(px(24.0))
+                    .gap(px(tokens::SPACE_24))
                     .child(
                         div()
                             .flex()
@@ -14897,13 +14727,13 @@ impl AverroesApp {
                             .child(
                                 div()
                                     .id("configured-agents-scroll")
-                                    .mt(px(20.0))
+                                    .mt(px(tokens::SPACE_20))
                                     .flex_1()
                                     .min_h(px(0.0))
                                     .overflow_y_scrollbar()
                                     .flex()
                                     .flex_col()
-                                    .gap(px(9.0))
+                                    .gap(px(tokens::SPACE_8))
                                     .when(rows.is_empty(), |this| {
                                         this.child(settings_empty_state(
                                             i18n::text(cx, "settings.no_agents"),
@@ -14923,14 +14753,14 @@ impl AverroesApp {
                             .flex()
                             .flex_col()
                             .overflow_y_scrollbar()
-                            .p(px(18.0))
-                            .rounded(px(12.0))
+                            .p(px(tokens::SPACE_16))
+                            .rounded(px(tokens::RADIUS_CARD))
                             .bg(theme.surface_subtle)
                             .child(
                                 div()
                                     .font(UiTheme::display_font())
-                                    .text_size(px(17.0))
-                                    .font_weight(FontWeight::BOLD)
+                                    .text_size(px(tokens::TEXT_TITLE2))
+                                    .font_weight(tokens::WEIGHT_SEMIBOLD)
                                     .child(if editing {
                                         i18n::text(cx, "settings.edit_agent")
                                     } else {
@@ -14939,9 +14769,9 @@ impl AverroesApp {
                             )
                             .child(
                                 div()
-                                    .mt(px(5.0))
-                                    .mb(px(16.0))
-                                    .text_size(px(11.0))
+                                    .mt(px(tokens::SPACE_4))
+                                    .mb(px(tokens::SPACE_16))
+                                    .text_size(px(tokens::TEXT_CAPTION))
                                     .text_color(theme.muted)
                                     .child(i18n::text(cx, "settings.agent_description_help")),
                             )
@@ -14949,12 +14779,12 @@ impl AverroesApp {
                             .child(Input::new(&self.agent_name_input).w_full())
                             .child(
                                 form_label(i18n::text(cx, "settings.agent_description"), theme)
-                                    .mt(px(13.0)),
+                                    .mt(px(tokens::SPACE_12)),
                             )
                             .child(Input::new(&self.agent_description_input).w_full())
                             .child(
                                 form_label(i18n::text(cx, "settings.agent_model"), theme)
-                                    .mt(px(13.0)),
+                                    .mt(px(tokens::SPACE_12)),
                             )
                             .child(
                                 Select::new(&self.agent_model_select)
@@ -14968,16 +14798,21 @@ impl AverroesApp {
                             )
                             .when_some(notice, |this, notice| this.child(notice))
                             .child(
-                                div().mt(px(18.0)).flex_none().flex().gap(px(8.0)).child(
-                                    Button::new("save-agent")
-                                        .primary()
-                                        .icon(IconName::CircleCheck)
-                                        .label(i18n::text(cx, "settings.save_agent"))
-                                        .disabled(!model_selected)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.save_agent_profile(window, cx)
-                                        })),
-                                ),
+                                div()
+                                    .mt(px(tokens::SPACE_16))
+                                    .flex_none()
+                                    .flex()
+                                    .gap(px(tokens::SPACE_8))
+                                    .child(
+                                        Button::new("save-agent")
+                                            .primary()
+                                            .icon(IconName::CircleCheck)
+                                            .label(i18n::text(cx, "settings.save_agent"))
+                                            .disabled(!model_selected)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.save_agent_profile(window, cx)
+                                            })),
+                                    ),
                             ),
                     ),
             )
@@ -15002,45 +14837,42 @@ impl AverroesApp {
         let copilot_uses_login = copilot && self.key_input.read(cx).value().trim().is_empty();
         let notice = self.notice.clone().map(|notice| {
             div()
-                .px(px(11.0))
-                .py(px(9.0))
-                .rounded(px(9.0))
+                .px(px(tokens::SPACE_12))
+                .py(px(tokens::SPACE_8))
+                .rounded(px(tokens::RADIUS_CARD))
                 .bg(if notice.success {
                     theme.success_soft
                 } else {
                     theme.destructive_soft
                 })
                 .text_color(if notice.success {
-                    theme.success
+                    theme.success_text
                 } else {
-                    theme.destructive
+                    theme.destructive_text
                 })
-                .text_size(px(11.0))
+                .text_size(px(tokens::TEXT_CAPTION))
                 .child(notice.text)
                 .into_any_element()
         });
 
-        div()
+        card(theme, tokens::SPACE_16)
             .id("settings-add-provider-form")
             .flex()
             .flex_col()
             .flex_none()
             .w(px(330.0))
-            .p(px(18.0))
-            .rounded(px(12.0))
-            .bg(theme.surface_subtle)
             .child(
                 div()
                     .font(UiTheme::display_font())
-                    .text_size(px(17.0))
-                    .font_weight(FontWeight::BOLD)
+                    .text_size(px(tokens::TEXT_TITLE2))
+                    .font_weight(tokens::WEIGHT_SEMIBOLD)
                     .child(i18n::text(cx, "settings.add_provider")),
             )
             .child(
                 div()
-                    .mt(px(5.0))
-                    .mb(px(18.0))
-                    .text_size(px(11.0))
+                    .mt(px(tokens::SPACE_4))
+                    .mb(px(tokens::SPACE_16))
+                    .text_size(px(tokens::TEXT_CAPTION))
                     .text_color(theme.muted)
                     .child(i18n::text(cx, "settings.credentials_direct")),
             )
@@ -15055,7 +14887,7 @@ impl AverroesApp {
                         .placeholder(i18n::text(cx, "settings.choose_provider")),
                 ),
             )
-            .child(form_label(i18n::text(cx, "settings.name"), theme).mt(px(14.0)))
+            .child(form_label(i18n::text(cx, "settings.name"), theme).mt(px(tokens::SPACE_12)))
             .child(
                 div()
                     .flex_none()
@@ -15064,14 +14896,16 @@ impl AverroesApp {
                     .child(Input::new(&self.name_input).w_full()),
             )
             .when(needs_base_url, |this| {
-                this.child(form_label(i18n::text(cx, "settings.base_url"), theme).mt(px(14.0)))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w_full()
-                            .h(px(34.0))
-                            .child(Input::new(&self.url_input).w_full()),
-                    )
+                this.child(
+                    form_label(i18n::text(cx, "settings.base_url"), theme).mt(px(tokens::SPACE_12)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .w_full()
+                        .h(px(34.0))
+                        .child(Input::new(&self.url_input).w_full()),
+                )
             })
             .when(needs_key, |this| {
                 this.child(
@@ -15083,7 +14917,7 @@ impl AverroesApp {
                         },
                         theme,
                     )
-                    .mt(px(14.0)),
+                    .mt(px(tokens::SPACE_12)),
                 )
                 .child(
                     div()
@@ -15096,8 +14930,8 @@ impl AverroesApp {
             .when(codex, |this| {
                 this.child(
                     div()
-                        .mt(px(14.0))
-                        .text_size(px(11.0))
+                        .mt(px(tokens::SPACE_12))
+                        .text_size(px(tokens::TEXT_CAPTION))
                         .text_color(theme.muted)
                         .child(i18n::text(cx, "settings.codex_description")),
                 )
@@ -15105,8 +14939,8 @@ impl AverroesApp {
             .when(copilot, |this| {
                 this.child(
                     div()
-                        .mt(px(14.0))
-                        .text_size(px(11.0))
+                        .mt(px(tokens::SPACE_12))
+                        .text_size(px(tokens::TEXT_CAPTION))
                         .text_color(theme.muted)
                         .child(i18n::text(cx, "settings.copilot_description")),
                 )
@@ -15132,8 +14966,8 @@ impl AverroesApp {
             .when(qdivzero, |this| {
                 this.child(
                     div()
-                        .mt(px(14.0))
-                        .text_size(px(11.0))
+                        .mt(px(tokens::SPACE_12))
+                        .text_size(px(tokens::TEXT_CAPTION))
                         .text_color(theme.muted)
                         .child(i18n::text(cx, "settings.qdivzero_description")),
                 )
@@ -15141,8 +14975,8 @@ impl AverroesApp {
             .when(selected_kind == Some(ConnectionKind::Ollama), |this| {
                 this.child(
                     div()
-                        .mt(px(14.0))
-                        .text_size(px(11.0))
+                        .mt(px(tokens::SPACE_12))
+                        .text_size(px(tokens::TEXT_CAPTION))
                         .text_color(theme.muted)
                         .child(i18n::text(cx, "settings.ollama_description")),
                 )
@@ -15150,21 +14984,21 @@ impl AverroesApp {
             .when(ollama_cloud, |this| {
                 this.child(
                     div()
-                        .mt(px(14.0))
-                        .text_size(px(11.0))
+                        .mt(px(tokens::SPACE_12))
+                        .text_size(px(tokens::TEXT_CAPTION))
                         .text_color(theme.muted)
                         .child(i18n::text(cx, "settings.ollama_cloud_description")),
                 )
             })
             .when_some(notice, |this, notice| {
-                this.child(div().mt(px(14.0)).child(notice))
+                this.child(div().mt(px(tokens::SPACE_12)).child(notice))
             })
             .child(
                 div()
-                    .mt(px(18.0))
+                    .mt(px(tokens::SPACE_16))
                     .flex()
                     .items_center()
-                    .gap(px(7.0))
+                    .gap(px(tokens::SPACE_8))
                     .when(codex, |this| {
                         this.child(
                             Button::new("models-connect-chatgpt")
@@ -15217,11 +15051,8 @@ impl AverroesApp {
             .map(|profile| profile.name)
             .unwrap_or_else(|| "integration".into());
         let save_connection_id = connection_id.clone();
-        div()
-            .mt(px(18.0))
-            .p(px(16.0))
-            .rounded(px(12.0))
-            .bg(theme.surface_subtle)
+        card(theme, tokens::SPACE_16)
+            .mt(px(tokens::SPACE_16))
             .child(
                 div()
                     .flex()
@@ -15229,7 +15060,7 @@ impl AverroesApp {
                     .child(
                         div()
                             .flex_1()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(tokens::WEIGHT_SEMIBOLD)
                             .child(format!("Add a model to {connection_name}")),
                     )
                     .child(
@@ -15245,9 +15076,9 @@ impl AverroesApp {
             )
             .child(
                 div()
-                    .mt(px(13.0))
+                    .mt(px(tokens::SPACE_12))
                     .flex()
-                    .gap(px(8.0))
+                    .gap(px(tokens::SPACE_8))
                     .child(
                         div()
                             .flex_1()
@@ -15263,7 +15094,7 @@ impl AverroesApp {
             )
             .child(
                 div()
-                    .mt(px(12.0))
+                    .mt(px(tokens::SPACE_12))
                     .child(form_label(
                         i18n::text(cx, "settings.reasoning_levels"),
                         theme,
@@ -15272,13 +15103,13 @@ impl AverroesApp {
             )
             .child(
                 div()
-                    .mt(px(7.0))
-                    .text_size(px(11.0))
+                    .mt(px(tokens::SPACE_8))
+                    .text_size(px(tokens::TEXT_CAPTION))
                     .text_color(theme.faint)
                     .child(i18n::text(cx, "settings.reasoning_help")),
             )
             .child(
-                div().mt(px(14.0)).flex().justify_end().child(
+                div().mt(px(tokens::SPACE_12)).flex().justify_end().child(
                     Button::new("save-manual-model")
                         .primary()
                         .icon(IconName::Plus)
@@ -15320,14 +15151,14 @@ impl AverroesApp {
             div()
                 .flex()
                 .items_start()
-                .gap(px(12.0))
-                .py(px(6.0))
-                .text_size(px(11.0))
+                .gap(px(tokens::SPACE_12))
+                .py(px(tokens::SPACE_6))
+                .text_size(px(tokens::TEXT_CAPTION))
                 .child(
                     div()
                         .flex_none()
                         .w(px(52.0))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(tokens::WEIGHT_SEMIBOLD)
                         .text_color(color)
                         .child(entry.level.label()),
                 )
@@ -15366,13 +15197,13 @@ impl AverroesApp {
                             .mx_auto()
                             .w_full()
                             .max_w(px(1100.0))
-                            .px(px(32.0))
-                            .py(px(30.0))
+                            .px(px(tokens::SPACE_32))
+                            .py(px(tokens::SPACE_32))
                             .child(
                                 div()
                                     .flex()
                                     .items_start()
-                                    .gap(px(20.0))
+                                    .gap(px(tokens::SPACE_20))
                                     .child(
                                         div()
                                             .flex_1()
@@ -15388,7 +15219,7 @@ impl AverroesApp {
                                             .flex_none()
                                             .flex()
                                             .items_center()
-                                            .gap(px(6.0))
+                                            .gap(px(tokens::SPACE_6))
                                             .child(
                                                 Input::new(&self.diagnostics_search)
                                                     .prefix(IconName::Search)
@@ -15406,21 +15237,21 @@ impl AverroesApp {
                             )
                             .child(
                                 div()
-                                    .mt(px(22.0))
+                                    .mt(px(tokens::SPACE_24))
                                     .flex_1()
                                     .min_h(px(0.0))
-                                    .p(px(16.0))
+                                    .p(px(tokens::SPACE_16))
                                     .flex()
                                     .flex_col()
                                     .bg(theme.surface_subtle)
-                                    .rounded(px(12.0))
+                                    .rounded(px(tokens::RADIUS_CARD))
                                     .child(
                                         div()
                                             .flex_none()
                                             .flex()
                                             .items_center()
                                             .justify_end()
-                                            .gap(px(4.0))
+                                            .gap(px(tokens::SPACE_4))
                                             .child(
                                                 Button::new("copy-settings-diagnostics")
                                                     .ghost()
@@ -15446,27 +15277,24 @@ impl AverroesApp {
                                     )
                                     .child(
                                         div()
-                                            .mt(px(10.0))
+                                            .mt(px(tokens::SPACE_8))
                                             .flex_1()
                                             .min_h(px(0.0))
                                             .overflow_y_scrollbar()
                                             .when(entries.is_empty(), |this| {
-                                                this.child(
-                                                    div()
-                                                        .py(px(24.0))
-                                                        .text_size(px(11.0))
-                                                        .text_color(theme.faint)
-                                                        .child(i18n::text(cx, "settings.no_diagnostics")),
-                                                )
+                                                this.child(empty_state(
+                                                    theme,
+                                                    i18n::text(cx, "settings.no_diagnostics"),
+                                                ))
                                             })
                                             .when(!entries.is_empty() && !has_matches, |this| {
-                                                this.child(
-                                                    div()
-                                                        .py(px(24.0))
-                                                        .text_size(px(11.0))
-                                                        .text_color(theme.faint)
-                                                        .child(i18n::text(cx, "settings.no_diagnostics_match")),
-                                                )
+                                                this.child(empty_state(
+                                                    theme,
+                                                    i18n::text(
+                                                        cx,
+                                                        "settings.no_diagnostics_match",
+                                                    ),
+                                                ))
                                             })
                                             .children(rows),
                                     ),
@@ -15489,37 +15317,31 @@ impl AverroesApp {
                     .mx_auto()
                     .w_full()
                     .max_w(px(760.0))
-                    .px(px(32.0))
-                    .py(px(30.0))
+                    .px(px(tokens::SPACE_32))
+                    .py(px(tokens::SPACE_32))
                     .child(settings_page_title(
                         i18n::text(cx, "settings.storage"),
                         i18n::text(cx, "settings.local_by_design"),
                         theme,
                     ))
                     .child(
-                        div()
-                            .mt(px(22.0))
-                            .p(px(18.0))
-                            .bg(theme.surface_subtle)
-                            .rounded(px(12.0))
+                        card(theme, tokens::SPACE_16)
+                            .mt(px(tokens::SPACE_24))
                             .child(
                                 div()
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(tokens::WEIGHT_SEMIBOLD)
                                     .child(i18n::text(cx, "settings.private_storage")),
                             )
                             .child(
-                                div()
-                                    .mt(px(7.0))
-                                    .text_size(px(12.0))
-                                    .text_color(theme.muted)
-                                    .child(i18n::text(cx, "settings.storage_description")),
+                                field_hint(theme, i18n::text(cx, "settings.storage_description"))
+                                    .mt(px(tokens::SPACE_8)),
                             )
                             .child(
                                 div()
-                                    .mt(px(16.0))
+                                    .mt(px(tokens::SPACE_16))
                                     .flex()
                                     .flex_col()
-                                    .gap(px(8.0))
+                                    .gap(px(tokens::SPACE_8))
                                     .child(storage_path_row(
                                         i18n::text(cx, "settings.encrypted_credentials"),
                                         "~/.averroes/config/providers.enc",
@@ -15539,10 +15361,10 @@ impl AverroesApp {
                     )
                     .child(
                         div()
-                            .mt(px(14.0))
-                            .p(px(18.0))
+                            .mt(px(tokens::SPACE_12))
+                            .p(px(tokens::SPACE_16))
                             .bg(theme.surface_subtle)
-                            .rounded(px(12.0))
+                            .rounded(px(tokens::RADIUS_CARD))
                             .child(
                                 div()
                                     .flex()
@@ -15550,7 +15372,7 @@ impl AverroesApp {
                                     .child(
                                         div()
                                             .flex_1()
-                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .font_weight(tokens::WEIGHT_SEMIBOLD)
                                             .child(i18n::text(cx, "settings.language")),
                                     )
                                     .child(
@@ -15566,8 +15388,8 @@ impl AverroesApp {
                             )
                             .child(
                                 div()
-                                    .mt(px(7.0))
-                                    .text_size(px(12.0))
+                                    .mt(px(tokens::SPACE_8))
+                                    .text_size(px(tokens::TEXT_SMALL))
                                     .text_color(theme.muted)
                                     .child(i18n::text(cx, "settings.language_description")),
                             ),
@@ -15586,8 +15408,8 @@ impl AverroesApp {
                     .mx_auto()
                     .w_full()
                     .max_w(px(760.0))
-                    .px(px(32.0))
-                    .py(px(30.0))
+                    .px(px(tokens::SPACE_32))
+                    .py(px(tokens::SPACE_32))
                     .child(settings_page_title(
                         i18n::text(cx, "about.title"),
                         i18n::text(cx, "settings.about_description"),
@@ -15596,10 +15418,10 @@ impl AverroesApp {
                     .child(
                         div()
                             .id("about-averroes-card")
-                            .mt(px(22.0))
-                            .p(px(22.0))
+                            .mt(px(tokens::SPACE_24))
+                            .p(px(tokens::SPACE_24))
                             .bg(theme.surface_subtle)
-                            .rounded(px(14.0))
+                            .rounded(px(tokens::RADIUS_SHEET))
                             .cursor_pointer()
                             .hover(|style| style.bg(theme.surface_hover))
                             .on_click(cx.listener(|_, _, _, cx| {
@@ -15609,7 +15431,7 @@ impl AverroesApp {
                             }))
                             .flex()
                             .items_center()
-                            .gap(px(18.0))
+                            .gap(px(tokens::SPACE_16))
                             .child(img("brand/averroes.png").size(px(76.0)).flex_none())
                             .child(
                                 div()
@@ -15618,14 +15440,14 @@ impl AverroesApp {
                                     .child(
                                         div()
                                             .font(UiTheme::display_font())
-                                            .text_size(px(20.0))
-                                            .font_weight(FontWeight::BOLD)
+                                            .text_size(px(tokens::TEXT_TITLE1))
+                                            .font_weight(tokens::WEIGHT_SEMIBOLD)
                                             .child("Averroes"),
                                     )
                                     .child(
                                         div()
-                                            .mt(px(5.0))
-                                            .text_size(px(12.0))
+                                            .mt(px(tokens::SPACE_4))
+                                            .text_size(px(tokens::TEXT_SMALL))
                                             .text_color(theme.muted)
                                             .child(format!(
                                                 "{}: {APP_VERSION}",
@@ -15636,21 +15458,21 @@ impl AverroesApp {
                     )
                     .child(
                         div()
-                            .mt(px(14.0))
-                            .p(px(18.0))
+                            .mt(px(tokens::SPACE_12))
+                            .p(px(tokens::SPACE_16))
                             .bg(theme.surface_subtle)
-                            .rounded(px(12.0))
-                            .text_size(px(13.0))
+                            .rounded(px(tokens::RADIUS_CARD))
+                            .text_size(px(tokens::TEXT_BODY))
                             .text_color(theme.muted)
                             .child(i18n::text(cx, "about.philosopher")),
                     )
                     .child(
                         div()
                             .id("about-valendra-card")
-                            .mt(px(14.0))
-                            .p(px(18.0))
+                            .mt(px(tokens::SPACE_12))
+                            .p(px(tokens::SPACE_16))
                             .bg(theme.surface_subtle)
-                            .rounded(px(12.0))
+                            .rounded(px(tokens::RADIUS_CARD))
                             .cursor_pointer()
                             .hover(|style| style.bg(theme.surface_hover))
                             .on_click(cx.listener(|_, _, _, cx| {
@@ -15658,11 +15480,11 @@ impl AverroesApp {
                             }))
                             .flex()
                             .items_center()
-                            .gap(px(12.0))
+                            .gap(px(tokens::SPACE_12))
                             .child(img("brand/valendra.svg").size(px(34.0)).flex_none())
                             .child(
                                 div()
-                                    .text_size(px(12.0))
+                                    .text_size(px(tokens::TEXT_SMALL))
                                     .text_color(theme.muted)
                                     .child(i18n::text(cx, "about.attribution")),
                             ),
@@ -15679,17 +15501,7 @@ impl AverroesApp {
         } else {
             i18n::text(cx, "settings.choose_per_conversation")
         };
-        div()
-            .flex_none()
-            .h(px(28.0))
-            .px(px(14.0))
-            .flex()
-            .items_center()
-            .justify_between()
-            .bg(theme.rail)
-            .text_size(px(10.0))
-            .text_color(theme.faint)
-            .font(UiTheme::mono_font())
+        status_bar_surface(theme)
             .child(format!(
                 "{} {} · {}",
                 connection_count,
@@ -15755,11 +15567,17 @@ impl Render for AverroesApp {
             .flex()
             .size_full()
             .overflow_hidden()
-            .bg(theme.background)
             .text_color(theme.foreground)
             .font(UiTheme::ui_font())
             .child(self.render_rail(cx))
-            .child(content)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .bg(theme.background)
+                    .child(content),
+            )
             .children(sheet_layer)
             .children(dialog_layer)
     }
@@ -16241,19 +16059,6 @@ fn sort_conversation_summaries(conversations: &mut [ConversationSummary]) {
             })
             .then_with(|| left.id.cmp(&right.id))
     });
-}
-
-fn sidebar_heading(label: impl Into<SharedString>, theme: UiTheme, top: f32) -> AnyElement {
-    let label = label.into();
-    div()
-        .px(px(10.0))
-        .pt(px(top))
-        .pb(px(8.0))
-        .text_size(px(13.0))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(theme.faint)
-        .child(label)
-        .into_any_element()
 }
 
 fn format_context_tokens(tokens: Option<u64>) -> String {
@@ -16804,7 +16609,8 @@ mod task_progress_tests {
 
 #[cfg(test)]
 mod composer_visual_tests {
-    use super::{composer_metrics, private_conversation_icon};
+    use super::private_conversation_icon;
+    use crate::ui::components::composer_metrics;
     use gpui_component::IconName;
 
     #[test]
@@ -16813,16 +16619,16 @@ mod composer_visual_tests {
 
         assert_eq!(metrics.max_width, 680.0);
         assert_eq!(metrics.surface_radius, 14.0);
-        assert_eq!(metrics.text_min_height, 68.0);
-        assert_eq!(metrics.footer_height, 42.0);
-        assert_eq!(metrics.footer_horizontal_padding, 10.0);
-        assert_eq!(metrics.control_gap, 4.0);
+        assert_eq!(metrics.text_min_height, 76.0);
+        assert_eq!(metrics.footer_height, 46.0);
+        assert_eq!(metrics.footer_horizontal_padding, 12.0);
+        assert_eq!(metrics.control_gap, 6.0);
         assert_eq!(metrics.send_size, 28.0);
-        assert_eq!(metrics.attachment_radius, 7.0);
+        assert_eq!(metrics.attachment_radius, 6.0);
         assert_eq!(metrics.empty_logo_size, 96.0);
         assert_eq!(metrics.empty_title_size, 24.0);
-        assert_eq!(metrics.empty_brand_gap, 10.0);
-        assert_eq!(metrics.empty_composer_gap, 22.0);
+        assert_eq!(metrics.empty_brand_gap, 8.0);
+        assert_eq!(metrics.empty_composer_gap, 24.0);
         assert_eq!(metrics.footer_text_size, 11.0);
         assert_eq!(metrics.model_width, 132.0);
         assert_eq!(metrics.reasoning_width, 60.0);
@@ -16836,7 +16642,7 @@ mod composer_visual_tests {
 
         assert_eq!(metrics.max_width, 760.0);
         assert_eq!(metrics.surface_radius, 14.0);
-        assert_eq!(metrics.footer_height, 42.0);
+        assert_eq!(metrics.footer_height, 46.0);
         assert_eq!(metrics.send_size, 28.0);
         assert_eq!(metrics.footer_text_size, 12.0);
         assert_eq!(metrics.model_width, 148.0);
@@ -16916,10 +16722,10 @@ mod attachment_tests {
 fn sidebar_empty(label: impl Into<SharedString>, theme: UiTheme) -> AnyElement {
     let label = label.into();
     div()
-        .px(px(9.0))
-        .pb(px(8.0))
-        .text_size(px(12.0))
-        .text_color(theme.faint)
+        .px(px(tokens::SPACE_8))
+        .pb(px(tokens::SPACE_8))
+        .text_size(px(tokens::TEXT_SMALL))
+        .text_color(theme.muted)
         .child(label)
         .into_any_element()
 }
@@ -17053,7 +16859,7 @@ fn render_tool_group(
                     .flex()
                     .flex_col()
                     .gap(px(0.0))
-                    .rounded(px(10.0))
+                    .rounded(px(tokens::RADIUS_CARD))
                     .bg(theme.surface_subtle)
                     .overflow_hidden()
                     .child(render_tool_group_summary(
@@ -17073,7 +16879,7 @@ fn render_tool_group(
         ToolGroupRenderMode::Expanded => div()
             .flex()
             .flex_col()
-            .gap(px(5.0))
+            .gap(px(tokens::SPACE_4))
             .child(render_tool_group_summary(
                 session_id,
                 message_index,
@@ -17168,10 +16974,10 @@ fn render_tool_group_summary(
         .id(SharedString::from(group_id_string.clone()))
         .flex()
         .items_center()
-        .gap(px(8.0))
+        .gap(px(tokens::SPACE_8))
         .w_full()
-        .p(px(9.0))
-        .rounded(px(10.0))
+        .p(px(tokens::SPACE_8))
+        .rounded(px(tokens::RADIUS_CARD))
         .bg(theme.surface_subtle)
         .hover(|style| style.bg(theme.surface_hover))
         .cursor_pointer()
@@ -17185,10 +16991,10 @@ fn render_tool_group_summary(
                 .min_w(px(0.0))
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
+                .gap(px(tokens::SPACE_2))
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(px(tokens::TEXT_SMALL))
                         .text_color(theme.foreground)
                         .child(group_title),
                 )
@@ -17198,14 +17004,14 @@ fn render_tool_group_summary(
                         .whitespace_nowrap()
                         .overflow_hidden()
                         .text_ellipsis()
-                        .text_size(px(11.0))
+                        .text_size(px(tokens::TEXT_CAPTION))
                         .text_color(theme.muted)
                         .child(name_summary),
                 ),
         )
         .child(
             div()
-                .text_size(px(10.0))
+                .text_size(px(tokens::TEXT_CAPTION))
                 .text_color(tool_activity_state_color(status, theme))
                 .child(localized_tool_activity_state_label(cx, status)),
         )
@@ -17259,14 +17065,14 @@ fn render_tool_activity(
             let details = if expanded {
                 Some(
                     div()
-                        .mt(px(9.0))
-                        .pl(px(23.0))
+                        .mt(px(tokens::SPACE_8))
+                        .pl(px(tokens::SPACE_24))
                         .flex()
                         .flex_col()
-                        .gap(px(7.0))
+                        .gap(px(tokens::SPACE_8))
                         .child(
                             div()
-                                .text_size(px(10.0))
+                                .text_size(px(tokens::TEXT_CAPTION))
                                 .text_color(theme.faint)
                                 .child(i18n::text(cx, "tool.arguments")),
                         )
@@ -17275,11 +17081,11 @@ fn render_tool_activity(
                             &activity.name,
                             &input,
                             theme,
-                            11.0,
+                            tokens::TEXT_SMALL,
                         ))
                         .child(
                             div()
-                                .text_size(px(10.0))
+                                .text_size(px(tokens::TEXT_CAPTION))
                                 .text_color(theme.faint)
                                 .child(i18n::text(cx, "tool.result")),
                         )
@@ -17296,7 +17102,7 @@ fn render_tool_activity(
                             } else {
                                 theme.muted
                             },
-                            11.0,
+                            tokens::TEXT_SMALL,
                         )),
                 )
             } else {
@@ -17306,15 +17112,15 @@ fn render_tool_activity(
                 .id(SharedString::from(activity_id.clone()))
                 .flex()
                 .flex_col()
-                .p(px(9.0));
+                .p(px(tokens::SPACE_8));
             if nested {
                 activity_row = activity_row
                     .border_t_1()
                     .border_color(theme.border)
-                    .pt(px(10.0));
+                    .pt(px(tokens::SPACE_8));
             } else {
                 activity_row = activity_row
-                    .rounded(px(10.0))
+                    .rounded(px(tokens::RADIUS_CARD))
                     .bg(theme.surface_subtle)
                     .hover(|style| style.bg(theme.surface_hover));
             }
@@ -17323,14 +17129,14 @@ fn render_tool_activity(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(8.0))
+                        .gap(px(tokens::SPACE_8))
                         .child(tool_icon(&activity.name, 15.0).text_color(theme.muted))
                         .child(
                             div()
                                 .id(SharedString::from(format!("{activity_id}-agent")))
                                 .flex_1()
                                 .min_w(px(0.0))
-                                .text_size(px(12.0))
+                                .text_size(px(tokens::TEXT_SMALL))
                                 .text_color(theme.foreground)
                                 .child(tool_activity_title(cx, activity))
                                 .when(opens_agent, |this| {
@@ -17347,13 +17153,13 @@ fn render_tool_activity(
                         )
                         .child(
                             div()
-                                .text_size(px(10.0))
+                                .text_size(px(tokens::TEXT_CAPTION))
                                 .text_color(state_color)
                                 .child(state_label),
                         )
                         .child(
                             div()
-                                .text_size(px(10.0))
+                                .text_size(px(tokens::TEXT_CAPTION))
                                 .text_color(theme.faint)
                                 .child(duration),
                         )
@@ -17389,7 +17195,7 @@ fn render_tool_activity(
     div()
         .flex()
         .flex_col()
-        .when(!nested, |this| this.gap(px(5.0)))
+        .when(!nested, |this| this.gap(px(tokens::SPACE_4)))
         .children(rows)
         .into_any_element()
 }
@@ -17487,7 +17293,7 @@ fn render_agent_thread_transcript(
                 )))
                 .w_full()
                 .pt(if index == 0 { px(6.0) } else { px(0.0) })
-                .pb(px(22.0))
+                .pb(px(tokens::SPACE_24))
                 .child(render_agent_thread_message(
                     thread_id, index, message, streaming, theme, cx,
                 ))
@@ -17496,7 +17302,7 @@ fn render_agent_thread_transcript(
         .collect::<Vec<_>>();
 
     div()
-        .mt(px(6.0))
+        .mt(px(tokens::SPACE_6))
         .w_full()
         .flex()
         .flex_col()
@@ -17521,9 +17327,9 @@ fn render_agent_thread_message(
             .child(
                 div()
                     .max_w(px(620.0))
-                    .px(px(15.0))
-                    .py(px(11.0))
-                    .rounded(px(13.0))
+                    .px(px(tokens::SPACE_16))
+                    .py(px(tokens::SPACE_12))
+                    .rounded(px(tokens::RADIUS_SHEET))
                     .bg(theme.surface_subtle)
                     .child(TextView::markdown(message_id, message.text.clone()).selectable(true)),
             )
@@ -17581,7 +17387,7 @@ fn render_agent_thread_message(
         .w_full()
         .flex()
         .flex_col()
-        .gap(px(12.0))
+        .gap(px(tokens::SPACE_12))
         .children(content)
         .into_any_element()
 }
@@ -17831,9 +17637,9 @@ fn render_reasoning_block(
         div()
             .id(panel_id.clone())
             .w_full()
-            .px(px(12.0))
-            .py(px(9.0))
-            .rounded(px(10.0))
+            .px(px(tokens::SPACE_12))
+            .py(px(tokens::SPACE_8))
+            .rounded(px(tokens::RADIUS_CARD))
             .bg(theme.surface_subtle)
             .text_color(theme.muted)
             .child(
@@ -17841,7 +17647,7 @@ fn render_reasoning_block(
                     .w_full()
                     .flex()
                     .items_center()
-                    .gap(px(4.0))
+                    .gap(px(tokens::SPACE_4))
                     .child(
                         Button::new(toggle_id)
                             .ghost()
@@ -17886,16 +17692,16 @@ fn render_reasoning_block(
             .when(state.expanded, |this| {
                 this.child(
                     div()
-                        .mt(px(7.0))
-                        .pt(px(7.0))
+                        .mt(px(tokens::SPACE_8))
+                        .pt(px(tokens::SPACE_8))
                         .border_t_1()
                         .border_color(theme.border)
-                        .text_size(px(12.0))
+                        .text_size(px(tokens::TEXT_SMALL))
                         .child(
                             div()
                                 .flex()
                                 .flex_col()
-                                .gap(px(7.0))
+                                .gap(px(tokens::SPACE_8))
                                 .children(reasoning_content),
                         ),
                 )
@@ -18366,7 +18172,7 @@ fn render_agent_thread_tool_group(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(5.0))
+                    .gap(px(tokens::SPACE_4))
                     .child(render_agent_thread_tool_group_summary(
                         thread_id,
                         message_index,
@@ -18384,7 +18190,7 @@ fn render_agent_thread_tool_group(
         ToolGroupRenderMode::Expanded => div()
             .flex()
             .flex_col()
-            .gap(px(5.0))
+            .gap(px(tokens::SPACE_4))
             .child(render_agent_thread_tool_group_summary(
                 thread_id,
                 message_index,
@@ -18475,10 +18281,10 @@ fn render_agent_thread_tool_group_summary(
         )))
         .flex()
         .items_center()
-        .gap(px(8.0))
+        .gap(px(tokens::SPACE_8))
         .w_full()
-        .p(px(9.0))
-        .rounded(px(10.0))
+        .p(px(tokens::SPACE_8))
+        .rounded(px(tokens::RADIUS_CARD))
         .bg(theme.surface_subtle)
         .hover(|style| style.bg(theme.surface_hover))
         .cursor_pointer()
@@ -18492,22 +18298,22 @@ fn render_agent_thread_tool_group_summary(
                 .min_w(px(0.0))
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
-                .child(div().text_size(px(12.0)).child(group_title))
+                .gap(px(tokens::SPACE_2))
+                .child(div().text_size(px(tokens::TEXT_SMALL)).child(group_title))
                 .child(
                     div()
                         .min_w(px(0.0))
                         .whitespace_nowrap()
                         .overflow_hidden()
                         .text_ellipsis()
-                        .text_size(px(11.0))
+                        .text_size(px(tokens::TEXT_CAPTION))
                         .text_color(theme.muted)
                         .child(name_summary),
                 ),
         )
         .child(
             div()
-                .text_size(px(10.0))
+                .text_size(px(tokens::TEXT_CAPTION))
                 .text_color(tool_activity_state_color(status, theme))
                 .child(localized_tool_activity_state_label(cx, status)),
         )
@@ -18543,24 +18349,24 @@ fn render_agent_thread_tool_activity(
     let header = div()
         .flex()
         .items_center()
-        .gap(px(7.0))
+        .gap(px(tokens::SPACE_8))
         .child(tool_icon(&activity.name, 14.0).text_color(theme.muted))
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.0))
-                .text_size(px(12.0))
+                .text_size(px(tokens::TEXT_SMALL))
                 .child(tool_activity_title(cx, activity)),
         )
         .child(
             div()
-                .text_size(px(10.0))
+                .text_size(px(tokens::TEXT_CAPTION))
                 .text_color(tool_activity_state_color(activity.state, theme))
                 .child(localized_tool_activity_state_label(cx, activity.state)),
         )
         .child(
             div()
-                .text_size(px(10.0))
+                .text_size(px(tokens::TEXT_CAPTION))
                 .text_color(theme.faint)
                 .child(duration),
         )
@@ -18594,7 +18400,7 @@ fn render_agent_thread_tool_activity(
             .whitespace_nowrap()
             .overflow_hidden()
             .text_ellipsis()
-            .text_size(px(11.0))
+            .text_size(px(tokens::TEXT_CAPTION))
             .text_color(theme.muted)
             .child(activity.summary.clone())
     });
@@ -18603,11 +18409,11 @@ fn render_agent_thread_tool_activity(
         div()
             .flex()
             .flex_col()
-            .gap(px(7.0))
-            .pl(px(21.0))
+            .gap(px(tokens::SPACE_8))
+            .pl(px(tokens::SPACE_20))
             .child(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(px(tokens::TEXT_CAPTION))
                     .text_color(theme.faint)
                     .child(i18n::text(cx, "tool.arguments")),
             )
@@ -18616,11 +18422,11 @@ fn render_agent_thread_tool_activity(
                 &activity.name,
                 &tool_input_for_display(&activity.input),
                 theme,
-                10.0,
+                tokens::TEXT_CAPTION,
             ))
             .child(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(px(tokens::TEXT_CAPTION))
                     .text_color(theme.faint)
                     .child(i18n::text(cx, "tool.result")),
             )
@@ -18637,20 +18443,20 @@ fn render_agent_thread_tool_activity(
                 } else {
                     theme.muted
                 },
-                10.0,
+                tokens::TEXT_CAPTION,
             ))
     });
 
     div()
         .id(SharedString::from(activity_id.clone()))
         .w_full()
-        .p(px(9.0))
-        .rounded(px(10.0))
+        .p(px(tokens::SPACE_8))
+        .rounded(px(tokens::RADIUS_CARD))
         .bg(theme.surface_subtle)
         .hover(|style| style.bg(theme.surface_hover))
         .flex()
         .flex_col()
-        .gap(px(7.0))
+        .gap(px(tokens::SPACE_8))
         .child(header)
         .when_some(summary, |this, summary| this.child(summary))
         .when_some(details, |this, details| this.child(details))
@@ -18661,7 +18467,7 @@ fn render_activity_indicator(id: String, theme: UiTheme, dot_size: f32) -> AnyEl
     div()
         .flex()
         .items_center()
-        .gap(px(3.0))
+        .gap(px(tokens::SPACE_2))
         .children((0..3).map(move |index| {
             let animation_id = format!("{id}-{index}");
             div()
@@ -18726,24 +18532,30 @@ fn render_source_summary(
         div()
             .flex()
             .items_center()
-            .gap(px(5.0))
+            .gap(px(tokens::SPACE_4))
             .h(px(26.0))
-            .px(px(7.0))
-            .rounded(px(7.0))
+            .px(px(tokens::SPACE_8))
+            .rounded(px(tokens::RADIUS_CONTROL))
             .bg(theme.surface_subtle)
-            .child(div().flex().items_center().gap(px(2.0)).children(icons))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(tokens::SPACE_2))
+                    .children(icons),
+            )
             .when(remaining > 0, |this| {
                 this.child(
                     div()
-                        .text_size(px(10.0))
+                        .text_size(px(tokens::TEXT_CAPTION))
                         .text_color(theme.faint)
                         .child(format!("+{remaining}")),
                 )
             })
             .child(
                 div()
-                    .text_size(px(10.0))
-                    .font_weight(FontWeight::MEDIUM)
+                    .text_size(px(tokens::TEXT_CAPTION))
+                    .font_weight(tokens::WEIGHT_MEDIUM)
                     .text_color(theme.muted)
                     .child(i18n::text(cx, "chat.sources")),
             )
@@ -18882,24 +18694,24 @@ fn render_user_question(
         .collect::<Vec<_>>();
     let send_session_id = session_id.clone();
     div()
-        .p(px(12.0))
-        .rounded(px(10.0))
+        .p(px(tokens::SPACE_12))
+        .rounded(px(tokens::RADIUS_CARD))
         .border_1()
         .border_color(theme.border)
         .bg(theme.surface_subtle)
         .flex()
         .flex_col()
-        .gap(px(10.0))
+        .gap(px(tokens::SPACE_8))
         .child(
             div()
-                .text_size(px(11.0))
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(tokens::TEXT_CAPTION))
+                .font_weight(tokens::WEIGHT_SEMIBOLD)
                 .text_color(theme.muted)
                 .child(i18n::text(cx, "chat.input_needed")),
         )
         .child(
             div()
-                .text_size(px(14.0))
+                .text_size(px(tokens::TEXT_BODY))
                 .text_color(theme.foreground)
                 .child(question.question.clone()),
         )
@@ -18908,7 +18720,7 @@ fn render_user_question(
                 div()
                     .flex()
                     .flex_wrap()
-                    .gap(px(6.0))
+                    .gap(px(tokens::SPACE_6))
                     .children(option_buttons),
             )
         })
@@ -18916,7 +18728,7 @@ fn render_user_question(
             div()
                 .flex()
                 .items_center()
-                .gap(px(7.0))
+                .gap(px(tokens::SPACE_8))
                 .child(Input::new(input).flex_1())
                 .child(
                     Button::new(format!("send-user-question-{}", question.id))
@@ -18942,7 +18754,7 @@ fn render_assistant_text_segment(
 ) -> AnyElement {
     if streaming {
         fade_in(
-            render_streaming_markdown(theme, text).text_size(px(14.0)),
+            render_streaming_markdown(theme, text).text_size(px(tokens::TEXT_BODY)),
             format!("{stream_animation_id}-content"),
             STREAM_TEXT_FADE_DURATION,
         )
@@ -18964,7 +18776,7 @@ fn render_reasoning_text_segment(id: String, text: &str, streaming: bool) -> Any
     let text = normalize_reasoning_for_display(text);
     let markdown = TextView::markdown(id.clone(), text.into_owned())
         .selectable(true)
-        .text_size(px(12.0));
+        .text_size(px(tokens::TEXT_SMALL));
     if streaming {
         fade_in(markdown, format!("{id}-content"), STREAM_TEXT_FADE_DURATION).into_any_element()
     } else {
@@ -18979,8 +18791,8 @@ fn render_reasoning_summary_segment(id: String, text: &str, theme: UiTheme) -> A
     let text = normalize_reasoning_for_display(text);
     TextView::markdown(id, text.into_owned())
         .selectable(true)
-        .text_size(px(12.0))
-        .font_weight(FontWeight::BOLD)
+        .text_size(px(tokens::TEXT_SMALL))
+        .font_weight(tokens::WEIGHT_SEMIBOLD)
         .text_color(theme.foreground)
         .into_any_element()
 }
@@ -19000,7 +18812,7 @@ fn render_image_attachments(
                 .id(SharedString::from(format!("{message_id}-image-{index}")))
                 .max_w(px(460.0))
                 .max_h(px(360.0))
-                .rounded(px(10.0))
+                .rounded(px(tokens::RADIUS_CARD))
                 .overflow_hidden()
                 .bg(theme.background)
                 .child(
@@ -19009,8 +18821,8 @@ fn render_image_attachments(
                         .max_h(px(360.0))
                         .with_fallback(move || {
                             div()
-                                .p(px(10.0))
-                                .text_size(px(12.0))
+                                .p(px(tokens::SPACE_8))
+                                .text_size(px(tokens::TEXT_SMALL))
                                 .text_color(theme.muted)
                                 .child(fallback_name.clone())
                                 .into_any_element()
@@ -19154,7 +18966,7 @@ fn render_message_actions(
     div()
         .flex()
         .items_center()
-        .gap(px(2.0))
+        .gap(px(tokens::SPACE_2))
         .text_color(theme.faint)
         .when_some(copy_button, |actions, copy| actions.child(copy))
         .when(assistant, |actions| {
@@ -19207,19 +19019,19 @@ fn render_message(
             .flex()
             .flex_col()
             .items_end()
-            .gap(px(2.0))
+            .gap(px(tokens::SPACE_2))
             .child(
                 div()
                     .max_w(px(620.0))
                     .px(if has_images { px(8.0) } else { px(15.0) })
-                    .py(px(11.0))
-                    .rounded(px(13.0))
+                    .py(px(tokens::SPACE_12))
+                    .rounded(px(tokens::RADIUS_SHEET))
                     .bg(theme.surface_subtle)
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(8.0))
+                            .gap(px(tokens::SPACE_8))
                             .when(!body.trim().is_empty(), |this| {
                                 this.child(
                                     TextView::markdown(message_id.clone(), body.clone())
@@ -19290,16 +19102,16 @@ fn render_message(
     let message_element = div()
         .flex()
         .flex_col()
-        .gap(px(9.0))
+        .gap(px(tokens::SPACE_8))
         .when(error, |this| {
-            this.p(px(13.0))
-                .rounded(px(12.0))
+            this.p(px(tokens::SPACE_12))
+                .rounded(px(tokens::RADIUS_CARD))
                 .bg(theme.destructive_soft)
                 .child(
                     div()
-                        .text_size(px(10.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.destructive)
+                        .text_size(px(tokens::TEXT_CAPTION))
+                        .font_weight(tokens::WEIGHT_SEMIBOLD)
+                        .text_color(theme.destructive_text)
                         .child(i18n::text(cx, "chat.error")),
                 )
         })
@@ -19330,13 +19142,7 @@ fn render_message(
 }
 
 fn form_label(label: impl Into<SharedString>, theme: UiTheme) -> gpui::Div {
-    let label = label.into();
-    div()
-        .mb(px(6.0))
-        .text_size(px(11.0))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme.muted)
-        .child(label)
+    field_label(theme, label).mb(px(tokens::SPACE_6))
 }
 
 fn settings_page_title(
@@ -19350,15 +19156,15 @@ fn settings_page_title(
         .child(
             div()
                 .font(UiTheme::display_font())
-                .text_size(px(24.0))
-                .font_weight(FontWeight::BOLD)
+                .text_size(px(tokens::TEXT_LARGE))
+                .font_weight(tokens::WEIGHT_SEMIBOLD)
                 .child(title),
         )
         .child(
             div()
-                .mt(px(7.0))
+                .mt(px(tokens::SPACE_8))
                 .max_w(px(680.0))
-                .text_size(px(12.0))
+                .text_size(px(tokens::TEXT_SMALL))
                 .text_color(theme.muted)
                 .child(description),
         )
@@ -19397,14 +19203,14 @@ fn settings_empty_state(
     let title = title.into();
     let description = description.into();
     div()
-        .p(px(20.0))
+        .p(px(tokens::SPACE_20))
         .bg(theme.surface_subtle)
-        .rounded(px(10.0))
-        .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+        .rounded(px(tokens::RADIUS_CARD))
+        .child(div().font_weight(tokens::WEIGHT_SEMIBOLD).child(title))
         .child(
             div()
-                .mt(px(5.0))
-                .text_size(px(12.0))
+                .mt(px(tokens::SPACE_4))
+                .text_size(px(tokens::TEXT_SMALL))
                 .text_color(theme.muted)
                 .child(description),
         )
@@ -19419,8 +19225,8 @@ fn storage_path_row(
     div()
         .flex()
         .items_center()
-        .gap(px(12.0))
-        .text_size(px(12.0))
+        .gap(px(tokens::SPACE_12))
+        .text_size(px(tokens::TEXT_SMALL))
         .child(div().flex_1().text_color(theme.muted).child(label))
         .child(
             div()
