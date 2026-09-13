@@ -135,6 +135,27 @@ impl WorkDatabase {
         Ok(())
     }
 
+    pub fn rename_project(&self, project_id: &str, name: &str) -> Result<bool, WorkDatabaseError> {
+        let renamed = self.connection.lock().execute(
+            "UPDATE projects SET name = ?2 WHERE id = ?1",
+            params![project_id, name],
+        )?;
+        Ok(renamed > 0)
+    }
+
+    pub fn delete_project(&self, project_id: &str) -> Result<bool, WorkDatabaseError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM conversations WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        let deleted =
+            transaction.execute("DELETE FROM projects WHERE id = ?1", params![project_id])?;
+        transaction.commit()?;
+        Ok(deleted > 0)
+    }
+
     pub fn window_states(&self) -> Result<Vec<WorkWindowState>, WorkDatabaseError> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
@@ -322,6 +343,26 @@ impl WorkDatabase {
             ],
         )?;
         Ok(folder)
+    }
+
+    pub fn rename_conversation_folder(
+        &self,
+        folder_id: &str,
+        name: &str,
+    ) -> Result<bool, WorkDatabaseError> {
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if name.is_empty() {
+            return Err(WorkDatabaseError::InvalidFolder(
+                "folder name cannot be empty".into(),
+            ));
+        }
+        let updated = self.connection.lock().execute(
+            "UPDATE conversation_folders
+             SET name = ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![folder_id, name, now()],
+        )?;
+        Ok(updated > 0)
     }
 
     pub fn set_conversation_folder(
@@ -2474,6 +2515,28 @@ mod tests {
     }
 
     #[test]
+    fn renames_and_deletes_projects_with_their_conversations() {
+        let (directory, database) = database();
+        let root = directory.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let project = database.open_project(&root).unwrap();
+
+        assert!(database.rename_project(&project.id, "Renamed").unwrap());
+        assert_eq!(database.projects().unwrap()[0].name, "Renamed");
+        assert!(!database.rename_project("missing", "Renamed").unwrap());
+
+        let mut conversation = test_conversation("project-conversation");
+        conversation.project_id = Some(project.id.clone());
+        database.save_conversation(&conversation).unwrap();
+        assert!(database.conversation(&conversation.id).unwrap().is_some());
+
+        assert!(database.delete_project(&project.id).unwrap());
+        assert!(database.projects().unwrap().is_empty());
+        assert!(database.conversation(&conversation.id).unwrap().is_none());
+        assert!(!database.delete_project(&project.id).unwrap());
+    }
+
+    #[test]
     fn conversation_folders_are_scoped_to_their_workspace() {
         let (directory, database) = database();
         let first_root = directory.path().join("first");
@@ -2527,6 +2590,43 @@ mod tests {
             .conversation_folder_ids(&first.id)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn renames_and_deletes_folders_without_deleting_conversations() {
+        let (directory, database) = database();
+        let root = directory.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = database.open_project(&root).unwrap();
+        let folder = database
+            .create_conversation_folder(&workspace.id, "Research")
+            .unwrap();
+
+        assert!(database
+            .rename_conversation_folder(&folder.id, "Renamed")
+            .unwrap());
+        assert_eq!(
+            database.conversation_folders(&workspace.id).unwrap()[0].name,
+            "Renamed"
+        );
+        assert!(!database
+            .rename_conversation_folder("missing", "Renamed")
+            .unwrap());
+
+        let mut conversation = test_conversation("folder-conversation");
+        conversation.project_id = Some(workspace.id.clone());
+        database.save_conversation(&conversation).unwrap();
+        database
+            .set_conversation_folder(&conversation.id, Some(&folder.id))
+            .unwrap();
+
+        assert!(database.delete_conversation_folder(&folder.id).unwrap());
+        assert!(database.conversation(&conversation.id).unwrap().is_some());
+        assert!(database
+            .conversation_folder_ids(&workspace.id)
+            .unwrap()
+            .is_empty());
+        assert!(!database.delete_conversation_folder(&folder.id).unwrap());
     }
 
     #[test]

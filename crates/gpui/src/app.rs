@@ -2409,6 +2409,7 @@ impl AverroesApp {
             stream_recovery_checkpoints: HashMap::new(),
             _subscriptions: subscriptions,
         };
+        app.refresh_conversation_folders();
         app.sync_embedding_selectors(window, cx);
         if should_probe_codex {
             app.refresh_codex_account(cx);
@@ -6619,6 +6620,428 @@ impl AverroesApp {
         true
     }
 
+    fn open_rename_project(
+        &mut self,
+        project_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .cloned()
+        else {
+            self.show_error(i18n::text(cx, "notice.project_missing"), cx);
+            return;
+        };
+        let rename_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(i18n::text(cx, "dialog.project_name"))
+                .default_value(project.name)
+        });
+        let view = cx.entity();
+        let project_id = project_id.to_string();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            rename_input.update(cx, |input, cx| input.focus(window, cx));
+            let submit_input = rename_input.clone();
+            let submit_view = view.clone();
+            let submit_id = project_id.clone();
+            let cancel_button = Button::new("rename-project-cancel")
+                .secondary()
+                .label(i18n::text(cx, "dialog.cancel"))
+                .on_click(|_, window, cx| window.close_dialog(cx));
+            let confirm_input = rename_input.clone();
+            let confirm_view = view.clone();
+            let confirm_id = project_id.clone();
+            let confirm_button = Button::new("rename-project-confirm")
+                .primary()
+                .label(i18n::text(cx, "dialog.rename"))
+                .on_click(move |_, window, cx| {
+                    let name = confirm_input.read(cx).value().trim().to_string();
+                    if confirm_view.update(cx, |app, cx| app.rename_project(&confirm_id, &name, cx))
+                    {
+                        window.close_dialog(cx);
+                    }
+                });
+            dialog
+                .title(i18n::text(cx, "dialog.rename_project_title"))
+                .w(px(420.0))
+                .child(
+                    div()
+                        .py(px(tokens::SPACE_8))
+                        .child(Input::new(&rename_input).w_full()),
+                )
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(tokens::SPACE_8))
+                        .child(cancel_button)
+                        .child(confirm_button),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(i18n::text(cx, "dialog.rename"))
+                        .cancel_text(i18n::text(cx, "dialog.cancel"))
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, _, cx| {
+                    let name = submit_input.read(cx).value().trim().to_string();
+                    submit_view.update(cx, |app, cx| app.rename_project(&submit_id, &name, cx))
+                })
+        });
+    }
+
+    fn rename_project(&mut self, project_id: &str, name: &str, cx: &mut Context<Self>) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            self.show_error(i18n::text(cx, "dialog.project_name_empty"), cx);
+            return false;
+        }
+        match self.runtime.database.rename_project(project_id, name) {
+            Ok(true) => {
+                self.notice = None;
+                if let Some(project) = self
+                    .projects
+                    .iter_mut()
+                    .find(|project| project.id == project_id)
+                {
+                    project.name = name.to_string();
+                }
+                self.refresh_navigation();
+                cx.notify();
+                true
+            }
+            Ok(false) => {
+                self.show_error(i18n::text(cx, "notice.project_missing"), cx);
+                false
+            }
+            Err(error) => {
+                self.show_error(error.to_string(), cx);
+                false
+            }
+        }
+    }
+
+    fn open_delete_project(
+        &mut self,
+        project_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.name.clone())
+            .unwrap_or_else(|| i18n::text(cx, "dialog.this_project").to_string());
+        let localization = cx.global::<i18n::Localization>().clone();
+        let view = cx.entity();
+        let project_id = project_id.to_string();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let confirm_view = view.clone();
+            let confirm_id = project_id.clone();
+            let delete_label = localization.text("dialog.delete");
+            let cancel_label = localization.text("dialog.cancel");
+            let confirm_button = Button::new("delete-project-confirm")
+                .danger()
+                .label(delete_label.clone())
+                .on_click(move |_, window, cx| {
+                    if confirm_view
+                        .update(cx, |app, cx| app.delete_project(&confirm_id, window, cx))
+                    {
+                        window.close_dialog(cx);
+                    }
+                });
+            let cancel_button = Button::new("delete-project-cancel")
+                .secondary()
+                .label(cancel_label.clone())
+                .on_click(|_, window, cx| window.close_dialog(cx));
+            alert
+                .title(localization.text("dialog.delete_project_title"))
+                .description(localization.format(
+                    "dialog.delete_project_description",
+                    &[("name", name.clone())],
+                ))
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(tokens::SPACE_8))
+                        .child(cancel_button)
+                        .child(confirm_button),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(delete_label)
+                        .ok_variant(ButtonVariant::Danger)
+                        .cancel_text(cancel_label)
+                        .show_cancel(true),
+                )
+        });
+    }
+
+    fn delete_project(
+        &mut self,
+        project_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.runtime.database.delete_project(project_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.show_error(i18n::text(cx, "notice.project_missing"), cx);
+                return false;
+            }
+            Err(error) => {
+                self.show_error(error.to_string(), cx);
+                return false;
+            }
+        }
+
+        let previous_active = self.active().id.to_string();
+        let removed_sessions = self
+            .sessions
+            .iter()
+            .filter(|session| session.project_id.as_deref() == Some(project_id))
+            .count();
+        self.sessions
+            .retain(|session| session.project_id.as_deref() != Some(project_id));
+        let active_session_removed = !self
+            .sessions
+            .iter()
+            .any(|session| session.id.as_str() == previous_active);
+        let mut sync_selectors = false;
+        if self.sessions.is_empty() {
+            self.sessions.push(ShellSession::new(
+                None,
+                self.remembered_binding.clone(),
+                false,
+            ));
+            self.active_session = 0;
+            sync_selectors = true;
+        } else if active_session_removed {
+            self.active_session = self.active_session.min(self.sessions.len() - 1);
+            sync_selectors = true;
+        }
+
+        self.projects.retain(|project| project.id != project_id);
+        self.conversations
+            .retain(|conversation| conversation.project_id.as_deref() != Some(project_id));
+        if self.active_workspace_id.as_deref() == Some(project_id) {
+            self.active_workspace_id = None;
+        }
+        self.notice = None;
+        self.refresh_navigation();
+        if sync_selectors {
+            if self.active_workspace_id.is_none() {
+                self.route = Route::Home;
+            } else {
+                self.route = Route::Chat;
+                self.mark_active_read(cx);
+                self.sync_selectors_to_active(window, cx);
+            }
+        }
+        if removed_sessions > 0 {
+            diagnostics::record(
+                DiagnosticLevel::Info,
+                "project.action",
+                format!("Deleted project with {removed_sessions} conversation(s)."),
+            );
+        }
+        cx.notify();
+        true
+    }
+
+    fn open_rename_conversation_folder(
+        &mut self,
+        folder_id: &str,
+        folder_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rename_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(i18n::text(cx, "dialog.folder_name"))
+                .default_value(folder_name.to_owned())
+        });
+        let view = cx.entity();
+        let folder_id = folder_id.to_owned();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            rename_input.update(cx, |input, cx| input.focus(window, cx));
+            let submit_input = rename_input.clone();
+            let submit_view = view.clone();
+            let submit_id = folder_id.clone();
+            let cancel_button = Button::new("rename-folder-cancel")
+                .secondary()
+                .label(i18n::text(cx, "dialog.cancel"))
+                .on_click(|_, window, cx| window.close_dialog(cx));
+            let confirm_input = rename_input.clone();
+            let confirm_view = view.clone();
+            let confirm_id = folder_id.clone();
+            let confirm_button = Button::new("rename-folder-confirm")
+                .primary()
+                .label(i18n::text(cx, "dialog.rename"))
+                .on_click(move |_, window, cx| {
+                    let name = confirm_input.read(cx).value().trim().to_owned();
+                    if confirm_view.update(cx, |app, cx| {
+                        app.rename_conversation_folder(&confirm_id, &name, cx)
+                    }) {
+                        window.close_dialog(cx);
+                    }
+                });
+            dialog
+                .title(i18n::text(cx, "dialog.rename_folder_title"))
+                .w(px(420.0))
+                .child(
+                    div()
+                        .py(px(tokens::SPACE_8))
+                        .child(Input::new(&rename_input).w_full()),
+                )
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(tokens::SPACE_8))
+                        .child(cancel_button)
+                        .child(confirm_button),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(i18n::text(cx, "dialog.rename"))
+                        .cancel_text(i18n::text(cx, "dialog.cancel"))
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, _, cx| {
+                    let name = submit_input.read(cx).value().trim().to_owned();
+                    submit_view.update(cx, |app, cx| {
+                        app.rename_conversation_folder(&submit_id, &name, cx)
+                    })
+                })
+        });
+    }
+
+    fn rename_conversation_folder(
+        &mut self,
+        folder_id: &str,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if name.is_empty() {
+            self.show_error(i18n::text(cx, "dialog.folder_name_empty"), cx);
+            return false;
+        }
+        match self
+            .runtime
+            .database
+            .rename_conversation_folder(folder_id, &name)
+        {
+            Ok(true) => {
+                if let Some(folder) = self
+                    .conversation_folders
+                    .iter_mut()
+                    .find(|folder| folder.id == folder_id)
+                {
+                    folder.name = name;
+                }
+                self.conversation_folders.sort_by(|left, right| {
+                    left.name
+                        .to_ascii_lowercase()
+                        .cmp(&right.name.to_ascii_lowercase())
+                });
+                self.notice = None;
+                cx.notify();
+                true
+            }
+            Ok(false) => {
+                self.show_error(i18n::text(cx, "notice.folder_missing"), cx);
+                false
+            }
+            Err(error) => {
+                self.show_error(error.to_string(), cx);
+                false
+            }
+        }
+    }
+
+    fn open_delete_conversation_folder(
+        &mut self,
+        folder_id: &str,
+        folder_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let localization = cx.global::<i18n::Localization>().clone();
+        let view = cx.entity();
+        let folder_id = folder_id.to_owned();
+        let folder_name = folder_name.to_owned();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let confirm_view = view.clone();
+            let confirm_id = folder_id.clone();
+            let delete_label = localization.text("dialog.delete");
+            let cancel_label = localization.text("dialog.cancel");
+            let confirm_button = Button::new("delete-folder-confirm")
+                .danger()
+                .label(delete_label.clone())
+                .on_click(move |_, window, cx| {
+                    if confirm_view.update(cx, |app, cx| {
+                        app.delete_conversation_folder(&confirm_id, cx)
+                    }) {
+                        window.close_dialog(cx);
+                    }
+                });
+            let cancel_button = Button::new("delete-folder-cancel")
+                .secondary()
+                .label(cancel_label.clone())
+                .on_click(|_, window, cx| window.close_dialog(cx));
+            alert
+                .title(localization.text("dialog.delete_folder_title"))
+                .description(localization.format(
+                    "dialog.delete_folder_description",
+                    &[("name", folder_name.clone())],
+                ))
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(tokens::SPACE_8))
+                        .child(cancel_button)
+                        .child(confirm_button),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(delete_label)
+                        .ok_variant(ButtonVariant::Danger)
+                        .cancel_text(cancel_label)
+                        .show_cancel(true),
+                )
+        });
+    }
+
+    fn delete_conversation_folder(&mut self, folder_id: &str, cx: &mut Context<Self>) -> bool {
+        match self.runtime.database.delete_conversation_folder(folder_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.show_error(i18n::text(cx, "notice.folder_missing"), cx);
+                return false;
+            }
+            Err(error) => {
+                self.show_error(error.to_string(), cx);
+                return false;
+            }
+        }
+        self.conversation_folders
+            .retain(|folder| folder.id != folder_id);
+        self.conversation_folder_ids
+            .retain(|_, assigned_folder_id| assigned_folder_id != folder_id);
+        self.expanded_conversation_folders.remove(folder_id);
+        self.notice = None;
+        cx.notify();
+        true
+    }
+
     fn set_conversation_pinned(
         &mut self,
         conversation_id: &str,
@@ -10645,7 +11068,7 @@ impl AverroesApp {
         .indent(if indented {
             tokens::SPACE_32
         } else {
-            tokens::SPACE_8
+            tokens::SPACE_24
         })
         .accessory(actions)
         .selected(selected)
@@ -10819,21 +11242,18 @@ impl AverroesApp {
 
         let mut project_rows = Vec::new();
         let mut recent_rows = Vec::new();
-        let visible_projects = if is_home {
-            self.projects.clone()
-        } else {
-            self.projects
-                .iter()
-                .filter(|project| self.active_workspace_id.as_ref() == Some(&project.id))
-                .cloned()
-                .collect()
-        };
+        let visible_projects = visible_projects_for_route(
+            self.route,
+            self.active_workspace_id.as_deref(),
+            &self.projects,
+        );
         for project in visible_projects {
             let id = project.id.clone();
-            let mut conversations = if is_home {
-                Vec::new()
-            } else {
+            let is_active_workspace = self.active_workspace_id.as_deref() == Some(id.as_str());
+            let mut conversations = if !is_home && is_active_workspace {
                 workspace_conversations.remove(&id).unwrap_or_default()
+            } else {
+                Vec::new()
             };
             conversations
                 .retain(|conversation| !featured_conversation_ids.contains(&conversation.id));
@@ -10842,9 +11262,6 @@ impl AverroesApp {
             let project_group = SharedString::from(format!("project-row-{id}"));
             let new_conversation_project = project.clone();
             let project_conversation_count = div()
-                .absolute()
-                .top(px(0.0))
-                .left(px(0.0))
                 .size(px(24.0))
                 .flex()
                 .items_center()
@@ -10862,29 +11279,39 @@ impl AverroesApp {
             .with_size(px(tokens::CONTROL_SMALL))
             .icon(IconName::Plus)
             .tooltip(i18n::text(cx, "sidebar.new_workspace_conversation"))
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
             .opacity(0.0)
             .group_hover(project_group.clone(), |style| style.opacity(1.0))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.new_session_for_project(Some(new_conversation_project.clone()), window, cx)
             }));
-            if is_home {
+            let project_actions = project_actions_button(
+                id.clone(),
+                format!("project-actions-{id}"),
+                Some(project_group.clone()),
+                cx,
+            );
+            if shows_project_rows(self.route) {
                 if !self.projects_expanded {
                     continue;
                 }
                 project_rows.push(
                     SidebarRow::new(SharedString::from(format!("project-{id}")), project.name)
-                        .icon(IconName::FolderClosed)
+                        .icon(if is_active_workspace {
+                            IconName::FolderOpen
+                        } else {
+                            IconName::FolderClosed
+                        })
                         .accessory(
                             div()
-                                .relative()
                                 .flex_none()
-                                .size(px(24.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(tokens::SPACE_2))
                                 .child(project_conversation_count)
-                                .child(new_conversation_button),
+                                .child(new_conversation_button)
+                                .child(project_actions),
                         )
+                        .selected(!is_home && is_active_workspace)
                         .render(theme)
                         .group(project_group)
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -10892,9 +11319,25 @@ impl AverroesApp {
                         }))
                         .into_any_element(),
                 );
+            }
+            if is_home || !is_active_workspace {
                 continue;
             }
             let mut remaining = conversations;
+            if self.conversation_folders.is_empty() {
+                project_rows.push(
+                    div()
+                        .flex_none()
+                        .w_full()
+                        .pl(px(tokens::SPACE_24))
+                        .pr(px(tokens::SPACE_12))
+                        .pb(px(tokens::SPACE_8))
+                        .text_size(px(tokens::TEXT_CAPTION))
+                        .text_color(theme.faint)
+                        .child(i18n::text(cx, "folder.empty"))
+                        .into_any_element(),
+                );
+            }
             for folder in self.conversation_folders.clone() {
                 let folder_id = folder.id.clone();
                 let folder_conversations = remaining
@@ -10913,19 +11356,13 @@ impl AverroesApp {
                 let folder_toggle_id = folder_id.clone();
                 let folder_group_for_hover = folder_group.clone();
                 let folder_for_new_conversation = folder.clone();
-                let folder_count = div()
-                    .absolute()
-                    .top(px(0.0))
-                    .right(px(0.0))
-                    .size(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(tokens::TEXT_CAPTION))
-                    .text_color(theme.faint)
-                    .when(folder_conversations.is_empty(), |this| this.opacity(0.0))
-                    .group_hover(folder_group_for_hover.clone(), |style| style.opacity(0.0))
-                    .child(folder_conversations.len().to_string());
+                let folder_actions = conversation_folder_actions_button(
+                    folder_id.clone(),
+                    folder.name.clone(),
+                    format!("conversation-folder-actions-{folder_id}"),
+                    Some(folder_group.clone()),
+                    cx,
+                );
                 let new_conversation_button = Button::new(SharedString::from(format!(
                     "new-conversation-in-folder-{folder_id}"
                 )))
@@ -10934,9 +11371,6 @@ impl AverroesApp {
                 .with_size(px(tokens::CONTROL_SMALL))
                 .icon(IconName::Plus)
                 .tooltip(i18n::text(cx, "folder.new_conversation"))
-                .absolute()
-                .top(px(0.0))
-                .right(px(0.0))
                 .opacity(0.0)
                 .group_hover(folder_group_for_hover, |style| style.opacity(1.0))
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -10976,13 +11410,15 @@ impl AverroesApp {
                                     .text_color(theme.muted),
                                 ),
                         )
+                        .indent(tokens::SPACE_24)
                         .accessory(
                             div()
-                                .relative()
                                 .flex_none()
-                                .size(px(24.0))
-                                .child(folder_count)
-                                .child(new_conversation_button),
+                                .flex()
+                                .items_center()
+                                .gap(px(tokens::SPACE_2))
+                                .child(new_conversation_button)
+                                .child(folder_actions),
                         )
                         .render(theme)
                         .group(folder_group)
@@ -11101,6 +11537,14 @@ impl AverroesApp {
                     .find(|project| &project.id == project_id)
             })
             .map(|project| {
+                let actions = project_actions_use_active_context(self.route).then(|| {
+                    project_actions_button(
+                        project.id.clone(),
+                        format!("active-project-actions-{}", project.id),
+                        None,
+                        cx,
+                    )
+                });
                 div()
                     .id("active-project-footer")
                     .flex_none()
@@ -11117,6 +11561,7 @@ impl AverroesApp {
                             .flex()
                             .items_center()
                             .gap(px(tokens::SPACE_8))
+                            .hover(|style| style.bg(theme.surface_hover))
                             .rounded(px(SIDEBAR_RADIUS))
                             .child(
                                 div()
@@ -11155,6 +11600,7 @@ impl AverroesApp {
                                             .child(i18n::text(cx, "sidebar.current_project")),
                                     ),
                             )
+                            .children(actions)
                             .when(self.background_indexing, |this| {
                                 this.child(
                                     Icon::new(IconName::Loader)
@@ -11200,7 +11646,7 @@ impl AverroesApp {
                                 Button::new("search-conversations")
                                     .ghost()
                                     .small()
-                                    .with_size(px(30.0))
+                                    .with_size(px(tokens::CONTROL_SMALL))
                                     .selected(self.conversation_search_open)
                                     .icon(IconName::Search)
                                     .tooltip(i18n::text(cx, "sidebar.search"))
@@ -11220,7 +11666,7 @@ impl AverroesApp {
                                 Button::new("open-settings-nav")
                                     .ghost()
                                     .small()
-                                    .with_size(px(30.0))
+                                    .with_size(px(tokens::CONTROL_SMALL))
                                     .selected(self.route == Route::Connections)
                                     .icon(IconName::Settings2)
                                     .tooltip(i18n::text(cx, "settings.title"))
@@ -11337,7 +11783,7 @@ impl AverroesApp {
                                         if is_home {
                                             "home.recent_workspaces"
                                         } else {
-                                            "sidebar.folders"
+                                            "folder.section"
                                         },
                                     ))
                                     .child(
@@ -11362,7 +11808,7 @@ impl AverroesApp {
                                 })
                                 .ghost()
                                 .small()
-                                .with_size(px(28.0))
+                                .with_size(px(tokens::CONTROL_SMALL))
                                 .icon(IconName::Plus)
                                 .tooltip(i18n::text(
                                     cx,
@@ -11930,13 +12376,21 @@ impl AverroesApp {
             .into_iter()
             .map(|project| {
                 let project_id = project.id.clone();
+                let card_group = SharedString::from(format!("home-project-row-{project_id}"));
+                let actions = project_actions_button(
+                    project_id.clone(),
+                    format!("home-project-actions-{project_id}"),
+                    Some(card_group.clone()),
+                    cx,
+                );
                 card(theme, tokens::SPACE_16)
-                    .id(SharedString::from(format!("home-project-{}", project.id)))
+                    .id(SharedString::from(format!("home-project-{project_id}")))
                     .w_full()
                     .flex()
                     .items_center()
                     .gap(px(tokens::SPACE_12))
                     .cursor_pointer()
+                    .group(card_group)
                     .hover(|style| style.bg(theme.surface_hover))
                     .child(
                         Icon::new(IconName::Folder)
@@ -11964,6 +12418,7 @@ impl AverroesApp {
                                     .child(project.root.to_string_lossy().to_string()),
                             ),
                     )
+                    .child(actions)
                     .child(
                         Icon::new(IconName::ChevronRight)
                             .size(px(14.0))
@@ -12066,7 +12521,6 @@ impl AverroesApp {
                                     ),
                             ),
                     )
-                    .when(!setup_complete, |home| home.child(setup_panel))
                     .child(
                         div()
                             .flex()
@@ -12130,7 +12584,8 @@ impl AverroesApp {
                                     ),
                                 )
                             }),
-                    ),
+                    )
+                    .when(!setup_complete, |home| home.child(setup_panel)),
             )
             .into_any_element()
     }
@@ -15592,6 +16047,161 @@ fn non_empty_input(input: &Entity<InputState>, cx: &App) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+fn project_actions_button(
+    project_id: String,
+    button_id: String,
+    hover_group: Option<SharedString>,
+    cx: &mut Context<AverroesApp>,
+) -> AnyElement {
+    let app_view = cx.entity().downgrade();
+    let rename_view = app_view.clone();
+    let delete_view = app_view;
+    let rename_id = project_id.clone();
+    let delete_id = project_id;
+    let trigger = Button::new(button_id)
+        .ghost()
+        .small()
+        .with_size(px(tokens::CONTROL_SMALL))
+        .icon(IconName::Ellipsis)
+        .tooltip(i18n::text(cx, "menu.project_actions"))
+        .when_some(hover_group, |button, group| {
+            button
+                .opacity(0.0)
+                .group_hover(group, |style| style.opacity(1.0))
+        })
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _window, cx| {
+            let rename_view = rename_view.clone();
+            let delete_view = delete_view.clone();
+            let rename_id = rename_id.clone();
+            let delete_id = delete_id.clone();
+            menu.min_w(px(178.0))
+                .item(
+                    PopupMenuItem::new(i18n::text(cx, "menu.rename"))
+                        .icon(Icon::default().path("icons/pencil.svg"))
+                        .on_click(move |_, window, cx| {
+                            if let Err(error) = rename_view.update(cx, |app, cx| {
+                                app.open_rename_project(&rename_id, window, cx)
+                            }) {
+                                diagnostics::record(
+                                    DiagnosticLevel::Error,
+                                    "project.action",
+                                    format!("Rename action could not reach the app: {error}"),
+                                );
+                            }
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(i18n::text(cx, "menu.delete_project"))
+                        .icon(Icon::default().path("icons/trash.svg"))
+                        .on_click(move |_, window, cx| {
+                            if let Err(error) = delete_view.update(cx, |app, cx| {
+                                app.open_delete_project(&delete_id, window, cx)
+                            }) {
+                                diagnostics::record(
+                                    DiagnosticLevel::Error,
+                                    "project.action",
+                                    format!("Delete action could not reach the app: {error}"),
+                                );
+                            }
+                        }),
+                )
+        });
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(trigger)
+        .into_any_element()
+}
+
+fn conversation_folder_actions_button(
+    folder_id: String,
+    folder_name: String,
+    button_id: String,
+    hover_group: Option<SharedString>,
+    cx: &mut Context<AverroesApp>,
+) -> AnyElement {
+    let app_view = cx.entity().downgrade();
+    let rename_view = app_view.clone();
+    let delete_view = app_view;
+    let rename_id = folder_id.clone();
+    let delete_id = folder_id;
+    let rename_name = folder_name.clone();
+    let delete_name = folder_name;
+    let trigger = Button::new(button_id)
+        .ghost()
+        .small()
+        .with_size(px(tokens::CONTROL_SMALL))
+        .icon(IconName::Ellipsis)
+        .tooltip(i18n::text(cx, "menu.folder_actions"))
+        .when_some(hover_group, |button, group| {
+            button
+                .opacity(0.0)
+                .group_hover(group, |style| style.opacity(1.0))
+        })
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _window, cx| {
+            let rename_view = rename_view.clone();
+            let delete_view = delete_view.clone();
+            let rename_id = rename_id.clone();
+            let delete_id = delete_id.clone();
+            let rename_name = rename_name.clone();
+            let delete_name = delete_name.clone();
+            menu.min_w(px(178.0))
+                .item(
+                    PopupMenuItem::new(i18n::text(cx, "menu.rename"))
+                        .icon(Icon::default().path("icons/pencil.svg"))
+                        .on_click(move |_, window, cx| {
+                            if let Err(error) = rename_view.update(cx, |app, cx| {
+                                app.open_rename_conversation_folder(
+                                    &rename_id,
+                                    &rename_name,
+                                    window,
+                                    cx,
+                                )
+                            }) {
+                                diagnostics::record(
+                                    DiagnosticLevel::Error,
+                                    "folder.action",
+                                    format!(
+                                        "Rename folder action could not reach the app: {error}"
+                                    ),
+                                );
+                            }
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(i18n::text(cx, "menu.delete_folder"))
+                        .icon(Icon::default().path("icons/trash.svg"))
+                        .on_click(move |_, window, cx| {
+                            if let Err(error) = delete_view.update(cx, |app, cx| {
+                                app.open_delete_conversation_folder(
+                                    &delete_id,
+                                    &delete_name,
+                                    window,
+                                    cx,
+                                )
+                            }) {
+                                diagnostics::record(
+                                    DiagnosticLevel::Error,
+                                    "folder.action",
+                                    format!(
+                                        "Delete folder action could not reach the app: {error}"
+                                    ),
+                                );
+                            }
+                        }),
+                )
+        });
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(trigger)
+        .into_any_element()
+}
+
 fn conversation_actions_button(
     conversation_id: String,
     button_id: String,
@@ -16045,6 +16655,30 @@ fn group_conversations_by_workspace(
         sort_conversation_summaries(conversations);
     }
     (global, by_workspace)
+}
+
+fn visible_projects_for_route(
+    route: Route,
+    active_workspace_id: Option<&str>,
+    projects: &[WorkProject],
+) -> Vec<WorkProject> {
+    if route == Route::Home {
+        projects.to_vec()
+    } else {
+        projects
+            .iter()
+            .filter(|project| active_workspace_id == Some(project.id.as_str()))
+            .cloned()
+            .collect()
+    }
+}
+
+fn shows_project_rows(route: Route) -> bool {
+    route == Route::Home
+}
+
+fn project_actions_use_active_context(route: Route) -> bool {
+    route != Route::Home
 }
 
 fn sort_conversation_summaries(conversations: &mut [ConversationSummary]) {
@@ -16543,6 +17177,75 @@ async fn load_attachment_content(
             );
         }
         Ok((text, MessageContent::Parts(content_parts)))
+    }
+}
+
+#[cfg(test)]
+mod visible_project_tests {
+    use super::{
+        project_actions_use_active_context, shows_project_rows, visible_projects_for_route, Route,
+        WorkProject,
+    };
+    use std::path::PathBuf;
+
+    fn project(id: &str) -> WorkProject {
+        WorkProject {
+            id: id.into(),
+            name: id.into(),
+            root: PathBuf::from(format!("/{id}")),
+            created_at: 0,
+            last_opened_at: 0,
+        }
+    }
+
+    #[test]
+    fn chat_shows_only_the_active_workspace_project() {
+        let projects = vec![project("active"), project("other")];
+
+        let visible = visible_projects_for_route(Route::Chat, Some("active"), &projects);
+
+        assert_eq!(
+            visible
+                .iter()
+                .map(|project| project.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["active"]
+        );
+    }
+
+    #[test]
+    fn home_keeps_all_projects_as_a_workspace_selector() {
+        let projects = vec![project("active"), project("other")];
+
+        let visible = visible_projects_for_route(Route::Home, Some("active"), &projects);
+
+        assert_eq!(
+            visible
+                .iter()
+                .map(|project| project.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["active", "other"]
+        );
+    }
+
+    #[test]
+    fn chat_does_not_render_a_workspace_level() {
+        assert!(!shows_project_rows(Route::Chat));
+    }
+
+    #[test]
+    fn home_renders_the_workspace_level_for_selection() {
+        assert!(shows_project_rows(Route::Home));
+    }
+
+    #[test]
+    fn chat_keeps_project_actions_in_the_active_context() {
+        assert!(project_actions_use_active_context(Route::Chat));
+    }
+
+    #[test]
+    fn home_keeps_project_actions_on_project_rows() {
+        assert!(!project_actions_use_active_context(Route::Home));
     }
 }
 
