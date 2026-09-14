@@ -24,9 +24,7 @@ impl SystemEnvironment {
             .filter(|path| path.exists())
             .or_else(default_shell)
             .unwrap_or_else(|| PathBuf::from("/bin/sh"));
-        let inherited = env::vars()
-            .filter(|(key, _)| !is_sensitive_variable(key))
-            .collect::<HashMap<_, _>>();
+        let inherited = env::vars().collect::<HashMap<_, _>>();
         let mut variables = login_shell_environment(&shell).unwrap_or(inherited);
         let path = variables
             .get("PATH")
@@ -69,7 +67,6 @@ fn parse_environment_output(output: &[u8]) -> HashMap<String, String> {
                 || key
                     .chars()
                     .any(|character| character.is_whitespace() || character == '=')
-                || is_sensitive_variable(key)
             {
                 return None;
             }
@@ -83,22 +80,6 @@ fn default_shell() -> Option<PathBuf> {
         .into_iter()
         .map(PathBuf::from)
         .find(|path| path.exists())
-}
-
-fn is_sensitive_variable(key: &str) -> bool {
-    let key = key.to_ascii_uppercase();
-    [
-        "TOKEN",
-        "SECRET",
-        "PASSWORD",
-        "API_KEY",
-        "APIKEY",
-        "PRIVATE_KEY",
-        "CREDENTIAL",
-        "AUTHORIZATION",
-    ]
-    .iter()
-    .any(|part| key.contains(part))
 }
 
 #[cfg(test)]
@@ -118,14 +99,21 @@ mod tests {
     }
 
     #[test]
-    fn filters_secrets_from_environment_snapshot() {
-        assert!(is_sensitive_variable("OPENAI_API_KEY"));
-        assert!(is_sensitive_variable("GITHUB_TOKEN"));
-        assert!(!is_sensitive_variable("LANG"));
+    fn preserves_secret_variables_in_environment_snapshot() {
+        let environment = parse_environment_output(
+            b"JIRA_API_TOKEN=secret\0OPENAI_API_KEY=key\0GITHUB_TOKEN=token\0",
+        );
+
+        assert_eq!(
+            environment.get("JIRA_API_TOKEN"),
+            Some(&"secret".to_owned())
+        );
+        assert_eq!(environment.get("OPENAI_API_KEY"), Some(&"key".to_owned()));
+        assert_eq!(environment.get("GITHUB_TOKEN"), Some(&"token".to_owned()));
     }
 
     #[test]
-    fn parses_login_shell_environment_without_startup_noise_or_secrets() {
+    fn parses_login_shell_environment_without_startup_noise() {
         let output = b"Welcome\nSHELL=/bin/zsh\0PATH=/custom/bin:/usr/bin\0KEY=value=with=equals\0bad entry\0OPENAI_API_KEY=secret\0";
         let environment = parse_environment_output(output);
 
@@ -138,7 +126,10 @@ mod tests {
             environment.get("KEY"),
             Some(&"value=with=equals".to_owned())
         );
-        assert!(!environment.contains_key("OPENAI_API_KEY"));
+        assert_eq!(
+            environment.get("OPENAI_API_KEY"),
+            Some(&"secret".to_owned())
+        );
         assert!(!environment.contains_key("bad entry"));
     }
 }

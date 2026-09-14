@@ -1259,8 +1259,8 @@ Use it only as state and verify it through `history`.\n\n\
             let mut context = String::from(concat!(
                 "## Workspace Skills\n\n",
                 "Available workspace skills are listed below with lightweight metadata. ",
-                "Use `$skill-name` when the user explicitly selects a skill. For ordinary requests, ",
-                "use the filtered skill listing and load the exact skill only after deciding it applies.\n\n",
+                "Compare them with the user's request and load the exact skill when it clearly applies. ",
+                "Use the filtered skill listing when the skill name is unclear.\n\n",
             ));
             let mut catalog_count = 0;
             for skill in index.list() {
@@ -1279,22 +1279,7 @@ Use it only as state and verify it through `history`.\n\n\
 
             let mut loaded = Vec::new();
 
-            for mention in index
-                .explicit_skill_mentions(&user_input)
-                .into_iter()
-                .take(MAX_AUTO_SKILLS)
-            {
-                let skill = match index.resolve(&mention) {
-                    Ok(skill) => skill,
-                    Err(error) => {
-                        crate::observability::diagnostics::record(
-                            crate::observability::diagnostics::DiagnosticLevel::Warning,
-                            "skills.resolution",
-                            format!("Could not resolve explicitly mentioned skill '{mention}': {error}."),
-                        );
-                        continue;
-                    }
-                };
+            for skill in index.find_relevant(&user_input).into_iter().take(MAX_AUTO_SKILLS) {
                 let name = skill.name.clone();
                 let description = skill.description.clone();
                 let content = match index.load(&name) {
@@ -6370,7 +6355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_requests_expose_skill_catalog_without_loading_matches() {
+    async fn ordinary_requests_load_matching_skills_without_a_dollar_mention() {
         let workspace = tempfile::tempdir().unwrap();
         let skills = workspace.path().join("skills");
         std::fs::create_dir_all(&skills).unwrap();
@@ -6398,8 +6383,8 @@ mod tests {
             .unwrap();
 
         assert!(context.contains("`focus`"));
-        assert!(!context.contains("Loaded skill: focus"));
-        assert!(!context.contains("Always define one next action"));
+        assert!(context.contains("Loaded skill: focus"));
+        assert!(context.contains("Always define one next action"));
     }
 
     #[tokio::test]
@@ -6436,7 +6421,7 @@ mod tests {
         agent.set_skill_index(Some(index));
 
         let context = agent
-            .resolve_skill_context("What should I focus on?")
+            .resolve_skill_context("What should I do next?")
             .await
             .unwrap();
 

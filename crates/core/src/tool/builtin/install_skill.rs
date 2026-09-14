@@ -129,10 +129,9 @@ impl Tool for InstallSkillTool {
             .join("skills")
             .join(&installed_slug);
         Ok(ToolResult::ok(format!(
-            "Installed skill '{}' in {}. Mention '${}' in the user's request before loading it.",
+            "Installed skill '{}' in {}. It will be loaded automatically when a future request matches it.",
             skill.name,
             path.display(),
-            installed_slug,
         ))
         .with_metadata(json!({
             "skill_id": skill.id,

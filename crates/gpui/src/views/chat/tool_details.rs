@@ -55,19 +55,34 @@ pub(crate) fn render_tool_detail(
 ) -> AnyElement {
     let scroll_id = format!("{}-{}", id_prefix.into(), section.scroll_suffix());
     let content: SharedString = content.into();
-    // `overflow_y_scrollbar` wraps the element in a full-size scroll area.
-    // A child in a flex column has no intrinsic height once that wrapper is
-    // applied, so using only `max_h` makes the viewport collapse to zero and
-    // leaves the Arguments/Result labels with an apparently empty body. Give
-    // the viewport an intrinsic height for short payloads and let the
-    // scrollbar take over once the payload reaches the limit.
+    // `overflow_y_scrollbar` reuses the source element as the scrollable
+    // content. Give the viewport a fixed, already-capped height; applying
+    // `max_h` here would cap the content itself and leave no scroll extent.
     let height = tool_detail_viewport_height(&content, section, text_size);
+    let content = div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex_none()
+        .h_auto()
+        .min_h_full()
+        .child(content);
+
+    #[cfg(test)]
+    let debug_scroll_id = format!("{scroll_id}-content-end");
+
+    #[cfg(test)]
+    let content = content.child(
+        div()
+            .h(px(0.0))
+            .flex_none()
+            .debug_selector(move || debug_scroll_id.clone()),
+    );
+
     div()
         .w_full()
         .min_w(px(0.0))
         .flex_none()
         .h(px(height))
-        .max_h(px(tool_detail_max_height(section)))
         .font(crate::ui::UiTheme::mono_font())
         .text_size(px(text_size))
         .text_color(color)
@@ -129,6 +144,7 @@ pub(crate) fn render_patch_diff(
             .w_full()
             .min_w(px(0.0))
             .px(px(crate::ui::tokens::SPACE_6))
+            .flex_shrink_0()
             .bg(background)
             .text_color(color)
             .whitespace_normal()
@@ -145,7 +161,6 @@ pub(crate) fn render_patch_diff(
         .min_w(px(0.0))
         .flex_none()
         .h(px(height))
-        .max_h(px(tool_detail_max_height(ToolDetailSection::Arguments)))
         .font(UiTheme::mono_font())
         .text_size(px(text_size))
         .overflow_y_scrollbar()
@@ -187,6 +202,64 @@ mod tests {
 
         assert!(short >= 18.0);
         assert!(long <= tool_detail_max_height(ToolDetailSection::Result));
+    }
+
+    #[gpui::test]
+    fn long_tool_output_scrolls_inside_its_viewport(cx: &mut gpui::TestAppContext) {
+        use gpui::{
+            point, px, Context, IntoElement, ParentElement, Render, ScrollDelta, ScrollWheelEvent,
+            Styled, VisualTestContext, Window,
+        };
+
+        struct TestView;
+
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                gpui::div()
+                    .w(px(240.0))
+                    .h(px(240.0))
+                    .child(super::render_tool_detail(
+                        "tool-output",
+                        "line\n".repeat(100),
+                        ToolDetailSection::Result,
+                        gpui::Rgba::default(),
+                        11.0,
+                    ))
+            }
+        }
+
+        fn draw(cx: &mut VisualTestContext) {
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                _ = window.draw(cx);
+            });
+        }
+
+        cx.update(gpui_component::init);
+        let (_, cx) = cx.add_window_view(|_, _| TestView);
+        draw(cx);
+
+        let initial_y = cx
+            .debug_bounds("tool-output-output-content-end")
+            .unwrap()
+            .origin
+            .y;
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(10.0), px(10.0)),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-100.0))),
+            ..Default::default()
+        });
+        draw(cx);
+
+        let after_y = cx
+            .debug_bounds("tool-output-output-content-end")
+            .unwrap()
+            .origin
+            .y;
+        assert!(
+            after_y < initial_y,
+            "tool output did not move after scrolling: initial={initial_y:?}, after={after_y:?}"
+        );
     }
 
     #[test]
