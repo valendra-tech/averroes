@@ -103,7 +103,8 @@ impl SidebarRow {
             .cursor_pointer()
             .text_size(px(tokens::TEXT_BODY))
             .when(self.selected, |row| {
-                row.bg(theme.selection).font_weight(tokens::WEIGHT_MEDIUM)
+                row.bg(theme.surface_hover)
+                    .font_weight(tokens::WEIGHT_MEDIUM)
             })
             .hover(|style| style.bg(theme.surface_hover))
             .children(self.leading)

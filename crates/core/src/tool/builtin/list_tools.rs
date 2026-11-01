@@ -100,7 +100,7 @@ mod tests {
                     description: "Reads a file".into(),
                 },
                 EnabledTool {
-                    name: "web_search_intrernal".into(),
+                    name: "web_search".into(),
                     description: "Searches the web".into(),
                 },
             ],
@@ -121,13 +121,13 @@ mod tests {
         let tool = ListToolsTool;
         let all = tool.execute(&context(), &json!({})).await.unwrap();
         assert!(all.content.contains("file_read"));
-        assert!(all.content.contains("web_search_intrernal"));
+        assert!(all.content.contains("web_search"));
 
         let filtered = tool
             .execute(&context(), &json!({ "query": "web" }))
             .await
             .unwrap();
         assert!(!filtered.content.contains("file_read"));
-        assert!(filtered.content.contains("web_search_intrernal"));
+        assert!(filtered.content.contains("web_search"));
     }
 }

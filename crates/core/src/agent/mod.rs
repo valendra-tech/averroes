@@ -50,6 +50,9 @@ const PROVIDER_INITIAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_SILENT_PROVIDER_RETRIES: usize = 1;
 const ASCII_BYTES_PER_TOKEN: usize = 4;
 const MAX_TOOL_OUTCOMES: usize = 256;
+/// Upper bound for tool output included in live UI events. The provider still
+/// receives the larger bounded payload used by the agent loop.
+pub const MAX_TOOL_EVENT_OUTPUT_CHARS: usize = 12_000;
 const ITERATION_LIMIT_FINAL_CONTEXT: &str = concat!(
     "[Tool execution budget reached]\n\n",
     "Tool use is disabled for this response. Use the results already available in the conversation ",
@@ -6300,7 +6303,7 @@ mod tests {
         assert!(is_delegation_tool("list_agents"));
         assert!(is_delegation_tool("call_agents"));
         assert!(is_delegation_tool("call_agent"));
-        assert!(!is_delegation_tool("web_search_intrernal"));
+        assert!(!is_delegation_tool("web_search"));
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@ use gpui::FontWeight;
 pub const TEXT_CAPTION: f32 = 11.0;
 pub const TEXT_SMALL: f32 = 12.0;
 pub const TEXT_BODY: f32 = 13.0;
+pub const TEXT_MESSAGE: f32 = 14.5;
 pub const TEXT_TITLE3: f32 = 15.0;
 pub const TEXT_TITLE2: f32 = 17.0;
 pub const TEXT_TITLE1: f32 = 20.0;
@@ -26,15 +27,16 @@ pub const SPACE_32: f32 = 32.0;
 pub const RADIUS_CONTROL: f32 = 6.0;
 pub const RADIUS_CARD: f32 = 10.0;
 pub const RADIUS_SHEET: f32 = 14.0;
+pub const RADIUS_COMPOSER: f32 = 16.0;
 
 pub const CONTROL_SMALL: f32 = 22.0;
 pub const CONTROL_REGULAR: f32 = 28.0;
 pub const CONTROL_LARGE: f32 = 32.0;
-pub const ROW_HEIGHT: f32 = 32.0;
+pub const ROW_HEIGHT: f32 = 34.0;
 pub const NAV_HEIGHT: f32 = 36.0;
 pub const TOOLBAR_HEIGHT: f32 = 44.0;
 
-pub const SIDEBAR_WIDTH: f32 = 300.0;
+pub const SIDEBAR_WIDTH: f32 = 280.0;
 pub const SIDEBAR_GUTTER: f32 = 12.0;
 pub const ICON_SIZE: f32 = 16.0;
 pub const ICON_SMALL: f32 = 13.0;
@@ -49,6 +51,7 @@ mod tests {
             TEXT_CAPTION,
             TEXT_SMALL,
             TEXT_BODY,
+            TEXT_MESSAGE,
             TEXT_TITLE3,
             TEXT_TITLE2,
             TEXT_TITLE1,
@@ -78,8 +81,9 @@ mod tests {
         assert_eq!(RADIUS_CONTROL, 6.0);
         assert_eq!(RADIUS_CARD, 10.0);
         assert_eq!(RADIUS_SHEET, 14.0);
-        assert_eq!(ROW_HEIGHT, 32.0);
+        assert_eq!(RADIUS_COMPOSER, 16.0);
+        assert_eq!(ROW_HEIGHT, 34.0);
         assert_eq!(TOOLBAR_HEIGHT, 44.0);
-        assert_eq!(SIDEBAR_WIDTH, 300.0);
+        assert_eq!(SIDEBAR_WIDTH, 280.0);
     }
 }

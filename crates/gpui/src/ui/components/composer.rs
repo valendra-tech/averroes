@@ -18,20 +18,19 @@ pub struct ComposerMetrics {
     pub footer_text_size: f32,
     pub model_width: f32,
     pub reasoning_width: f32,
-    pub security_width: f32,
     pub privacy_icon_size: f32,
 }
 
 pub fn composer_metrics(compact: bool) -> ComposerMetrics {
     ComposerMetrics {
         max_width: if compact { 680.0 } else { 760.0 },
-        surface_radius: tokens::RADIUS_SHEET,
-        text_min_height: 76.0,
-        footer_height: 46.0,
+        surface_radius: tokens::RADIUS_COMPOSER,
+        text_min_height: 56.0,
+        footer_height: 44.0,
         footer_horizontal_padding: tokens::SPACE_12,
         footer_bottom_padding: tokens::SPACE_12,
         control_gap: tokens::SPACE_6,
-        send_size: tokens::CONTROL_REGULAR,
+        send_size: 32.0,
         attachment_radius: tokens::RADIUS_CONTROL,
         empty_logo_size: 96.0,
         empty_title_size: tokens::TEXT_LARGE,
@@ -42,9 +41,8 @@ pub fn composer_metrics(compact: bool) -> ComposerMetrics {
         } else {
             tokens::TEXT_SMALL
         },
-        model_width: if compact { 132.0 } else { 148.0 },
-        reasoning_width: if compact { 60.0 } else { 68.0 },
-        security_width: if compact { 94.0 } else { 108.0 },
+        model_width: if compact { 210.0 } else { 240.0 },
+        reasoning_width: if compact { 80.0 } else { 88.0 },
         privacy_icon_size: tokens::ICON_SIZE,
     }
 }

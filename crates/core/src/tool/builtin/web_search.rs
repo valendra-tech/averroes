@@ -27,7 +27,7 @@ struct WebSearchParams {
 #[async_trait]
 impl Tool for WebSearchTool {
     fn name(&self) -> &str {
-        "web_search_intrernal"
+        "web_search"
     }
 
     fn description(&self) -> &str {
@@ -230,11 +230,11 @@ mod tests {
 
     #[test]
     fn rejects_search_limits_outside_the_advertised_range() {
-        assert!(validate_search_limits("web_search_intrernal", 0, 20).is_err());
-        assert!(validate_search_limits("web_search_intrernal", 31, 20).is_err());
-        assert!(validate_search_limits("web_search_intrernal", 8, 4).is_err());
-        assert!(validate_search_limits("web_search_intrernal", 8, 61).is_err());
-        assert!(validate_search_limits("web_search_intrernal", 8, 20).is_ok());
+        assert!(validate_search_limits("web_search", 0, 20).is_err());
+        assert!(validate_search_limits("web_search", 31, 20).is_err());
+        assert!(validate_search_limits("web_search", 8, 4).is_err());
+        assert!(validate_search_limits("web_search", 8, 61).is_err());
+        assert!(validate_search_limits("web_search", 8, 20).is_ok());
     }
 
     #[test]

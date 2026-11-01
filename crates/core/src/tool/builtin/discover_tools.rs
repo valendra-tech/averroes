@@ -93,7 +93,7 @@ mod tests {
                     description: "Reads a file from the workspace".into(),
                 },
                 EnabledTool {
-                    name: "web_search_intrernal".into(),
+                    name: "web_search".into(),
                     description: "Searches the internet".into(),
                 },
             ],
@@ -115,7 +115,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.content.contains("web_search_intrernal"));
+        assert!(result.content.contains("web_search"));
         assert!(result.content.contains("file_read"));
         assert!(result
             .content

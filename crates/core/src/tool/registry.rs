@@ -37,6 +37,7 @@ impl ToolRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<ToolRef> {
+        let name = super::canonical_tool_name(name);
         if let Some(tool) = self.tools.get(name) {
             return Some(tool.clone());
         }
@@ -256,6 +257,42 @@ mod tests {
         let tool = registry.get("echo");
         assert!(tool.is_some());
         assert_eq!(tool.unwrap().name(), "echo");
+    }
+
+    #[test]
+    fn retired_web_search_name_resolves_to_the_canonical_tool() {
+        struct SearchTool;
+
+        #[async_trait]
+        impl Tool for SearchTool {
+            fn name(&self) -> &str {
+                "web_search"
+            }
+
+            fn description(&self) -> &str {
+                "Search tool"
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                json!({"type": "object", "properties": {}})
+            }
+
+            async fn execute(
+                &self,
+                _ctx: &ToolContext,
+                _params: &serde_json::Value,
+            ) -> Result<ToolResult> {
+                Ok(ToolResult::ok("ok"))
+            }
+        }
+
+        let registry = ToolRegistry::new();
+        registry.register(SearchTool);
+
+        let tool = registry
+            .get("web_search_intrernal")
+            .expect("legacy alias should resolve");
+        assert_eq!(tool.name(), "web_search");
     }
 
     #[tokio::test]

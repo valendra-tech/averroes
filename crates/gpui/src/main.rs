@@ -417,7 +417,7 @@ fn main() {
             // Keep the UI copy in embedded catalogs. English is the default;
             // the catalog can be switched without any filesystem or network
             // work during rendering.
-            cx.set_global(Localization::new(Locale::English));
+            cx.set_global(Localization::new(Locale::system_default()));
             UiTheme::install_component_theme(cx);
             cx.set_app_identity("com.valendra.averroes", "Averroes");
             cx.activate(true);

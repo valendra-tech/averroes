@@ -152,8 +152,9 @@ that credentials, model catalogs, and connection metadata remain consistent.
 
 ## Tools
 
-The registry is extensible and the agent discovers the complete registered
-catalog before enabling tools for a task. The built-in groups are:
+The registry is extensible and every registered tool is advertised from the
+first turn. Independent read-only calls execute concurrently; state-changing
+and interactive tools run in order. The built-in groups are:
 
 - Workspace: `bash`, `change_directory`, `file_read`, `file_write`, `patch`,
   `glob`, `grep`, `checkpoint`.

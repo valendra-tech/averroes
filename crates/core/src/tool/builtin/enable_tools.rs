@@ -98,7 +98,7 @@ mod tests {
             agent_id: "agent".into(),
             enabled_tools: Vec::new(),
             available_tools: vec![EnabledTool {
-                name: "web_search_intrernal".into(),
+                name: "web_search".into(),
                 description: "Searches the internet".into(),
             }],
             tool_activation: Arc::new(ToolActivation::default()),
@@ -116,7 +116,7 @@ mod tests {
     async fn reports_that_registered_tools_are_already_available() {
         let context = context();
         let result = EnableToolsTool
-            .execute(&context, &json!({ "names": ["web_search_intrernal"] }))
+            .execute(&context, &json!({ "names": ["web_search"] }))
             .await
             .unwrap();
 

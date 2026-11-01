@@ -30,7 +30,7 @@ pub mod task;
 pub(crate) mod web_browser;
 pub mod web_fetch;
 #[path = "web_search.rs"]
-pub mod web_search_intrernal;
+pub mod web_search;
 
 use crate::skill::SkillIndex;
 use crate::tool::ToolRegistry;
@@ -64,7 +64,7 @@ pub fn register_all(registry: &ToolRegistry) {
     registry.register(web_fetch::WebFetchTool::default());
     registry.register(browser::BrowserTool::default());
     desktop::register(registry);
-    registry.register(web_search_intrernal::WebSearchTool);
+    registry.register(web_search::WebSearchTool);
     registry.register(list_agents::ListAgentsTool);
     registry.register(call_agents::CallAgentsTool);
 }

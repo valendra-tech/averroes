@@ -142,7 +142,8 @@ fn title_request(model: &str, user_message: &str) -> crate::provider::ChatReques
         temperature: None,
         system: Some(
             "Generate a concise title (3-5 words) for this conversation based on the \
-             user's first message. Reply with only the title, no quotes, no punctuation."
+             user's first message. Use the same language as the user's message. Reply \
+             with only the title, no quotes, no punctuation."
                 .to_string(),
         ),
         reasoning_effort: None,
@@ -243,6 +244,16 @@ mod tests {
             request.messages[0].text(),
             "Review the latest customer emails"
         );
+    }
+
+    #[test]
+    fn title_request_uses_the_user_language() {
+        let request = title_request("gpt-5.6-luna", "Hola, ¿cómo estás?");
+
+        assert!(request
+            .system
+            .as_deref()
+            .is_some_and(|system| system.contains("same language")));
     }
 
     #[test]

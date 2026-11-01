@@ -73,7 +73,7 @@ impl UiTheme {
         let destructive = rgb(0xFF3B30);
         Self {
             background: rgb(0xFFFFFF),
-            rail: rgb(0xECECEC).opacity(0.72),
+            rail: rgb(0xF6F6F7),
             surface: rgb(0xFFFFFF),
             surface_subtle: rgb(0xF5F5F7),
             surface_hover: rgb(0xE5E5EA),
@@ -140,7 +140,7 @@ impl UiTheme {
         theme.mode = mode;
         theme.font_family = Self::UI_FONT.into();
         theme.mono_font_family = Self::MONO_FONT.into();
-        theme.font_size = px(crate::ui::tokens::TEXT_BODY);
+        theme.font_size = px(17.0);
         theme.mono_font_size = px(crate::ui::tokens::TEXT_SMALL);
         theme.radius = px(crate::ui::tokens::RADIUS_CONTROL);
         theme.radius_lg = px(crate::ui::tokens::RADIUS_SHEET);
@@ -288,6 +288,8 @@ mod tests {
             ("muted/surface", theme.muted, theme.surface),
             ("faint/background", theme.faint, theme.background),
             ("faint/surface", theme.faint, theme.surface),
+            ("faint/rail", theme.faint, theme.rail),
+            ("muted/rail", theme.muted, theme.rail),
             ("accent_text/surface", theme.accent_text, theme.surface),
             ("success_text/surface", theme.success_text, theme.surface),
             ("warning_text/surface", theme.warning_text, theme.surface),
@@ -311,6 +313,8 @@ mod tests {
             ("muted/surface", theme.muted, theme.surface),
             ("faint/background", theme.faint, theme.background),
             ("faint/surface", theme.faint, theme.surface),
+            ("faint/rail", theme.faint, theme.rail),
+            ("muted/rail", theme.muted, theme.rail),
             ("accent_text/surface", theme.accent_text, theme.surface),
             ("success_text/surface", theme.success_text, theme.surface),
             ("warning_text/surface", theme.warning_text, theme.surface),

@@ -166,7 +166,7 @@ impl ToolActivation {
         activation.names.write().unwrap().extend(
             names
                 .into_iter()
-                .map(|name| name.trim().to_string())
+                .map(|name| canonical_tool_name(name.trim()).to_string())
                 .filter(|name| !name.is_empty()),
         );
         activation
@@ -370,6 +370,15 @@ pub enum ToolError {
 
 pub type Result<T> = std::result::Result<T, ToolError>;
 
+/// Maps retired tool names to the current public name. Persisted conversations
+/// and in-flight provider responses may still contain the old spelling.
+pub fn canonical_tool_name(name: &str) -> &str {
+    match name {
+        "web_search_intrernal" => "web_search",
+        _ => name,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +427,16 @@ mod tests {
         assert_eq!(result.images.len(), 1);
         assert_eq!(result.images[0].media_type, "image/png");
         assert_eq!(result.images[0].data, "aW1hZ2U=");
+    }
+
+    #[test]
+    fn tool_activation_canonicalizes_retired_names() {
+        let activation =
+            ToolActivation::new(vec!["web_search_intrernal".into(), "file_read".into()]);
+
+        assert_eq!(
+            activation.names(),
+            vec!["file_read".to_string(), "web_search".to_string()]
+        );
     }
 }

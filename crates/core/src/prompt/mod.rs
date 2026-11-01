@@ -189,8 +189,10 @@ mod tests {
         assert!(prompt.contains("Use\n`browser` only"));
         assert!(prompt.contains("one independent delegated agent for the request by default"));
         assert!(prompt.contains("must never launch another subagent"));
-        assert!(prompt.contains("Context management is automatic"));
+        assert!(prompt.contains("Context management is"));
+        assert!(prompt.contains("automatic: Averroes compacts"));
         assert!(!prompt.contains("compact_conversation"));
+        assert!(!prompt.contains("web_search_intrernal"));
     }
 
     #[test]

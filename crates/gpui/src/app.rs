@@ -57,7 +57,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled, StyledImage, StyledText,
     Subscription, SystemNotification, Task, Transformation, Window, WindowBounds,
 };
-use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariant, ButtonVariants};
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::link::Link;
@@ -434,11 +434,28 @@ struct ModelChoice {
     info: ModelInfo,
 }
 
+impl ModelChoice {
+    fn display_label(&self) -> SharedString {
+        let display_name = self.info.display_name.trim();
+        let short = display_name
+            .rsplit(['/', ':'])
+            .next()
+            .filter(|model| !model.is_empty())
+            .unwrap_or(display_name);
+        let label = if short.is_empty() {
+            self.info.id.as_str()
+        } else {
+            short
+        };
+        label.to_owned().into()
+    }
+}
+
 impl SelectItem for ModelChoice {
     type Value = Self;
 
     fn title(&self) -> SharedString {
-        self.info.display_name.clone().into()
+        self.display_label()
     }
 
     fn display_title(&self) -> Option<AnyElement> {
@@ -472,30 +489,6 @@ impl SelectItem for ModelChoice {
         self.info.display_name.to_ascii_lowercase().contains(&query)
             || self.info.id.to_ascii_lowercase().contains(&query)
             || self.connection_name.to_ascii_lowercase().contains(&query)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ToolApprovalChoice {
-    policy: ToolApprovalPolicy,
-    label: SharedString,
-}
-
-impl ToolApprovalChoice {
-    fn new(policy: ToolApprovalPolicy, label: SharedString) -> Self {
-        Self { policy, label }
-    }
-}
-
-impl SelectItem for ToolApprovalChoice {
-    type Value = ToolApprovalPolicy;
-
-    fn title(&self) -> SharedString {
-        self.label.clone()
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.policy
     }
 }
 
@@ -1518,7 +1511,6 @@ pub struct AverroesApp {
     connection_select: Entity<SelectState<Vec<SharedString>>>,
     model_select: Entity<SelectState<SearchableVec<SelectGroup<ModelChoice>>>>,
     reasoning_select: Entity<SelectState<Vec<SharedString>>>,
-    security_select: Entity<SelectState<Vec<ToolApprovalChoice>>>,
     kind_select: Entity<SelectState<Vec<ConnectionKindChoice>>>,
     connection_labels: Vec<(SharedString, ConnectionId)>,
     model_choices: Vec<ModelChoice>,
@@ -1884,8 +1876,6 @@ impl AverroesApp {
         });
         let reasoning_select =
             cx.new(|cx| SelectState::new(vec![i18n::text(cx, "reasoning.auto")], None, window, cx));
-        let security_select =
-            cx.new(|cx| SelectState::new(tool_approval_choices(cx), None, window, cx));
         let kind_select = cx.new(|cx| {
             SelectState::new(
                 vec![
@@ -2115,14 +2105,6 @@ impl AverroesApp {
             },
         ));
         subscriptions.push(cx.subscribe_in(
-            &security_select,
-            window,
-            |this, _, event: &SelectEvent<Vec<ToolApprovalChoice>>, window, cx| {
-                let SelectEvent::Confirm(value) = event;
-                this.select_tool_approval_policy(value.as_ref().copied(), window, cx);
-            },
-        ));
-        subscriptions.push(cx.subscribe_in(
             &kind_select,
             window,
             |this, _, event: &SelectEvent<Vec<ConnectionKindChoice>>, window, cx| {
@@ -2311,7 +2293,6 @@ impl AverroesApp {
             connection_select,
             model_select,
             reasoning_select,
-            security_select,
             kind_select,
             connection_labels,
             model_choices,
@@ -3489,7 +3470,7 @@ impl AverroesApp {
             .trim()
             .to_owned();
         if name.is_empty() {
-            self.show_error("Give the agent a name", cx);
+            self.show_error(i18n::text(cx, "notice.agent_name_required"), cx);
             return;
         }
         let id = self
@@ -3497,11 +3478,11 @@ impl AverroesApp {
             .clone()
             .unwrap_or_else(|| agent_id_from_name(&name));
         let Some(connection_id) = self.agent_form_connection_id.clone() else {
-            self.show_error("Choose a connection for this agent", cx);
+            self.show_error(i18n::text(cx, "notice.agent_connection_required"), cx);
             return;
         };
         let Some(model_id) = self.agent_form_model_id.clone() else {
-            self.show_error("Choose a model for this agent", cx);
+            self.show_error(i18n::text(cx, "notice.agent_model_required"), cx);
             return;
         };
         match self.runtime.save_agent(AgentProfile {
@@ -5254,10 +5235,11 @@ impl AverroesApp {
         session.pending_user_question_session_id = None;
         if let Some(message) = session.messages.last_mut() {
             message.reasoning_complete = true;
+            let stopped_summary = i18n::text(cx, "tool.stopped_by_user").to_string();
             for activity in &mut message.tool_activities {
                 if activity.state == ToolActivityState::Running {
-                    activity.state = ToolActivityState::Failed;
-                    activity.summary = "Stopped by user".into();
+                    activity.state = ToolActivityState::Interrupted;
+                    activity.summary = stopped_summary.clone();
                     activity.duration_ms = Some(activity.started_at.elapsed().as_millis() as u64);
                 }
             }
@@ -5388,7 +5370,7 @@ impl AverroesApp {
             project,
             binding,
             messages: Vec::new(),
-            title: "New conversation".into(),
+            title: i18n::text(cx, "sidebar.new_work").to_string(),
             folder_id,
         })
     }
@@ -7322,7 +7304,7 @@ impl AverroesApp {
         };
         let mut pages = Vec::new();
         match tool_name {
-            "web_search_intrernal" => {
+            "web_search" | "web_search_intrernal" => {
                 if let Some(results) = metadata.get("results").and_then(|value| value.as_array()) {
                     for result in results {
                         let Some(url) = result.get("url").and_then(|value| value.as_str()) else {
@@ -8579,7 +8561,6 @@ impl AverroesApp {
     fn select_tool_approval_policy(
         &mut self,
         policy: Option<ToolApprovalPolicy>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let policy = policy.unwrap_or_default();
@@ -8588,7 +8569,6 @@ impl AverroesApp {
             agent.set_tool_approval_policy(policy);
         }
         self.notice = None;
-        self.refresh_security_picker(window, cx);
         let binding = self.active().binding.clone();
         if binding.is_ready() {
             match self.runtime.database.remember_binding(&binding) {
@@ -8696,15 +8676,6 @@ impl AverroesApp {
                 return;
             }
             select.set_selected_value(&selected_label, window, cx);
-        });
-    }
-
-    fn refresh_security_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let selected = self.active().binding.approval_policy;
-        let items = tool_approval_choices(cx);
-        self.security_select.update(cx, |select, cx| {
-            select.set_items(items, window, cx);
-            select.set_selected_value(&selected, window, cx);
         });
     }
 
@@ -9152,12 +9123,12 @@ impl AverroesApp {
         let selected_from_control = self.kind_select.read(cx).selected_value().copied();
         let Some(kind) = effective_connection_kind(self.selected_kind, selected_from_control)
         else {
-            self.show_error("Choose how you want to connect", cx);
+            self.show_error(i18n::text(cx, "notice.choose_connection"), cx);
             return;
         };
         let name = self.name_input.read(cx).value().trim().to_string();
         if name.is_empty() {
-            self.show_error("Give this connection a recognizable name", cx);
+            self.show_error(i18n::text(cx, "notice.connection_name"), cx);
             return;
         }
         let base_url = self.url_input.read(cx).value().trim().to_string();
@@ -9233,7 +9204,7 @@ impl AverroesApp {
             .trim()
             .to_string();
         if model_id.is_empty() {
-            self.show_error("Enter a model ID", cx);
+            self.show_error(i18n::text(cx, "notice.enter_model_id"), cx);
             return;
         }
 
@@ -9312,7 +9283,7 @@ impl AverroesApp {
                 });
                 cx.notify();
             }
-            Ok(false) => self.show_error("That connection no longer exists", cx),
+            Ok(false) => self.show_error(i18n::text(cx, "notice.connection_missing"), cx),
             Err(error) => self.show_error(error.to_string(), cx),
         }
     }
@@ -9428,7 +9399,7 @@ impl AverroesApp {
 
     fn force_compact_active(&mut self, cx: &mut Context<Self>) {
         let Some(agent) = self.active().agent.clone() else {
-            self.show_error("Send a message before compacting the context", cx);
+            self.show_error(i18n::text(cx, "notice.compact_message_required"), cx);
             return;
         };
         if self.active().context_busy || self.active().processing {
@@ -9504,7 +9475,10 @@ impl AverroesApp {
                     }
                 }
                 if let Some(error) = error {
-                    app.show_error(format!("Could not compact context: {error}"), cx);
+                    app.show_error(
+                        i18n::format(cx, "notice.compact_failed", &[("error", error)]),
+                        cx,
+                    );
                 }
                 cx.notify();
             });
@@ -10601,7 +10575,6 @@ impl AverroesApp {
         let connection_id = self.active().binding.connection_id.clone();
         self.sync_connection_picker(window, cx);
         self.refresh_model_picker(window, cx);
-        self.refresh_security_picker(window, cx);
         let is_codex = connection_id
             .as_ref()
             .and_then(|id| self.runtime.connection(id))
@@ -11063,7 +11036,7 @@ impl AverroesApp {
         );
         SidebarRow::new(
             SharedString::from(format!("workspace-conversation-{conversation_id}")),
-            conversation.title,
+            title_for_display(&conversation.title),
         )
         .indent(if indented {
             tokens::SPACE_32
@@ -11113,7 +11086,7 @@ impl AverroesApp {
         );
         SidebarRow::new(
             SharedString::from(format!("attention-conversation-{conversation_id}")),
-            conversation.title,
+            title_for_display(&conversation.title),
         )
         .icon(IconName::Bell)
         .accessory(actions)
@@ -11213,7 +11186,7 @@ impl AverroesApp {
             );
             let row = SidebarRow::new(
                 SharedString::from(format!("conversation-{id}")),
-                conversation.title,
+                title_for_display(&conversation.title),
             )
             .icon_path("icons/pin.svg")
             .accessory(actions)
@@ -11549,34 +11522,24 @@ impl AverroesApp {
                     .id("active-project-footer")
                     .flex_none()
                     .border_t_1()
-                    .border_color(theme.border.opacity(0.72))
+                    .border_color(theme.hairline)
                     .px(px(SIDEBAR_GUTTER))
-                    .py(px(tokens::SPACE_12))
+                    .py(px(tokens::SPACE_8))
                     .child(
                         div()
                             .id("active-project-footer-row")
-                            .h(px(48.0))
+                            .h(px(44.0))
                             .w_full()
-                            .px(px(tokens::SPACE_12))
+                            .px(px(tokens::SPACE_8))
                             .flex()
                             .items_center()
                             .gap(px(tokens::SPACE_8))
                             .hover(|style| style.bg(theme.surface_hover))
                             .rounded(px(SIDEBAR_RADIUS))
                             .child(
-                                div()
-                                    .flex_none()
-                                    .size(px(30.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(tokens::RADIUS_CARD))
-                                    .bg(theme.surface_hover)
-                                    .child(
-                                        Icon::new(IconName::FolderOpen)
-                                            .size(px(15.0))
-                                            .text_color(theme.foreground),
-                                    ),
+                                Icon::new(IconName::FolderOpen)
+                                    .size(px(16.0))
+                                    .text_color(theme.muted),
                             )
                             .child(
                                 div()
@@ -11620,7 +11583,7 @@ impl AverroesApp {
             .h_full()
             .bg(theme.rail)
             .border_r_1()
-            .border_color(theme.border.opacity(0.72))
+            .border_color(theme.hairline)
             .pt(px(tokens::SPACE_24))
             .child(
                 div()
@@ -11629,12 +11592,17 @@ impl AverroesApp {
                     .h(px(52.0))
                     .px(px(tokens::SPACE_16))
                     .child(
-                        div().flex().items_center().child(
-                            div()
-                                .text_size(px(tokens::TEXT_TITLE2))
-                                .font_weight(tokens::WEIGHT_SEMIBOLD)
-                                .child(i18n::text(cx, "sidebar.brand")),
-                        ),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(tokens::SPACE_8))
+                            .child(img(averroes_logo_asset(cx)).size(px(20.0)).flex_none())
+                            .child(
+                                div()
+                                    .text_size(px(tokens::TEXT_TITLE2))
+                                    .font_weight(tokens::WEIGHT_SEMIBOLD)
+                                    .child(i18n::text(cx, "sidebar.brand")),
+                            ),
                     )
                     .child(div().flex_1())
                     .child(
@@ -11921,7 +11889,13 @@ impl AverroesApp {
         // gpui-component. The composer action is also the stop action while a
         // request is running, so keep the button interactive.
         let send_button = Button::new(if compact { "send-new" } else { "send-open" })
-            .primary()
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .color(theme.foreground.into())
+                    .foreground(theme.background.into())
+                    .hover(theme.muted.into())
+                    .active(theme.foreground.into()),
+            )
             .with_size(px(metrics.send_size))
             .rounded(px(tokens::RADIUS_SHEET))
             .tooltip(if session.processing {
@@ -11949,7 +11923,7 @@ impl AverroesApp {
                     div()
                         .size(px(tokens::SPACE_8))
                         .rounded(px(tokens::SPACE_2))
-                        .bg(gpui::rgba(0xFFFFFFFF)),
+                        .bg(theme.background),
                 )
                 .into_any_element()
         } else {
@@ -12002,8 +11976,9 @@ impl AverroesApp {
             .flex_col()
             .bg(theme.surface)
             .border_1()
-            .border_color(theme.border)
+            .border_color(theme.hairline)
             .rounded(px(metrics.surface_radius))
+            .shadow_sm()
             .overflow_hidden()
             .can_drop(|value, _, _| value.downcast_ref::<ExternalPaths>().is_some())
             .drag_over::<ExternalPaths>(move |style, _, _, _| {
@@ -12040,7 +12015,7 @@ impl AverroesApp {
                                 Textarea::new(&self.composer)
                                     .flex_1()
                                     .min_w(px(120.0))
-                                    .min_h(px(42.0))
+                                    .min_h(px(38.0))
                                     .appearance(false)
                                     .bordered(false),
                             ),
@@ -12078,27 +12053,13 @@ impl AverroesApp {
                             .gap(px(tokens::SPACE_4))
                             .flex_none()
                             .child(
-                                Button::new("remote-agent-compose")
-                                    .ghost()
-                                    .small()
-                                    .selected(self.remote_agent_is_active())
-                                    .icon(IconName::Bot)
-                                    .label(if self.remote_agent_is_active() {
-                                        i18n::text(cx, "remote_agent.on_short")
-                                    } else {
-                                        i18n::text(cx, "remote_agent.share_short")
-                                    })
-                                    .tooltip(i18n::text(cx, "remote_agent.compose_tooltip"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_remote_agent_for_active(cx);
-                                    })),
-                            )
-                            .child(
                                 Select::new(&self.model_select)
                                     .w(px(metrics.model_width))
-                                    .h(px(28.0))
+                                    .h(px(29.0))
                                     .small()
                                     .appearance(false)
+                                    .menu_width(px(420.0))
+                                    .menu_max_h(px(420.0))
                                     .placeholder(i18n::text(cx, "composer.model"))
                                     .search_placeholder(i18n::text(cx, "composer.search_models"))
                                     .disabled(self.model_choices.is_empty()),
@@ -12109,19 +12070,17 @@ impl AverroesApp {
                                     .h(px(28.0))
                                     .small()
                                     .appearance(false)
+                                    .menu_width(px(170.0))
+                                    .menu_max_h(px(220.0))
                                     .placeholder(i18n::text(cx, "composer.effort"))
                                     .search_placeholder(i18n::text(cx, "composer.search_effort"))
                                     .disabled(!has_model),
                             )
-                            .child(
-                                Select::new(&self.security_select)
-                                    .w(px(metrics.security_width))
-                                    .h(px(28.0))
-                                    .small()
-                                    .appearance(false)
-                                    .placeholder(i18n::text(cx, "composer.security"))
-                                    .search_placeholder(i18n::text(cx, "composer.search_security")),
-                            ),
+                            .child(composer_more_button(
+                                session.binding.approval_policy,
+                                self.remote_agent_is_active(),
+                                cx,
+                            )),
                     )
                     .when_some(private_selector, |footer, selector| {
                         footer.child(div().ml(px(tokens::SPACE_6)).flex_none().child(selector))
@@ -12990,7 +12949,7 @@ impl AverroesApp {
         let theme = UiTheme::current(cx);
         let brand_asset = averroes_logo_asset(cx);
         let session = self.active();
-        let title = session.title.clone();
+        let title = title_for_display(&session.title);
         let context_usage = session.context_usage;
         let context_busy = session.context_busy;
         let has_agent = session.agent.is_some();
@@ -13016,6 +12975,7 @@ impl AverroesApp {
         }
         let patch_history = collect_patch_history(session, &agent_threads);
         let patch_count = patch_history.len().to_string();
+        let has_patches = !patch_history.is_empty();
 
         if is_empty {
             let empty_metrics = composer_metrics(true);
@@ -13166,9 +13126,9 @@ impl AverroesApp {
                                             IconName::ChevronRight
                                         })
                                         .tooltip(if self.show_tool_activity {
-                                            "Hide tool activity"
+                                            i18n::text(cx, "chat.hide_tool_activity")
                                         } else {
-                                            "Show tool activity"
+                                            i18n::text(cx, "chat.show_tool_activity")
                                         })
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.toggle_tool_activity_visibility(cx);
@@ -13184,12 +13144,6 @@ impl AverroesApp {
                             .px(px(tokens::SPACE_8))
                             .gap(px(tokens::SPACE_6))
                             .rounded(px(tokens::RADIUS_CARD))
-                            .border_1()
-                            .border_color(if self.show_context {
-                                theme.focus_ring
-                            } else {
-                                theme.border
-                            })
                             .bg(if self.show_context {
                                 theme.accent_soft
                             } else {
@@ -13199,11 +13153,13 @@ impl AverroesApp {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .hover(|style| {
-                                style.bg(theme.accent_soft).border_color(theme.focus_ring)
-                            })
+                            .hover(|style| style.bg(theme.accent_soft))
                             .text_size(px(tokens::TEXT_CAPTION))
-                            .text_color(theme.muted)
+                            .text_color(if self.show_context {
+                                theme.foreground
+                            } else {
+                                theme.muted
+                            })
                             .child(
                                 Icon::new(if self.show_context {
                                     IconName::PanelRightClose
@@ -13230,50 +13186,48 @@ impl AverroesApp {
                                 this.toggle_context_sidebar(cx);
                             })),
                     )
-                    .child(
-                        div()
-                            .id("patch-history-button")
-                            .ml(px(tokens::SPACE_6))
-                            .flex_none()
-                            .h(px(30.0))
-                            .px(px(tokens::SPACE_8))
-                            .gap(px(tokens::SPACE_6))
-                            .rounded(px(tokens::RADIUS_CARD))
-                            .border_1()
-                            .border_color(if self.show_patches {
-                                theme.focus_ring
-                            } else {
-                                theme.border
-                            })
-                            .bg(if self.show_patches {
-                                theme.accent_soft
-                            } else {
-                                theme.surface_subtle
-                            })
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .hover(|style| {
-                                style.bg(theme.accent_soft).border_color(theme.focus_ring)
-                            })
-                            .text_size(px(tokens::TEXT_CAPTION))
-                            .text_color(theme.muted)
-                            .child(
-                                Icon::new(IconName::File)
-                                    .size(px(13.0))
-                                    .text_color(theme.faint),
-                            )
-                            .child(
-                                div()
-                                    .font_weight(tokens::WEIGHT_MEDIUM)
-                                    .child(i18n::text(cx, "chat.patches")),
-                            )
-                            .child(patch_count.clone())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_patch_history_sidebar(cx);
-                            })),
-                    ),
+                    .when(has_patches, |this| {
+                        this.child(
+                            div()
+                                .id("patch-history-button")
+                                .ml(px(tokens::SPACE_6))
+                                .flex_none()
+                                .h(px(30.0))
+                                .px(px(tokens::SPACE_8))
+                                .gap(px(tokens::SPACE_6))
+                                .rounded(px(tokens::RADIUS_CARD))
+                                .bg(if self.show_patches {
+                                    theme.accent_soft
+                                } else {
+                                    theme.surface_subtle
+                                })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme.accent_soft))
+                                .text_size(px(tokens::TEXT_CAPTION))
+                                .text_color(if self.show_patches {
+                                    theme.foreground
+                                } else {
+                                    theme.muted
+                                })
+                                .child(
+                                    Icon::new(IconName::File)
+                                        .size(px(13.0))
+                                        .text_color(theme.faint),
+                                )
+                                .child(
+                                    div()
+                                        .font_weight(tokens::WEIGHT_MEDIUM)
+                                        .child(i18n::text(cx, "chat.patches")),
+                                )
+                                .child(patch_count.clone())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_patch_history_sidebar(cx);
+                                })),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -13442,7 +13396,7 @@ impl AverroesApp {
             div()
                 .text_size(px(tokens::TEXT_CAPTION))
                 .text_color(agent_thread_status_color(thread.status, theme))
-                .child(agent_thread_status_label(thread.status))
+                .child(agent_thread_status_label(cx, thread.status))
                 .into_any_element()
         };
 
@@ -13480,7 +13434,7 @@ impl AverroesApp {
                             .whitespace_nowrap()
                             .overflow_hidden()
                             .text_ellipsis()
-                            .child(thread.title),
+                            .child(title_for_display(&thread.title)),
                     )
                     .child(status),
             )
@@ -13804,13 +13758,13 @@ impl AverroesApp {
                             .min_w(px(0.0))
                             .text_size(px(tokens::TEXT_SMALL))
                             .overflow_hidden()
-                            .child(thread.title.clone()),
+                            .child(title_for_display(&thread.title)),
                     )
                     .child(
                         div()
                             .text_size(px(tokens::TEXT_CAPTION))
                             .text_color(theme.faint)
-                            .child(agent_thread_status_label(thread.status)),
+                            .child(agent_thread_status_label(cx, thread.status)),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_agent_thread(thread_id.clone(), cx);
@@ -13851,7 +13805,7 @@ impl AverroesApp {
                                 .flex_1()
                                 .text_size(px(tokens::TEXT_SMALL))
                                 .font_weight(tokens::WEIGHT_MEDIUM)
-                                .child(thread.title.clone()),
+                                .child(title_for_display(&thread.title)),
                         )
                         .child(
                             Button::new("close-agent-thread")
@@ -13871,7 +13825,7 @@ impl AverroesApp {
                         .text_color(theme.faint)
                         .child(format!(
                             "{} · {}",
-                            agent_thread_status_label(thread.status),
+                            agent_thread_status_label(cx, thread.status),
                             thread.model_id
                         )),
                 )
@@ -14267,25 +14221,6 @@ impl AverroesApp {
                 theme.surface,
             )
         };
-        let notice = self.notice.clone().map(|notice| {
-            div()
-                .mt(px(tokens::SPACE_12))
-                .p(px(tokens::SPACE_8))
-                .rounded(px(tokens::RADIUS_CONTROL))
-                .bg(if notice.success {
-                    theme.success_soft
-                } else {
-                    theme.destructive_soft
-                })
-                .text_color(if notice.success {
-                    theme.success_text
-                } else {
-                    theme.destructive_text
-                })
-                .text_size(px(tokens::TEXT_CAPTION))
-                .child(notice.text)
-                .into_any_element()
-        });
 
         let detail_row = |icon: IconName, title: SharedString, description: SharedString| {
             div()
@@ -14737,7 +14672,6 @@ impl AverroesApp {
                                         ],
                                     )),
                             )
-                            .when_some(notice, |this, notice| this.child(notice))
                             .child(
                                 div()
                                     .mt(px(tokens::SPACE_16))
@@ -15133,25 +15067,6 @@ impl AverroesApp {
             .collect::<Vec<_>>();
         let editing = self.editing_agent_id.is_some();
         let model_selected = self.agent_form_model_id.is_some();
-        let notice = self.notice.clone().map(|notice| {
-            div()
-                .mt(px(tokens::SPACE_12))
-                .p(px(tokens::SPACE_8))
-                .rounded(px(tokens::RADIUS_CONTROL))
-                .bg(if notice.success {
-                    theme.success_soft
-                } else {
-                    theme.destructive_soft
-                })
-                .text_color(if notice.success {
-                    theme.success_text
-                } else {
-                    theme.destructive_text
-                })
-                .text_size(px(tokens::TEXT_CAPTION))
-                .child(notice.text)
-                .into_any_element()
-        });
 
         div()
             .flex_1()
@@ -15251,7 +15166,6 @@ impl AverroesApp {
                                     .search_placeholder(i18n::text(cx, "composer.search_models"))
                                     .disabled(self.model_choices.is_empty()),
                             )
-                            .when_some(notice, |this, notice| this.child(notice))
                             .child(
                                 div()
                                     .mt(px(tokens::SPACE_16))
@@ -15290,25 +15204,6 @@ impl AverroesApp {
         let needs_key = selected_kind.is_some_and(ConnectionKind::requires_api_key)
             && (!copilot || self.show_manual_copilot_token);
         let copilot_uses_login = copilot && self.key_input.read(cx).value().trim().is_empty();
-        let notice = self.notice.clone().map(|notice| {
-            div()
-                .px(px(tokens::SPACE_12))
-                .py(px(tokens::SPACE_8))
-                .rounded(px(tokens::RADIUS_CARD))
-                .bg(if notice.success {
-                    theme.success_soft
-                } else {
-                    theme.destructive_soft
-                })
-                .text_color(if notice.success {
-                    theme.success_text
-                } else {
-                    theme.destructive_text
-                })
-                .text_size(px(tokens::TEXT_CAPTION))
-                .child(notice.text)
-                .into_any_element()
-        });
 
         card(theme, tokens::SPACE_16)
             .id("settings-add-provider-form")
@@ -15444,9 +15339,6 @@ impl AverroesApp {
                         .text_color(theme.muted)
                         .child(i18n::text(cx, "settings.ollama_cloud_description")),
                 )
-            })
-            .when_some(notice, |this, notice| {
-                this.child(div().mt(px(tokens::SPACE_12)).child(notice))
             })
             .child(
                 div()
@@ -15948,6 +15840,55 @@ impl AverroesApp {
             .into_any_element()
     }
 
+    fn render_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let notice = self.notice.as_ref()?;
+        let theme = UiTheme::current(cx);
+        let (icon, background, text_color) = if notice.success {
+            (
+                IconName::CircleCheck,
+                theme.success_soft,
+                theme.success_text,
+            )
+        } else {
+            (
+                IconName::CircleX,
+                theme.destructive_soft,
+                theme.destructive_text,
+            )
+        };
+
+        Some(
+            div()
+                .flex_none()
+                .w_full()
+                .px(px(tokens::SPACE_16))
+                .py(px(tokens::SPACE_8))
+                .flex()
+                .items_center()
+                .gap(px(tokens::SPACE_8))
+                .border_b_1()
+                .border_color(theme.hairline)
+                .bg(background)
+                .text_size(px(tokens::TEXT_CAPTION))
+                .text_color(text_color)
+                .child(Icon::new(icon).size(px(tokens::ICON_SMALL)))
+                .child(div().flex_1().min_w(px(0.0)).child(notice.text.clone()))
+                .child(
+                    Button::new("dismiss-notice")
+                        .ghost()
+                        .small()
+                        .with_size(px(tokens::CONTROL_SMALL))
+                        .icon(IconName::CircleX)
+                        .tooltip(i18n::text(cx, "common.dismiss"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.notice = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_status_line(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = UiTheme::current(cx);
         let connection_count = self.runtime.connections().len();
@@ -16008,6 +15949,7 @@ impl Render for AverroesApp {
             Route::Connections => self.render_connections(cx),
             Route::ScheduledTasks => self.render_scheduled_tasks(cx),
         };
+        let notice = self.render_notice(cx);
         let sheet_layer = ComponentRoot::render_sheet_layer(window, cx);
         let dialog_layer = ComponentRoot::render_dialog_layer(window, cx);
 
@@ -16030,8 +15972,11 @@ impl Render for AverroesApp {
                     .flex_1()
                     .min_w(px(0.0))
                     .h_full()
+                    .flex()
+                    .flex_col()
                     .bg(theme.background)
-                    .child(content),
+                    .when_some(notice, |this, notice| this.child(notice))
+                    .child(div().flex_1().min_w(px(0.0)).min_h(px(0.0)).child(content)),
             )
             .children(sheet_layer)
             .children(dialog_layer)
@@ -16045,6 +15990,80 @@ fn averroes_logo_asset(_: &gpui::App) -> &'static str {
 fn non_empty_input(input: &Entity<InputState>, cx: &App) -> Option<String> {
     let value = input.read(cx).value().trim().to_owned();
     (!value.is_empty()).then_some(value)
+}
+
+fn composer_more_button(
+    approval_policy: ToolApprovalPolicy,
+    remote_active: bool,
+    cx: &mut Context<AverroesApp>,
+) -> AnyElement {
+    let app_view = cx.entity().downgrade();
+    let ask_view = app_view.clone();
+    let allow_view = app_view.clone();
+    let remote_view = app_view;
+
+    Button::new("composer-more")
+        .ghost()
+        .small()
+        .with_size(px(tokens::CONTROL_SMALL))
+        .icon(IconName::Ellipsis)
+        .tooltip(i18n::text(cx, "composer.more"))
+        .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _window, cx| {
+            let ask_view = ask_view.clone();
+            let allow_view = allow_view.clone();
+            let remote_view = remote_view.clone();
+            menu.min_w(px(250.0))
+                .item(
+                    PopupMenuItem::new(i18n::text(cx, "security.ask_before_tools"))
+                        .checked(approval_policy == ToolApprovalPolicy::Ask)
+                        .on_click(move |_, _, cx| {
+                            if let Err(error) = ask_view.update(cx, |app, cx| {
+                                app.select_tool_approval_policy(Some(ToolApprovalPolicy::Ask), cx)
+                            }) {
+                                diagnostics::record(
+                                    DiagnosticLevel::Error,
+                                    "composer.security",
+                                    format!("Security action could not reach the app: {error}"),
+                                );
+                            }
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(i18n::text(cx, "security.allow_all_tools"))
+                        .checked(approval_policy == ToolApprovalPolicy::AllowAll)
+                        .on_click(move |_, _, cx| {
+                            if let Err(error) = allow_view.update(cx, |app, cx| {
+                                app.select_tool_approval_policy(
+                                    Some(ToolApprovalPolicy::AllowAll),
+                                    cx,
+                                )
+                            }) {
+                                diagnostics::record(
+                                    DiagnosticLevel::Error,
+                                    "composer.security",
+                                    format!("Security action could not reach the app: {error}"),
+                                );
+                            }
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(i18n::text(cx, "settings.remote_agent"))
+                        .checked(remote_active)
+                        .on_click(move |_, _, cx| {
+                            if let Err(error) = remote_view
+                                .update(cx, |app, cx| app.toggle_remote_agent_for_active(cx))
+                            {
+                                diagnostics::record(
+                                    DiagnosticLevel::Error,
+                                    "composer.remote_agent",
+                                    format!("Remote Agent action could not reach the app: {error}"),
+                                );
+                            }
+                        }),
+                )
+        })
+        .into_any_element()
 }
 
 fn project_actions_button(
@@ -16523,19 +16542,6 @@ fn preferred_reasoning_effort(model: &ModelInfo) -> Option<String> {
     }
 }
 
-fn tool_approval_choices(cx: &App) -> Vec<ToolApprovalChoice> {
-    vec![
-        ToolApprovalChoice::new(
-            ToolApprovalPolicy::Ask,
-            i18n::text(cx, "security.ask_before_tools"),
-        ),
-        ToolApprovalChoice::new(
-            ToolApprovalPolicy::AllowAll,
-            i18n::text(cx, "security.allow_all_tools"),
-        ),
-    ]
-}
-
 fn localized_reasoning_effort_label(cx: &App, effort: &str) -> SharedString {
     let key = match effort.to_ascii_lowercase().as_str() {
         "none" => "reasoning.none",
@@ -16556,7 +16562,7 @@ fn reasoning_effort_from_label(label: &str) -> Option<String> {
         "low" | "bajo" => Some("low".into()),
         "medium" | "medio" => Some("medium".into()),
         "high" | "alto" => Some("high".into()),
-        "xhigh" | "muy alto" => Some("xhigh".into()),
+        "xhigh" | "muy alto" | "alto+" => Some("xhigh".into()),
         "max" | "máximo" => Some("max".into()),
         _ => None,
     }
@@ -16779,7 +16785,7 @@ fn tool_display_name(name: &str) -> String {
         "change_directory" => "Change directory".into(),
         "glob" | "find_files" => "Find files".into(),
         "grep" => "Search files".into(),
-        "web_search_intrernal" => "Search web".into(),
+        "web_search" | "web_search_intrernal" => "Search web".into(),
         "web_fetch" => "Fetch URL".into(),
         "browser" => "Use browser".into(),
         "checkpoint" => "Checkpoint".into(),
@@ -16820,7 +16826,7 @@ fn localized_tool_display_name(cx: &App, name: &str) -> SharedString {
         "change_directory" => Some("tool.change_directory"),
         "glob" | "find_files" => Some("tool.find_files"),
         "grep" => Some("tool.search_files"),
-        "web_search_intrernal" => Some("tool.search_web"),
+        "web_search" | "web_search_intrernal" => Some("tool.search_web"),
         "web_fetch" => Some("tool.fetch_url"),
         "browser" => Some("tool.browser"),
         "checkpoint" => Some("tool.checkpoint"),
@@ -16856,7 +16862,7 @@ fn tool_activity_title(cx: &App, activity: &ToolActivity) -> SharedString {
         "call_agents" | "call_agent" => {
             i18n::format(cx, "tool.call_agent_for", &[("agent", argument)])
         }
-        "web_search_intrernal" | "web_search" => {
+        "web_search" | "web_search_intrernal" => {
             i18n::format(cx, "tool.search_web_for", &[("query", argument)])
         }
         "web_fetch" => i18n::format(cx, "tool.fetch_url_for", &[("url", argument)]),
@@ -17042,13 +17048,14 @@ fn normalize_web_source_url(raw_url: &str) -> Option<String> {
     Some(url.to_string())
 }
 
-fn agent_thread_status_label(status: AgentThreadStatus) -> &'static str {
-    match status {
-        AgentThreadStatus::Running => "Running",
-        AgentThreadStatus::Completed => "Done",
-        AgentThreadStatus::Failed => "Failed",
-        AgentThreadStatus::Interrupted => "Interrupted",
-    }
+fn agent_thread_status_label(cx: &App, status: AgentThreadStatus) -> SharedString {
+    let key = match status {
+        AgentThreadStatus::Running => "tool.running",
+        AgentThreadStatus::Completed => "tool.done",
+        AgentThreadStatus::Failed => "tool.failed",
+        AgentThreadStatus::Interrupted => "tool.interrupted",
+    };
+    i18n::text(cx, key)
 }
 
 fn agent_thread_status_color(status: AgentThreadStatus, theme: UiTheme) -> gpui::Rgba {
@@ -17321,21 +17328,20 @@ mod composer_visual_tests {
         let metrics = composer_metrics(true);
 
         assert_eq!(metrics.max_width, 680.0);
-        assert_eq!(metrics.surface_radius, 14.0);
-        assert_eq!(metrics.text_min_height, 76.0);
-        assert_eq!(metrics.footer_height, 46.0);
+        assert_eq!(metrics.surface_radius, 16.0);
+        assert_eq!(metrics.text_min_height, 56.0);
+        assert_eq!(metrics.footer_height, 44.0);
         assert_eq!(metrics.footer_horizontal_padding, 12.0);
         assert_eq!(metrics.control_gap, 6.0);
-        assert_eq!(metrics.send_size, 28.0);
+        assert_eq!(metrics.send_size, 32.0);
         assert_eq!(metrics.attachment_radius, 6.0);
         assert_eq!(metrics.empty_logo_size, 96.0);
         assert_eq!(metrics.empty_title_size, 24.0);
         assert_eq!(metrics.empty_brand_gap, 8.0);
         assert_eq!(metrics.empty_composer_gap, 24.0);
         assert_eq!(metrics.footer_text_size, 11.0);
-        assert_eq!(metrics.model_width, 132.0);
-        assert_eq!(metrics.reasoning_width, 60.0);
-        assert_eq!(metrics.security_width, 94.0);
+        assert_eq!(metrics.model_width, 210.0);
+        assert_eq!(metrics.reasoning_width, 80.0);
         assert_eq!(metrics.privacy_icon_size, 16.0);
     }
 
@@ -17344,13 +17350,12 @@ mod composer_visual_tests {
         let metrics = composer_metrics(false);
 
         assert_eq!(metrics.max_width, 760.0);
-        assert_eq!(metrics.surface_radius, 14.0);
-        assert_eq!(metrics.footer_height, 46.0);
-        assert_eq!(metrics.send_size, 28.0);
+        assert_eq!(metrics.surface_radius, 16.0);
+        assert_eq!(metrics.footer_height, 44.0);
+        assert_eq!(metrics.send_size, 32.0);
         assert_eq!(metrics.footer_text_size, 12.0);
-        assert_eq!(metrics.model_width, 148.0);
-        assert_eq!(metrics.reasoning_width, 68.0);
-        assert_eq!(metrics.security_width, 108.0);
+        assert_eq!(metrics.model_width, 240.0);
+        assert_eq!(metrics.reasoning_width, 88.0);
     }
 
     #[test]
@@ -17765,6 +17770,8 @@ fn render_tool_activity(
                 activity.output.clone()
             };
             let agent_tool_output = output.clone();
+            let output_truncated =
+                output.chars().count() >= averroes_core::agent::MAX_TOOL_EVENT_OUTPUT_CHARS;
             let details = if expanded {
                 Some(
                     div()
@@ -17891,6 +17898,15 @@ fn render_tool_activity(
                         ),
                 )
                 .when_some(details, |this, details| this.child(details))
+                .when(expanded && output_truncated, |this| {
+                    this.child(
+                        div()
+                            .pl(px(tokens::SPACE_24))
+                            .text_size(px(tokens::TEXT_CAPTION))
+                            .text_color(theme.faint)
+                            .child(i18n::text(cx, "tool.output_truncated")),
+                    )
+                })
                 .into_any_element()
         })
         .collect::<Vec<_>>();
@@ -18340,10 +18356,10 @@ fn render_reasoning_block(
         div()
             .id(panel_id.clone())
             .w_full()
-            .px(px(tokens::SPACE_12))
-            .py(px(tokens::SPACE_8))
+            .px(px(tokens::SPACE_8))
+            .py(px(tokens::SPACE_6))
             .rounded(px(tokens::RADIUS_CARD))
-            .bg(theme.surface_subtle)
+            .hover(|style| style.bg(theme.surface_subtle))
             .text_color(theme.muted)
             .child(
                 div()
@@ -19043,6 +19059,8 @@ fn render_agent_thread_tool_activity(
     let activity_id = format!("agent-thread-tool-{thread_id}-{message_index}-{tool_index}");
     let expanded = activity.expanded;
     let output = activity.output.clone();
+    let output_truncated =
+        output.chars().count() >= averroes_core::agent::MAX_TOOL_EVENT_OUTPUT_CHARS;
     let toggle_thread_id = thread_id.to_owned();
     let duration = activity
         .duration_ms
@@ -19163,6 +19181,15 @@ fn render_agent_thread_tool_activity(
         .child(header)
         .when_some(summary, |this, summary| this.child(summary))
         .when_some(details, |this, details| this.child(details))
+        .when(expanded && output_truncated, |this| {
+            this.child(
+                div()
+                    .pl(px(tokens::SPACE_20))
+                    .text_size(px(tokens::TEXT_CAPTION))
+                    .text_color(theme.faint)
+                    .child(i18n::text(cx, "tool.output_truncated")),
+            )
+        })
         .into_any_element()
 }
 
@@ -19457,7 +19484,7 @@ fn render_assistant_text_segment(
 ) -> AnyElement {
     if streaming {
         fade_in(
-            render_streaming_markdown(theme, text).text_size(px(tokens::TEXT_BODY)),
+            render_streaming_markdown(theme, text).text_size(px(tokens::TEXT_MESSAGE)),
             format!("{stream_animation_id}-content"),
             STREAM_TEXT_FADE_DURATION,
         )
@@ -19471,6 +19498,7 @@ fn render_assistant_text_segment(
             text.to_owned(),
         )
         .selectable(true)
+        .text_size(px(tokens::TEXT_MESSAGE))
         .into_any_element()
     }
 }
@@ -19738,7 +19766,8 @@ fn render_message(
                             .when(!body.trim().is_empty(), |this| {
                                 this.child(
                                     TextView::markdown(message_id.clone(), body.clone())
-                                        .selectable(true),
+                                        .selectable(true)
+                                        .text_size(px(tokens::TEXT_MESSAGE)),
                                 )
                             })
                             .children(image_attachments),
@@ -20067,8 +20096,30 @@ fn short_title(text: &str) -> String {
     }
 }
 
+fn is_placeholder_title(title: &str) -> bool {
+    matches!(
+        title.trim(),
+        "" | "New conversation" | "New session" | "Nueva conversación" | "Nueva sesión"
+    )
+}
+
 fn can_apply_generated_title(current: &str, fallback: &str) -> bool {
-    current == fallback || matches!(current.trim(), "" | "New conversation" | "New session")
+    current == fallback || is_placeholder_title(current)
+}
+
+fn title_for_display(title: &str) -> String {
+    let trimmed = title.trim();
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    if first.is_lowercase() {
+        let mut result = first.to_uppercase().collect::<String>();
+        result.push_str(chars.as_str());
+        result
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 fn update_check_can_start(state: &UpdateState) -> bool {
@@ -20086,12 +20137,30 @@ fn update_dialog_can_retry_open(state: &UpdateState, open_error: Option<&str>) -
 #[cfg(test)]
 mod conversation_creation_tests {
     use super::{
-        can_select_conversation_privacy, is_persistible_window_session, message_action_id,
-        set_conversation_privacy, NewConversationSeed, SessionId, ShellMessage, ShellSession,
+        can_apply_generated_title, can_select_conversation_privacy, is_persistible_window_session,
+        message_action_id, set_conversation_privacy, title_for_display, NewConversationSeed,
+        SessionId, ShellMessage, ShellSession,
     };
     use averroes_core::connection::SessionBinding;
     use averroes_core::work::WorkProject;
     use std::path::PathBuf;
+
+    #[test]
+    fn lowercase_conversation_titles_are_capitalized_for_display() {
+        assert_eq!(
+            title_for_display("cuentame la historia de jerez"),
+            "Cuentame la historia de jerez"
+        );
+        assert_eq!(title_for_display("Hola"), "Hola");
+        assert_eq!(title_for_display("  "), "");
+    }
+
+    #[test]
+    fn localized_placeholder_titles_can_be_replaced_by_generated_titles() {
+        assert!(can_apply_generated_title("Nueva conversación", "Hola"));
+        assert!(can_apply_generated_title("New conversation", "Hola"));
+        assert!(!can_apply_generated_title("Mi título", "Hola"));
+    }
 
     #[test]
     fn privacy_selection_is_only_available_for_a_new_empty_idle_session() {
@@ -20525,7 +20594,20 @@ mod workspace_grouping_tests {
             "tool.context_window_automatic",
             "chat.copy_message",
             "chat.branch",
+            "chat.hide_tool_activity",
+            "chat.show_tool_activity",
+            "common.dismiss",
+            "composer.more",
             "conversation.private",
+            "notice.agent_connection_required",
+            "notice.agent_model_required",
+            "notice.agent_name_required",
+            "notice.compact_failed",
+            "notice.connection_missing",
+            "security.allow_all_short",
+            "security.ask_short",
+            "tool.output_truncated",
+            "tool.stopped_by_user",
         ];
         let catalogs = [
             include_str!("../locales/en.json"),
@@ -20787,5 +20869,38 @@ mod remote_agent_question_tests {
             parse_remote_question_callback(callback),
             Some(("question-1234abcd", 1))
         );
+    }
+}
+
+#[cfg(test)]
+mod model_choice_tests {
+    use super::{ConnectionId, ConnectionKind, ModelChoice, ModelInfo, ModelSource};
+    use averroes_core::provider::ModelCapabilities;
+
+    #[test]
+    fn model_choice_keeps_the_distinctive_model_id_visible() {
+        let choice = ModelChoice {
+            connection_id: ConnectionId("qdivzero".into()),
+            connection_name: "QDivZero".into(),
+            connection_kind: ConnectionKind::QDivZero,
+            info: ModelInfo {
+                id: "unlimited:qwen3.8-flash".into(),
+                display_name: "unlimited:qwen3.8-flash".into(),
+                provider: "qdivzero".into(),
+                description: None,
+                capabilities: ModelCapabilities {
+                    chat: true,
+                    embeddings: false,
+                    vision: false,
+                    tools: true,
+                },
+                source: ModelSource::Live,
+                featured: false,
+                default_reasoning_effort: None,
+                available_reasoning_efforts: Vec::new(),
+            },
+        };
+
+        assert_eq!(choice.display_label(), "qwen3.8-flash");
     }
 }

@@ -3,7 +3,7 @@ use crate::provider::types::{ContentPart, MessageContent, Role, ToolCall};
 use crate::provider::{ChatMessage, ChatResponse};
 use crate::storage::work::{WorkHistoryEntry, WorkHistoryKind};
 use crate::tool::builtin::ask_user::redact_confirmation_params;
-use crate::tool::{EnabledTool, ToolContext, ToolResult};
+use crate::tool::{EnabledTool, ToolContext, ToolRegistry, ToolResult};
 use anyhow::Result;
 use futures::future::join_all;
 use serde_json::Value;
@@ -105,15 +105,12 @@ impl Agent {
             memory_search_backend: self.memory_search_backend.read().unwrap().clone(),
             agent_event_sink: events.cloned(),
         };
-        let parallel_web_tools = tool_calls.len() > 1
-            && tool_calls
-                .iter()
-                .all(|tool_call| is_parallel_web_tool(&tool_call.function.name));
-        let executions = if parallel_web_tools {
+        let parallel_reads = all_calls_run_in_parallel(&self.tool_registry, tool_calls);
+        let executions = if parallel_reads {
             tracing::debug!(
                 count = tool_calls.len(),
                 session_id = %self.session_id,
-                "executing independent web tools in parallel"
+                "executing independent read-only tools in parallel"
             );
             join_all(
                 tool_calls
@@ -166,39 +163,33 @@ impl Agent {
         ctx: &ToolContext,
         events: Option<&tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
     ) -> ToolCallExecution {
+        let tool_name = crate::tool::canonical_tool_name(&tool_call.function.name).to_owned();
         let delegation_blocked =
-            !self.config.allow_delegation && super::is_delegation_tool(&tool_call.function.name);
-        let user_question_blocked =
-            !self.user_questions_allowed() && tool_call.function.name == "ask_user";
+            !self.config.allow_delegation && super::is_delegation_tool(tool_name.as_str());
+        let user_question_blocked = !self.user_questions_allowed() && tool_name == "ask_user";
         if delegation_blocked
             || user_question_blocked
-            || !ctx
-                .enabled_tools
-                .iter()
-                .any(|tool| tool.name == tool_call.function.name)
+            || !ctx.enabled_tools.iter().any(|tool| tool.name == tool_name)
         {
             let message = if user_question_blocked {
                 "Tool 'ask_user' is unavailable in a non-interactive scheduled run.".to_owned()
             } else if delegation_blocked {
                 format!(
                     "Tool '{}' is unavailable: delegated agents are leaf workers and cannot launch subagents.",
-                    tool_call.function.name
+                    tool_name
                 )
             } else {
-                format!(
-                    "Tool '{}' is not available in this request.",
-                    tool_call.function.name
-                )
+                format!("Tool '{}' is not available in this request.", tool_name)
             };
             if let Some(events) = events {
                 let _ = events.send(AgentStreamEvent::ToolStarted {
                     call_id: Some(tool_call.id.clone()),
-                    name: tool_call.function.name.clone(),
+                    name: tool_name.clone(),
                     input: serde_json::Value::String(tool_call.function.arguments.clone()),
                 });
                 let _ = events.send(AgentStreamEvent::ToolFinished {
                     call_id: Some(tool_call.id.clone()),
-                    name: tool_call.function.name.clone(),
+                    name: tool_name.clone(),
                     success: false,
                     summary: message.clone(),
                     output: message.clone(),
@@ -219,7 +210,7 @@ impl Agent {
                     &message,
                     serde_json::json!({
                         "call_id": tool_call.id,
-                        "name": tool_call.function.name,
+                        "name": tool_name,
                         "success": false,
                     }),
                     Vec::new(),
@@ -235,12 +226,12 @@ impl Agent {
                 if let Some(events) = events {
                     let _ = events.send(AgentStreamEvent::ToolStarted {
                         call_id: Some(tool_call.id.clone()),
-                        name: tool_call.function.name.clone(),
+                        name: tool_name.clone(),
                         input: serde_json::Value::String(tool_call.function.arguments.clone()),
                     });
                     let _ = events.send(AgentStreamEvent::ToolFinished {
                         call_id: Some(tool_call.id.clone()),
-                        name: tool_call.function.name.clone(),
+                        name: tool_name.clone(),
                         success: false,
                         summary: format!("invalid arguments: {error}"),
                         output: format!("Invalid arguments: {error}"),
@@ -261,7 +252,7 @@ impl Agent {
                         format!("invalid arguments: {error}"),
                         serde_json::json!({
                             "call_id": tool_call.id,
-                            "name": tool_call.function.name,
+                            "name": tool_name,
                             "success": false,
                         }),
                         Vec::new(),
@@ -275,14 +266,14 @@ impl Agent {
         if let Some(events) = events {
             let _ = events.send(AgentStreamEvent::ToolStarted {
                 call_id: Some(tool_call.id.clone()),
-                name: tool_call.function.name.clone(),
+                name: tool_name.clone(),
                 input: redact_confirmation_params(&params),
             });
         }
 
         let result = match self
             .tool_registry
-            .execute(&tool_call.function.name, ctx, &params)
+            .execute(tool_name.as_str(), ctx, &params)
             .await
         {
             Ok(result) => result,
@@ -290,7 +281,7 @@ impl Agent {
         };
         self.record_tool_outcome(&tool_call.id, result.success);
 
-        let context_action = if result.success && tool_call.function.name == "new_context" {
+        let context_action = if result.success && tool_name == "new_context" {
             result.metadata.as_ref().and_then(|metadata| {
                 (metadata.get("context_action").and_then(Value::as_str) == Some("new_context"))
                     .then(|| ContextRequest {
@@ -306,7 +297,7 @@ impl Agent {
         let had_failure = !result.success;
 
         if matches!(
-            tool_call.function.name.as_str(),
+            tool_name.as_str(),
             "create_global_memory" | "delete_global_memory"
         ) {
             let prompt = result
@@ -327,10 +318,13 @@ impl Agent {
                 result.error.as_deref().unwrap_or("unknown error")
             };
             let summary = event_output.chars().take(180).collect();
-            let output = event_output.chars().take(12_000).collect();
+            let output = event_output
+                .chars()
+                .take(super::MAX_TOOL_EVENT_OUTPUT_CHARS)
+                .collect();
             let _ = events.send(AgentStreamEvent::ToolFinished {
                 call_id: Some(tool_call.id.clone()),
-                name: tool_call.function.name.clone(),
+                name: tool_name.clone(),
                 success: result.success,
                 summary,
                 output,
@@ -352,7 +346,7 @@ impl Agent {
             result_text,
             serde_json::json!({
                 "call_id": tool_call.id,
-                "name": tool_call.function.name,
+                "name": tool_name,
                 "arguments": params,
                 "success": result.success,
                 "metadata": result.metadata,
@@ -399,21 +393,137 @@ fn tool_result_message_content(result: &ToolResult) -> MessageContent {
     MessageContent::Parts(parts)
 }
 
-fn is_parallel_web_tool(name: &str) -> bool {
-    matches!(name, "web_fetch" | "web_search_intrernal")
+/// Independent read-only calls can share one round trip without changing the
+/// conversation state. Stateful tools, interactive tools, and delegated
+/// agents stay sequential so their effects and approval prompts remain
+/// deterministic.
+fn all_calls_run_in_parallel(tool_registry: &ToolRegistry, tool_calls: &[ToolCall]) -> bool {
+    tool_calls.len() > 1
+        && tool_calls.iter().all(|tool_call| {
+            let name = crate::tool::canonical_tool_name(&tool_call.function.name);
+            if name == "ask_user" || super::is_delegation_tool(name) {
+                return false;
+            }
+            tool_registry
+                .get(name)
+                .is_some_and(|tool| tool.is_read_only() && !tool.requires_confirmation())
+        })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_parallel_web_tool, tool_result_message_content};
-    use crate::provider::types::{ContentPart, MessageContent};
-    use crate::tool::ToolResult;
+    use super::{all_calls_run_in_parallel, tool_result_message_content};
+    use crate::provider::types::{ContentPart, FunctionCall, MessageContent, ToolCall};
+    use crate::tool::{Tool, ToolRegistry, ToolResult};
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+
+    struct ReadOnlyTool;
+
+    #[async_trait]
+    impl Tool for ReadOnlyTool {
+        fn name(&self) -> &str {
+            "read_only"
+        }
+
+        fn description(&self) -> &str {
+            "Read-only test tool"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::tool::ToolContext,
+            _params: &Value,
+        ) -> crate::tool::Result<crate::tool::ToolResult> {
+            Ok(crate::tool::ToolResult::ok("ok"))
+        }
+
+        fn is_read_only(&self) -> bool {
+            true
+        }
+    }
+
+    struct StatefulTool;
+
+    #[async_trait]
+    impl Tool for StatefulTool {
+        fn name(&self) -> &str {
+            "stateful"
+        }
+
+        fn description(&self) -> &str {
+            "Stateful test tool"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::tool::ToolContext,
+            _params: &Value,
+        ) -> crate::tool::Result<crate::tool::ToolResult> {
+            Ok(crate::tool::ToolResult::ok("ok"))
+        }
+    }
+
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            id: format!("{name}-call"),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: "{}".into(),
+            },
+        }
+    }
 
     #[test]
-    fn only_stateless_web_reads_run_in_parallel() {
-        assert!(is_parallel_web_tool("web_fetch"));
-        assert!(is_parallel_web_tool("web_search_intrernal"));
-        assert!(!is_parallel_web_tool("browser"));
+    fn independent_read_only_calls_run_in_parallel() {
+        let registry = ToolRegistry::new();
+        registry.register(ReadOnlyTool);
+
+        assert!(all_calls_run_in_parallel(
+            &registry,
+            &[call("read_only"), call("read_only")]
+        ));
+    }
+
+    #[test]
+    fn single_calls_and_stateful_calls_stay_sequential() {
+        let registry = ToolRegistry::new();
+        registry.register(ReadOnlyTool);
+        registry.register(StatefulTool);
+
+        assert!(!all_calls_run_in_parallel(&registry, &[call("read_only")]));
+        assert!(!all_calls_run_in_parallel(
+            &registry,
+            &[call("read_only"), call("stateful")]
+        ));
+        assert!(!all_calls_run_in_parallel(
+            &registry,
+            &[call("read_only"), call("missing")]
+        ));
+    }
+
+    #[test]
+    fn interactive_and_delegation_calls_never_run_in_parallel() {
+        let registry = ToolRegistry::new();
+        registry.register(ReadOnlyTool);
+
+        assert!(!all_calls_run_in_parallel(
+            &registry,
+            &[call("read_only"), call("ask_user")]
+        ));
+        assert!(!all_calls_run_in_parallel(
+            &registry,
+            &[call("read_only"), call("call_agents")]
+        ));
     }
 
     #[test]

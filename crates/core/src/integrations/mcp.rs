@@ -243,6 +243,16 @@ impl McpClient {
     }
 
     async fn stdio_request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.stdio_request_with_timeout(method, params, MCP_REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn stdio_request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Value> {
         let command = self
             .command
             .as_deref()
@@ -261,30 +271,39 @@ impl McpClient {
         let stderr = child.stderr.take().context("MCP stderr unavailable")?;
         let mut lines = BufReader::new(stdout).lines();
         let stderr_task = tokio::spawn(drain_stream(stderr));
-        write_json_line(
-            &mut stdin,
-            &json_rpc_request(
-                1,
-                "initialize",
-                json!({
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": { "name": "Averroes", "version": env!("CARGO_PKG_VERSION") }
-                }),
-            ),
-        )
-        .await?;
-        read_json_response(&mut lines, 1).await?;
-        write_json_line(
-            &mut stdin,
-            &json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} }),
-        )
-        .await?;
-        write_json_line(&mut stdin, &json_rpc_request(2, method, params)).await?;
-        let result = read_json_response(&mut lines, 2).await;
+        let result = tokio::time::timeout(timeout, async {
+            write_json_line(
+                &mut stdin,
+                &json_rpc_request(
+                    1,
+                    "initialize",
+                    json!({
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": { "name": "Averroes", "version": env!("CARGO_PKG_VERSION") }
+                    }),
+                ),
+            )
+            .await?;
+            read_json_response(&mut lines, 1).await?;
+            write_json_line(
+                &mut stdin,
+                &json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} }),
+            )
+            .await?;
+            write_json_line(&mut stdin, &json_rpc_request(2, method, params)).await?;
+            read_json_response(&mut lines, 2).await
+        })
+        .await;
         let _ = child.kill().await;
         let _ = stderr_task.await;
-        result
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "MCP server '{}' did not answer within {timeout:?}",
+                self.server_name
+            )),
+        }
     }
 
     async fn ensure_http_initialized(&self) -> anyhow::Result<()> {
@@ -864,6 +883,31 @@ mcpServers:
         assert_eq!(result.images[0].media_type, "image/png");
         assert_eq!(result.images[0].data, "aW1hZ2U=");
         assert_eq!(result.metadata.unwrap()["structured_content"]["width"], 640);
+    }
+
+    #[tokio::test]
+    async fn stdio_request_times_out_instead_of_blocking_the_agent() {
+        let client = McpClient::from_project_server(
+            "slow-server".into(),
+            &ProjectMcpServer {
+                command: Some("sleep".into()),
+                args: vec!["30".into()],
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("stdio MCP client should be valid");
+
+        let error = client
+            .stdio_request_with_timeout(
+                "tools/list",
+                json!({}),
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .expect_err("a silent MCP server must time out");
+
+        assert!(error.to_string().contains("did not answer"));
     }
 
     #[test]
