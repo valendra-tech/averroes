@@ -158,7 +158,7 @@ and interactive tools run in order. The built-in groups are:
 
 - Workspace: `bash`, `change_directory`, `file_read`, `file_write`, `patch`,
   `glob`, `grep`, `checkpoint`.
-- Web: `web_search`, `web_fetch`, and `browser` (OxiBrowser; fetch and browser
+- Web: `web_search_internal`, `web_fetch`, and `browser` (OxiBrowser; fetch and browser
   contribute opened pages to conversation sources).
 - Desktop: `desktop_screenshot`, `desktop_input` (macOS UI capture and input).
 - Skills: `list_skills`, `load_skill`, `search_skills`, `install_skill`.

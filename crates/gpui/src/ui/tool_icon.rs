@@ -20,7 +20,9 @@ fn tool_icon_path(tool_name: &str) -> &'static str {
         "change_directory" => "tools/folder-search.svg",
         "glob" | "find_files" => "tools/folder-search.svg",
         "grep" | "search" => "tools/search.svg",
-        "web_fetch" | "web_search" | "web_search_intrernal" | "browser" => "tools/globe.svg",
+        "web_fetch" | "web_search_internal" | "web_search" | "web_search_intrernal" | "browser" => {
+            "tools/globe.svg"
+        }
         "checkpoint" => "tools/checkpoint.svg",
         "task_list" | "add_task" | "update_task" | "mark_task_as_done" => "tools/task.svg",
         "ask_user" => "tools/ask-user.svg",

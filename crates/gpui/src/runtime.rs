@@ -754,12 +754,12 @@ mod delegated_agent_tool_tests {
     #[test]
     fn restored_threads_keep_tools_and_do_not_replace_newer_live_state() {
         let registry = AgentThreadRegistry::new();
-        let mut saved = thread_with_tools(vec!["web_search".into()]);
+        let mut saved = thread_with_tools(vec!["web_search_internal".into()]);
         saved.status = AgentThreadStatus::Running;
         registry.restore([saved]);
 
         let restored = registry.get("thread-1").expect("saved thread restored");
-        assert_eq!(restored.enabled_tools, vec!["web_search"]);
+        assert_eq!(restored.enabled_tools, vec!["web_search_internal"]);
         assert_eq!(restored.status, AgentThreadStatus::Interrupted);
 
         let mut live = thread_with_tools(vec!["shell".into()]);

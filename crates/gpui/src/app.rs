@@ -7304,7 +7304,7 @@ impl AverroesApp {
         };
         let mut pages = Vec::new();
         match tool_name {
-            "web_search" | "web_search_intrernal" => {
+            "web_search_internal" | "web_search" | "web_search_intrernal" => {
                 if let Some(results) = metadata.get("results").and_then(|value| value.as_array()) {
                     for result in results {
                         let Some(url) = result.get("url").and_then(|value| value.as_str()) else {
@@ -16785,7 +16785,7 @@ fn tool_display_name(name: &str) -> String {
         "change_directory" => "Change directory".into(),
         "glob" | "find_files" => "Find files".into(),
         "grep" => "Search files".into(),
-        "web_search" | "web_search_intrernal" => "Search web".into(),
+        "web_search_internal" | "web_search" | "web_search_intrernal" => "Search web".into(),
         "web_fetch" => "Fetch URL".into(),
         "browser" => "Use browser".into(),
         "checkpoint" => "Checkpoint".into(),
@@ -16826,7 +16826,7 @@ fn localized_tool_display_name(cx: &App, name: &str) -> SharedString {
         "change_directory" => Some("tool.change_directory"),
         "glob" | "find_files" => Some("tool.find_files"),
         "grep" => Some("tool.search_files"),
-        "web_search" | "web_search_intrernal" => Some("tool.search_web"),
+        "web_search_internal" | "web_search" | "web_search_intrernal" => Some("tool.search_web"),
         "web_fetch" => Some("tool.fetch_url"),
         "browser" => Some("tool.browser"),
         "checkpoint" => Some("tool.checkpoint"),
@@ -16862,7 +16862,7 @@ fn tool_activity_title(cx: &App, activity: &ToolActivity) -> SharedString {
         "call_agents" | "call_agent" => {
             i18n::format(cx, "tool.call_agent_for", &[("agent", argument)])
         }
-        "web_search" | "web_search_intrernal" => {
+        "web_search_internal" | "web_search" | "web_search_intrernal" => {
             i18n::format(cx, "tool.search_web_for", &[("query", argument)])
         }
         "web_fetch" => i18n::format(cx, "tool.fetch_url_for", &[("url", argument)]),
@@ -18471,7 +18471,7 @@ mod agent_thread_render_tests {
         message.text = "Answer".into();
         message.tool_activities.push(ToolActivity {
             call_id: Some("call-1".into()),
-            name: "web_search".into(),
+            name: "web_search_internal".into(),
             text_offset: 0,
             group_id: None,
             input: "{}".into(),
@@ -18500,7 +18500,7 @@ mod agent_thread_render_tests {
         message.text = "Answer".into();
         message.tool_activities.push(ToolActivity {
             call_id: Some("call-inline".into()),
-            name: "web_search".into(),
+            name: "web_search_internal".into(),
             text_offset: 3,
             group_id: Some(0),
             input: "{}".into(),

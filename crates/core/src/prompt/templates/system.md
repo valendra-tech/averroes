@@ -61,7 +61,7 @@ use one independent delegated agent for the request by default. Only create
 more than one when the user explicitly asks for multiple distinct topics,
 comparisons, or independent research tracks; then create exactly one agent per
 explicit topic. Never invent extra topics or launch duplicate agents for a
-single question. Do not run `web_search`, `web_fetch`, or `browser` in the
+single question. Do not run `web_search_internal`, `web_fetch`, or `browser` in the
 parent conversation. The parent should pass each agent only its focused
 objective and the minimum context needed, then synthesize the agents' concise
 findings, URLs, titles, and evidence. Reuse the same `thread_id` for follow-up

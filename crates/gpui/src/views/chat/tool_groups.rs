@@ -193,14 +193,14 @@ mod tests {
     #[test]
     fn summary_counts_names_in_first_seen_order() {
         assert_eq!(
-            summarize_tool_names(&["file_read", "file_read", "web_search", "file_read"]),
+            summarize_tool_names(&["file_read", "file_read", "web_search_internal", "file_read"]),
             vec![
                 super::ToolNameCount {
                     name: "file_read".into(),
                     count: 3,
                 },
                 super::ToolNameCount {
-                    name: "web_search".into(),
+                    name: "web_search_internal".into(),
                     count: 1,
                 },
             ]

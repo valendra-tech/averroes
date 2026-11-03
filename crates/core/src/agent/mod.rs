@@ -6303,7 +6303,7 @@ mod tests {
         assert!(is_delegation_tool("list_agents"));
         assert!(is_delegation_tool("call_agents"));
         assert!(is_delegation_tool("call_agent"));
-        assert!(!is_delegation_tool("web_search"));
+        assert!(!is_delegation_tool("web_search_internal"));
     }
 
     #[tokio::test]

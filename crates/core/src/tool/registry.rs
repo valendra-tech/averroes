@@ -266,7 +266,7 @@ mod tests {
         #[async_trait]
         impl Tool for SearchTool {
             fn name(&self) -> &str {
-                "web_search"
+                "web_search_internal"
             }
 
             fn description(&self) -> &str {
@@ -292,7 +292,11 @@ mod tests {
         let tool = registry
             .get("web_search_intrernal")
             .expect("legacy alias should resolve");
-        assert_eq!(tool.name(), "web_search");
+        assert_eq!(tool.name(), "web_search_internal");
+        let tool = registry
+            .get("web_search")
+            .expect("v0.18.0 alias should resolve");
+        assert_eq!(tool.name(), "web_search_internal");
     }
 
     #[tokio::test]

@@ -374,7 +374,7 @@ pub type Result<T> = std::result::Result<T, ToolError>;
 /// and in-flight provider responses may still contain the old spelling.
 pub fn canonical_tool_name(name: &str) -> &str {
     match name {
-        "web_search_intrernal" => "web_search",
+        "web_search" | "web_search_intrernal" => "web_search_internal",
         _ => name,
     }
 }
@@ -436,7 +436,7 @@ mod tests {
 
         assert_eq!(
             activation.names(),
-            vec!["file_read".to_string(), "web_search".to_string()]
+            vec!["file_read".to_string(), "web_search_internal".to_string()]
         );
     }
 }

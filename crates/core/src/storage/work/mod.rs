@@ -2715,7 +2715,7 @@ mod tests {
                 connection_id: Some(ConnectionId("connection-1".into())),
                 model_id: Some("model-1".into()),
                 reasoning_effort: Some("high".into()),
-                tools: vec!["discover_tools".into(), "web_search".into()],
+                tools: vec!["discover_tools".into(), "web_search_internal".into()],
                 approval_policy: Default::default(),
             },
             context_summary: Some(

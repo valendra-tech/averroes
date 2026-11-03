@@ -193,6 +193,7 @@ mod tests {
         assert!(prompt.contains("automatic: Averroes compacts"));
         assert!(!prompt.contains("compact_conversation"));
         assert!(!prompt.contains("web_search_intrernal"));
+        assert!(prompt.contains("web_search_internal"));
     }
 
     #[test]

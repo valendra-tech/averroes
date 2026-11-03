@@ -135,6 +135,9 @@ mod tests {
         assert!(registry.get("new_context").is_some());
         assert!(registry.get("get_context_remaining").is_some());
         assert!(registry.get("bash").is_some());
+        let names = registry.names();
+        assert!(names.iter().any(|name| name == "web_search_internal"));
+        assert!(!names.iter().any(|name| name == "web_search"));
         assert!(registry.get("history").is_none());
         assert!(registry.get("notes").is_none());
     }
