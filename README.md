@@ -130,6 +130,8 @@ The supplied vector mark is stored in `assets/qdivzero-harness.svg`. UI PNGs and
 `iconutil`). New bundles and installers use the QDivZero Harness display name.
 The interface uses the transparent horizontal mark, with a light-ink variant for
 dark appearance; the rounded square tile is reserved for the macOS application icon.
+DMG filenames use the stable `QDivZero.Harness-<version>-macos-<arch>.dmg` basename
+so GitHub asset-name normalization cannot invalidate the checksum manifest.
 
 ## Development
 
