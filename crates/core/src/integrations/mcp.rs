@@ -280,7 +280,7 @@ impl McpClient {
                     json!({
                         "protocolVersion": MCP_PROTOCOL_VERSION,
                         "capabilities": {},
-                        "clientInfo": { "name": "Averroes", "version": env!("CARGO_PKG_VERSION") }
+                        "clientInfo": { "name": crate::branding::APP_NAME, "version": env!("CARGO_PKG_VERSION") }
                     }),
                 ),
             )
@@ -316,7 +316,7 @@ impl McpClient {
                 json!({
                     "protocolVersion": MCP_PROTOCOL_VERSION,
                     "capabilities": {},
-                    "clientInfo": { "name": "Averroes", "version": env!("CARGO_PKG_VERSION") }
+                    "clientInfo": { "name": crate::branding::APP_NAME, "version": env!("CARGO_PKG_VERSION") }
                 }),
             )
             .await?;

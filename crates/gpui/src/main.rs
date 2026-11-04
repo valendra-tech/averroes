@@ -1,8 +1,10 @@
 #![recursion_limit = "512"]
 
 mod app;
+mod brand;
 mod i18n;
 mod keychain;
+mod pdf;
 mod remote_agent;
 mod response_rate;
 mod runtime;
@@ -21,9 +23,9 @@ use app::AverroesApp;
 use averroes_core::config::ConfigPaths;
 use averroes_core::work::{WorkDatabase, WorkWindowMode, WorkWindowState};
 use gpui::{
-    div, img, point, px, size, App, AppContext, AssetSource, Bounds, Context, IntoElement, Menu,
-    MenuItem, ParentElement, Render, SharedString, Styled, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions,
+    div, point, px, size, App, AppContext, AssetSource, Bounds, Context, IntoElement, Menu,
+    MenuItem, ParentElement, Render, SharedString, Styled, TitlebarOptions, Window, WindowBounds,
+    WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::Root as ComponentRoot;
@@ -38,6 +40,7 @@ use shortcuts::{
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use ui::layout::WindowChrome;
 use ui::UiTheme;
 
 fn scheduled_task_id() -> Option<String> {
@@ -192,7 +195,12 @@ impl AssetSource for UiAssets {
             "tools/skills.svg" => Some(&include_bytes!("../assets/tools/skills.svg")[..]),
             "tools/skill.svg" => Some(&include_bytes!("../assets/tools/skill.svg")[..]),
             "tools/tool.svg" => Some(&include_bytes!("../assets/tools/tool.svg")[..]),
-            "brand/averroes.png" => Some(&include_bytes!("../../../assets/logo.png")[..]),
+            brand::APP_LOGO_ASSET => {
+                Some(&include_bytes!("../../../assets/qdivzero-harness-logo.png")[..])
+            }
+            brand::APP_LOGO_DARK_ASSET => {
+                Some(&include_bytes!("../../../assets/qdivzero-harness-logo-dark.png")[..])
+            }
             "brand/valendra.svg" => Some(&include_bytes!("../assets/brand/valendra.svg")[..]),
             _ => None,
         };
@@ -294,7 +302,6 @@ impl Render for RootView {
         }
 
         let theme = UiTheme::current(cx);
-        let brand_asset = "brand/averroes.png";
         let message = self
             .error
             .clone()
@@ -315,7 +322,7 @@ impl Render for RootView {
                     .bg(theme.surface)
                     .border_1()
                     .border_color(theme.hairline)
-                    .child(img(brand_asset).size(px(56.0)))
+                    .child(brand::logo(cx, 104.0))
                     .child(
                         div()
                             .mt(px(ui::tokens::SPACE_12))
@@ -405,7 +412,7 @@ fn main() {
     // this, source favicons are sent to the default NullHttpClient and every
     // render produces a noisy "No HttpClient available" error.
     let http_client = Arc::new(
-        ReqwestClient::user_agent("averroes-gpui").unwrap_or_else(|_| ReqwestClient::new()),
+        ReqwestClient::user_agent(brand::HTTP_CLIENT_NAME).unwrap_or_else(|_| ReqwestClient::new()),
     );
 
     gpui_platform::application()
@@ -419,7 +426,7 @@ fn main() {
             // work during rendering.
             cx.set_global(Localization::new(Locale::system_default()));
             UiTheme::install_component_theme(cx);
-            cx.set_app_identity("com.valendra.averroes", "Averroes");
+            cx.set_app_identity(brand::BUNDLE_ID, brand::APP_NAME);
             cx.activate(true);
             APP_QUITTING.store(false, Ordering::SeqCst);
             cx.on_app_quit(|_| {
@@ -441,13 +448,13 @@ fn main() {
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.on_action(|_: &NewWindow, cx| {
                 if let Err(error) = open_averroes_window(cx, None) {
-                    tracing::error!(%error, "failed to open Averroes window");
+                    tracing::error!(%error, "failed to open application window");
                 }
             });
             cx.on_action(|_: &OpenWorkspace, cx| {
                 cx.defer(|cx| {
                     let Some(root) = active_component_root(cx) else {
-                        tracing::warn!("open workspace requested without an Averroes window");
+                        tracing::warn!("open workspace requested without an application window");
                         return;
                     };
                     if let Err(error) = root.update(cx, |root, window, cx| {
@@ -465,7 +472,7 @@ fn main() {
                 let project_id = action.project_id.clone();
                 cx.defer(move |cx| {
                     let Some(root) = active_component_root(cx) else {
-                        tracing::warn!("recent project requested without an Averroes window");
+                        tracing::warn!("recent project requested without an application window");
                         return;
                     };
                     if let Err(error) = root.update(cx, |root, window, cx| {
@@ -484,15 +491,15 @@ fn main() {
 
             let restored_windows = load_restorable_windows();
             if restored_windows.is_empty() {
-                open_averroes_window(cx, None).expect("failed to open Averroes window");
+                open_averroes_window(cx, None).expect("failed to open application window");
             } else {
                 for state in restored_windows {
                     if let Err(error) = open_averroes_window(cx, Some(state)) {
-                        tracing::error!(%error, "failed to restore Averroes window");
+                        tracing::error!(%error, "failed to restore application window");
                     }
                 }
                 if cx.windows().is_empty() {
-                    open_averroes_window(cx, None).expect("failed to open Averroes window");
+                    open_averroes_window(cx, None).expect("failed to open application window");
                 }
             }
         });
@@ -523,6 +530,7 @@ fn load_restorable_windows() -> Vec<WorkWindowState> {
 }
 
 fn open_averroes_window(cx: &mut App, restored: Option<WorkWindowState>) -> anyhow::Result<()> {
+    let (traffic_x, traffic_y) = WindowChrome::traffic_light_position();
     let default_bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
     let window_state = restored.unwrap_or_else(|| WorkWindowState {
         id: uuid::Uuid::new_v4().to_string(),
@@ -533,6 +541,7 @@ fn open_averroes_window(cx: &mut App, restored: Option<WorkWindowState>) -> anyh
         width: f32::from(default_bounds.size.width).round() as i32,
         height: f32::from(default_bounds.size.height).round() as i32,
         mode: WorkWindowMode::Windowed,
+        layout: Default::default(),
     });
     let bounds = Bounds {
         origin: point(px(window_state.x as f32), px(window_state.y as f32)),
@@ -550,11 +559,11 @@ fn open_averroes_window(cx: &mut App, restored: Option<WorkWindowState>) -> anyh
         WindowOptions {
             window_bounds: Some(window_bounds),
             window_min_size: Some(size(px(980.0), px(680.0))),
-            window_background: WindowBackgroundAppearance::Blurred,
+            window_background: ui::material::EffectiveVisuals::WINDOW_BACKGROUND,
             titlebar: Some(TitlebarOptions {
-                title: Some("Averroes".into()),
+                title: Some(brand::APP_NAME.into()),
                 appears_transparent: true,
-                traffic_light_position: Some(point(px(14.0), px(15.0))),
+                traffic_light_position: Some(point(px(traffic_x), px(traffic_y))),
             }),
             ..Default::default()
         },
@@ -562,7 +571,11 @@ fn open_averroes_window(cx: &mut App, restored: Option<WorkWindowState>) -> anyh
             let view = cx.new(|cx| RootView::new(window, cx, window_state));
             let recent_projects = view.read(cx).recent_projects_for_menu(cx);
             refresh_application_menu(cx, recent_projects);
-            cx.new(|cx| ComponentRoot::new(view, window, cx).bordered(false))
+            cx.new(|cx| {
+                ComponentRoot::new(view, window, cx)
+                    .bordered(false)
+                    .bg(gpui::rgba(0))
+            })
         },
     )?;
     Ok(())
@@ -572,6 +585,29 @@ fn open_averroes_window(cx: &mut App, restored: Option<WorkWindowState>) -> anyh
 mod tests {
     use super::{application_quit_mode, first_live_preference};
     use gpui::QuitMode;
+
+    #[test]
+    fn interface_logos_load_as_unframed_horizontal_marks_not_dock_icons() {
+        for asset in [
+            crate::brand::APP_LOGO_ASSET,
+            "brand/qdivzero-harness-dark.png",
+        ] {
+            let bytes = gpui::AssetSource::load(&super::UiAssets, asset)
+                .unwrap()
+                .unwrap();
+            let logo = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            assert!(
+                logo.width() as f32 / logo.height() as f32 > 1.8,
+                "interface logo must preserve the supplied horizontal proportions"
+            );
+            assert_eq!(logo.get_pixel(0, 0)[3], 0);
+            let transparent = logo.pixels().filter(|pixel| pixel[3] == 0).count();
+            assert!(
+                transparent > (logo.width() * logo.height()) as usize / 2,
+                "interface logo must remain an unframed mark with transparent negative space"
+            );
+        }
+    }
 
     #[test]
     fn closing_the_last_window_quits_the_desktop_process() {

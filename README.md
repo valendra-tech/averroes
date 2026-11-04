@@ -1,14 +1,15 @@
-# Averroes
+# QDivZero Harness
 
-Averroes is a local-first AI workspace and agent harness written in Rust. It
+QDivZero Harness is a local-first AI workspace and agent harness written in Rust. It
 combines a high-performance core with a native GPUI desktop application for
 conversations, coding workspaces, provider integrations, tools, skills, and
 delegated agents.
 
-The project is named after Ibn Rushd (Averroes), the Andalusian philosopher,
-physician, and jurist from Córdoba whose work connected rigorous reasoning with
-practical knowledge. Averroes is developed by [Valendra.tech](https://valendra.tech)
-with care.
+Formerly named Averroes, the application now uses the QDivZero identity and mark
+from [QDivZero Platform](https://platform.qdiv0.com). The existing repository,
+Cargo package names, native bundle/Keychain identifiers and `.averroes` data paths
+remain compatible with current installations. The project is developed by
+[Valendra.tech](https://valendra.tech).
 
 ## Highlights
 
@@ -32,12 +33,18 @@ with care.
   tasks, checkpoints, and embedding metadata.
 - Live tool and reasoning activity in the UI, grouped without hiding the
   underlying event order.
+- A built-in artifact viewer for generated markdown, text, images, and PDF
+  files, with a `publish_artifact` tool agents use to surface deliverables.
+- A floating macOS workspace with native sidebar vibrancy, visible workspace
+  navigation, grouped conversation controls, a multiline composer, and a shared,
+  resizable Files / Context / Changes inspector. Sidebar and inspector sizes
+  are restored independently for each window.
 - macOS update checks and release DMGs generated automatically from GitHub
   Releases.
 
 ## Install
 
-Averroes ships as a signed, notarized macOS app. The current public build is
+The application ships as a signed, notarized macOS app. The current public build is
 arm64. macOS 13.0 is the supported runtime minimum.
 
 ### From GitHub Releases
@@ -50,7 +57,8 @@ arm64. macOS 13.0 is the supported runtime minimum.
 shasum -a 256 -c SHA256SUMS.txt
 ```
 
-4. Open the DMG and drag Averroes to Applications.
+4. Open the DMG and drag QDivZero Harness to Applications. Earlier public releases
+   use the previous Averroes name.
 
 The application checks for newer releases at startup. When an update is
 available, download and open the verified DMG from the update dialog.
@@ -114,7 +122,14 @@ manual model metadata can declare `embeddings = true` when required.
 - Rust stable with Cargo.
 - macOS for the `averroes-gpui` desktop application and DMG packaging.
 - A configured provider connection for model requests. Ollama can be used
-  locally without an API key.
+locally without an API key.
+
+The supplied vector mark is stored in `assets/qdivzero-harness.svg`. UI PNGs and
+`assets/QDivZeroHarness.icns` can be regenerated headlessly with
+`bash scripts/generate-app-icon.sh` (requires `rsvg-convert`, ImageMagick and
+`iconutil`). New bundles and installers use the QDivZero Harness display name.
+The interface uses the transparent horizontal mark, with a light-ink variant for
+dark appearance; the rounded square tile is reserved for the macOS application icon.
 
 ## Development
 
@@ -150,6 +165,61 @@ Workspace-specific session and tab state lives under the active workspace's
 `.averroes/` directory. The UI is the recommended way to edit configuration so
 that credentials, model catalogs, and connection metadata remain consistent.
 
+### Appearance
+
+Settings → Appearance offers **Automatic** or **Opaque** panel materials and
+**Follow System** or **Reduced** motion. System Reduce Transparency and Reduce
+Motion preferences always take precedence. Chat, code, forms, and document
+pages keep solid reading surfaces.
+
+Automatic uses GPUI's native macOS blurred window background as the common
+glass base behind the floating panes, including the outer inset and gaps.
+AppKit's semantic `NSVisualEffectView::Sidebar` material remains bounded to the
+sidebar above that base and follows window activation. Opaque mode and system
+Reduce Transparency disable the common blur and make the chrome solid. The
+conversation, settings and document panes remain solid in both modes. The macOS material
+adapter is isolated in
+`crates/gpui/src/ui/macos_material.rs`; native compositing and input behavior
+should be visually checked on the target macOS release.
+
+The B floating presentation uses a small outer inset, a rounded sidebar and
+reading workspace, and a grouped toolbar action capsule. AppKit owns the native
+outer shape, shadow and traffic lights. The frame's translucent tint is drawn
+over the native blur; native sidebar material follows its rounded bounds. The
+shared theme supplies the frame and control treatments.
+
+The existing sidebar keeps new conversation, search, settings, add-ons and
+scheduled-task access visible. Pinned and running/unread conversations, workspace
+folders and recent conversations retain their compact hierarchy. The footer
+shows the active workspace with its real project actions.
+
+Conversation rows have distinct hover/selection states and spacing between
+entries. Running conversations show a localized activity pill with a circular
+indicator that respects Reduced Motion. The task panel pairs real completed/total
+progress with readable Pending, In progress, Blocked, Cancelled and Completed
+states; completed titles remain legible without strikethrough.
+
+Settings keep their existing categories and actions, with icon navigation,
+consistent 32–34px controls and grouped surfaces. Conversation-index counts are
+localized and shown once beside the index action.
+
+The transcript and multiline composer are centered in the reading column. A new
+empty conversation keeps its centered welcome/composer layout; an open
+conversation has the composer at the bottom. Attachment, model, reasoning,
+options, privacy and Send/Stop controls retain their functional order. The complete
+searchable model catalog remains available, grouped by connection, with responsive
+trigger widths when the inspector is open.
+
+Context usage, Changes and Files retain direct toolbar actions. These actions
+share one resizable inspector with explicit tabs and a close button; artifact
+previews remain owned by their conversation.
+
+Drag either side's divider to resize it, or focus the divider and use the left
+and right arrow keys. Files, Context, and Changes share one inspector width.
+Window resizing temporarily fits panes to the available space without
+overwriting the user's requested sizes. Appearance preferences live in
+`settings.toml`; per-window layout lives alongside window state in SQLite.
+
 ## Tools
 
 The registry is extensible and every registered tool is advertised from the
@@ -158,6 +228,8 @@ and interactive tools run in order. The built-in groups are:
 
 - Workspace: `bash`, `change_directory`, `file_read`, `file_write`, `patch`,
   `glob`, `grep`, `checkpoint`.
+- Artifacts: `publish_artifact` registers a generated markdown, text, image,
+  LaTeX, or PDF file in the built-in viewer.
 - Web: `web_search_internal`, `web_fetch`, and `browser` (OxiBrowser; fetch and browser
   contribute opened pages to conversation sources).
 - Desktop: `desktop_screenshot`, `desktop_input` (macOS UI capture and input).
@@ -174,7 +246,7 @@ another delegated agent.
 
 ## Skills and workspace instructions
 
-Before working in a project, Averroes loads applicable `AGENTS.md` instructions
+Before working in a project, QDivZero Harness loads applicable `AGENTS.md` instructions
 from the active workspace. Skills are discovered from workspace-local
 locations, including:
 
@@ -216,7 +288,7 @@ mcpServers:
 `stdio`, Streamable HTTP, and legacy HTTP+SSE MCP servers are invoked as
 JSON-RPC tools. A `webmcp` entry is opened in the browser and reads the page's
 `document.modelContext` tools. OAuth access tokens are referenced from the
-project file but stored encrypted in Averroes' Keychain-backed credential
+project file but stored encrypted in QDivZero Harness's Keychain-backed credential
 vault; secrets are never written to `mcp.yaml`.
 
 ## Memory, search, and compaction

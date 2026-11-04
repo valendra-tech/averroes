@@ -12,7 +12,7 @@ pub fn status_bar_surface(theme: UiTheme) -> Div {
         .justify_between()
         .border_t_1()
         .border_color(theme.hairline)
-        .bg(theme.rail)
+        .bg(theme.surface_subtle)
         .text_size(px(tokens::TEXT_CAPTION))
         .text_color(theme.faint)
 }

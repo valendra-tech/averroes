@@ -27,7 +27,7 @@ pub(crate) struct UpdateClient {
 impl UpdateClient {
     pub(crate) fn new() -> Result<Self, UpdateError> {
         let client = reqwest::Client::builder()
-            .user_agent(format!("Averroes/{APP_VERSION}"))
+            .user_agent(format!("{}/{APP_VERSION}", crate::brand::HTTP_CLIENT_NAME))
             .timeout(REQUEST_TIMEOUT)
             .redirect(Policy::custom(|attempt| {
                 if is_trusted_redirect_url(attempt.url()) {

@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub agents: Vec<AgentProfile>,
     #[serde(default)]
     pub remote_agent: RemoteAgentSection,
+    #[serde(default)]
+    pub appearance: AppearanceSection,
 }
 
 const fn config_version() -> u32 {
@@ -36,8 +38,32 @@ impl Default for AppConfig {
             skills: SkillsSection::default(),
             agents: Vec::new(),
             remote_agent: RemoteAgentSection::default(),
+            appearance: AppearanceSection::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterialPreference {
+    #[default]
+    Automatic,
+    Opaque,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionPreference {
+    #[default]
+    FollowSystem,
+    Reduced,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppearanceSection {
+    pub material: MaterialPreference,
+    pub motion: MotionPreference,
 }
 
 /// Configuration for the Telegram transport that exposes an existing

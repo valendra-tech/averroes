@@ -84,6 +84,7 @@ impl PromptBuilder {
         let system_environment = SystemEnvironment::detect();
         let tmpl = self.env.get_template("system").unwrap();
         tmpl.render(context! {
+            app_name => crate::branding::APP_NAME,
             working_dir => working_dir,
             os => std::env::consts::OS,
             shell => system_environment.shell.display().to_string(),
@@ -190,10 +191,15 @@ mod tests {
         assert!(prompt.contains("one independent delegated agent for the request by default"));
         assert!(prompt.contains("must never launch another subagent"));
         assert!(prompt.contains("Context management is"));
-        assert!(prompt.contains("automatic: Averroes compacts"));
+        assert!(prompt.contains(&format!(
+            "automatic: {} compacts",
+            crate::branding::APP_NAME
+        )));
         assert!(!prompt.contains("compact_conversation"));
         assert!(!prompt.contains("web_search_intrernal"));
         assert!(prompt.contains("web_search_internal"));
+        assert!(prompt.contains("publish_artifact"));
+        assert!(prompt.contains("PDFs produced from LaTeX"));
     }
 
     #[test]

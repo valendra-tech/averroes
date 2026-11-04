@@ -8,7 +8,9 @@ use averroes_core::agent::{Agent, AgentConfig, AgentStreamEvent};
 use averroes_core::codex::{CodexAccount, CodexClient, CodexError, CodexLogin, CodexModel};
 use averroes_core::compaction::{CompactionConfig, CompactionStrategyType};
 use averroes_core::config::AgentProfile;
-use averroes_core::config::{AppConfig, ConfigError, ConfigPaths, RemoteAgentSection};
+use averroes_core::config::{
+    AppConfig, AppearanceSection, ConfigError, ConfigPaths, RemoteAgentSection,
+};
 use averroes_core::connection::{
     ConnectionId, ConnectionKind, ConnectionProfile, CredentialRef, SessionBinding,
 };
@@ -1085,6 +1087,9 @@ impl AppRuntime {
             database.clone(),
         ));
         tools.register(builtin::checkpoint::CheckpointTool::new(database.clone()));
+        tools.register(builtin::artifact::PublishArtifactTool::new(
+            database.clone(),
+        ));
         tools.register(builtin::task::TaskListTool::new(database.clone()));
         tools.register(builtin::task::AddTaskTool::new(database.clone()));
         tools.register(builtin::task::UpdateTaskTool::new(database.clone()));
@@ -1140,6 +1145,15 @@ impl AppRuntime {
 
     pub fn config(&self) -> AppConfig {
         self.config.read().clone()
+    }
+
+    pub fn save_appearance(&self, appearance: AppearanceSection) -> Result<(), RuntimeError> {
+        let mut config = self.config.write();
+        let mut next = config.clone();
+        next.appearance = appearance;
+        next.save_to(&self.paths)?;
+        *config = next;
+        Ok(())
     }
 
     pub fn scheduled_tasks_for(
@@ -2826,7 +2840,7 @@ async fn fetch_github_skill_files(
         let endpoint = format!("https://api.github.com/repos/{source}/contents/{root}");
         let response = client
             .get(&endpoint)
-            .header(reqwest::header::USER_AGENT, "Averroes")
+            .header(reqwest::header::USER_AGENT, crate::brand::HTTP_CLIENT_NAME)
             .send()
             .await
             .map_err(|error| {
@@ -2887,7 +2901,7 @@ async fn collect_github_skill_files(
                         })?;
                     let response = client
                         .get(endpoint)
-                        .header(reqwest::header::USER_AGENT, "Averroes")
+                        .header(reqwest::header::USER_AGENT, crate::brand::HTTP_CLIENT_NAME)
                         .send()
                         .await
                         .map_err(|error| {
@@ -2956,7 +2970,7 @@ async fn download_github_skill_files(
         async move {
             let response = client
                 .get(&file.download_url)
-                .header(reqwest::header::USER_AGENT, "Averroes")
+                .header(reqwest::header::USER_AGENT, crate::brand::HTTP_CLIENT_NAME)
                 .send()
                 .await
                 .map_err(|error| {

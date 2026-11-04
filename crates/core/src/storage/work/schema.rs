@@ -90,6 +90,20 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS tasks_conversation_updated
             ON tasks(conversation_id, status, updated_at, task_id);
+        CREATE TABLE IF NOT EXISTS artifacts (
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            artifact_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            title TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            description TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(conversation_id, artifact_id),
+            UNIQUE(conversation_id, path)
+        );
+        CREATE INDEX IF NOT EXISTS artifacts_conversation_updated
+            ON artifacts(conversation_id, updated_at DESC, artifact_id);
         CREATE TABLE IF NOT EXISTS scheduled_tasks (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
@@ -140,6 +154,7 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             width INTEGER NOT NULL,
             height INTEGER NOT NULL,
             mode TEXT NOT NULL,
+            layout_json TEXT NOT NULL DEFAULT '{}',
             updated_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS global_memories (
@@ -195,6 +210,12 @@ pub(super) fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS notes_workspace_updated
             ON notes(workspace_root, updated_at DESC, path COLLATE NOCASE);",
     )?;
+    if !table_has_column(connection, "app_windows", "layout_json")? {
+        connection.execute(
+            "ALTER TABLE app_windows ADD COLUMN layout_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )?;
+    }
     if !conversation_has_column(connection, "unread")? {
         connection.execute(
             "ALTER TABLE conversations ADD COLUMN unread INTEGER NOT NULL DEFAULT 0",

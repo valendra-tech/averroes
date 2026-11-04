@@ -299,7 +299,7 @@ pub fn format_remote_live_markdown(
         out.push_str(&clip_chars(answer, 1_800));
     }
     if out.is_empty() {
-        "Averroes is working…".into()
+        format!("{} is working…", crate::brand::APP_NAME)
     } else {
         out
     }

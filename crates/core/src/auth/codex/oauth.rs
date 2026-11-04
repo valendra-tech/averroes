@@ -118,7 +118,10 @@ pub(super) async fn complete_login(
         write_callback_response(
             &mut stream,
             200,
-            "ChatGPT is connected. You can return to Averroes.",
+            &format!(
+                "ChatGPT is connected. You can return to {}.",
+                crate::branding::APP_NAME
+            ),
         )
         .await?;
         return Ok(());
@@ -210,7 +213,7 @@ async fn write_callback_response(
 ) -> Result<(), CodexError> {
     let reason = if status == 200 { "OK" } else { "Error" };
     let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Averroes</title></head><body style=\"font-family:-apple-system;padding:48px;background:#171717;color:#f5f5f5\"><h1>{message}</h1><p>This window can now be closed.</p></body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{app_name}</title></head><body style=\"font-family:-apple-system;padding:48px;background:#171717;color:#f5f5f5\"><h1>{message}</h1><p>This window can now be closed.</p></body></html>", app_name = crate::branding::APP_NAME
     );
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}",

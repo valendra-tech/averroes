@@ -1,3 +1,4 @@
+use crate::brand::{logo, APP_NAME};
 use crate::i18n;
 use crate::remote_agent::{
     capture_desktop_screenshot, TelegramCallbackQuery, TelegramClient, TelegramMessage,
@@ -18,14 +19,22 @@ use crate::tool_groups::{
 };
 use crate::ui::{
     animation::{
-        fade_in, ATTACHMENT_FADE_DURATION, MESSAGE_FADE_DURATION, STATE_FADE_DURATION,
-        STREAM_TEXT_FADE_DURATION,
+        animate_if, fade_in, reduced_motion, ATTACHMENT_FADE_DURATION, MESSAGE_FADE_DURATION,
+        STATE_FADE_DURATION, STREAM_TEXT_FADE_DURATION,
     },
     components::{
-        badge, card, composer_metrics, empty_state, field_hint, field_label, section_header,
-        segmented_tab, status_bar_surface, toolbar_surface, SidebarRow,
+        activity_ring, badge, card, composer_metrics, embedding_status_text, empty_state,
+        field_hint, field_label, floating_surface, panel_surface, section_header, segmented_tab,
+        settings_card, settings_group, settings_input, settings_row, status_bar_surface,
+        status_pill, workspace_surface, SidebarRow, StatusTone, TaskProgressSummary,
+        TaskStatusPresentation,
     },
+    inspector::{InspectorState, InspectorTab},
+    layout::{resized_width, ResizeGesture, ResizeTarget, ShellLayout, WindowChrome},
+    macos_material::{self, AccessibilityObserver, SidebarMaterialHost},
     markdown::{normalize_reasoning_for_display, render_streaming_markdown},
+    material::{EffectiveVisuals, MaterialMode},
+    model_picker::{grouped_model_items, ModelChoice},
     provider_logo, tokens, tool_icon, UiTheme,
 };
 use crate::update::{open_installer, UpdateClient, UpdateInfo, UpdateState};
@@ -33,7 +42,9 @@ use crate::version::APP_VERSION;
 use averroes_core::agent::orchestration::{AgentThreadSnapshot, AgentThreadStatus};
 use averroes_core::agent::{Agent, AgentStreamEvent, ContextUsage};
 use averroes_core::codex::CodexAccount;
-use averroes_core::config::AgentProfile;
+use averroes_core::config::{
+    AgentProfile, AppearanceSection, MaterialPreference, MotionPreference,
+};
 use averroes_core::connection::{ConnectionId, ConnectionKind, ConnectionProfile, SessionBinding};
 use averroes_core::diagnostics::{self, DiagnosticLevel};
 use averroes_core::integrations::mcp::{McpAuth, McpAuthType, McpTransport, ProjectMcpServer};
@@ -44,17 +55,19 @@ use averroes_core::task::scheduled::{ScheduledTask, ScheduledTaskSchedule};
 use averroes_core::tool::ToolApprovalPolicy;
 use averroes_core::work::{
     now, CheckpointStatus, ConversationSearchResult, ConversationSummary, EmbeddingConfig,
-    EmbeddingIndexStatus, TaskStatus, WorkCheckpoint, WorkConversation, WorkConversationFolder,
-    WorkHistoryEntry, WorkMessage, WorkMessageRole, WorkProject, WorkSource, WorkTask,
-    WorkToolActivity, WorkToolActivityState, WorkWindowMode, WorkWindowState,
+    EmbeddingIndexStatus, TaskStatus, WorkArtifact, WorkArtifactKind, WorkCheckpoint,
+    WorkConversation, WorkConversationFolder, WorkHistoryEntry, WorkMessage, WorkMessageRole,
+    WorkProject, WorkSource, WorkTask, WorkToolActivity, WorkToolActivityState, WorkWindowLayout,
+    WorkWindowMode, WorkWindowState,
 };
 use base64::Engine as _;
+use futures::StreamExt as _;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     div, img, list, px, Anchor, Animation, AnimationExt as _, AnyElement, App, AppContext,
-    ClipboardItem, Context, Entity, ExternalPaths, FollowMode, FutureExt as _, HighlightStyle,
-    InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled, StyledImage, StyledText,
+    ClipboardItem, Context, DragMoveEvent, Entity, ExternalPaths, FollowMode, FutureExt as _,
+    InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState, MouseButton,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, StyledImage,
     Subscription, SystemNotification, Task, Transformation, Window, WindowBounds,
 };
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariant, ButtonVariants};
@@ -81,6 +94,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt as _;
 
 // Keep the main window responsive while the provider emits many small deltas.
 // A completed batch is still applied immediately when the stream goes idle.
@@ -93,7 +107,6 @@ const STREAM_RECOVERY_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 const REMOTE_LIVE_EDIT_INTERVAL: Duration = Duration::from_millis(750);
 const REMOTE_QUESTION_CALLBACK_PREFIX: &str = "ask-answer";
 const CONVERSATION_SEARCH_DEBOUNCE: Duration = Duration::from_millis(280);
-const SIDEBAR_WIDTH: f32 = tokens::SIDEBAR_WIDTH;
 const SIDEBAR_GUTTER: f32 = tokens::SIDEBAR_GUTTER;
 const SIDEBAR_NAV_HEIGHT: f32 = tokens::NAV_HEIGHT;
 const SIDEBAR_RADIUS: f32 = tokens::RADIUS_CARD;
@@ -222,6 +235,7 @@ enum Route {
 enum SettingsTab {
     Models,
     Agents,
+    Appearance,
     RemoteAgent,
     Diagnostics,
     Storage,
@@ -342,6 +356,87 @@ struct PatchHistoryEntry {
     agent_title: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum ArtifactPreview {
+    #[default]
+    Idle,
+    Markdown(String),
+    Text(String),
+    Image {
+        path: PathBuf,
+        width: u32,
+        height: u32,
+    },
+    Pdf {
+        page_count: usize,
+    },
+    Unsupported {
+        size: u64,
+    },
+}
+
+struct ArtifactPanelState {
+    generation: u64,
+    selected: Option<WorkArtifact>,
+    preview: ArtifactPreview,
+    loading: bool,
+    error: Option<String>,
+    zoom: f32,
+    pdf_page: usize,
+    pdf_pages: HashMap<usize, crate::pdf::PdfPageImage>,
+    pdf_rendering: bool,
+}
+
+impl Default for ArtifactPanelState {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            selected: None,
+            preview: ArtifactPreview::Idle,
+            loading: false,
+            error: None,
+            zoom: 1.0,
+            pdf_page: 0,
+            pdf_pages: HashMap::new(),
+            pdf_rendering: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactRequestKey {
+    session_id: SessionId,
+    artifact_id: String,
+    generation: u64,
+}
+
+fn artifact_request_session_mut<'a>(
+    sessions: &'a mut [ShellSession],
+    key: &ArtifactRequestKey,
+) -> Option<&'a mut ShellSession> {
+    sessions.iter_mut().find(|session| {
+        session.id == key.session_id
+            && session.artifact_panel.generation == key.generation
+            && session
+                .artifact_panel
+                .selected
+                .as_ref()
+                .map(|artifact| artifact.id.as_str())
+                == Some(key.artifact_id.as_str())
+    })
+}
+
+#[derive(Clone, Copy)]
+struct DraggedResize {
+    target: ResizeTarget,
+}
+
+impl Render for DraggedResize {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ComposerAttachment {
     path: PathBuf,
@@ -424,72 +519,6 @@ fn remote_attachment_path(file_name: &str) -> PathBuf {
 struct PendingRemoteAccessRequest {
     chat_id: i64,
     label: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ModelChoice {
-    connection_id: ConnectionId,
-    connection_name: SharedString,
-    connection_kind: ConnectionKind,
-    info: ModelInfo,
-}
-
-impl ModelChoice {
-    fn display_label(&self) -> SharedString {
-        let display_name = self.info.display_name.trim();
-        let short = display_name
-            .rsplit(['/', ':'])
-            .next()
-            .filter(|model| !model.is_empty())
-            .unwrap_or(display_name);
-        let label = if short.is_empty() {
-            self.info.id.as_str()
-        } else {
-            short
-        };
-        label.to_owned().into()
-    }
-}
-
-impl SelectItem for ModelChoice {
-    type Value = Self;
-
-    fn title(&self) -> SharedString {
-        self.display_label()
-    }
-
-    fn display_title(&self) -> Option<AnyElement> {
-        Some(
-            div()
-                .flex()
-                .w_full()
-                .min_w(px(0.0))
-                .overflow_hidden()
-                .items_center()
-                .gap(px(tokens::SPACE_6))
-                .child(provider_logo(self.connection_kind, 14.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .overflow_hidden()
-                        .truncate()
-                        .child(self.title()),
-                )
-                .into_any_element(),
-        )
-    }
-
-    fn value(&self) -> &Self::Value {
-        self
-    }
-
-    fn matches(&self, query: &str) -> bool {
-        let query = query.to_ascii_lowercase();
-        self.info.display_name.to_ascii_lowercase().contains(&query)
-            || self.info.id.to_ascii_lowercase().contains(&query)
-            || self.connection_name.to_ascii_lowercase().contains(&query)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -808,7 +837,7 @@ fn shell_tool_activity_from_work(activity: WorkToolActivity) -> ToolActivity {
         group_id: activity.group_id,
         input: activity.input,
         summary: if interrupted && activity.summary.is_empty() {
-            "Interrupted when Averroes closed".into()
+            format!("Interrupted when {APP_NAME} closed")
         } else {
             activity.summary
         },
@@ -1104,6 +1133,8 @@ struct ShellSession {
     checkpoints: Vec<WorkCheckpoint>,
     tasks: Vec<WorkTask>,
     sources: Vec<WorkSource>,
+    artifacts: Vec<WorkArtifact>,
+    artifact_panel: ArtifactPanelState,
     queued_messages: Vec<QueuedMessage>,
     queue_autostart: bool,
     pending_user_question: Option<averroes_core::tool::builtin::ask_user::UserQuestion>,
@@ -1149,6 +1180,8 @@ impl ShellSession {
             checkpoints: Vec::new(),
             tasks: Vec::new(),
             sources: Vec::new(),
+            artifacts: Vec::new(),
+            artifact_panel: ArtifactPanelState::default(),
             queued_messages: Vec::new(),
             queue_autostart: false,
             pending_user_question: None,
@@ -1236,6 +1269,8 @@ impl ShellSession {
             checkpoints: conversation.checkpoints,
             tasks: conversation.tasks,
             sources: normalize_tool_sources(conversation.sources),
+            artifacts: Vec::new(),
+            artifact_panel: ArtifactPanelState::default(),
             queued_messages: Vec::new(),
             queue_autostart: false,
             pending_user_question: None,
@@ -1598,8 +1633,16 @@ pub struct AverroesApp {
     skill_marketplace_busy: bool,
     show_sources: bool,
     show_tool_activity: bool,
-    show_context: bool,
-    show_patches: bool,
+    inspector: InspectorState,
+    requested_layout: WorkWindowLayout,
+    shell_layout: ShellLayout,
+    resize_dirty: bool,
+    resize_gesture: Option<ResizeGesture>,
+    sidebar_resize_focus: gpui::FocusHandle,
+    inspector_resize_focus: gpui::FocusHandle,
+    visuals: EffectiveVisuals,
+    sidebar_material: SidebarMaterialHost,
+    _accessibility_observer: Option<AccessibilityObserver>,
     conversation_list: ListState,
     conversation_list_session: Option<SessionId>,
     selected_agent_thread: Option<String>,
@@ -1609,6 +1652,484 @@ pub struct AverroesApp {
 }
 
 impl AverroesApp {
+    fn refresh_visuals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let system = macos_material::system_visual_options();
+        self.visuals = EffectiveVisuals::resolve(self.runtime.config().appearance, system);
+        window.set_background_appearance(self.visuals.window_background);
+        macos_material::configure_window(window);
+        if self.visuals.material == MaterialMode::Opaque {
+            self.sidebar_material.clear();
+        }
+        cx.set_global(self.visuals);
+        cx.notify();
+    }
+
+    fn save_appearance(
+        &mut self,
+        next: AppearanceSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.runtime.save_appearance(next) {
+            Ok(()) => self.refresh_visuals(window, cx),
+            Err(error) => self.show_error(error.to_string(), cx),
+        }
+    }
+
+    fn render_screen_toolbar(
+        &self,
+        title: impl Into<SharedString>,
+        subtitle: impl Into<SharedString>,
+        actions: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let subtitle = subtitle.into();
+        div()
+            .bg(theme.background)
+            .rounded_t(px(tokens::RADIUS_WORKSPACE))
+            .flex_none()
+            .h(px(tokens::TOOLBAR_HEIGHT))
+            .px(px(tokens::SPACE_16))
+            .flex()
+            .items_center()
+            .gap(px(tokens::SPACE_12))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(
+                        div()
+                            .text_size(px(tokens::TEXT_BODY))
+                            .font_weight(tokens::WEIGHT_MEDIUM)
+                            .truncate()
+                            .child(title.into()),
+                    )
+                    .when(!subtitle.is_empty(), |heading| {
+                        heading.child(
+                            div()
+                                .text_size(px(tokens::TEXT_CAPTION))
+                                .text_color(theme.muted)
+                                .truncate()
+                                .child(subtitle),
+                        )
+                    }),
+            )
+            .child(actions)
+            .into_any_element()
+    }
+
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.requested_layout.sidebar_visible = !self.requested_layout.sidebar_visible;
+        self.persist_window_state();
+        cx.notify();
+    }
+
+    fn toggle_conversation_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.conversation_search_open = !self.conversation_search_open;
+        if self.conversation_search_open {
+            self.requested_layout.sidebar_visible = true;
+            self.refresh_conversation_search(cx);
+            self.schedule_semantic_conversation_search(cx);
+            self.conversation_search
+                .update(cx, |input, cx| input.focus(window, cx));
+        } else {
+            self.conversation_search_results.clear();
+        }
+        self.persist_window_state();
+        cx.notify();
+    }
+
+    fn render_sidebar_navigation(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(52.0))
+                    .px(px(tokens::SPACE_16))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(tokens::SPACE_8))
+                            .child(logo(cx, 40.0))
+                            .child(
+                                div()
+                                    .text_size(px(tokens::TEXT_TITLE3))
+                                    .font_weight(tokens::WEIGHT_SEMIBOLD)
+                                    .line_clamp(2)
+                                    .child(i18n::text(cx, "sidebar.brand")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(tokens::SPACE_2))
+                            .child(
+                                Button::new("open-home-nav")
+                                    .ghost()
+                                    .with_size(px(tokens::CONTROL_SMALL))
+                                    .icon(IconName::FolderOpen)
+                                    .tooltip(i18n::text(cx, "sidebar.home"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.project_settings_open = false;
+                                        this.route = Route::Home;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("search-conversations")
+                                    .ghost()
+                                    .with_size(px(tokens::CONTROL_SMALL))
+                                    .selected(self.conversation_search_open)
+                                    .icon(IconName::Search)
+                                    .tooltip(i18n::text(cx, "sidebar.search"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_conversation_search(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("open-settings-nav")
+                                    .ghost()
+                                    .with_size(px(tokens::CONTROL_SMALL))
+                                    .selected(self.route == Route::Connections)
+                                    .icon(IconName::Settings2)
+                                    .tooltip(i18n::text(cx, "settings.title"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.settings_tab = settings_entry_tab();
+                                        this.project_settings_open = false;
+                                        this.route = Route::Connections;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(SIDEBAR_GUTTER))
+                    .pb(px(tokens::SPACE_12))
+                    .child(
+                        SidebarRow::new("new-work", i18n::text(cx, "sidebar.new_work"))
+                            .icon_path("icons/square-pen.svg")
+                            .icon_color(theme.foreground)
+                            .render(theme, cx)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.new_session(window, cx)),
+                            ),
+                    )
+                    .child(
+                        SidebarRow::new(
+                            "open-complements-nav",
+                            i18n::text(cx, "sidebar.complements"),
+                        )
+                        .icon_path("tools/skills.svg")
+                        .selected(self.project_settings_open)
+                        .render(theme, cx)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.open_project_settings(window, cx)
+                            }),
+                        ),
+                    )
+                    .child(
+                        SidebarRow::new(
+                            "open-scheduled-tasks-nav",
+                            i18n::text(cx, "sidebar.scheduled_tasks"),
+                        )
+                        .icon(IconName::Calendar)
+                        .selected(self.route == Route::ScheduledTasks)
+                        .render(theme, cx)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.project_settings_open = false;
+                            this.refresh_scheduled_tasks();
+                            this.route = Route::ScheduledTasks;
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn finish_resize(&mut self) {
+        self.resize_gesture = None;
+        if std::mem::take(&mut self.resize_dirty) {
+            self.persist_window_state();
+        }
+    }
+
+    fn render_resize_handle(&self, target: ResizeTarget, cx: &mut Context<Self>) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let (id, label, focus, width) = match target {
+            ResizeTarget::Sidebar => (
+                "sidebar-resize-handle",
+                "sidebar.resize",
+                self.sidebar_resize_focus.clone(),
+                self.shell_layout.sidebar_width,
+            ),
+            ResizeTarget::Inspector => (
+                "inspector-resize-handle",
+                "inspector.resize",
+                self.inspector_resize_focus.clone(),
+                self.shell_layout.inspector_width,
+            ),
+        };
+        div()
+            .id(id)
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .w(px(8.0))
+            .when(target == ResizeTarget::Sidebar, |handle| {
+                handle.right(px(-4.0))
+            })
+            .when(target == ResizeTarget::Inspector, |handle| {
+                handle.left(px(-4.0))
+            })
+            .cursor_col_resize()
+            .track_focus(&focus)
+            .tab_stop(true)
+            .role(gpui::Role::Splitter)
+            .aria_orientation(gpui::Orientation::Vertical)
+            .aria_label(i18n::text(cx, label))
+            .hover(|style| style.bg(theme.accent_soft))
+            .focus(|style| style.bg(theme.accent_soft))
+            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
+                let delta = match event.keystroke.key.as_str() {
+                    "left" => -16.0,
+                    "right" => 16.0,
+                    _ => return,
+                };
+                let initial = match target {
+                    ResizeTarget::Sidebar => this.requested_layout.sidebar_width,
+                    ResizeTarget::Inspector => this.requested_layout.inspector_width,
+                };
+                let width = resized_width(target, initial as f32, delta);
+                match target {
+                    ResizeTarget::Sidebar => this.requested_layout.sidebar_width = width,
+                    ResizeTarget::Inspector => this.requested_layout.inspector_width = width,
+                };
+                this.resize_dirty = true;
+                this.finish_resize();
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .on_drag(DraggedResize { target }, |dragged, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| *dragged)
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.resize_gesture = Some(ResizeGesture::new(
+                        target,
+                        width,
+                        f32::from(event.position.x),
+                    ));
+                    window.focus(&focus, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .occlude()
+            .into_any_element()
+    }
+
+    fn render_shared_inspector(
+        &mut self,
+        usage: ContextUsage,
+        busy: bool,
+        has_agent: bool,
+        threads: &[AgentThreadSnapshot],
+        patches: &[PatchHistoryEntry],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let body = match self.inspector.active {
+            Some(InspectorTab::Files) => self.render_artifact_contents(cx),
+            Some(InspectorTab::Context) => {
+                self.render_context_contents(usage, busy, has_agent, threads, cx)
+            }
+            Some(InspectorTab::Changes) => self.render_patch_history_contents(patches, cx),
+            None => return gpui::Empty.into_any_element(),
+        };
+        let tabs = [
+            (InspectorTab::Files, "inspector.files", "files"),
+            (InspectorTab::Context, "inspector.context", "context"),
+            (InspectorTab::Changes, "inspector.changes", "changes"),
+        ];
+        let header = div()
+            .relative()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(42.0))
+                    .px(px(tokens::SPACE_12))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(tokens::TEXT_SMALL))
+                            .font_weight(tokens::WEIGHT_MEDIUM)
+                            .child(i18n::text(cx, "inspector.title")),
+                    )
+                    .child(
+                        Button::new("inspector-close")
+                            .ghost()
+                            .with_size(px(tokens::CONTROL_COMPACT))
+                            .icon(IconName::PanelRightClose)
+                            .tooltip(i18n::text(cx, "inspector.close"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.inspector.close();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .mx(px(tokens::SPACE_12))
+                    .mb(px(tokens::SPACE_12))
+                    .p(px(tokens::SPACE_2))
+                    .rounded(px(tokens::RADIUS_CONTROL))
+                    .bg(theme.surface_subtle)
+                    .children(tabs.into_iter().map(|(tab, label, key)| {
+                        let selected = self.inspector.active == Some(tab);
+                        segmented_tab(
+                            theme,
+                            SharedString::from(format!("inspector-tab-{key}")),
+                            i18n::text(cx, label),
+                            selected,
+                        )
+                        .flex_1()
+                        .justify_center()
+                        .h(px(28.0))
+                        .px(px(tokens::SPACE_4))
+                        .text_size(px(tokens::TEXT_CAPTION))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.inspector.select(tab);
+                            cx.notify();
+                        }))
+                    })),
+            );
+        div()
+            .w(px(self.shell_layout.inspector_slot_width))
+            .h_full()
+            .flex_none()
+            .p(px(ShellLayout::INSPECTOR_INSET))
+            .child(
+                panel_surface(theme, tokens::RADIUS_INSPECTOR)
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .bg(theme.surface)
+                    .border_color(theme.hairline)
+                    .pb(px(tokens::RADIUS_INSPECTOR))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .rounded(px(tokens::RADIUS_INSPECTOR))
+                            .overflow_hidden()
+                            .child(header)
+                            .child(div().flex_1().min_h(px(0.0)).child(body)),
+                    )
+                    .child(self.render_resize_handle(ResizeTarget::Inspector, cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_chat_toolbar(
+        &self,
+        title: impl Into<SharedString>,
+        conversation_actions: impl IntoElement,
+        usage: ContextUsage,
+        busy: bool,
+        has_tools: bool,
+        patch_count: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let percentage = if busy {
+            "…".into()
+        } else {
+            usage
+                .percentage()
+                .map(|percentage| format!("{percentage}%"))
+                .unwrap_or_else(|| "—".into())
+        };
+        let controls = floating_surface(theme, self.visuals.material, tokens::RADIUS_COMPOSER)
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(tokens::SPACE_2))
+            .px(px(tokens::SPACE_4))
+            .py(px(tokens::SPACE_2))
+            .child(conversation_actions)
+            .when(has_tools, |group| {
+                group.child(
+                    Button::new("toggle-tool-activity")
+                        .ghost()
+                        .with_size(px(tokens::CONTROL_ICON))
+                        .rounded_full()
+                        .icon(if self.show_tool_activity {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .tooltip(i18n::text(
+                            cx,
+                            if self.show_tool_activity {
+                                "chat.hide_tool_activity"
+                            } else {
+                                "chat.show_tool_activity"
+                            },
+                        ))
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.toggle_tool_activity_visibility(cx)),
+                        ),
+                )
+            })
+            .child(
+                Button::new("context-usage-button")
+                    .ghost()
+                    .small()
+                    .selected(self.inspector.active == Some(InspectorTab::Context))
+                    .label(percentage)
+                    .tooltip(i18n::text(cx, "chat.context"))
+                    .text_size(px(tokens::TEXT_CAPTION))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_context_sidebar(cx))),
+            )
+            .when(patch_count > 0, |group| {
+                group.child(
+                    Button::new("patch-history-button")
+                        .ghost()
+                        .small()
+                        .selected(self.inspector.active == Some(InspectorTab::Changes))
+                        .icon(IconName::File)
+                        .label(patch_count.to_string())
+                        .tooltip(i18n::text(cx, "chat.patches"))
+                        .text_size(px(tokens::TEXT_CAPTION))
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.toggle_patch_history_sidebar(cx)),
+                        ),
+                )
+            })
+            .child(self.render_artifacts_button(theme, cx));
+        self.render_screen_toolbar(title, "", controls, cx)
+    }
+
     fn refresh_scheduled_tasks(&mut self) {
         let workspace = self
             .active_workspace_id
@@ -1670,7 +2191,14 @@ impl AverroesApp {
                     .child(
                         Button::new(SharedString::from(format!("toggle-scheduled-{toggle_id}")))
                             .small()
-                            .label(if task.enabled { "Disable" } else { "Enable" })
+                            .label(i18n::text(
+                                cx,
+                                if task.enabled {
+                                    "scheduled.disable"
+                                } else {
+                                    "scheduled.enable"
+                                },
+                            ))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Ok(current) = this.runtime.scheduled_tasks.get(&toggle_id) {
                                     if let Err(error) = this
@@ -1703,7 +2231,7 @@ impl AverroesApp {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        div()
+        let content = div()
             .flex()
             .flex_col()
             .flex_1()
@@ -1711,19 +2239,6 @@ impl AverroesApp {
             .p(px(tokens::SPACE_32))
             .gap(px(tokens::SPACE_16))
             .overflow_y_scrollbar()
-            .bg(theme.background)
-            .child(
-                div()
-                    .text_size(px(tokens::TEXT_TITLE1))
-                    .font_weight(tokens::WEIGHT_SEMIBOLD)
-                    .child(i18n::text(cx, "scheduled.title")),
-            )
-            .child(
-                div()
-                    .text_size(px(tokens::TEXT_BODY))
-                    .text_color(theme.muted)
-                    .child(i18n::text(cx, "scheduled.description")),
-            )
             .child(
                 div()
                     .flex()
@@ -1825,6 +2340,18 @@ impl AverroesApp {
                 )
             })
             .children(rows)
+            .into_any_element();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(self.render_screen_toolbar(
+                i18n::text(cx, "scheduled.title"),
+                i18n::text(cx, "scheduled.description"),
+                gpui::Empty,
+                cx,
+            ))
+            .child(content)
             .into_any_element()
     }
 
@@ -1837,7 +2364,7 @@ impl AverroesApp {
         diagnostics::record(
             DiagnosticLevel::Info,
             "app",
-            "Averroes UI started; refreshing connected provider catalogs.",
+            format!("{APP_NAME} UI started; refreshing connected provider catalogs."),
         );
         let connections = runtime.connections();
         let connection_labels: Vec<(SharedString, ConnectionId)> = connections
@@ -2067,9 +2594,10 @@ impl AverroesApp {
             app.persist_window_state();
             async {}
         }));
-        subscriptions.push(cx.observe_window_bounds(window, |app, window, _cx| {
+        subscriptions.push(cx.observe_window_bounds(window, |app, window, cx| {
             app.capture_window_bounds(window);
             app.persist_window_state();
+            cx.notify();
         }));
         subscriptions.push(cx.subscribe_in(
             &composer,
@@ -2201,9 +2729,9 @@ impl AverroesApp {
                 this.select_embedding_model(value.as_ref(), cx);
             },
         ));
-        subscriptions.push(cx.observe_window_appearance(window, |_, window, cx| {
+        subscriptions.push(cx.observe_window_appearance(window, |app, window, cx| {
             UiTheme::sync_component_theme(window, cx);
-            cx.notify();
+            app.refresh_visuals(window, cx);
         }));
 
         let should_probe_codex = connections
@@ -2244,6 +2772,10 @@ impl AverroesApp {
             match runtime.database.conversation(conversation_id) {
                 Ok(Some(conversation)) => {
                     let mut session = ShellSession::from_work(conversation, &projects);
+                    session.artifacts = runtime
+                        .database
+                        .artifacts(session.id.as_str())
+                        .unwrap_or_default();
                     let _ =
                         ensure_binding_tools(&mut session.binding, &runtime.default_agent_tools());
                     restored_sessions.push(session);
@@ -2277,6 +2809,11 @@ impl AverroesApp {
             .then(|| restored_sessions[active_session].project_id.clone())
             .flatten();
         capture_window_bounds_into(&mut window_state, window.window_bounds());
+        let requested_layout = window_state.layout.normalized();
+        let visuals = EffectiveVisuals::resolve(
+            runtime.config().appearance,
+            macos_material::system_visual_options(),
+        );
         let mut app = Self {
             runtime,
             window_state,
@@ -2381,8 +2918,16 @@ impl AverroesApp {
             skill_marketplace_busy: false,
             show_sources: true,
             show_tool_activity: true,
-            show_context: false,
-            show_patches: false,
+            inspector: InspectorState::default(),
+            requested_layout,
+            shell_layout: ShellLayout::default(),
+            resize_dirty: false,
+            resize_gesture: None,
+            sidebar_resize_focus: cx.focus_handle(),
+            inspector_resize_focus: cx.focus_handle(),
+            visuals,
+            sidebar_material: SidebarMaterialHost::default(),
+            _accessibility_observer: None,
             conversation_list,
             conversation_list_session: None,
             selected_agent_thread: None,
@@ -2390,6 +2935,23 @@ impl AverroesApp {
             stream_recovery_checkpoints: HashMap::new(),
             _subscriptions: subscriptions,
         };
+        app.refresh_visuals(window, cx);
+        let (sender, mut changes) = futures::channel::mpsc::unbounded::<()>();
+        app._accessibility_observer =
+            Some(macos_material::observe_system_visual_options(move || {
+                let _ = sender.unbounded_send(());
+            }));
+        cx.spawn_in(window, async move |this, cx| {
+            while changes.next().await.is_some() {
+                if this
+                    .update_in(cx, |app, window, cx| app.refresh_visuals(window, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         app.refresh_conversation_folders();
         app.sync_embedding_selectors(window, cx);
         if should_probe_codex {
@@ -4965,6 +5527,7 @@ impl AverroesApp {
         let mut state = self.window_state.clone();
         state.session_ids = session_ids;
         state.active_session_id = active_session_id;
+        state.layout = self.requested_layout.normalized();
         if let Err(error) = self.runtime.database.save_window_state(&state) {
             diagnostics::record(
                 DiagnosticLevel::Warning,
@@ -5393,7 +5956,7 @@ impl AverroesApp {
         self.route = Route::Chat;
         self.project_settings_open = false;
         self.show_sources = true;
-        self.show_context = false;
+        self.inspector.close();
         self.selected_agent_thread = None;
         self.agent_thread_view = None;
         self.attachments.clear();
@@ -5918,7 +6481,8 @@ impl AverroesApp {
             let search_state = dialog_state.clone();
             let search = Button::new("skill-marketplace-search")
                 .primary()
-                .loading(busy && active_skill_action.is_none())
+                .loading(busy && active_skill_action.is_none() && !reduced_motion(cx))
+                .disabled(busy && active_skill_action.is_none())
                 .label(i18n::text(cx, "project.search"))
                 .on_click(move |_, window, cx| {
                     search_view.update(cx, |app, cx| {
@@ -5973,7 +6537,7 @@ impl AverroesApp {
                                 action_skill.id
                             )))
                             .secondary()
-                            .loading(action_busy)
+                            .loading(action_busy && !reduced_motion(cx))
                             .label(i18n::text(
                                 cx,
                                 if action_busy {
@@ -6264,6 +6828,11 @@ impl AverroesApp {
         match self.runtime.database.conversation(conversation_id) {
             Ok(Some(conversation)) => {
                 let mut session = ShellSession::from_work(conversation, &self.projects);
+                session.artifacts = self
+                    .runtime
+                    .database
+                    .artifacts(session.id.as_str())
+                    .unwrap_or_default();
                 if session.project_id.is_none() {
                     if let Some(project) = self.projects.first() {
                         session.project_id = Some(project.id.clone());
@@ -6282,7 +6851,7 @@ impl AverroesApp {
                 self.route = Route::Chat;
                 self.project_settings_open = false;
                 self.show_sources = true;
-                self.show_context = false;
+                self.inspector.close();
                 self.selected_agent_thread = None;
                 self.agent_thread_view = None;
                 self.attachments.clear();
@@ -7852,6 +8421,7 @@ impl AverroesApp {
                         {
                             self.update_task(session_id, task);
                         }
+                        self.apply_artifact_metadata(session_id, metadata.as_ref(), cx);
                     }
                     AgentStreamEvent::ToolConfirmationRequested { .. }
                     | AgentStreamEvent::ToolConfirmationResolved { .. } => {}
@@ -8179,6 +8749,7 @@ impl AverroesApp {
                 images,
             } => {
                 self.record_web_sources(session_id, &name, metadata.as_ref());
+                self.apply_artifact_metadata(session_id, metadata.as_ref(), cx);
                 if let Some(session) = self
                     .sessions
                     .iter_mut()
@@ -8760,7 +9331,7 @@ impl AverroesApp {
         self.codex_busy = true;
         self.notice = Some(Notice {
             success: true,
-            text: "Starting secure ChatGPT sign-in…".into(),
+            text: i18n::text(cx, "notice.chatgpt_sign_in_started").to_string(),
         });
         let runtime = self.runtime.clone();
         let task_runtime = runtime.clone();
@@ -8785,8 +9356,7 @@ impl AverroesApp {
                 cx.open_url(&login.auth_url);
                 app.notice = Some(Notice {
                     success: true,
-                    text: "Finish signing in in your browser. The OAuth session stays encrypted in Averroes' private storage."
-                        .into(),
+                    text: i18n::text(cx, "notice.browser_sign_in").to_string(),
                 });
                 cx.notify();
             });
@@ -8803,7 +9373,7 @@ impl AverroesApp {
                         app.codex_account = Some(account);
                         app.notice = Some(Notice {
                             success: true,
-                            text: "ChatGPT connected to Averroes.".into(),
+                            text: i18n::text(cx, "notice.chatgpt_connected").to_string(),
                         });
                         // The central catalog refresh updates every Codex
                         // connection, including one that is not the active
@@ -8832,7 +9402,7 @@ impl AverroesApp {
         self.copilot_busy = true;
         self.notice = Some(Notice {
             success: true,
-            text: "Starting secure GitHub sign-in…".into(),
+            text: i18n::text(cx, "notice.github_sign_in_started").to_string(),
         });
         let runtime = self.runtime.clone();
         let task_runtime = runtime.clone();
@@ -8860,9 +9430,10 @@ impl AverroesApp {
                 cx.open_url(&login.auth_url);
                 app.notice = Some(Notice {
                     success: true,
-                    text: format!(
-                        "Enter code {} in GitHub to connect this Copilot account. The token is encrypted in Averroes' private storage.",
-                        login.user_code
+                    text: i18n::format(
+                        cx,
+                        "notice.github_code",
+                        &[("code", login.user_code.clone())],
                     ),
                 });
                 cx.notify();
@@ -9297,22 +9868,335 @@ impl AverroesApp {
     }
 
     fn toggle_context_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.show_context = !self.show_context;
-        if self.show_context {
-            self.show_patches = false;
-        } else {
-            self.selected_agent_thread = None;
-        }
+        self.inspector.toggle(InspectorTab::Context);
         cx.notify();
     }
 
     fn toggle_patch_history_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.show_patches = !self.show_patches;
-        if self.show_patches {
-            self.show_context = false;
-            self.selected_agent_thread = None;
+        self.inspector.toggle(InspectorTab::Changes);
+        cx.notify();
+    }
+
+    fn toggle_artifacts_panel(&mut self, cx: &mut Context<Self>) {
+        self.inspector.toggle(InspectorTab::Files);
+        cx.notify();
+    }
+
+    fn open_artifact(&mut self, artifact: WorkArtifact, cx: &mut Context<Self>) {
+        self.inspector.select(InspectorTab::Files);
+        self.agent_thread_view = None;
+        let generation = self.active().artifact_panel.generation.wrapping_add(1);
+        self.active_mut().artifact_panel = ArtifactPanelState {
+            generation,
+            selected: Some(artifact.clone()),
+            loading: true,
+            ..ArtifactPanelState::default()
+        };
+        self.load_artifact_preview(artifact, cx);
+        cx.notify();
+    }
+
+    fn back_to_artifact_list(&mut self, cx: &mut Context<Self>) {
+        let generation = self.active().artifact_panel.generation.wrapping_add(1);
+        self.active_mut().artifact_panel = ArtifactPanelState {
+            generation,
+            ..Default::default()
+        };
+        cx.notify();
+    }
+
+    fn load_artifact_preview(&mut self, artifact: WorkArtifact, cx: &mut Context<Self>) {
+        let runtime = self.runtime.clone();
+        let key = ArtifactRequestKey {
+            session_id: self.active().id.clone(),
+            artifact_id: artifact.id.clone(),
+            generation: self.active().artifact_panel.generation,
+        };
+        let path = artifact.path.clone();
+        let kind = artifact.kind;
+        let request =
+            runtime.spawn_background(async move { load_artifact_preview_file(path, kind).await });
+        cx.spawn(async move |this, cx| {
+            let result = request.await.unwrap_or_else(|error| Err(error.to_string()));
+            _ = this.update(cx, |app, cx| {
+                app.finish_artifact_preview(&key, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_artifact_preview(
+        &mut self,
+        key: &ArtifactRequestKey,
+        result: Result<ArtifactPreview, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = artifact_request_session_mut(&mut self.sessions, key) else {
+            return;
+        };
+        let panel = &mut session.artifact_panel;
+        panel.loading = false;
+        let pdf = matches!(&result, Ok(ArtifactPreview::Pdf { .. }));
+        match result {
+            Ok(preview @ ArtifactPreview::Pdf { .. }) => {
+                panel.preview = preview;
+                panel.error = None;
+                panel.pdf_page = 0;
+                panel.pdf_pages.clear();
+                panel.pdf_rendering = false;
+            }
+            Ok(preview) => {
+                panel.preview = preview;
+                panel.error = None;
+            }
+            Err(error) => {
+                panel.preview = ArtifactPreview::Idle;
+                panel.error = Some(error);
+            }
+        }
+        if pdf {
+            self.start_pdf_page_render_for(&key.session_id, 0, cx);
         }
         cx.notify();
+    }
+
+    fn start_pdf_page_render(&mut self, page: usize, cx: &mut Context<Self>) {
+        self.start_pdf_page_render_for(&self.active().id.clone(), page, cx);
+    }
+
+    fn start_pdf_page_render_for(
+        &mut self,
+        session_id: &SessionId,
+        page: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| &session.id == session_id)
+        else {
+            return;
+        };
+        let panel = &mut session.artifact_panel;
+        let Some(artifact) = panel.selected.clone() else {
+            return;
+        };
+        let ArtifactPreview::Pdf { page_count } = panel.preview else {
+            return;
+        };
+        if page >= page_count || panel.pdf_pages.contains_key(&page) || panel.pdf_rendering {
+            return;
+        }
+        panel.pdf_rendering = true;
+        let key = ArtifactRequestKey {
+            session_id: session_id.clone(),
+            artifact_id: artifact.id.clone(),
+            generation: panel.generation,
+        };
+        let runtime = self.runtime.clone();
+        let path = artifact.path.clone();
+        let request = runtime.spawn_background(async move {
+            tokio::task::spawn_blocking(move || {
+                crate::pdf::render_page(&path, page, crate::pdf::default_scale())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = request.await.unwrap_or_else(|error| Err(error.to_string()));
+            _ = this.update(cx, |app, cx| {
+                app.finish_pdf_page_render(&key, page, result, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_pdf_page_render(
+        &mut self,
+        key: &ArtifactRequestKey,
+        page: usize,
+        result: Result<crate::pdf::PdfPageImage, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = artifact_request_session_mut(&mut self.sessions, key) else {
+            return;
+        };
+        let panel = &mut session.artifact_panel;
+        panel.pdf_rendering = false;
+        match result {
+            Ok(image) => {
+                panel.pdf_pages.insert(page, image);
+                panel.error = None;
+            }
+            Err(error) => panel.error = Some(error),
+        }
+        let current_page = panel.pdf_page;
+        if current_page != page
+            && !panel.pdf_pages.contains_key(&current_page)
+            && panel.error.is_none()
+        {
+            self.start_pdf_page_render_for(&key.session_id, current_page, cx);
+        }
+        cx.notify();
+    }
+
+    fn change_artifact_page(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let panel = &mut self.active_mut().artifact_panel;
+        let ArtifactPreview::Pdf { page_count } = panel.preview else {
+            return;
+        };
+        if page_count == 0 {
+            return;
+        }
+        let next = (panel.pdf_page as isize + delta).clamp(0, page_count.saturating_sub(1) as isize)
+            as usize;
+        if next == panel.pdf_page {
+            return;
+        }
+        panel.pdf_page = next;
+        self.start_pdf_page_render(next, cx);
+        cx.notify();
+    }
+
+    fn adjust_artifact_zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let panel = &mut self.active_mut().artifact_panel;
+        panel.zoom = (panel.zoom + delta).clamp(0.5, 3.0);
+        cx.notify();
+    }
+
+    fn reset_artifact_zoom(&mut self, cx: &mut Context<Self>) {
+        self.active_mut().artifact_panel.zoom = 1.0;
+        cx.notify();
+    }
+
+    fn refresh_artifact(&mut self, cx: &mut Context<Self>) {
+        if let Some(artifact) = self.active().artifact_panel.selected.clone() {
+            self.open_artifact(artifact, cx);
+        }
+    }
+
+    fn open_artifact_external(&self) -> Result<(), String> {
+        let artifact = self
+            .active()
+            .artifact_panel
+            .selected
+            .as_ref()
+            .ok_or_else(|| "No artifact selected".to_string())?;
+        std::process::Command::new("open")
+            .arg(&artifact.path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn reveal_artifact(&self) -> Result<(), String> {
+        let artifact = self
+            .active()
+            .artifact_panel
+            .selected
+            .as_ref()
+            .ok_or_else(|| "No artifact selected".to_string())?;
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&artifact.path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn remove_artifact(&mut self, artifact_id: String, cx: &mut Context<Self>) {
+        let session_id = self.active().id.clone();
+        match self
+            .runtime
+            .database
+            .delete_artifact(session_id.as_str(), &artifact_id)
+        {
+            Ok(_) => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == session_id)
+                {
+                    session
+                        .artifacts
+                        .retain(|artifact| artifact.id != artifact_id);
+                }
+                if self
+                    .active()
+                    .artifact_panel
+                    .selected
+                    .as_ref()
+                    .is_some_and(|artifact| artifact.id == artifact_id)
+                {
+                    self.back_to_artifact_list(cx);
+                }
+                cx.notify();
+            }
+            Err(error) => self.show_error(error.to_string(), cx),
+        }
+    }
+
+    fn copy_artifact_path(&mut self, cx: &mut Context<Self>) {
+        let Some(artifact) = self.active().artifact_panel.selected.as_ref() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(
+            artifact.path.display().to_string(),
+        ));
+        self.notice = Some(Notice {
+            success: true,
+            text: i18n::text(cx, "artifact.path_copied").to_string(),
+        });
+        cx.notify();
+    }
+
+    fn apply_artifact_metadata(
+        &mut self,
+        session_id: &SessionId,
+        metadata: Option<&serde_json::Value>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(metadata) = metadata else {
+            return;
+        };
+        let Some(artifact) = metadata
+            .get("artifact")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<WorkArtifact>(value).ok())
+        else {
+            return;
+        };
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| &session.id == session_id)
+        {
+            if let Some(existing) = session
+                .artifacts
+                .iter_mut()
+                .find(|existing| existing.id == artifact.id)
+            {
+                *existing = artifact.clone();
+            } else {
+                session.artifacts.push(artifact.clone());
+            }
+            session.artifacts.sort_by(|left, right| {
+                right
+                    .updated_at
+                    .cmp(&left.updated_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        }
+        if self.active().id == *session_id
+            && metadata
+                .get("open")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
+            self.open_artifact(artifact, cx);
+        }
     }
 
     fn toggle_task_progress_panel(&mut self, session_id: &SessionId, cx: &mut Context<Self>) {
@@ -9343,8 +10227,7 @@ impl AverroesApp {
         }
         self.agent_thread_view = Some(thread_id);
         self.selected_agent_thread = None;
-        self.show_context = false;
-        self.show_patches = false;
+        self.inspector.close();
         cx.notify();
     }
 
@@ -10538,7 +11421,7 @@ impl AverroesApp {
         self.route = Route::Chat;
         self.project_settings_open = false;
         self.active_workspace_id = self.active().project_id.clone();
-        self.show_context = false;
+        self.inspector.close();
         self.selected_agent_thread = None;
         self.agent_thread_view = None;
         self.attachments.clear();
@@ -10558,7 +11441,7 @@ impl AverroesApp {
         self.project_settings_open = false;
         self.active_workspace_id = self.active().project_id.clone();
         self.refresh_conversation_folders();
-        self.show_context = false;
+        self.inspector.close();
         self.selected_agent_thread = None;
         self.agent_thread_view = None;
         self.attachments.clear();
@@ -10739,7 +11622,8 @@ impl AverroesApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = UiTheme::current(cx);
-        let (completed, total) = task_progress_counts(tasks);
+        let summary = TaskProgressSummary::from_tasks(tasks);
+        let (completed, total) = (summary.completed, summary.total);
         let collapsed = self.collapsed_task_panels.contains(session_id.as_str());
         let session_key = session_id.to_string();
         let header_id = SharedString::from(format!("task-progress-header-{session_key}"));
@@ -10763,12 +11647,15 @@ impl AverroesApp {
         let header = div()
             .id(header_id)
             .w_full()
-            .px(px(tokens::SPACE_8))
-            .py(px(tokens::SPACE_6))
+            .px(px(tokens::SPACE_12))
+            .py(px(tokens::SPACE_8))
             .flex()
             .items_center()
             .justify_between()
             .cursor_pointer()
+            .role(gpui::Role::Button)
+            .aria_label(progress)
+            .rounded_t(px(tokens::RADIUS_SHEET))
             .hover(|style| style.bg(theme.surface_hover))
             .child(
                 div()
@@ -10777,10 +11664,25 @@ impl AverroesApp {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .text_size(px(tokens::TEXT_SMALL))
+                    .text_size(px(tokens::TEXT_BODY))
                     .font_weight(tokens::WEIGHT_MEDIUM)
                     .text_color(theme.foreground)
-                    .child(progress),
+                    .child(i18n::text(cx, "chat.tasks_title")),
+            )
+            .child(
+                status_pill(
+                    theme,
+                    if summary.running > 0 {
+                        StatusTone::Info
+                    } else if summary.blocked > 0 {
+                        StatusTone::Warning
+                    } else if completed == total {
+                        StatusTone::Success
+                    } else {
+                        StatusTone::Neutral
+                    },
+                )
+                .child(format!("{completed}/{total}")),
             )
             .child(
                 Button::new(toggle_id)
@@ -10812,72 +11714,33 @@ impl AverroesApp {
                     tooltip.push('\n');
                     tooltip.push_str(description);
                 }
-                let color = match status {
-                    TaskStatus::Done => theme.success,
-                    TaskStatus::InProgress => theme.warning,
-                    TaskStatus::Blocked => theme.destructive,
-                    TaskStatus::Cancelled | TaskStatus::Pending => theme.faint,
-                };
-                let icon = match task_progress_icon(status) {
-                    TaskProgressIcon::Check => Icon::new(IconName::Check)
-                        .size(px(14.0))
-                        .text_color(color)
-                        .into_any_element(),
-                    TaskProgressIcon::Loader => Icon::new(IconName::Loader)
-                        .size(px(14.0))
-                        .text_color(color)
-                        .with_animation(
-                            format!("task-progress-spinner-{session_key}-{task_id}"),
-                            Animation::new(Duration::from_millis(800)).repeat(),
-                            |icon, delta| {
-                                icon.transform(Transformation::rotate(gpui::percentage(delta)))
-                            },
-                        )
-                        .into_any_element(),
-                    TaskProgressIcon::Circle => div()
-                        .flex_none()
-                        .size(px(14.0))
-                        .border_1()
-                        .border_color(color)
-                        .rounded_full()
-                        .into_any_element(),
-                    TaskProgressIcon::CircleX => Icon::new(IconName::CircleX)
-                        .size(px(14.0))
-                        .text_color(color)
-                        .into_any_element(),
-                };
-                let title = if status == TaskStatus::Done {
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_size(px(tokens::TEXT_SMALL))
-                        .child(StyledText::new(title.clone()).with_highlights([(
-                            0..title.len(),
-                            HighlightStyle {
-                                color: Some(theme.faint.into()),
-                                strikethrough: Some(StrikethroughStyle {
-                                    thickness: px(1.0),
-                                    color: Some(theme.faint.into()),
-                                }),
-                                ..Default::default()
-                            },
-                        )]))
-                        .into_any_element()
+                let presentation = TaskStatusPresentation::for_status(status);
+                let icon = if presentation.spinning {
+                    activity_ring(
+                        theme,
+                        format!("task-progress-spinner-{session_key}-{task_id}"),
+                        self.visuals.reduced_motion,
+                    )
                 } else {
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_size(px(tokens::TEXT_SMALL))
-                        .text_color(theme.foreground)
-                        .child(title)
+                    Icon::new(presentation.icon)
+                        .size(px(tokens::ICON_SIZE))
+                        .text_color(presentation.tone.foreground(theme))
                         .into_any_element()
                 };
+                let title = div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(tokens::TEXT_SMALL))
+                    .text_color(if status == TaskStatus::Done {
+                        theme.muted
+                    } else {
+                        theme.foreground
+                    })
+                    .child(title)
+                    .into_any_element();
 
                 Button::new(SharedString::from(format!(
                     "task-progress-row-{session_key}-{task_id}"
@@ -10885,17 +11748,25 @@ impl AverroesApp {
                 .text()
                 .w_full()
                 .justify_start()
+                .h_auto()
+                .p_0()
+                .rounded(px(tokens::RADIUS_CONTROL))
                 .tooltip(tooltip)
                 .child(
                     div()
                         .w_full()
-                        .px(px(tokens::SPACE_8))
-                        .py(px(tokens::SPACE_2))
+                        .min_h(px(34.0))
+                        .px(px(tokens::SPACE_12))
+                        .py(px(tokens::SPACE_6))
                         .flex()
                         .items_center()
                         .gap(px(tokens::SPACE_8))
                         .child(icon)
-                        .child(title),
+                        .child(title)
+                        .child(
+                            status_pill(theme, presentation.tone)
+                                .child(i18n::text(cx, presentation.label_key)),
+                        ),
                 )
                 .into_any_element()
             })
@@ -10905,10 +11776,25 @@ impl AverroesApp {
             .w_full()
             .bg(theme.surface)
             .border_1()
-            .border_color(theme.border)
-            .rounded(px(tokens::RADIUS_CARD))
+            .border_color(theme.hairline)
+            .rounded(px(tokens::RADIUS_SHEET))
             .overflow_hidden()
-            .child(header);
+            .child(header)
+            .child(
+                div()
+                    .mx(px(tokens::SPACE_12))
+                    .mb(px(tokens::SPACE_8))
+                    .h(px(3.0))
+                    .rounded_full()
+                    .bg(theme.surface_subtle)
+                    .child(
+                        div()
+                            .h_full()
+                            .w(gpui::relative(summary.fraction()))
+                            .rounded_full()
+                            .bg(theme.accent),
+                    ),
+            );
         if !collapsed {
             panel = panel.child(
                 div()
@@ -10917,6 +11803,9 @@ impl AverroesApp {
                     .overflow_y_scrollbar()
                     .flex()
                     .flex_col()
+                    .px(px(tokens::SPACE_4))
+                    .pb(px(tokens::SPACE_8))
+                    .gap(px(tokens::SPACE_2))
                     .children(rows),
             );
         }
@@ -11023,19 +11912,20 @@ impl AverroesApp {
             .copied()
             .unwrap_or((false, false));
         let unread = conversation.unread || session_unread;
-        let group = SharedString::from(format!("workspace-conversation-row-{conversation_id}"));
+        let placement = if indented { "folder" } else { "history" };
+        let group = SharedString::from(format!("{placement}-conversation-row-{conversation_id}"));
         let actions = conversation_actions_button(
             conversation_id.clone(),
             format!("workspace-conversation-actions-{conversation_id}"),
             Some(group.clone()),
             Some(conversation.pinned),
-            processing,
-            unread,
+            false,
+            false,
             self.conversation_folders.clone(),
             cx,
         );
         SidebarRow::new(
-            SharedString::from(format!("workspace-conversation-{conversation_id}")),
+            SharedString::from(format!("{placement}-conversation-{conversation_id}")),
             title_for_display(&conversation.title),
         )
         .indent(if indented {
@@ -11045,9 +11935,10 @@ impl AverroesApp {
         })
         .accessory(actions)
         .selected(selected)
-        .unread(unread)
         .processing(processing)
-        .render(theme)
+        .unread(unread)
+        .conversation()
+        .render(theme, cx)
         .group(group)
         .on_click(
             cx.listener(move |this, _, window, cx| {
@@ -11079,8 +11970,8 @@ impl AverroesApp {
             format!("attention-conversation-actions-{conversation_id}"),
             Some(group.clone()),
             Some(conversation.pinned),
-            processing,
-            unread,
+            false,
+            false,
             self.conversation_folders.clone(),
             cx,
         );
@@ -11091,9 +11982,10 @@ impl AverroesApp {
         .icon(IconName::Bell)
         .accessory(actions)
         .selected(selected)
-        .unread(unread)
         .processing(processing)
-        .render(theme)
+        .unread(unread)
+        .conversation()
+        .render(theme, cx)
         .group(group)
         .on_click(
             cx.listener(move |this, _, window, cx| {
@@ -11106,7 +11998,6 @@ impl AverroesApp {
     fn render_rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = UiTheme::current(cx);
         let active_id = self.active().id.to_string();
-        let complements_open = self.project_settings_open;
         let session_states = self
             .sessions
             .iter()
@@ -11179,8 +12070,8 @@ impl AverroesApp {
                 format!("conversation-actions-{id}"),
                 Some(group.clone()),
                 Some(conversation.pinned),
-                processing,
-                unread,
+                false,
+                false,
                 self.conversation_folders.clone(),
                 cx,
             );
@@ -11191,9 +12082,10 @@ impl AverroesApp {
             .icon_path("icons/pin.svg")
             .accessory(actions)
             .selected(selected)
-            .unread(unread)
             .processing(processing)
-            .render(theme)
+            .unread(unread)
+            .conversation()
+            .render(theme, cx)
             .group(group)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_conversation(&select_id, window, cx)
@@ -11285,7 +12177,7 @@ impl AverroesApp {
                                 .child(project_actions),
                         )
                         .selected(!is_home && is_active_workspace)
-                        .render(theme)
+                        .render(theme, cx)
                         .group(project_group)
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.select_project(&new_work_project_id, window, cx)
@@ -11393,7 +12285,7 @@ impl AverroesApp {
                                 .child(new_conversation_button)
                                 .child(folder_actions),
                         )
-                        .render(theme)
+                        .render(theme, cx)
                         .group(folder_group)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let folder_toggle_id = folder_toggle_id.clone();
@@ -11486,6 +12378,8 @@ impl AverroesApp {
                 .child(
                     div()
                         .mt(px(tokens::SPACE_4))
+                        .max_h(px(160.0))
+                        .overflow_y_scrollbar()
                         .when(search_rows.is_empty() && search_query.is_empty(), |this| {
                             this.child(sidebar_empty(i18n::text(cx, "sidebar.search_all"), theme))
                         })
@@ -11528,7 +12422,7 @@ impl AverroesApp {
                     .child(
                         div()
                             .id("active-project-footer-row")
-                            .h(px(44.0))
+                            .h(px(36.0))
                             .w_full()
                             .px(px(tokens::SPACE_8))
                             .flex()
@@ -11542,26 +12436,16 @@ impl AverroesApp {
                                     .text_color(theme.muted),
                             )
                             .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .child(
-                                        div()
-                                            .text_size(px(tokens::TEXT_BODY))
-                                            .font_weight(tokens::WEIGHT_MEDIUM)
-                                            .text_color(theme.foreground)
-                                            .whitespace_nowrap()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .child(project.name.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .mt(px(tokens::SPACE_2))
-                                            .text_size(px(tokens::TEXT_CAPTION))
-                                            .text_color(theme.faint)
-                                            .child(i18n::text(cx, "sidebar.current_project")),
-                                    ),
+                                div().flex_1().min_w(px(0.0)).child(
+                                    div()
+                                        .text_size(px(tokens::TEXT_BODY))
+                                        .font_weight(tokens::WEIGHT_MEDIUM)
+                                        .text_color(theme.foreground)
+                                        .whitespace_nowrap()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .child(project.name.clone()),
+                                ),
                             )
                             .children(actions)
                             .when(self.background_indexing, |this| {
@@ -11575,135 +12459,18 @@ impl AverroesApp {
             })
             .map(IntoElement::into_any_element);
 
-        div()
+        panel_surface(theme, tokens::RADIUS_SIDEBAR)
+            .bg(theme.navigation_fill(self.visuals.material))
+            .id("sidebar-rail")
+            .relative()
             .flex_none()
             .flex()
             .flex_col()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.shell_layout.sidebar_width))
             .h_full()
-            .bg(theme.rail)
-            .border_r_1()
-            .border_color(theme.hairline)
-            .pt(px(tokens::SPACE_24))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .h(px(52.0))
-                    .px(px(tokens::SPACE_16))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(tokens::SPACE_8))
-                            .child(img(averroes_logo_asset(cx)).size(px(20.0)).flex_none())
-                            .child(
-                                div()
-                                    .text_size(px(tokens::TEXT_TITLE2))
-                                    .font_weight(tokens::WEIGHT_SEMIBOLD)
-                                    .child(i18n::text(cx, "sidebar.brand")),
-                            ),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(tokens::SPACE_2))
-                            .child(
-                                Button::new("search-conversations")
-                                    .ghost()
-                                    .small()
-                                    .with_size(px(tokens::CONTROL_SMALL))
-                                    .selected(self.conversation_search_open)
-                                    .icon(IconName::Search)
-                                    .tooltip(i18n::text(cx, "sidebar.search"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.conversation_search_open =
-                                            !this.conversation_search_open;
-                                        if this.conversation_search_open {
-                                            this.refresh_conversation_search(cx);
-                                            this.schedule_semantic_conversation_search(cx);
-                                        } else {
-                                            this.conversation_search_results.clear();
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("open-settings-nav")
-                                    .ghost()
-                                    .small()
-                                    .with_size(px(tokens::CONTROL_SMALL))
-                                    .selected(self.route == Route::Connections)
-                                    .icon(IconName::Settings2)
-                                    .tooltip(i18n::text(cx, "settings.title"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.settings_tab = settings_entry_tab();
-                                        this.project_settings_open = false;
-                                        this.route = Route::Connections;
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
+            .pt(px(WindowChrome::TITLEBAR_HEIGHT))
+            .child(self.render_sidebar_navigation(cx))
             .child(search_panel)
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(SIDEBAR_GUTTER))
-                    .pb(px(tokens::SPACE_2))
-                    .child(
-                        SidebarRow::new("new-work", i18n::text(cx, "sidebar.new_work"))
-                            .icon_path("icons/square-pen.svg")
-                            .icon_color(theme.foreground)
-                            .render(theme)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.new_session(window, cx)),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(SIDEBAR_GUTTER))
-                    .pb(px(tokens::SPACE_12))
-                    .child(
-                        SidebarRow::new(
-                            "open-complements-nav",
-                            i18n::text(cx, "sidebar.complements"),
-                        )
-                        .icon_path("tools/skills.svg")
-                        .selected(complements_open)
-                        .render(theme)
-                        .on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.open_project_settings(window, cx)
-                            }),
-                        ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(SIDEBAR_GUTTER))
-                    .pb(px(tokens::SPACE_12))
-                    .child(
-                        SidebarRow::new(
-                            "open-scheduled-tasks-nav",
-                            i18n::text(cx, "sidebar.scheduled_tasks"),
-                        )
-                        .icon(IconName::Calendar)
-                        .selected(self.route == Route::ScheduledTasks)
-                        .render(theme)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.project_settings_open = false;
-                            this.refresh_scheduled_tasks();
-                            this.route = Route::ScheduledTasks;
-                            cx.notify();
-                        })),
-                    ),
-            )
             .child(
                 div()
                     .flex_1()
@@ -11798,28 +12565,37 @@ impl AverroesApp {
                             ),
                     )
                     .children(project_rows)
-                    .when(!recent_rows.is_empty(), |this| {
-                        this.child(section_header(
-                            theme,
-                            i18n::text(cx, "sidebar.recents"),
-                            tokens::SPACE_20,
-                        ))
-                        .children(recent_rows)
+                    .when(!recent_rows.is_empty(), |history| {
+                        history
+                            .child(section_header(
+                                theme,
+                                i18n::text(cx, "sidebar.recents"),
+                                tokens::SPACE_20,
+                            ))
+                            .children(recent_rows)
                     }),
             )
             .children(active_project_footer)
+            .child(self.render_resize_handle(ResizeTarget::Sidebar, cx))
             .into_any_element()
     }
 
     fn render_composer(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = UiTheme::current(cx);
-        let metrics = composer_metrics(compact);
+        let column = if compact {
+            self.shell_layout.workspace_width
+        } else {
+            self.shell_layout.reading_width
+        };
+        let available = (column - tokens::SPACE_24 * 2.0 - 2.0).max(240.0);
+        let metrics = composer_metrics(compact, available);
         let session = self.active();
         let has_connection = session.binding.connection_id.is_some();
         let has_model = session.binding.model_id.is_some();
         let token_rate_indicator = session
             .response_rate
             .display_rate(Instant::now())
+            .filter(|_| available >= 600.0)
             .map(|rate| {
                 let rate_label = i18n::format(
                     cx,
@@ -11881,7 +12657,13 @@ impl AverroesApp {
                                 this.remove_attachment(index, cx);
                             })),
                     );
-                fade_in(chip, animation_id, ATTACHMENT_FADE_DURATION).into_any_element()
+                fade_in(
+                    chip,
+                    animation_id,
+                    ATTACHMENT_FADE_DURATION,
+                    self.visuals.reduced_motion,
+                )
+                .into_any_element()
             })
             .collect::<Vec<_>>();
         let has_attachments = !attachment_chips.is_empty();
@@ -11897,7 +12679,7 @@ impl AverroesApp {
                     .active(theme.foreground.into()),
             )
             .with_size(px(metrics.send_size))
-            .rounded(px(tokens::RADIUS_SHEET))
+            .rounded_full()
             .tooltip(if session.processing {
                 i18n::text(cx, "composer.stop")
             } else {
@@ -11931,6 +12713,7 @@ impl AverroesApp {
                 send_button.icon(IconName::ArrowUp),
                 format!("composer-send-button-{}-idle", session.id.as_str()),
                 STATE_FADE_DURATION,
+                self.visuals.reduced_motion,
             )
             .into_any_element()
         };
@@ -11971,7 +12754,8 @@ impl AverroesApp {
         };
         div()
             .w_full()
-            .max_w(px(metrics.max_width))
+            .min_w(px(0.0))
+            .max_w(px(metrics.max_width.min(available)))
             .flex()
             .flex_col()
             .bg(theme.surface)
@@ -12013,6 +12797,7 @@ impl AverroesApp {
                             .items_start()
                             .child(
                                 Textarea::new(&self.composer)
+                                    .text_size(px(tokens::TEXT_MESSAGE))
                                     .flex_1()
                                     .min_w(px(120.0))
                                     .min_h(px(38.0))
@@ -12038,7 +12823,7 @@ impl AverroesApp {
                             "context-open"
                         })
                         .ghost()
-                        .with_size(px(28.0))
+                        .with_size(px(tokens::CONTROL_COMPACT))
                         .mr(px(tokens::SPACE_2))
                         .icon(IconName::Plus)
                         .tooltip(i18n::text(cx, "composer.attach_files"))
@@ -12128,6 +12913,10 @@ impl AverroesApp {
                 let pending_user_question = is_last_assistant
                     .then_some(session.pending_user_question.as_ref())
                     .flatten();
+                let conversation_artifacts = (is_last_assistant
+                    && !this.inspector.files_open()
+                    && !session.artifacts.is_empty())
+                .then(|| session.artifacts.clone());
                 let theme = UiTheme::current(cx);
                 div()
                     .id(SharedString::from(format!(
@@ -12143,20 +12932,29 @@ impl AverroesApp {
                     .pb(px(tokens::SPACE_32))
                     .flex()
                     .justify_center()
-                    .child(div().w_full().max_w(px(820.0)).child(render_message(
-                        session_id,
-                        index,
-                        message,
-                        processing,
-                        streaming,
-                        show_tool_activity,
-                        show_sources,
-                        conversation_sources,
-                        pending_user_question,
-                        &ask_user_input,
-                        theme,
-                        cx,
-                    )))
+                    .child({
+                        let message_element =
+                            div().w_full().max_w(px(760.0)).child(render_message(
+                                session_id,
+                                index,
+                                message,
+                                processing,
+                                streaming,
+                                show_tool_activity,
+                                show_sources,
+                                conversation_sources,
+                                pending_user_question,
+                                &ask_user_input,
+                                theme,
+                                cx,
+                            ));
+                        if let Some(artifacts) = conversation_artifacts {
+                            message_element
+                                .child(render_artifact_strip(session_id, &artifacts, theme, cx))
+                        } else {
+                            message_element
+                        }
+                    })
                     .into_any_element()
             }),
         )
@@ -12438,7 +13236,7 @@ impl AverroesApp {
             )
             .children(pending_steps);
 
-        div()
+        let content = div()
             .flex_1()
             .min_w(px(0.0))
             .h_full()
@@ -12459,7 +13257,7 @@ impl AverroesApp {
                             .flex()
                             .items_center()
                             .gap(px(tokens::SPACE_16))
-                            .child(img(averroes_logo_asset(cx)).size(px(64.0)))
+                            .child(logo(cx, 96.0))
                             .child(
                                 div()
                                     .flex()
@@ -12546,6 +13344,18 @@ impl AverroesApp {
                     )
                     .when(!setup_complete, |home| home.child(setup_panel)),
             )
+            .into_any_element();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(self.render_screen_toolbar(
+                i18n::text(cx, "sidebar.brand"),
+                i18n::text(cx, "home.title"),
+                gpui::Empty,
+                cx,
+            ))
+            .child(content)
             .into_any_element()
     }
 
@@ -12598,6 +13408,19 @@ impl AverroesApp {
             ProjectSettingsTab::Mcp => self.render_project_mcp_settings(&project, cx),
             ProjectSettingsTab::Skills => self.render_project_skills_settings(&project, cx),
         };
+        let back = Button::new("project-settings-back")
+            .ghost()
+            .small()
+            .icon(IconName::ArrowLeft)
+            .label(i18n::text(cx, "project.back_to_project"))
+            .text_size(px(tokens::TEXT_SMALL))
+            .on_click(cx.listener(|this, _, _, cx| this.close_project_settings(cx)));
+        let header = self.render_screen_toolbar(
+            project_name,
+            i18n::text(cx, "sidebar.complements"),
+            back,
+            cx,
+        );
         div()
             .flex()
             .flex_col()
@@ -12606,38 +13429,16 @@ impl AverroesApp {
             .min_w(px(0.0))
             .min_h(px(0.0))
             .overflow_hidden()
+            .child(header)
             .child(
                 div()
-                    .h(px(72.0))
-                    .px(px(tokens::SPACE_32))
+                    .flex_1()
+                    .min_h(px(0.0))
                     .flex()
-                    .items_center()
-                    .gap(px(tokens::SPACE_12))
-                    .child(
-                        Button::new("project-settings-back")
-                            .secondary()
-                            .icon(IconName::ArrowLeft)
-                            .label(i18n::text(cx, "project.back_to_project"))
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.close_project_settings(cx)),
-                            ),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_size(px(tokens::TEXT_TITLE3))
-                            .font_weight(tokens::WEIGHT_SEMIBOLD)
-                            .child(project_name),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(tokens::TEXT_SMALL))
-                            .text_color(theme.muted)
-                            .child(i18n::text(cx, "sidebar.complements")),
-                    ),
+                    .flex_col()
+                    .child(tab_bar)
+                    .child(body),
             )
-            .child(tab_bar)
-            .child(body)
             .into_any_element()
     }
 
@@ -12947,7 +13748,6 @@ impl AverroesApp {
             return self.render_agent_thread_chat(&thread_id, cx);
         }
         let theme = UiTheme::current(cx);
-        let brand_asset = averroes_logo_asset(cx);
         let session = self.active();
         let title = title_for_display(&session.title);
         let context_usage = session.context_usage;
@@ -12974,43 +13774,53 @@ impl AverroesApp {
             }
         }
         let patch_history = collect_patch_history(session, &agent_threads);
-        let patch_count = patch_history.len().to_string();
-        let has_patches = !patch_history.is_empty();
 
         if is_empty {
-            let empty_metrics = composer_metrics(true);
+            let empty_metrics = composer_metrics(true, self.shell_layout.workspace_width);
             return div()
                 .flex()
                 .flex_col()
-                .size_full()
+                .flex_1()
+                .w_full()
+                .max_w(px((self.shell_layout.workspace_width - 2.0).max(0.0)))
                 .min_w(px(0.0))
+                .min_h(px(0.0))
+                .child(self.render_screen_toolbar(
+                    i18n::text(cx, "sidebar.new_work"),
+                    "",
+                    gpui::Empty,
+                    cx,
+                ))
                 .child(
-                    div().flex_1().flex().items_center().justify_center().child(
-                        div()
-                            .w_full()
-                            .max_w(px(690.0))
-                            .px(px(tokens::SPACE_16))
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap(px(empty_metrics.empty_composer_gap))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .gap(px(empty_metrics.empty_brand_gap))
-                                    .child(
-                                        img(brand_asset)
-                                            .size(px(empty_metrics.empty_logo_size))
-                                            .flex_none(),
-                                    )
-                                    .text_size(px(empty_metrics.empty_title_size))
-                                    .font_weight(tokens::WEIGHT_MEDIUM)
-                                    .child(i18n::text(cx, "chat.ready")),
-                            )
-                            .child(self.render_composer_stack(true, &tasks, &session_id, cx)),
-                    ),
+                    div()
+                        .flex_1()
+                        .w_full()
+                        .min_h(px(0.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w_full()
+                                .max_w(px(700.0))
+                                .px(px(tokens::SPACE_16))
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(empty_metrics.empty_composer_gap))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .gap(px(empty_metrics.empty_brand_gap))
+                                        .child(logo(cx, empty_metrics.empty_logo_width))
+                                        .text_size(px(empty_metrics.empty_title_size))
+                                        .font_weight(tokens::WEIGHT_MEDIUM)
+                                        .child(i18n::text(cx, "chat.ready")),
+                                )
+                                .child(self.render_composer_stack(true, &tasks, &session_id, cx)),
+                        ),
                 )
                 .into_any_element();
         }
@@ -13021,8 +13831,8 @@ impl AverroesApp {
                 let checkpoint_id = checkpoint.id.clone();
                 let (icon, color) = match checkpoint.status {
                     CheckpointStatus::Completed => (IconName::CircleCheck, theme.success),
-                    CheckpointStatus::InProgress => (IconName::Loader, theme.warning),
-                    CheckpointStatus::Blocked => (IconName::CircleX, theme.destructive),
+                    CheckpointStatus::InProgress => (IconName::LoaderCircle, theme.accent_text),
+                    CheckpointStatus::Blocked => (IconName::Pause, theme.warning_text),
                     CheckpointStatus::Pending => (IconName::Ellipsis, theme.faint),
                 };
                 let message_position = checkpoint.message_position;
@@ -13035,9 +13845,11 @@ impl AverroesApp {
                 .small()
                 .text_color(color);
                 let marker = if checkpoint.status == CheckpointStatus::InProgress {
-                    marker.child(Icon::new(icon).with_animation(
+                    marker.child(animate_if(
+                        Icon::new(icon),
                         format!("checkpoint-spinner-{}-{checkpoint_id}", session_id.as_str()),
                         Animation::new(Duration::from_millis(800)).repeat(),
+                        !self.visuals.reduced_motion,
                         |icon, delta| {
                             icon.transform(Transformation::rotate(gpui::percentage(delta)))
                         },
@@ -13057,6 +13869,7 @@ impl AverroesApp {
                                 checkpoint.status
                             ),
                             STATE_FADE_DURATION,
+                            self.visuals.reduced_motion,
                         )
                         .into_any_element(),
                     )
@@ -13090,145 +13903,15 @@ impl AverroesApp {
             .min_w(px(0.0))
             .min_h(px(0.0))
             .overflow_hidden()
-            .child(
-                div()
-                    .flex_none()
-                    .h(px(46.0))
-                    .px(px(tokens::SPACE_16))
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(tokens::SPACE_2))
-                            .text_size(px(tokens::TEXT_BODY))
-                            .font_weight(tokens::WEIGHT_MEDIUM)
-                            .child(
-                                div()
-                                    .min_w(px(0.0))
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(title),
-                            )
-                            .child(header_actions)
-                            .when(has_tool_activity, |this| {
-                                this.child(
-                                    Button::new("toggle-tool-activity")
-                                        .ghost()
-                                        .small()
-                                        .icon(if self.show_tool_activity {
-                                            IconName::ChevronDown
-                                        } else {
-                                            IconName::ChevronRight
-                                        })
-                                        .tooltip(if self.show_tool_activity {
-                                            i18n::text(cx, "chat.hide_tool_activity")
-                                        } else {
-                                            i18n::text(cx, "chat.show_tool_activity")
-                                        })
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.toggle_tool_activity_visibility(cx);
-                                        })),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .id("context-usage-button")
-                            .flex_none()
-                            .h(px(30.0))
-                            .px(px(tokens::SPACE_8))
-                            .gap(px(tokens::SPACE_6))
-                            .rounded(px(tokens::RADIUS_CARD))
-                            .bg(if self.show_context {
-                                theme.accent_soft
-                            } else {
-                                theme.surface_subtle
-                            })
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme.accent_soft))
-                            .text_size(px(tokens::TEXT_CAPTION))
-                            .text_color(if self.show_context {
-                                theme.foreground
-                            } else {
-                                theme.muted
-                            })
-                            .child(
-                                Icon::new(if self.show_context {
-                                    IconName::PanelRightClose
-                                } else {
-                                    IconName::PanelRightOpen
-                                })
-                                .size(px(13.0))
-                                .text_color(theme.faint),
-                            )
-                            .child(
-                                div()
-                                    .font_weight(tokens::WEIGHT_MEDIUM)
-                                    .child(i18n::text(cx, "chat.context")),
-                            )
-                            .child(if context_busy {
-                                "…".to_string()
-                            } else {
-                                context_usage
-                                    .percentage()
-                                    .map(|percentage| format!("{percentage}%"))
-                                    .unwrap_or_else(|| "—".into())
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_context_sidebar(cx);
-                            })),
-                    )
-                    .when(has_patches, |this| {
-                        this.child(
-                            div()
-                                .id("patch-history-button")
-                                .ml(px(tokens::SPACE_6))
-                                .flex_none()
-                                .h(px(30.0))
-                                .px(px(tokens::SPACE_8))
-                                .gap(px(tokens::SPACE_6))
-                                .rounded(px(tokens::RADIUS_CARD))
-                                .bg(if self.show_patches {
-                                    theme.accent_soft
-                                } else {
-                                    theme.surface_subtle
-                                })
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(theme.accent_soft))
-                                .text_size(px(tokens::TEXT_CAPTION))
-                                .text_color(if self.show_patches {
-                                    theme.foreground
-                                } else {
-                                    theme.muted
-                                })
-                                .child(
-                                    Icon::new(IconName::File)
-                                        .size(px(13.0))
-                                        .text_color(theme.faint),
-                                )
-                                .child(
-                                    div()
-                                        .font_weight(tokens::WEIGHT_MEDIUM)
-                                        .child(i18n::text(cx, "chat.patches")),
-                                )
-                                .child(patch_count.clone())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.toggle_patch_history_sidebar(cx);
-                                })),
-                        )
-                    }),
-            )
+            .child(self.render_chat_toolbar(
+                title,
+                header_actions,
+                context_usage,
+                context_busy,
+                has_tool_activity,
+                patch_history.len(),
+                cx,
+            ))
             .child(
                 div()
                     .flex_1()
@@ -13255,7 +13938,7 @@ impl AverroesApp {
                                 div()
                                     .flex_none()
                                     .px(px(tokens::SPACE_24))
-                                    .pb(px(tokens::SPACE_16))
+                                    .pb(px(tokens::SPACE_2))
                                     .flex()
                                     .justify_center()
                                     .child(self.render_composer_stack(
@@ -13299,17 +13982,15 @@ impl AverroesApp {
                                 ),
                         )
                     })
-                    .when(self.show_context, |this| {
-                        this.child(self.render_context_sidebar(
+                    .when(self.inspector.active.is_some(), |this| {
+                        this.child(self.render_shared_inspector(
                             context_usage,
                             context_busy,
                             has_agent,
                             &agent_threads,
+                            &patch_history,
                             cx,
                         ))
-                    })
-                    .when(self.show_patches && !self.show_context, |this| {
-                        this.child(self.render_patch_history_sidebar(&patch_history, cx))
                     }),
             )
             .into_any_element()
@@ -13368,6 +14049,7 @@ impl AverroesApp {
                             format!("agent-thread-waiting-{thread_id}"),
                             theme,
                             4.0,
+                            reduced_motion(cx),
                         )
                     } else {
                         i18n::text(cx, "chat.waiting_output").into_any_element()
@@ -13391,7 +14073,12 @@ impl AverroesApp {
             )
         };
         let status = if thread.status == AgentThreadStatus::Running {
-            render_activity_indicator(format!("agent-thread-status-{thread_id}"), theme, 3.0)
+            render_activity_indicator(
+                format!("agent-thread-status-{thread_id}"),
+                theme,
+                3.0,
+                reduced_motion(cx),
+            )
         } else {
             div()
                 .text_size(px(tokens::TEXT_CAPTION))
@@ -13408,7 +14095,7 @@ impl AverroesApp {
             .child(
                 div()
                     .flex_none()
-                    .h(px(46.0))
+                    .h(px(tokens::TOOLBAR_HEIGHT))
                     .px(px(tokens::SPACE_16))
                     .flex()
                     .items_center()
@@ -13477,7 +14164,7 @@ impl AverroesApp {
             .into_any_element()
     }
 
-    fn render_patch_history_sidebar(
+    fn render_patch_history_contents(
         &self,
         entries: &[PatchHistoryEntry],
         cx: &mut Context<Self>,
@@ -13618,45 +14305,11 @@ impl AverroesApp {
         );
 
         div()
-            .flex_none()
-            .w(px(360.0))
+            .size_full()
             .min_h(px(0.0))
-            .bg(theme.background)
-            .border_l_1()
-            .border_color(theme.border)
             .px(px(tokens::SPACE_16))
             .py(px(tokens::SPACE_16))
             .overflow_y_scrollbar()
-            .child(
-                div()
-                    .h(px(30.0))
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .gap(px(tokens::SPACE_8))
-                            .text_size(px(tokens::TEXT_BODY))
-                            .font_weight(tokens::WEIGHT_SEMIBOLD)
-                            .child(
-                                Icon::new(IconName::File)
-                                    .size(px(14.0))
-                                    .text_color(theme.faint),
-                            )
-                            .child(i18n::text(cx, "chat.patch_history")),
-                    )
-                    .child(
-                        Button::new("close-patch-history-sidebar")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Close)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_patch_history_sidebar(cx);
-                            })),
-                    ),
-            )
             .child(
                 div()
                     .mt(px(tokens::SPACE_8))
@@ -13677,7 +14330,7 @@ impl AverroesApp {
             .into_any_element()
     }
 
-    fn render_context_sidebar(
+    fn render_context_contents(
         &self,
         usage: ContextUsage,
         context_busy: bool,
@@ -13871,45 +14524,11 @@ impl AverroesApp {
         });
 
         div()
-            .flex_none()
-            .w(px(304.0))
+            .size_full()
             .min_h(px(0.0))
-            .bg(theme.background)
-            .border_l_1()
-            .border_color(theme.border)
             .px(px(tokens::SPACE_16))
             .py(px(tokens::SPACE_16))
             .overflow_y_scrollbar()
-            .child(
-                div()
-                    .h(px(30.0))
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .gap(px(tokens::SPACE_8))
-                            .text_size(px(tokens::TEXT_BODY))
-                            .font_weight(tokens::WEIGHT_SEMIBOLD)
-                            .child(
-                                Icon::new(IconName::PanelRightClose)
-                                    .size(px(14.0))
-                                    .text_color(theme.faint),
-                            )
-                            .child(i18n::text(cx, "chat.context")),
-                    )
-                    .child(
-                        Button::new("close-context-sidebar")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Close)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_context_sidebar(cx);
-                            })),
-                    ),
-            )
             .child(
                 div()
                     .mt(px(tokens::SPACE_12))
@@ -14063,7 +14682,7 @@ impl AverroesApp {
                         } else {
                             i18n::text(cx, "chat.compact_now")
                         })
-                        .loading(context_busy)
+                        .loading(context_busy && !reduced_motion(cx))
                         .disabled(context_busy || !has_agent)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.force_compact_active(cx);
@@ -14086,6 +14705,32 @@ impl AverroesApp {
 
     fn render_connections(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = UiTheme::current(cx);
+        let page = match self.settings_tab {
+            SettingsTab::Models => self.render_settings_models(cx),
+            SettingsTab::Agents => self.render_settings_agents(cx),
+            SettingsTab::Appearance => self.render_settings_appearance(cx),
+            SettingsTab::RemoteAgent => self.render_settings_remote_agent(cx),
+            SettingsTab::Diagnostics => self.render_settings_diagnostics(cx),
+            SettingsTab::Storage => self.render_settings_storage(cx),
+            SettingsTab::About => self.render_settings_about(cx),
+        };
+        let back = Button::new("back-to-chat")
+            .ghost()
+            .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+            .rounded(px(tokens::SPACE_8))
+            .icon(IconName::ArrowLeft)
+            .label(i18n::text(cx, "settings.back_to_work"))
+            .text_size(px(tokens::TEXT_SMALL))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.route = Route::Chat;
+                cx.notify();
+            }));
+        let header = self.render_screen_toolbar(
+            i18n::text(cx, "settings.title"),
+            i18n::text(cx, settings_tab_description(self.settings_tab)),
+            back,
+            cx,
+        );
         div()
             .flex()
             .flex_col()
@@ -14094,84 +14739,86 @@ impl AverroesApp {
             .min_w(px(0.0))
             .min_h(px(0.0))
             .overflow_hidden()
+            .child(header)
             .child(
                 div()
-                    .h(px(72.0))
-                    .px(px(tokens::SPACE_32))
+                    .flex_1()
+                    .min_h(px(0.0))
                     .flex()
-                    .items_center()
+                    .child(self.render_settings_navigation(theme, cx))
                     .child(
                         div()
                             .flex_1()
-                            .child(
-                                div()
-                                    .font(UiTheme::display_font())
-                                    .font_weight(tokens::WEIGHT_SEMIBOLD)
-                                    .child(i18n::text(cx, "settings.title")),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(tokens::TEXT_CAPTION))
-                                    .text_color(theme.faint)
-                                    .child(i18n::text(
-                                        cx,
-                                        settings_tab_description(self.settings_tab),
-                                    )),
-                            ),
-                    )
-                    .child(
-                        Button::new("back-to-chat")
-                            .secondary()
-                            .icon(IconName::ArrowLeft)
-                            .label(i18n::text(cx, "settings.back_to_work"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.route = Route::Chat;
-                                cx.notify();
-                            })),
+                            .min_w(px(0.0))
+                            .min_h(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .child(page),
                     ),
             )
-            .child(self.render_settings_tabs(theme, cx))
-            .when(self.settings_tab == SettingsTab::Models, |this| {
-                this.child(self.render_settings_models(cx))
-            })
-            .when(self.settings_tab == SettingsTab::Agents, |this| {
-                this.child(self.render_settings_agents(cx))
-            })
-            .when(self.settings_tab == SettingsTab::RemoteAgent, |this| {
-                this.child(self.render_settings_remote_agent(cx))
-            })
-            .when(self.settings_tab == SettingsTab::Diagnostics, |this| {
-                this.child(self.render_settings_diagnostics(cx))
-            })
-            .when(self.settings_tab == SettingsTab::Storage, |this| {
-                this.child(self.render_settings_storage(cx))
-            })
-            .when(self.settings_tab == SettingsTab::About, |this| {
-                this.child(self.render_settings_about(cx))
-            })
             .child(self.render_status_line(cx))
             .into_any_element()
     }
 
-    fn render_settings_tabs(&self, theme: UiTheme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_settings_navigation(&self, theme: UiTheme, cx: &mut Context<Self>) -> AnyElement {
         let tabs = [
-            (SettingsTab::Models, "settings.models", "models"),
-            (SettingsTab::Agents, "settings.agents", "agents"),
+            (
+                SettingsTab::Models,
+                "settings.models",
+                "models",
+                IconName::Cpu,
+            ),
+            (
+                SettingsTab::Agents,
+                "settings.agents",
+                "agents",
+                IconName::Bot,
+            ),
+            (
+                SettingsTab::Appearance,
+                "settings.appearance",
+                "appearance",
+                IconName::Palette,
+            ),
             (
                 SettingsTab::RemoteAgent,
                 "settings.remote_agent",
                 "remote-agent",
+                IconName::Network,
             ),
             (
                 SettingsTab::Diagnostics,
                 "settings.diagnostics",
                 "diagnostics",
+                IconName::SquareTerminal,
             ),
-            (SettingsTab::Storage, "settings.storage", "storage"),
-            (SettingsTab::About, "settings.about", "about"),
+            (
+                SettingsTab::Storage,
+                "settings.storage",
+                "storage",
+                IconName::HardDrive,
+            ),
+            (
+                SettingsTab::About,
+                "settings.about",
+                "about",
+                IconName::Info,
+            ),
         ];
-        toolbar_surface(theme)
-            .children(tabs.into_iter().map(|(tab, label, key)| {
+        div()
+            .id("settings-navigation")
+            .bg(theme.surface_subtle.opacity(0.55))
+            .w(px(177.0))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .p(px(tokens::SPACE_12))
+            .gap(px(tokens::SPACE_4))
+            .border_r_1()
+            .border_color(theme.hairline)
+            .overflow_y_scrollbar()
+            .children(tabs.into_iter().map(|(tab, label, key, icon)| {
                 let selected = self.settings_tab == tab;
                 segmented_tab(
                     theme,
@@ -14179,11 +14826,153 @@ impl AverroesApp {
                     i18n::text(cx, label),
                     selected,
                 )
+                .icon(Icon::new(icon).size(px(tokens::ICON_SIZE)))
+                .text_color(if selected {
+                    theme.accent_text
+                } else {
+                    theme.muted
+                })
+                .justify_start()
+                .gap(px(tokens::SPACE_8))
+                .px(px(tokens::SPACE_12))
+                .rounded(px(tokens::SPACE_8))
+                .when(selected, |button| {
+                    button.custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(theme.accent_soft.into())
+                            .foreground(theme.accent_text.into())
+                            .hover(theme.accent_soft.into())
+                            .active(theme.accent_soft.into()),
+                    )
+                })
+                .w_full()
+                .h_auto()
+                .min_h(px(38.0))
+                .py(px(tokens::SPACE_6))
+                .text_size(px(tokens::TEXT_SMALL))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.settings_tab = tab;
                     cx.notify();
                 }))
             }))
+            .into_any_element()
+    }
+
+    fn render_settings_appearance(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let preference = self.runtime.config().appearance;
+        let automatic = preference.material == MaterialPreference::Automatic;
+        let system = macos_material::system_visual_options();
+        let material_help = if automatic && system.reduce_transparency {
+            "appearance.system_opaque"
+        } else if automatic && self.visuals.material == MaterialMode::Opaque {
+            "appearance.fallback_opaque"
+        } else {
+            "appearance.material_description"
+        };
+        let material = div()
+            .flex_none()
+            .flex()
+            .gap(px(tokens::SPACE_2))
+            .p(px(tokens::SPACE_2))
+            .rounded(px(tokens::RADIUS_CONTROL))
+            .bg(theme.surface_subtle)
+            .children(
+                [
+                    (
+                        MaterialPreference::Automatic,
+                        "appearance.automatic",
+                        "automatic",
+                    ),
+                    (MaterialPreference::Opaque, "appearance.opaque", "opaque"),
+                ]
+                .into_iter()
+                .map(|(value, label, key)| {
+                    segmented_tab(
+                        theme,
+                        SharedString::from(format!("material-{key}")),
+                        i18n::text(cx, label),
+                        preference.material == value,
+                    )
+                    .text_size(px(tokens::TEXT_SMALL))
+                    .h(px(tokens::SETTINGS_ACTION_HEIGHT))
+                    .px(px(tokens::SPACE_8))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let mut next = this.runtime.config().appearance;
+                        next.material = value;
+                        this.save_appearance(next, window, cx);
+                    }))
+                }),
+            );
+        let motion = div()
+            .flex_none()
+            .flex()
+            .gap(px(tokens::SPACE_2))
+            .p(px(tokens::SPACE_2))
+            .rounded(px(tokens::RADIUS_CONTROL))
+            .bg(theme.surface_subtle)
+            .children(
+                [
+                    (
+                        MotionPreference::FollowSystem,
+                        "appearance.follow_system",
+                        "system",
+                    ),
+                    (MotionPreference::Reduced, "appearance.reduced", "reduced"),
+                ]
+                .into_iter()
+                .map(|(value, label, key)| {
+                    segmented_tab(
+                        theme,
+                        SharedString::from(format!("motion-{key}")),
+                        i18n::text(cx, label),
+                        preference.motion == value,
+                    )
+                    .text_size(px(tokens::TEXT_SMALL))
+                    .h(px(tokens::SETTINGS_ACTION_HEIGHT))
+                    .px(px(tokens::SPACE_8))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let mut next = this.runtime.config().appearance;
+                        next.motion = value;
+                        this.save_appearance(next, window, cx);
+                    }))
+                }),
+            );
+        div()
+            .id("appearance-settings")
+            .size_full()
+            .overflow_y_scrollbar()
+            .p(px(tokens::SPACE_32))
+            .child(
+                div()
+                    .max_w(px(tokens::SETTINGS_PAGE_WIDTH))
+                    .mx_auto()
+                    .child(settings_page_title(
+                        i18n::text(cx, "settings.appearance"),
+                        i18n::text(cx, "settings.appearance_description"),
+                        theme,
+                    ))
+                    .child(
+                        settings_group(theme)
+                            .mt(px(tokens::SPACE_24))
+                            .child(settings_row(
+                                theme,
+                                i18n::text(cx, "appearance.material"),
+                                i18n::text(cx, material_help),
+                                material,
+                            ))
+                            .child(
+                                settings_row(
+                                    theme,
+                                    i18n::text(cx, "appearance.motion"),
+                                    i18n::text(cx, "appearance.motion_description"),
+                                    motion,
+                                )
+                                .border_t_1()
+                                .border_color(theme.hairline),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -14262,24 +15051,25 @@ impl AverroesApp {
         };
 
         div()
+            .id("remote-agent-settings-scroll")
             .flex_1()
             .min_h(px(0.0))
-            .overflow_hidden()
+            .overflow_y_scrollbar()
             .child(
                 div()
                     .mx_auto()
                     .w_full()
-                    .max_w(px(1100.0))
-                    .h_full()
+                    .max_w(px(tokens::SETTINGS_PAGE_WIDTH))
                     .px(px(tokens::SPACE_32))
                     .py(px(tokens::SPACE_32))
                     .flex()
+                    .flex_col()
                     .gap(px(tokens::SPACE_24))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .flex_1()
+                            .flex_none().w_full()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
                             .child(settings_page_title(
@@ -14439,17 +15229,13 @@ impl AverroesApp {
                             )
                     )
                     .child(
-                        div()
+                        settings_group(theme)
                             .flex_none()
-                            .w(px(330.0))
-                            .h_full()
+                            .w_full()
                             .min_h(px(0.0))
                             .flex()
                             .flex_col()
-                            .overflow_y_scrollbar()
                             .p(px(tokens::SPACE_16))
-                            .rounded(px(tokens::RADIUS_CARD))
-                            .bg(theme.surface_subtle)
                             .child(
                                 div()
                                     .font(UiTheme::display_font())
@@ -14466,7 +15252,7 @@ impl AverroesApp {
                                     .child(i18n::text(cx, "settings.remote_agent_connect_description")),
                             )
                             .child(form_label(i18n::text(cx, "settings.remote_agent_token"), theme))
-                            .child(Input::new(&self.remote_agent_token_input).w_full().mask_toggle())
+                            .child(settings_input(&self.remote_agent_token_input).mask_toggle())
                             .child(
                                 div()
                                     .mt(px(tokens::SPACE_8))
@@ -14708,16 +15494,10 @@ impl AverroesApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let status = self.embedding_status.clone();
-        let status_text = match status.as_ref() {
-            Some(status) if status.config.is_some() => format!(
-                "Indexed {} of {} conversations · {} fragments",
-                status.indexed_conversations, status.total_conversations, status.indexed_fragments
-            ),
-            _ => i18n::text(cx, "settings.not_configured").to_string(),
-        };
+        let status_text = embedding_status_text(cx.global::<i18n::Localization>(), status.as_ref());
         let has_provider = self.embedding_connection_id.is_some();
         let has_model = self.embedding_model_id.is_some();
-        card(theme, tokens::SPACE_16)
+        settings_card(theme)
             .mt(px(tokens::SPACE_24))
             .child(
                 div()
@@ -14725,11 +15505,15 @@ impl AverroesApp {
                     .items_center()
                     .gap(px(tokens::SPACE_8))
                     .child(
+                        Icon::new(IconName::MemoryStick)
+                            .size(px(tokens::ICON_SIZE))
+                            .text_color(theme.accent_text),
+                    )
+                    .child(
                         div()
                             .font_weight(tokens::WEIGHT_SEMIBOLD)
                             .child(i18n::text(cx, "settings.memory_title")),
-                    )
-                    .child(badge(theme, status_text.clone())),
+                    ),
             )
             .child(
                 div()
@@ -14742,7 +15526,7 @@ impl AverroesApp {
                 div()
                     .mt(px(tokens::SPACE_16))
                     .flex()
-                    .gap(px(tokens::SPACE_8))
+                    .gap(px(tokens::SPACE_12))
                     .child(
                         div()
                             .flex_1()
@@ -14753,6 +15537,7 @@ impl AverroesApp {
                             .child(
                                 Select::new(&self.embedding_connection_select)
                                     .w_full()
+                                    .h(px(tokens::SETTINGS_CONTROL_HEIGHT))
                                     .placeholder(i18n::text(cx, "settings.choose_provider"))
                                     .search_placeholder(i18n::text(
                                         cx,
@@ -14770,6 +15555,7 @@ impl AverroesApp {
                             .child(
                                 Select::new(&self.embedding_model_select)
                                     .w_full()
+                                    .h(px(tokens::SETTINGS_CONTROL_HEIGHT))
                                     .placeholder(i18n::text(cx, "settings.choose_embedding_model"))
                                     .search_placeholder(i18n::text(cx, "settings.search_models"))
                                     .disabled(
@@ -14787,21 +15573,23 @@ impl AverroesApp {
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(tokens::TEXT_CAPTION))
-                            .text_color(theme.faint)
+                            .min_w(px(0.0))
+                            .text_size(px(tokens::TEXT_SMALL))
+                            .text_color(theme.muted)
                             .child(status_text),
                     )
                     .child(
                         Button::new("build-conversation-index")
                             .primary()
-                            .small()
-                            .icon(IconName::CircleCheck)
+                            .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                            .rounded(px(tokens::SPACE_8))
+                            .icon(IconName::Redo2)
                             .label(if self.embedding_index_busy {
                                 i18n::text(cx, "settings.building")
                             } else {
                                 i18n::text(cx, "settings.save_build_index")
                             })
-                            .loading(self.embedding_index_busy)
+                            .loading(self.embedding_index_busy && !reduced_motion(cx))
                             .disabled(!has_provider || !has_model || self.embedding_index_busy)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.compile_embedding_index(window, cx)
@@ -14813,6 +15601,7 @@ impl AverroesApp {
 
     fn render_settings_models(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = UiTheme::current(cx);
+        let compact = self.shell_layout.workspace_width < 840.0;
         let profiles = self.runtime.connections();
         let mut rows = Vec::new();
         for profile in profiles {
@@ -14839,9 +15628,11 @@ impl AverroesApp {
                     .items_center()
                     .gap(px(tokens::SPACE_12))
                     .px(px(tokens::SPACE_16))
-                    .py(px(tokens::SPACE_12))
-                    .bg(theme.surface_subtle)
-                    .rounded(px(tokens::RADIUS_CARD))
+                    .py(px(tokens::SPACE_16))
+                    .min_h(px(72.0))
+                    .bg(theme.surface)
+                    .border_b_1()
+                    .border_color(theme.hairline)
                     .child(
                         div()
                             .flex()
@@ -14849,7 +15640,7 @@ impl AverroesApp {
                             .justify_center()
                             .size(px(34.0))
                             .rounded(px(tokens::RADIUS_CARD))
-                            .bg(gpui::rgb(0xf3f4f6))
+                            .bg(theme.surface_subtle)
                             .child(provider_logo(profile.kind, 18.0)),
                     )
                     .child(
@@ -14858,7 +15649,8 @@ impl AverroesApp {
                             .min_w(px(0.0))
                             .child(
                                 div()
-                                    .font_weight(tokens::WEIGHT_SEMIBOLD)
+                                    .font_weight(tokens::WEIGHT_MEDIUM)
+                                    .truncate()
                                     .child(profile.name),
                             )
                             .child(
@@ -14873,15 +15665,10 @@ impl AverroesApp {
                                     )),
                             ),
                     )
-                    .child(
-                        div()
-                            .text_size(px(tokens::TEXT_SMALL))
-                            .text_color(if model_count == 0 {
-                                theme.faint
-                            } else {
-                                theme.foreground
-                            })
-                            .child(format!(
+                    .when(!compact, |row| {
+                        row.child(badge(
+                            theme,
+                            format!(
                                 "{model_count} {}",
                                 i18n::text(
                                     cx,
@@ -14891,14 +15678,19 @@ impl AverroesApp {
                                         "settings.models_count"
                                     }
                                 )
-                            )),
-                    )
+                            ),
+                        ))
+                    })
                     .child(
                         Button::new(format!("add-model-{}", connection_id))
                             .ghost()
-                            .small()
+                            .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                            .rounded(px(tokens::SPACE_8))
                             .icon(IconName::Plus)
-                            .label(i18n::text(cx, "settings.add_model"))
+                            .tooltip(i18n::text(cx, "settings.add_model"))
+                            .when(!compact, |button| {
+                                button.label(i18n::text(cx, "settings.add_model"))
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.manual_model_connection = Some(connection_id.clone());
                                 cx.notify();
@@ -14907,8 +15699,13 @@ impl AverroesApp {
                     .child(
                         Button::new(format!("remove-provider-{}", profile.id))
                             .ghost()
-                            .small()
-                            .icon(IconName::Delete)
+                            .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                            .rounded(px(tokens::SPACE_8))
+                            .icon(
+                                Icon::default()
+                                    .path("icons/trash.svg")
+                                    .size(px(tokens::ICON_SIZE)),
+                            )
                             .tooltip(i18n::text(cx, "settings.remove_provider"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.delete_connection(delete_connection_id.clone(), window, cx)
@@ -14921,27 +15718,28 @@ impl AverroesApp {
         let manual_model_card = self.render_manual_model_card(theme, cx);
 
         div()
+            .id("models-settings-scroll")
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .overflow_hidden()
+            .overflow_y_scrollbar()
             .child(
                 div()
                     .mx_auto()
                     .w_full()
-                    .max_w(px(1100.0))
-                    .flex_1()
-                    .min_h(px(0.0))
+                    .max_w(px(tokens::SETTINGS_PAGE_WIDTH))
                     .px(px(tokens::SPACE_32))
                     .py(px(tokens::SPACE_32))
                     .flex()
+                    .flex_col()
                     .gap(px(tokens::SPACE_24))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .flex_1()
+                            .flex_none()
+                            .w_full()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
                             .child(settings_page_title(
@@ -14966,7 +15764,8 @@ impl AverroesApp {
                                     .child(
                                         Button::new("refresh-model-catalogs")
                                             .ghost()
-                                            .small()
+                                            .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                                            .rounded(px(tokens::SPACE_8))
                                             .icon(IconName::Redo2)
                                             .label(i18n::text(cx, "settings.refresh_catalogs"))
                                             .on_click(cx.listener(|this, _, _, cx| {
@@ -14975,15 +15774,10 @@ impl AverroesApp {
                                     ),
                             )
                             .child(
-                                div()
+                                settings_group(theme)
                                     .id("connected-providers-scroll")
                                     .mt(px(tokens::SPACE_8))
-                                    .flex_1()
-                                    .min_h(px(0.0))
-                                    .overflow_y_scrollbar()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(tokens::SPACE_8))
+                                    .flex_none()
                                     .when(rows.is_empty(), |this| {
                                         this.child(settings_empty_state(
                                             i18n::text(cx, "settings.no_providers"),
@@ -15014,8 +15808,9 @@ impl AverroesApp {
                     .items_center()
                     .gap(px(tokens::SPACE_12))
                     .p(px(tokens::SPACE_12))
-                    .rounded(px(tokens::RADIUS_CARD))
-                    .bg(theme.surface_subtle)
+                    .bg(theme.surface)
+                    .border_b_1()
+                    .border_color(theme.hairline)
                     .child(
                         div()
                             .flex_1()
@@ -15045,7 +15840,8 @@ impl AverroesApp {
                     .child(
                         Button::new(format!("edit-agent-{}", agent.id))
                             .ghost()
-                            .small()
+                            .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                            .rounded(px(tokens::SPACE_8))
                             .icon(IconName::Settings2)
                             .label(i18n::text(cx, "settings.edit_agent"))
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -15055,8 +15851,13 @@ impl AverroesApp {
                     .child(
                         Button::new(format!("delete-agent-{}", agent.id))
                             .ghost()
-                            .small()
-                            .icon(IconName::Delete)
+                            .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                            .rounded(px(tokens::SPACE_8))
+                            .icon(
+                                Icon::default()
+                                    .path("icons/trash.svg")
+                                    .size(px(tokens::ICON_SIZE)),
+                            )
                             .tooltip(i18n::text(cx, "settings.remove_agent"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.delete_agent_profile(delete_id.clone(), cx)
@@ -15069,24 +15870,26 @@ impl AverroesApp {
         let model_selected = self.agent_form_model_id.is_some();
 
         div()
+            .id("agents-settings-scroll")
             .flex_1()
             .min_h(px(0.0))
-            .overflow_hidden()
+            .overflow_y_scrollbar()
             .child(
                 div()
                     .mx_auto()
                     .w_full()
-                    .max_w(px(1100.0))
-                    .h_full()
+                    .max_w(px(tokens::SETTINGS_PAGE_WIDTH))
                     .px(px(tokens::SPACE_32))
                     .py(px(tokens::SPACE_32))
                     .flex()
+                    .flex_col()
                     .gap(px(tokens::SPACE_24))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .flex_1()
+                            .flex_none()
+                            .w_full()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
                             .child(settings_page_title(
@@ -15095,15 +15898,10 @@ impl AverroesApp {
                                 theme,
                             ))
                             .child(
-                                div()
+                                settings_group(theme)
                                     .id("configured-agents-scroll")
                                     .mt(px(tokens::SPACE_20))
-                                    .flex_1()
-                                    .min_h(px(0.0))
-                                    .overflow_y_scrollbar()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(tokens::SPACE_8))
+                                    .flex_none()
                                     .when(rows.is_empty(), |this| {
                                         this.child(settings_empty_state(
                                             i18n::text(cx, "settings.no_agents"),
@@ -15115,17 +15913,13 @@ impl AverroesApp {
                             ),
                     )
                     .child(
-                        div()
+                        settings_group(theme)
                             .flex_none()
-                            .w(px(330.0))
-                            .h_full()
+                            .w_full()
                             .min_h(px(0.0))
                             .flex()
                             .flex_col()
-                            .overflow_y_scrollbar()
-                            .p(px(tokens::SPACE_16))
-                            .rounded(px(tokens::RADIUS_CARD))
-                            .bg(theme.surface_subtle)
+                            .p(px(tokens::SPACE_20))
                             .child(
                                 div()
                                     .font(UiTheme::display_font())
@@ -15146,12 +15940,12 @@ impl AverroesApp {
                                     .child(i18n::text(cx, "settings.agent_description_help")),
                             )
                             .child(form_label(i18n::text(cx, "settings.agent_name"), theme))
-                            .child(Input::new(&self.agent_name_input).w_full())
+                            .child(settings_input(&self.agent_name_input))
                             .child(
                                 form_label(i18n::text(cx, "settings.agent_description"), theme)
                                     .mt(px(tokens::SPACE_12)),
                             )
-                            .child(Input::new(&self.agent_description_input).w_full())
+                            .child(settings_input(&self.agent_description_input))
                             .child(
                                 form_label(i18n::text(cx, "settings.agent_model"), theme)
                                     .mt(px(tokens::SPACE_12)),
@@ -15159,9 +15953,7 @@ impl AverroesApp {
                             .child(
                                 Select::new(&self.agent_model_select)
                                     .w_full()
-                                    .h(px(28.0))
-                                    .small()
-                                    .appearance(false)
+                                    .h(px(tokens::SETTINGS_CONTROL_HEIGHT))
                                     .placeholder(i18n::text(cx, "composer.model"))
                                     .search_placeholder(i18n::text(cx, "composer.search_models"))
                                     .disabled(self.model_choices.is_empty()),
@@ -15175,6 +15967,8 @@ impl AverroesApp {
                                     .child(
                                         Button::new("save-agent")
                                             .primary()
+                                            .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                                            .rounded(px(tokens::SPACE_8))
                                             .icon(IconName::CircleCheck)
                                             .label(i18n::text(cx, "settings.save_agent"))
                                             .disabled(!model_selected)
@@ -15205,12 +15999,12 @@ impl AverroesApp {
             && (!copilot || self.show_manual_copilot_token);
         let copilot_uses_login = copilot && self.key_input.read(cx).value().trim().is_empty();
 
-        card(theme, tokens::SPACE_16)
+        settings_card(theme)
             .id("settings-add-provider-form")
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(330.0))
+            .w_full()
             .child(
                 div()
                     .font(UiTheme::display_font())
@@ -15234,6 +16028,7 @@ impl AverroesApp {
                 div().flex_none().w_full().h(px(34.0)).child(
                     Select::new(&self.kind_select)
                         .w_full()
+                        .h(px(tokens::SETTINGS_CONTROL_HEIGHT))
                         .placeholder(i18n::text(cx, "settings.choose_provider")),
                 ),
             )
@@ -15243,7 +16038,7 @@ impl AverroesApp {
                     .flex_none()
                     .w_full()
                     .h(px(34.0))
-                    .child(Input::new(&self.name_input).w_full()),
+                    .child(settings_input(&self.name_input)),
             )
             .when(needs_base_url, |this| {
                 this.child(
@@ -15254,7 +16049,7 @@ impl AverroesApp {
                         .flex_none()
                         .w_full()
                         .h(px(34.0))
-                        .child(Input::new(&self.url_input).w_full()),
+                        .child(settings_input(&self.url_input)),
                 )
             })
             .when(needs_key, |this| {
@@ -15274,7 +16069,7 @@ impl AverroesApp {
                         .flex_none()
                         .w_full()
                         .h(px(34.0))
-                        .child(Input::new(&self.key_input).w_full().mask_toggle()),
+                        .child(settings_input(&self.key_input).mask_toggle()),
                 )
             })
             .when(codex, |this| {
@@ -15297,7 +16092,8 @@ impl AverroesApp {
                 .child(
                     Button::new("toggle-models-copilot-token")
                         .ghost()
-                        .small()
+                        .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                        .rounded(px(tokens::SPACE_8))
                         .label(if self.show_manual_copilot_token {
                             i18n::text(cx, "settings.sign_in_github_instead")
                         } else {
@@ -15350,6 +16146,8 @@ impl AverroesApp {
                         this.child(
                             Button::new("models-connect-chatgpt")
                                 .secondary()
+                                .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                                .rounded(px(tokens::SPACE_8))
                                 .icon(IconName::ExternalLink)
                                 .label(
                                     if self
@@ -15357,27 +16155,30 @@ impl AverroesApp {
                                         .as_ref()
                                         .is_some_and(|account| account.authenticated)
                                     {
-                                        "Reconnect ChatGPT"
+                                        i18n::text(cx, "settings.reconnect")
                                     } else {
-                                        "Continue with ChatGPT"
+                                        i18n::text(cx, "settings.continue_chatgpt")
                                     },
                                 )
-                                .loading(self.codex_busy)
+                                .loading(self.codex_busy && !reduced_motion(cx))
+                                .disabled(self.codex_busy)
                                 .on_click(cx.listener(|this, _, _, cx| this.start_codex_login(cx))),
                         )
                     })
                     .child(
                         Button::new("models-save-provider")
                             .primary()
+                            .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                            .rounded(px(tokens::SPACE_8))
                             .icon(if copilot_uses_login {
                                 IconName::Github
                             } else {
                                 IconName::CircleCheck
                             })
                             .label(if copilot_uses_login {
-                                "Continue with GitHub"
+                                i18n::text(cx, "settings.continue_github")
                             } else {
-                                "Save provider"
+                                i18n::text(cx, "settings.save_connection")
                             })
                             .disabled(selected_kind.is_none())
                             .on_click(
@@ -15398,7 +16199,7 @@ impl AverroesApp {
             .map(|profile| profile.name)
             .unwrap_or_else(|| "integration".into());
         let save_connection_id = connection_id.clone();
-        card(theme, tokens::SPACE_16)
+        settings_card(theme)
             .mt(px(tokens::SPACE_16))
             .child(
                 div()
@@ -15408,12 +16209,17 @@ impl AverroesApp {
                         div()
                             .flex_1()
                             .font_weight(tokens::WEIGHT_SEMIBOLD)
-                            .child(format!("Add a model to {connection_name}")),
+                            .child(i18n::format(
+                                cx,
+                                "settings.add_model_to",
+                                &[("connection", connection_name)],
+                            )),
                     )
                     .child(
                         Button::new("cancel-manual-model")
                             .ghost()
-                            .small()
+                            .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                            .rounded(px(tokens::SPACE_8))
                             .label(i18n::text(cx, "dialog.cancel"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.manual_model_connection = None;
@@ -15430,13 +16236,13 @@ impl AverroesApp {
                         div()
                             .flex_1()
                             .child(form_label(i18n::text(cx, "settings.model_id"), theme))
-                            .child(Input::new(&self.manual_model_id_input).w_full()),
+                            .child(settings_input(&self.manual_model_id_input)),
                     )
                     .child(
                         div()
                             .flex_1()
                             .child(form_label(i18n::text(cx, "settings.display_name"), theme))
-                            .child(Input::new(&self.manual_model_name_input).w_full()),
+                            .child(settings_input(&self.manual_model_name_input)),
                     ),
             )
             .child(
@@ -15446,7 +16252,7 @@ impl AverroesApp {
                         i18n::text(cx, "settings.reasoning_levels"),
                         theme,
                     ))
-                    .child(Input::new(&self.manual_model_reasoning_input).w_full()),
+                    .child(settings_input(&self.manual_model_reasoning_input)),
             )
             .child(
                 div()
@@ -15459,6 +16265,8 @@ impl AverroesApp {
                 div().mt(px(tokens::SPACE_12)).flex().justify_end().child(
                     Button::new("save-manual-model")
                         .primary()
+                        .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                        .rounded(px(tokens::SPACE_8))
                         .icon(IconName::Plus)
                         .label(i18n::text(cx, "settings.add_model"))
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -15471,6 +16279,7 @@ impl AverroesApp {
 
     fn render_settings_diagnostics(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = UiTheme::current(cx);
+        let compact = self.shell_layout.workspace_width < 900.0;
         let entries = diagnostics::entries();
         let query = self
             .diagnostics_search
@@ -15497,6 +16306,7 @@ impl AverroesApp {
             };
             div()
                 .flex()
+                .when(compact, |row| row.flex_col())
                 .items_start()
                 .gap(px(tokens::SPACE_12))
                 .py(px(tokens::SPACE_6))
@@ -15532,121 +16342,117 @@ impl AverroesApp {
             .flex()
             .flex_col()
             .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .mx_auto()
-                            .w_full()
-                            .max_w(px(1100.0))
-                            .px(px(tokens::SPACE_32))
-                            .py(px(tokens::SPACE_32))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_start()
-                                    .gap(px(tokens::SPACE_20))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .child(settings_page_title(
-                                                "Diagnostics",
-                                                "Session-only request trace. Credentials and recognizable token values are redacted.",
-                                                theme,
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(tokens::SPACE_6))
-                                            .child(
-                                                Input::new(&self.diagnostics_search)
-                                                    .prefix(IconName::Search)
-                                                    .w(px(250.0)),
-                                            )
-                                            .child(
-                                                Button::new("refresh-diagnostics")
-                                                    .ghost()
-                                                    .small()
-                                                    .icon(IconName::Redo2)
-                                                    .label(i18n::text(cx, "settings.refresh"))
-                                                    .on_click(cx.listener(|_, _, _, cx| cx.notify())),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .mt(px(tokens::SPACE_24))
-                                    .flex_1()
-                                    .min_h(px(0.0))
-                                    .p(px(tokens::SPACE_16))
-                                    .flex()
-                                    .flex_col()
-                                    .bg(theme.surface_subtle)
-                                    .rounded(px(tokens::RADIUS_CARD))
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .justify_end()
-                                            .gap(px(tokens::SPACE_4))
-                                            .child(
-                                                Button::new("copy-settings-diagnostics")
-                                                    .ghost()
-                                                    .small()
-                                                    .icon(IconName::Copy)
-                                                    .label(i18n::text(cx, "settings.copy"))
-                                                    .on_click(|_, _, cx| {
-                                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                div().flex_1().min_h(px(0.0)).overflow_hidden().child(
+                    div()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .mx_auto()
+                        .w_full()
+                        .max_w(px(tokens::SETTINGS_PAGE_WIDTH))
+                        .px(px(tokens::SPACE_32))
+                        .py(px(tokens::SPACE_32))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_start()
+                                .gap(px(tokens::SPACE_20))
+                                .child(div().flex_1().min_w(px(0.0)).child(settings_page_title(
+                                    i18n::text(cx, "settings.diagnostics"),
+                                    i18n::text(cx, "settings.diagnostics_description"),
+                                    theme,
+                                )))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .w_full()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_6))
+                                        .child(
+                                            settings_input(&self.diagnostics_search)
+                                                .prefix(IconName::Search)
+                                                .flex_1()
+                                                .min_w(px(0.0)),
+                                        )
+                                        .child(
+                                            Button::new("refresh-diagnostics")
+                                                .ghost()
+                                                .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                                                .rounded(px(tokens::SPACE_8))
+                                                .icon(IconName::Redo2)
+                                                .label(i18n::text(cx, "settings.refresh"))
+                                                .on_click(cx.listener(|_, _, _, cx| cx.notify())),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .mt(px(tokens::SPACE_24))
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .p(px(tokens::SPACE_16))
+                                .flex()
+                                .flex_col()
+                                .bg(theme.surface_subtle)
+                                .rounded(px(tokens::RADIUS_CARD))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_end()
+                                        .gap(px(tokens::SPACE_4))
+                                        .child(
+                                            Button::new("copy-settings-diagnostics")
+                                                .ghost()
+                                                .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                                                .rounded(px(tokens::SPACE_8))
+                                                .icon(IconName::Copy)
+                                                .label(i18n::text(cx, "settings.copy"))
+                                                .on_click(|_, _, cx| {
+                                                    cx.write_to_clipboard(
+                                                        ClipboardItem::new_string(
                                                             diagnostics::export_text(),
-                                                        ));
-                                                    }),
-                                            )
-                                            .child(
-                                                Button::new("clear-settings-diagnostics")
-                                                    .ghost()
-                                                    .small()
-                                                    .label(i18n::text(cx, "settings.clear"))
-                                                    .on_click(cx.listener(|_, _, _, cx| {
-                                                        diagnostics::clear();
-                                                        cx.notify();
-                                                    })),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .mt(px(tokens::SPACE_8))
-                                            .flex_1()
-                                            .min_h(px(0.0))
-                                            .overflow_y_scrollbar()
-                                            .when(entries.is_empty(), |this| {
-                                                this.child(empty_state(
-                                                    theme,
-                                                    i18n::text(cx, "settings.no_diagnostics"),
-                                                ))
-                                            })
-                                            .when(!entries.is_empty() && !has_matches, |this| {
-                                                this.child(empty_state(
-                                                    theme,
-                                                    i18n::text(
-                                                        cx,
-                                                        "settings.no_diagnostics_match",
-                                                    ),
-                                                ))
-                                            })
-                                            .children(rows),
-                                    ),
-                            ),
-                    ),
+                                                        ),
+                                                    );
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("clear-settings-diagnostics")
+                                                .ghost()
+                                                .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                                                .rounded(px(tokens::SPACE_8))
+                                                .label(i18n::text(cx, "settings.clear"))
+                                                .on_click(cx.listener(|_, _, _, cx| {
+                                                    diagnostics::clear();
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(tokens::SPACE_8))
+                                        .flex_1()
+                                        .min_h(px(0.0))
+                                        .overflow_y_scrollbar()
+                                        .when(entries.is_empty(), |this| {
+                                            this.child(empty_state(
+                                                theme,
+                                                i18n::text(cx, "settings.no_diagnostics"),
+                                            ))
+                                        })
+                                        .when(!entries.is_empty() && !has_matches, |this| {
+                                            this.child(empty_state(
+                                                theme,
+                                                i18n::text(cx, "settings.no_diagnostics_match"),
+                                            ))
+                                        })
+                                        .children(rows),
+                                ),
+                        ),
+                ),
             )
             .into_any_element()
     }
@@ -15663,7 +16469,7 @@ impl AverroesApp {
                 div()
                     .mx_auto()
                     .w_full()
-                    .max_w(px(760.0))
+                    .max_w(px(tokens::SETTINGS_PAGE_WIDTH))
                     .px(px(tokens::SPACE_32))
                     .py(px(tokens::SPACE_32))
                     .child(settings_page_title(
@@ -15672,7 +16478,7 @@ impl AverroesApp {
                         theme,
                     ))
                     .child(
-                        card(theme, tokens::SPACE_16)
+                        settings_card(theme)
                             .mt(px(tokens::SPACE_24))
                             .child(
                                 div()
@@ -15725,7 +16531,8 @@ impl AverroesApp {
                                     .child(
                                         Button::new("toggle-language")
                                             .secondary()
-                                            .small()
+                                            .with_size(px(tokens::SETTINGS_ACTION_HEIGHT))
+                                            .rounded(px(tokens::SPACE_8))
                                             .label(locale.label())
                                             .on_click(move |_, _, cx| {
                                                 cx.set_global(i18n::Localization::new(next_locale));
@@ -15754,7 +16561,7 @@ impl AverroesApp {
                 div()
                     .mx_auto()
                     .w_full()
-                    .max_w(px(760.0))
+                    .max_w(px(tokens::SETTINGS_PAGE_WIDTH))
                     .px(px(tokens::SPACE_32))
                     .py(px(tokens::SPACE_32))
                     .child(settings_page_title(
@@ -15772,14 +16579,12 @@ impl AverroesApp {
                             .cursor_pointer()
                             .hover(|style| style.bg(theme.surface_hover))
                             .on_click(cx.listener(|_, _, _, cx| {
-                                cx.open_url(
-                                    "https://github.com/valendra-tech/valendra-landing-web",
-                                );
+                                cx.open_url("https://platform.qdiv0.com");
                             }))
                             .flex()
                             .items_center()
                             .gap(px(tokens::SPACE_16))
-                            .child(img("brand/averroes.png").size(px(76.0)).flex_none())
+                            .child(logo(cx, 104.0))
                             .child(
                                 div()
                                     .flex_1()
@@ -15789,7 +16594,7 @@ impl AverroesApp {
                                             .font(UiTheme::display_font())
                                             .text_size(px(tokens::TEXT_TITLE1))
                                             .font_weight(tokens::WEIGHT_SEMIBOLD)
-                                            .child("Averroes"),
+                                            .child(APP_NAME),
                                     )
                                     .child(
                                         div()
@@ -15811,7 +16616,7 @@ impl AverroesApp {
                             .rounded(px(tokens::RADIUS_CARD))
                             .text_size(px(tokens::TEXT_BODY))
                             .text_color(theme.muted)
-                            .child(i18n::text(cx, "about.philosopher")),
+                            .child(i18n::text(cx, "about.description")),
                     )
                     .child(
                         div()
@@ -15859,15 +16664,20 @@ impl AverroesApp {
 
         Some(
             div()
+                .id("global-notice")
                 .flex_none()
-                .w_full()
+                .mx(px(tokens::SPACE_12))
+                .my(px(tokens::SPACE_8))
                 .px(px(tokens::SPACE_16))
                 .py(px(tokens::SPACE_8))
                 .flex()
                 .items_center()
                 .gap(px(tokens::SPACE_8))
-                .border_b_1()
+                .border_1()
                 .border_color(theme.hairline)
+                .rounded(px(tokens::RADIUS_CARD))
+                .max_h(px(160.0))
+                .overflow_y_scrollbar()
                 .bg(background)
                 .text_size(px(tokens::TEXT_CAPTION))
                 .text_color(text_color)
@@ -15887,6 +16697,491 @@ impl AverroesApp {
                 )
                 .into_any_element(),
         )
+    }
+
+    fn render_artifacts_button(&self, theme: UiTheme, cx: &mut Context<Self>) -> AnyElement {
+        let count = self.active().artifacts.len();
+        let selected = self.inspector.files_open();
+        Button::new("artifacts-button")
+            .ghost()
+            .small()
+            .selected(selected)
+            .icon(IconName::PanelRightOpen)
+            .label(count.to_string())
+            .tooltip(i18n::text(cx, "chat.artifacts"))
+            .text_size(px(tokens::TEXT_CAPTION))
+            .text_color(if selected {
+                theme.foreground
+            } else {
+                theme.muted
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_artifacts_panel(cx);
+            }))
+            .into_any_element()
+    }
+
+    fn open_artifact_list(&mut self, cx: &mut Context<Self>) {
+        self.inspector.select(InspectorTab::Files);
+        self.agent_thread_view = None;
+        self.back_to_artifact_list(cx);
+        cx.notify();
+    }
+
+    fn render_artifact_contents(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = UiTheme::current(cx);
+        let selected = self.active().artifact_panel.selected.is_some();
+        div()
+            .id("artifact-sidebar")
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(self.render_artifact_header(theme, cx))
+            .child(div().flex_1().min_h(px(0.0)).w_full().child(if selected {
+                self.render_artifact_preview(theme, cx)
+            } else {
+                self.render_artifact_list(theme, cx)
+            }))
+            .when(selected, |this| {
+                this.child(self.render_artifact_footer(theme, cx))
+            })
+            .into_any_element()
+    }
+
+    fn render_artifact_header(&self, theme: UiTheme, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.active().artifact_panel.selected.clone();
+        let count = self.active().artifacts.len();
+        let top_row = div()
+            .flex_none()
+            .px(px(tokens::SPACE_12))
+            .py(px(tokens::SPACE_6))
+            .when(selected.is_some(), |row| {
+                row.child(
+                    Button::new("artifact-back")
+                        .ghost()
+                        .small()
+                        .icon(IconName::ChevronLeft)
+                        .label(i18n::text(cx, "artifact.back"))
+                        .text_size(px(tokens::TEXT_SMALL))
+                        .on_click(cx.listener(|this, _, _, cx| this.back_to_artifact_list(cx))),
+                )
+            })
+            .when(selected.is_none(), |row| {
+                row.child(
+                    div()
+                        .text_size(px(tokens::TEXT_CAPTION))
+                        .text_color(theme.muted)
+                        .child(i18n::format(
+                            cx,
+                            "artifact.title_count",
+                            &[("count", count.to_string())],
+                        )),
+                )
+            });
+
+        let details = selected.map(|artifact| {
+            let delete_id = artifact.id.clone();
+            let actions = div()
+                .flex()
+                .items_center()
+                .gap(px(tokens::SPACE_2))
+                .child(
+                    Button::new("artifact-refresh")
+                        .ghost()
+                        .small()
+                        .with_size(px(26.0))
+                        .icon(IconName::Redo2)
+                        .tooltip(i18n::text(cx, "artifact.refresh"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.refresh_artifact(cx);
+                        })),
+                )
+                .child(
+                    Button::new("artifact-copy-path")
+                        .ghost()
+                        .small()
+                        .with_size(px(26.0))
+                        .icon(IconName::Copy)
+                        .tooltip(i18n::text(cx, "artifact.copy_path"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.copy_artifact_path(cx);
+                        })),
+                )
+                .child(
+                    Button::new("artifact-reveal")
+                        .ghost()
+                        .small()
+                        .with_size(px(26.0))
+                        .icon(IconName::FolderOpen)
+                        .tooltip(i18n::text(cx, "artifact.reveal"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Err(error) = this.reveal_artifact() {
+                                this.show_error(error, cx);
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("artifact-open-external")
+                        .ghost()
+                        .small()
+                        .with_size(px(26.0))
+                        .icon(IconName::ExternalLink)
+                        .tooltip(i18n::text(cx, "artifact.open_external"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Err(error) = this.open_artifact_external() {
+                                this.show_error(error, cx);
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("artifact-delete")
+                        .ghost()
+                        .small()
+                        .with_size(px(26.0))
+                        .icon(IconName::Delete)
+                        .tooltip(i18n::text(cx, "artifact.remove"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.remove_artifact(delete_id.clone(), cx);
+                        })),
+                );
+            let workspace_root = self.active().workspace_root.clone();
+            let path = artifact_display_path(&artifact, workspace_root.as_deref());
+            div()
+                .flex()
+                .items_center()
+                .gap(px(tokens::SPACE_8))
+                .px(px(tokens::SPACE_12))
+                .pb(px(tokens::SPACE_8))
+                .child(
+                    Icon::new(artifact_kind_icon(artifact.kind))
+                        .size(px(16.0))
+                        .text_color(theme.muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(
+                            div()
+                                .text_size(px(tokens::TEXT_SMALL))
+                                .font_weight(tokens::WEIGHT_MEDIUM)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(artifact.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .mt(px(tokens::SPACE_2))
+                                .text_size(px(tokens::TEXT_CAPTION))
+                                .text_color(theme.faint)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(format!(
+                                    "{} · {}",
+                                    artifact_kind_label(cx, artifact.kind),
+                                    path
+                                )),
+                        ),
+                )
+                .child(actions)
+                .into_any_element()
+        });
+
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .border_b_1()
+            .border_color(theme.hairline)
+            .child(top_row)
+            .children(details)
+            .into_any_element()
+    }
+
+    fn render_artifact_list(&self, theme: UiTheme, cx: &mut Context<Self>) -> AnyElement {
+        let artifacts = self.active().artifacts.clone();
+        if artifacts.is_empty() {
+            return div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(tokens::SPACE_8))
+                .p(px(tokens::SPACE_24))
+                .child(
+                    Icon::new(IconName::File)
+                        .size(px(28.0))
+                        .text_color(theme.faint),
+                )
+                .child(
+                    div()
+                        .text_size(px(tokens::TEXT_SMALL))
+                        .text_color(theme.muted)
+                        .child(i18n::text(cx, "artifact.empty")),
+                )
+                .into_any_element();
+        }
+        let workspace_root = self.active().workspace_root.clone();
+        let rows = artifacts
+            .into_iter()
+            .map(|artifact| {
+                let path = artifact_display_path(&artifact, workspace_root.as_deref());
+                let row_id = format!("artifact-list-{}", artifact.id);
+                div()
+                    .id(SharedString::from(row_id))
+                    .w_full()
+                    .px(px(tokens::SPACE_8))
+                    .py(px(tokens::SPACE_8))
+                    .flex()
+                    .items_center()
+                    .gap(px(tokens::SPACE_8))
+                    .rounded(px(tokens::RADIUS_CONTROL))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.surface_hover))
+                    .child(
+                        Icon::new(artifact_kind_icon(artifact.kind))
+                            .size(px(tokens::ICON_SIZE))
+                            .text_color(theme.muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .text_size(px(tokens::TEXT_SMALL))
+                                    .font_weight(tokens::WEIGHT_MEDIUM)
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(artifact.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(tokens::SPACE_2))
+                                    .text_size(px(tokens::TEXT_CAPTION))
+                                    .text_color(theme.faint)
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(format!(
+                                        "{} · {}",
+                                        artifact_kind_label(cx, artifact.kind),
+                                        path
+                                    )),
+                            ),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronRight)
+                            .size(px(13.0))
+                            .text_color(theme.faint),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_artifact(artifact.clone(), cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("artifact-list-scroll")
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .p(px(tokens::SPACE_8))
+            .overflow_y_scrollbar()
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn render_artifact_preview(&self, theme: UiTheme, cx: &mut Context<Self>) -> AnyElement {
+        let panel = &self.active().artifact_panel;
+        let Some(artifact) = panel.selected.as_ref() else {
+            return div().into_any_element();
+        };
+        if panel.loading {
+            return render_artifact_loading(theme, cx);
+        }
+        if let Some(error) = panel.error.as_ref() {
+            return render_artifact_error(theme, artifact, error.clone(), cx);
+        }
+        match &panel.preview {
+            ArtifactPreview::Idle => render_artifact_loading(theme, cx),
+            ArtifactPreview::Markdown(text) => div()
+                .id("artifact-markdown-scroll")
+                .flex_1()
+                .min_h(px(0.0))
+                .w_full()
+                .overflow_y_scrollbar()
+                .child(
+                    div()
+                        .p(px(tokens::SPACE_16))
+                        .text_size(px(tokens::TEXT_MESSAGE))
+                        .child(
+                            TextView::markdown(
+                                format!("artifact-markdown-{}", artifact.id),
+                                text.clone(),
+                            )
+                            .selectable(true)
+                            .text_size(px(tokens::TEXT_MESSAGE)),
+                        ),
+                )
+                .into_any_element(),
+            ArtifactPreview::Text(text) => div()
+                .id("artifact-text-scroll")
+                .flex_1()
+                .min_h(px(0.0))
+                .w_full()
+                .overflow_scrollbar()
+                .child(
+                    div()
+                        .p(px(tokens::SPACE_16))
+                        .font(UiTheme::mono_font())
+                        .text_size(px(tokens::TEXT_SMALL))
+                        .whitespace_nowrap()
+                        .children(
+                            text.lines()
+                                .map(|line| div().min_h(px(18.0)).child(line.to_string())),
+                        ),
+                )
+                .into_any_element(),
+            ArtifactPreview::Image {
+                path,
+                width,
+                height,
+            } => render_artifact_image(
+                theme,
+                path,
+                *width,
+                *height,
+                panel.zoom,
+                self.shell_layout.inspector_width,
+            ),
+            ArtifactPreview::Pdf { page_count } => {
+                if let Some(image) = panel.pdf_pages.get(&panel.pdf_page) {
+                    render_artifact_image(
+                        theme,
+                        &image.path,
+                        image.width,
+                        image.height,
+                        panel.zoom,
+                        self.shell_layout.inspector_width,
+                    )
+                } else if panel.pdf_rendering {
+                    render_artifact_loading(theme, cx)
+                } else {
+                    render_artifact_page_placeholder(theme, *page_count, artifact, cx)
+                }
+            }
+            ArtifactPreview::Unsupported { size } => {
+                render_artifact_unsupported(theme, artifact, *size, cx)
+            }
+        }
+    }
+
+    fn render_artifact_footer(&self, theme: UiTheme, cx: &mut Context<Self>) -> AnyElement {
+        let panel = &self.active().artifact_panel;
+        let Some(artifact) = panel.selected.as_ref() else {
+            return div().into_any_element();
+        };
+        let is_pdf = matches!(panel.preview, ArtifactPreview::Pdf { .. });
+        let is_image = matches!(panel.preview, ArtifactPreview::Image { .. });
+        if !is_pdf && !is_image {
+            return div().into_any_element();
+        }
+        let mut footer = div()
+            .flex_none()
+            .h(px(42.0))
+            .px(px(tokens::SPACE_8))
+            .flex()
+            .items_center()
+            .gap(px(tokens::SPACE_4))
+            .border_t_1()
+            .border_color(theme.hairline)
+            .text_size(px(tokens::TEXT_CAPTION))
+            .text_color(theme.muted);
+        if is_pdf {
+            let page_count = match panel.preview {
+                ArtifactPreview::Pdf { page_count } => page_count,
+                _ => 0,
+            };
+            footer = footer
+                .child(
+                    Button::new("artifact-prev-page")
+                        .ghost()
+                        .small()
+                        .with_size(px(26.0))
+                        .icon(IconName::ChevronLeft)
+                        .disabled(panel.pdf_page == 0)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.change_artifact_page(-1, cx);
+                        })),
+                )
+                .child(i18n::format(
+                    cx,
+                    "artifact.page",
+                    &[
+                        ("current", (panel.pdf_page + 1).to_string()),
+                        ("total", page_count.to_string()),
+                    ],
+                ))
+                .child(
+                    Button::new("artifact-next-page")
+                        .ghost()
+                        .small()
+                        .with_size(px(26.0))
+                        .icon(IconName::ChevronRight)
+                        .disabled(panel.pdf_page + 1 >= page_count)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.change_artifact_page(1, cx);
+                        })),
+                );
+        }
+        footer
+            .child(div().flex_1())
+            .child(
+                Button::new("artifact-zoom-out")
+                    .ghost()
+                    .small()
+                    .with_size(px(26.0))
+                    .icon(IconName::Minus)
+                    .tooltip(i18n::text(cx, "artifact.zoom_out"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.adjust_artifact_zoom(-0.25, cx);
+                    })),
+            )
+            .child(
+                Button::new("artifact-zoom-fit")
+                    .ghost()
+                    .small()
+                    .with_size(px(26.0))
+                    .label(format!("{:.0}%", panel.zoom * 100.0))
+                    .tooltip(i18n::text(cx, "artifact.fit"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.reset_artifact_zoom(cx);
+                    })),
+            )
+            .child(
+                Button::new("artifact-zoom-in")
+                    .ghost()
+                    .small()
+                    .with_size(px(26.0))
+                    .icon(IconName::Plus)
+                    .tooltip(i18n::text(cx, "artifact.zoom_in"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.adjust_artifact_zoom(0.25, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .ml(px(tokens::SPACE_6))
+                    .text_size(px(tokens::TEXT_CAPTION))
+                    .text_color(theme.faint)
+                    .child(artifact_kind_label(cx, artifact.kind)),
+            )
+            .into_any_element()
     }
 
     fn render_status_line(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -15909,34 +17204,36 @@ impl AverroesApp {
     }
 }
 
-fn task_progress_counts(tasks: &[WorkTask]) -> (usize, usize) {
-    let completed = tasks
-        .iter()
-        .filter(|task| task.status == TaskStatus::Done)
-        .count();
-    (completed, tasks.len())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaskProgressIcon {
-    Check,
-    Loader,
-    Circle,
-    CircleX,
-}
-
-fn task_progress_icon(status: TaskStatus) -> TaskProgressIcon {
-    match status {
-        TaskStatus::Done => TaskProgressIcon::Check,
-        TaskStatus::InProgress => TaskProgressIcon::Loader,
-        TaskStatus::Pending => TaskProgressIcon::Circle,
-        TaskStatus::Blocked | TaskStatus::Cancelled => TaskProgressIcon::CircleX,
-    }
-}
-
 impl Render for AverroesApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = UiTheme::current(cx);
+        let inspector_open = self.route == Route::Chat
+            && !self.project_settings_open
+            && self.agent_thread_view.is_none()
+            && !self.active().messages.is_empty()
+            && self.inspector.active.is_some();
+        self.shell_layout = ShellLayout::resolve(
+            f32::from(window.viewport_size().width),
+            self.requested_layout,
+            inspector_open,
+        );
+        let sidebar_bounds = self
+            .shell_layout
+            .sidebar_material_bounds(f32::from(window.viewport_size().height));
+        if !self.sidebar_material.update(
+            window,
+            self.visuals.material,
+            sidebar_bounds,
+            tokens::RADIUS_SIDEBAR,
+        ) {
+            self.sidebar_material.clear();
+            self.visuals.material = MaterialMode::Opaque;
+            self.visuals.window_background = gpui::WindowBackgroundAppearance::Opaque;
+            window.set_background_appearance(self.visuals.window_background);
+            cx.set_global(self.visuals);
+        }
+        let (sidebar_action_x, sidebar_action_y) =
+            WindowChrome::sidebar_action_position(self.shell_layout.sidebar_width);
         let content = match self.route {
             Route::Home => self.render_home(cx),
             Route::Chat => {
@@ -15954,7 +17251,34 @@ impl Render for AverroesApp {
         let dialog_layer = ComponentRoot::render_dialog_layer(window, cx);
 
         div()
+            .id("averroes-root")
             .key_context("Averroes")
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedResize>, _, cx| {
+                    let target = event.drag(cx).target;
+                    let Some(gesture) = this
+                        .resize_gesture
+                        .filter(|gesture| gesture.target == target)
+                    else {
+                        return;
+                    };
+                    let width = gesture.width_at(f32::from(event.event.position.x));
+                    match target {
+                        ResizeTarget::Sidebar => this.requested_layout.sidebar_width = width,
+                        ResizeTarget::Inspector => this.requested_layout.inspector_width = width,
+                    }
+                    this.resize_dirty = true;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.finish_resize()),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.finish_resize()),
+            )
             .on_action(cx.listener(Self::handle_new_session))
             .on_action(cx.listener(Self::handle_close_session))
             .on_action(cx.listener(Self::handle_focus_input))
@@ -15966,25 +17290,406 @@ impl Render for AverroesApp {
             .overflow_hidden()
             .text_color(theme.foreground)
             .font(UiTheme::ui_font())
-            .child(self.render_rail(cx))
+            .text_size(px(tokens::TEXT_BODY))
+            .relative()
+            .bg(theme.canvas_fill(self.visuals.material))
             .child(
                 div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .h_full()
+                    .size_full()
                     .flex()
-                    .flex_col()
-                    .bg(theme.background)
-                    .when_some(notice, |this, notice| this.child(notice))
-                    .child(div().flex_1().min_w(px(0.0)).min_h(px(0.0)).child(content)),
+                    .p(px(ShellLayout::GUTTER))
+                    .gap(px(self.shell_layout.sidebar_gap))
+                    .when(self.shell_layout.sidebar_width > 0.0, |row| {
+                        row.child(self.render_rail(cx))
+                    })
+                    .child(
+                        workspace_surface(theme)
+                            .flex_1()
+                            .when(self.shell_layout.sidebar_width == 0.0, |column| {
+                                column.pt(px(WindowChrome::TITLEBAR_HEIGHT))
+                            })
+                            .when_some(notice, |column, notice| column.child(notice))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .min_h(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .child(content),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(sidebar_action_x))
+                    .top(px(sidebar_action_y))
+                    .child(
+                        Button::new("toggle-sidebar")
+                            .ghost()
+                            .with_size(px(tokens::CONTROL_ICON))
+                            .icon(IconName::PanelLeft)
+                            .tooltip(i18n::text(
+                                cx,
+                                if self.requested_layout.sidebar_visible {
+                                    "sidebar.hide"
+                                } else {
+                                    "sidebar.show"
+                                },
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                    ),
             )
             .children(sheet_layer)
             .children(dialog_layer)
     }
 }
 
-fn averroes_logo_asset(_: &gpui::App) -> &'static str {
-    "brand/averroes.png"
+fn artifact_kind_label(cx: &App, kind: WorkArtifactKind) -> SharedString {
+    let key = match kind {
+        WorkArtifactKind::Markdown => "artifact.kind.markdown",
+        WorkArtifactKind::Pdf => "artifact.kind.pdf",
+        WorkArtifactKind::Image => "artifact.kind.image",
+        WorkArtifactKind::Latex => "artifact.kind.latex",
+        WorkArtifactKind::Text => "artifact.kind.text",
+        WorkArtifactKind::Other => "artifact.kind.other",
+    };
+    i18n::text(cx, key)
+}
+
+fn artifact_kind_icon(kind: WorkArtifactKind) -> IconName {
+    match kind {
+        WorkArtifactKind::Markdown => IconName::BookOpen,
+        WorkArtifactKind::Image => IconName::GalleryVerticalEnd,
+        WorkArtifactKind::Pdf
+        | WorkArtifactKind::Latex
+        | WorkArtifactKind::Text
+        | WorkArtifactKind::Other => IconName::File,
+    }
+}
+
+fn artifact_display_path(artifact: &WorkArtifact, workspace_root: Option<&Path>) -> String {
+    if let Some(root) = workspace_root {
+        if let Ok(relative) = artifact.path.strip_prefix(root) {
+            return relative.display().to_string();
+        }
+    }
+    artifact.path.display().to_string()
+}
+
+fn format_artifact_size(size: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if size >= GB {
+        format!("{:.1} GB", size as f64 / GB as f64)
+    } else if size >= MB {
+        format!("{:.1} MB", size as f64 / MB as f64)
+    } else if size >= KB {
+        format!("{:.1} KB", size as f64 / KB as f64)
+    } else {
+        format!("{size} B")
+    }
+}
+
+fn render_artifact_loading(theme: UiTheme, cx: &mut Context<AverroesApp>) -> AnyElement {
+    div()
+        .flex_1()
+        .min_h(px(0.0))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(tokens::SPACE_8))
+        .child(animate_if(
+            Icon::new(IconName::Loader)
+                .size(px(20.0))
+                .text_color(theme.muted),
+            "artifact-loading-spinner",
+            Animation::new(Duration::from_millis(800)).repeat(),
+            !reduced_motion(cx),
+            |icon, delta| icon.transform(Transformation::rotate(gpui::percentage(delta))),
+        ))
+        .child(
+            div()
+                .text_size(px(tokens::TEXT_SMALL))
+                .text_color(theme.muted)
+                .child(i18n::text(cx, "artifact.loading")),
+        )
+        .into_any_element()
+}
+
+fn render_artifact_error(
+    theme: UiTheme,
+    artifact: &WorkArtifact,
+    error: String,
+    cx: &mut Context<AverroesApp>,
+) -> AnyElement {
+    div()
+        .flex_1()
+        .min_h(px(0.0))
+        .p(px(tokens::SPACE_16))
+        .flex()
+        .flex_col()
+        .gap(px(tokens::SPACE_8))
+        .child(
+            div()
+                .text_size(px(tokens::TEXT_CAPTION))
+                .font_weight(tokens::WEIGHT_SEMIBOLD)
+                .text_color(theme.destructive_text)
+                .child(i18n::text(cx, "artifact.error")),
+        )
+        .child(
+            div()
+                .text_size(px(tokens::TEXT_SMALL))
+                .text_color(theme.muted)
+                .child(error),
+        )
+        .child(
+            Button::new("artifact-error-open")
+                .secondary()
+                .small()
+                .icon(IconName::ExternalLink)
+                .label(i18n::text(cx, "artifact.open_external"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Err(error) = this.open_artifact_external() {
+                        this.show_error(error, cx);
+                    }
+                })),
+        )
+        .child(
+            div()
+                .text_size(px(tokens::TEXT_CAPTION))
+                .text_color(theme.faint)
+                .child(artifact.path.display().to_string()),
+        )
+        .into_any_element()
+}
+
+fn render_artifact_unsupported(
+    theme: UiTheme,
+    artifact: &WorkArtifact,
+    size: u64,
+    cx: &mut Context<AverroesApp>,
+) -> AnyElement {
+    div()
+        .flex_1()
+        .min_h(px(0.0))
+        .p(px(tokens::SPACE_16))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(tokens::SPACE_8))
+        .child(
+            Icon::new(artifact_kind_icon(artifact.kind))
+                .size(px(30.0))
+                .text_color(theme.muted),
+        )
+        .child(
+            div()
+                .text_size(px(tokens::TEXT_SMALL))
+                .text_color(theme.foreground)
+                .child(i18n::text(cx, "artifact.unsupported")),
+        )
+        .child(
+            div()
+                .text_size(px(tokens::TEXT_CAPTION))
+                .text_color(theme.faint)
+                .child(format_artifact_size(size)),
+        )
+        .child(
+            div()
+                .flex()
+                .gap(px(tokens::SPACE_6))
+                .child(
+                    Button::new("artifact-unsupported-open")
+                        .secondary()
+                        .small()
+                        .icon(IconName::ExternalLink)
+                        .label(i18n::text(cx, "artifact.open_external"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Err(error) = this.open_artifact_external() {
+                                this.show_error(error, cx);
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("artifact-unsupported-reveal")
+                        .ghost()
+                        .small()
+                        .icon(IconName::FolderOpen)
+                        .tooltip(i18n::text(cx, "artifact.reveal"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Err(error) = this.reveal_artifact() {
+                                this.show_error(error, cx);
+                            }
+                        })),
+                ),
+        )
+        .into_any_element()
+}
+
+fn render_artifact_image(
+    theme: UiTheme,
+    path: &Path,
+    width: u32,
+    height: u32,
+    zoom: f32,
+    panel_width: f32,
+) -> AnyElement {
+    let available_width = (panel_width - 32.0).max(120.0);
+    let display_width = available_width * zoom.max(0.5);
+    let display_height = display_width * (height as f32 / width.max(1) as f32);
+    div()
+        .id("artifact-image-scroll")
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
+        .bg(theme.paper_canvas)
+        .overflow_scrollbar()
+        .child(
+            div().p(px(tokens::SPACE_16)).child(
+                div()
+                    .w(px(display_width))
+                    .h(px(display_height))
+                    .bg(gpui::rgb(0xFFFFFF))
+                    .border_1()
+                    .border_color(theme.hairline)
+                    .shadow_sm()
+                    .child(img(path.to_path_buf()).w_full().h_full()),
+            ),
+        )
+        .into_any_element()
+}
+
+fn render_artifact_page_placeholder(
+    theme: UiTheme,
+    _page_count: usize,
+    _artifact: &WorkArtifact,
+    cx: &mut Context<AverroesApp>,
+) -> AnyElement {
+    div()
+        .flex_1()
+        .min_h(px(0.0))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(tokens::SPACE_8))
+        .child(
+            Icon::new(IconName::Loader)
+                .size(px(20.0))
+                .text_color(theme.muted),
+        )
+        .child(
+            div()
+                .text_size(px(tokens::TEXT_SMALL))
+                .text_color(theme.muted)
+                .child(i18n::text(cx, "artifact.loading")),
+        )
+        .into_any_element()
+}
+
+fn render_artifact_strip(
+    session_id: &SessionId,
+    artifacts: &[WorkArtifact],
+    theme: UiTheme,
+    cx: &mut Context<AverroesApp>,
+) -> AnyElement {
+    let visible = artifacts.iter().take(3).cloned().collect::<Vec<_>>();
+    let cards = visible
+        .into_iter()
+        .map(|artifact| {
+            let row_id = format!("artifact-strip-{}-{}", session_id.as_str(), artifact.id);
+            let open_artifact = artifact.clone();
+            div()
+                .id(SharedString::from(row_id))
+                .w_full()
+                .px(px(tokens::SPACE_8))
+                .py(px(tokens::SPACE_8))
+                .flex()
+                .items_center()
+                .gap(px(tokens::SPACE_8))
+                .rounded(px(tokens::RADIUS_CARD))
+                .border_1()
+                .border_color(theme.hairline)
+                .bg(theme.surface)
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.surface_hover))
+                .child(
+                    Icon::new(artifact_kind_icon(artifact.kind))
+                        .size(px(tokens::ICON_SIZE))
+                        .text_color(theme.muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(
+                            div()
+                                .text_size(px(tokens::TEXT_SMALL))
+                                .font_weight(tokens::WEIGHT_MEDIUM)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(artifact.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .mt(px(tokens::SPACE_2))
+                                .text_size(px(tokens::TEXT_CAPTION))
+                                .text_color(theme.faint)
+                                .child(artifact_kind_label(cx, artifact.kind)),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(tokens::TEXT_CAPTION))
+                        .font_weight(tokens::WEIGHT_MEDIUM)
+                        .text_color(theme.accent_text)
+                        .child(i18n::text(cx, "artifact.open")),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_artifact(open_artifact.clone(), cx);
+                }))
+                .into_any_element()
+        })
+        .collect::<Vec<_>>();
+
+    let view_all = (artifacts.len() > 3).then(|| {
+        Button::new("artifact-strip-view-all")
+            .ghost()
+            .small()
+            .label(i18n::text(cx, "artifact.view_all"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.open_artifact_list(cx);
+            }))
+    });
+
+    div()
+        .mt(px(tokens::SPACE_12))
+        .flex()
+        .flex_col()
+        .gap(px(tokens::SPACE_6))
+        .w_full()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(tokens::TEXT_CAPTION))
+                        .font_weight(tokens::WEIGHT_SEMIBOLD)
+                        .text_color(theme.muted)
+                        .child(i18n::text(cx, "chat.artifacts")),
+                )
+                .when_some(view_all, |this, button| this.child(button)),
+        )
+        .children(cards)
+        .into_any_element()
 }
 
 fn non_empty_input(input: &Entity<InputState>, cx: &App) -> Option<String> {
@@ -16232,6 +17937,7 @@ fn conversation_actions_button(
     cx: &mut Context<AverroesApp>,
 ) -> AnyElement {
     let theme = UiTheme::current(cx);
+    let status_color = theme.muted;
     let app_view = cx.entity().downgrade();
     let pin_view = app_view.clone();
     let rename_view = app_view.clone();
@@ -16242,15 +17948,16 @@ fn conversation_actions_button(
     let wrapper_id = format!("{button_id}-wrapper");
     let spinner_id = SharedString::from(format!("{button_id}-spinner"));
     let indicator = if processing {
-        Icon::new(IconName::Loader)
-            .size(px(12.0))
-            .text_color(theme.muted)
-            .with_animation(
-                spinner_id,
-                Animation::new(std::time::Duration::from_millis(800)).repeat(),
-                |icon, delta| icon.transform(Transformation::rotate(gpui::percentage(delta))),
-            )
-            .into_any_element()
+        animate_if(
+            Icon::new(IconName::Loader)
+                .size(px(12.0))
+                .text_color(status_color),
+            spinner_id,
+            Animation::new(std::time::Duration::from_millis(800)).repeat(),
+            !reduced_motion(cx),
+            |icon, delta| icon.transform(Transformation::rotate(gpui::percentage(delta))),
+        )
+        .into_any_element()
     } else {
         div()
             .size(px(6.0))
@@ -16273,6 +17980,7 @@ fn conversation_actions_button(
     let trigger = Button::new(button_id)
         .ghost()
         .small()
+        .text_color(status_color)
         .icon(IconName::Ellipsis)
         .tooltip(i18n::text(cx, "menu.conversation_actions"))
         .when_some(hover_group, |button, group| {
@@ -16505,29 +18213,6 @@ fn embedding_model_choices(
             (label.into(), model.id)
         })
         .collect()
-}
-
-fn grouped_model_items(choices: &[ModelChoice]) -> SearchableVec<SelectGroup<ModelChoice>> {
-    let mut groups: Vec<(ConnectionId, SelectGroup<ModelChoice>)> = Vec::new();
-    for choice in choices {
-        if let Some((_, group)) = groups
-            .iter_mut()
-            .find(|(connection_id, _)| connection_id == &choice.connection_id)
-        {
-            group.items.push(choice.clone());
-        } else {
-            groups.push((
-                choice.connection_id.clone(),
-                SelectGroup::new(choice.connection_name.clone()).item(choice.clone()),
-            ));
-        }
-    }
-    SearchableVec::new(
-        groups
-            .into_iter()
-            .map(|(_, group)| group)
-            .collect::<Vec<_>>(),
-    )
 }
 
 fn preferred_reasoning_effort(model: &ModelInfo) -> Option<String> {
@@ -16802,6 +18487,7 @@ fn tool_display_name(name: &str) -> String {
         "list_agents" => "List agents".into(),
         "call_agents" | "call_agent" => "Call agent".into(),
         "compact_conversation" => "Compact conversation".into(),
+        "publish_artifact" => "Publish artifact".into(),
         _ => name
             .split(['_', '-'])
             .filter(|part| !part.is_empty())
@@ -16843,6 +18529,7 @@ fn localized_tool_display_name(cx: &App, name: &str) -> SharedString {
         "list_agents" => Some("tool.list_agents"),
         "call_agents" | "call_agent" => Some("tool.call_agent"),
         "compact_conversation" => Some("tool.compact_conversation"),
+        "publish_artifact" => Some("tool.publish_artifact"),
         "context_reminder" => Some("tool.context_reminder"),
         "context_window" => Some("tool.context_window"),
         _ => None,
@@ -16866,6 +18553,7 @@ fn tool_activity_title(cx: &App, activity: &ToolActivity) -> SharedString {
             i18n::format(cx, "tool.search_web_for", &[("query", argument)])
         }
         "web_fetch" => i18n::format(cx, "tool.fetch_url_for", &[("url", argument)]),
+        "publish_artifact" => i18n::format(cx, "tool.publish_artifact_for", &[("title", argument)]),
         _ => format!("{label}: {argument}"),
     };
     SharedString::new(title)
@@ -16895,6 +18583,7 @@ fn tool_activity_argument(name: &str, input: &str, summary: &str) -> Option<Stri
             .or_else(|| string_value("agent_name"))
             .or_else(|| string_value("agent_id"))
             .or_else(|| Some("default".into())),
+        "publish_artifact" => string_value("title").or_else(|| string_value("path")),
         "browser" => {
             let action = string_value("action");
             let detail = ["url", "target", "value"]
@@ -17187,6 +18876,77 @@ async fn load_attachment_content(
     }
 }
 
+const MAX_ARTIFACT_TEXT_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_ARTIFACT_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_ARTIFACT_PDF_BYTES: u64 = 200 * 1024 * 1024;
+
+async fn load_artifact_preview_file(
+    path: PathBuf,
+    kind: WorkArtifactKind,
+) -> Result<ArtifactPreview, String> {
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|error| format!("Could not read '{}': {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("'{}' is not a file", path.display()));
+    }
+    let size = metadata.len();
+    match kind {
+        WorkArtifactKind::Markdown => Ok(ArtifactPreview::Markdown(
+            read_artifact_text(&path, size).await?,
+        )),
+        WorkArtifactKind::Text | WorkArtifactKind::Latex => Ok(ArtifactPreview::Text(
+            read_artifact_text(&path, size).await?,
+        )),
+        WorkArtifactKind::Image => {
+            if size > MAX_ARTIFACT_IMAGE_BYTES {
+                return Ok(ArtifactPreview::Unsupported { size });
+            }
+            let dimensions_path = path.clone();
+            let dimensions =
+                tokio::task::spawn_blocking(move || image::image_dimensions(&dimensions_path))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            match dimensions {
+                Ok((width, height)) => Ok(ArtifactPreview::Image {
+                    path,
+                    width,
+                    height,
+                }),
+                Err(_) => Ok(ArtifactPreview::Unsupported { size }),
+            }
+        }
+        WorkArtifactKind::Pdf => {
+            if size > MAX_ARTIFACT_PDF_BYTES {
+                return Ok(ArtifactPreview::Unsupported { size });
+            }
+            let page_path = path.clone();
+            let page_count =
+                tokio::task::spawn_blocking(move || crate::pdf::page_count(&page_path))
+                    .await
+                    .map_err(|error| error.to_string())??;
+            Ok(ArtifactPreview::Pdf { page_count })
+        }
+        WorkArtifactKind::Other => Ok(ArtifactPreview::Unsupported { size }),
+    }
+}
+
+async fn read_artifact_text(path: &Path, size: u64) -> Result<String, String> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| format!("Could not read '{}': {error}", path.display()))?;
+    let mut buffer = Vec::with_capacity(size.min(MAX_ARTIFACT_TEXT_BYTES) as usize);
+    file.take(MAX_ARTIFACT_TEXT_BYTES)
+        .read_to_end(&mut buffer)
+        .await
+        .map_err(|error| format!("Could not read '{}': {error}", path.display()))?;
+    let mut text = String::from_utf8_lossy(&buffer).into_owned();
+    if size > MAX_ARTIFACT_TEXT_BYTES {
+        text.push_str("\n\n[Preview truncated]");
+    }
+    Ok(text)
+}
+
 #[cfg(test)]
 mod visible_project_tests {
     use super::{
@@ -17276,7 +19036,8 @@ mod task_progress_tests {
 
     #[test]
     fn empty_task_list_has_zero_total_and_zero_completed() {
-        assert_eq!(task_progress_counts(&[]), (0, 0));
+        let summary = TaskProgressSummary::from_tasks(&[]);
+        assert_eq!((summary.completed, summary.total), (0, 0));
     }
 
     #[test]
@@ -17289,74 +19050,15 @@ mod task_progress_tests {
             task("cancelled", TaskStatus::Cancelled),
         ];
 
-        assert_eq!(task_progress_counts(&tasks), (1, 5));
-    }
-
-    #[test]
-    fn task_progress_status_icons_match_rendering_contract() {
-        assert_eq!(
-            task_progress_icon(TaskStatus::Done),
-            TaskProgressIcon::Check
-        );
-        assert_eq!(
-            task_progress_icon(TaskStatus::InProgress),
-            TaskProgressIcon::Loader
-        );
-        assert_eq!(
-            task_progress_icon(TaskStatus::Pending),
-            TaskProgressIcon::Circle
-        );
-        assert_eq!(
-            task_progress_icon(TaskStatus::Blocked),
-            TaskProgressIcon::CircleX
-        );
-        assert_eq!(
-            task_progress_icon(TaskStatus::Cancelled),
-            TaskProgressIcon::CircleX
-        );
+        let summary = TaskProgressSummary::from_tasks(&tasks);
+        assert_eq!((summary.completed, summary.total), (1, 5));
     }
 }
 
 #[cfg(test)]
 mod composer_visual_tests {
     use super::private_conversation_icon;
-    use crate::ui::components::composer_metrics;
     use gpui_component::IconName;
-
-    #[test]
-    fn compact_composer_matches_reference_geometry() {
-        let metrics = composer_metrics(true);
-
-        assert_eq!(metrics.max_width, 680.0);
-        assert_eq!(metrics.surface_radius, 16.0);
-        assert_eq!(metrics.text_min_height, 56.0);
-        assert_eq!(metrics.footer_height, 44.0);
-        assert_eq!(metrics.footer_horizontal_padding, 12.0);
-        assert_eq!(metrics.control_gap, 6.0);
-        assert_eq!(metrics.send_size, 32.0);
-        assert_eq!(metrics.attachment_radius, 6.0);
-        assert_eq!(metrics.empty_logo_size, 96.0);
-        assert_eq!(metrics.empty_title_size, 24.0);
-        assert_eq!(metrics.empty_brand_gap, 8.0);
-        assert_eq!(metrics.empty_composer_gap, 24.0);
-        assert_eq!(metrics.footer_text_size, 11.0);
-        assert_eq!(metrics.model_width, 210.0);
-        assert_eq!(metrics.reasoning_width, 80.0);
-        assert_eq!(metrics.privacy_icon_size, 16.0);
-    }
-
-    #[test]
-    fn open_composer_keeps_the_wider_conversation_width() {
-        let metrics = composer_metrics(false);
-
-        assert_eq!(metrics.max_width, 760.0);
-        assert_eq!(metrics.surface_radius, 16.0);
-        assert_eq!(metrics.footer_height, 44.0);
-        assert_eq!(metrics.send_size, 32.0);
-        assert_eq!(metrics.footer_text_size, 12.0);
-        assert_eq!(metrics.model_width, 240.0);
-        assert_eq!(metrics.reasoning_width, 88.0);
-    }
 
     #[test]
     fn private_conversation_toggle_uses_eye_icons() {
@@ -18069,6 +19771,7 @@ fn render_agent_thread_message(
                 format!("agent-thread-waiting-{thread_id}-{message_index}"),
                 theme,
                 4.0,
+                reduced_motion(cx),
             ))
             .into_any_element();
     }
@@ -18259,6 +19962,7 @@ fn render_reasoning_block(
                         format!("{text_id_prefix}-content-{part_index}"),
                         &part.content,
                         streaming && !state.complete,
+                        reduced_motion(cx),
                     ));
                 }
             }
@@ -18278,6 +19982,7 @@ fn render_reasoning_block(
                             format!("{text_id_prefix}-{start}"),
                             segment,
                             streaming && !state.complete && end == block_text.len(),
+                            reduced_motion(cx),
                         )
                     })
                 }
@@ -18405,7 +20110,7 @@ fn render_reasoning_block(
                             .text_color(theme.success)
                             .into_any_element()
                     } else {
-                        render_activity_indicator(panel_id.clone(), theme, 3.0)
+                        render_activity_indicator(panel_id.clone(), theme, 3.0, reduced_motion(cx))
                     }),
             )
             .when(state.expanded, |this| {
@@ -19193,31 +20898,34 @@ fn render_agent_thread_tool_activity(
         .into_any_element()
 }
 
-fn render_activity_indicator(id: String, theme: UiTheme, dot_size: f32) -> AnyElement {
+fn render_activity_indicator(
+    id: String,
+    theme: UiTheme,
+    dot_size: f32,
+    reduced: bool,
+) -> AnyElement {
     div()
         .flex()
         .items_center()
         .gap(px(tokens::SPACE_2))
         .children((0..3).map(move |index| {
             let animation_id = format!("{id}-{index}");
-            div()
-                .size(px(dot_size))
-                .rounded_full()
-                .bg(theme.muted)
-                .with_animation(
-                    animation_id,
-                    Animation::new(Duration::from_millis(900)).repeat(),
-                    move |dot, delta| {
-                        let phase = (delta + index as f32 / 3.0) % 1.0;
-                        let wave = if phase < 0.5 {
-                            phase * 2.0
-                        } else {
-                            (1.0 - phase) * 2.0
-                        };
-                        dot.opacity(0.3 + wave * 0.7)
-                    },
-                )
-                .into_any_element()
+            animate_if(
+                div().size(px(dot_size)).rounded_full().bg(theme.muted),
+                animation_id,
+                Animation::new(Duration::from_millis(900)).repeat(),
+                !reduced,
+                move |dot, delta| {
+                    let phase = (delta + index as f32 / 3.0) % 1.0;
+                    let wave = if phase < 0.5 {
+                        phase * 2.0
+                    } else {
+                        (1.0 - phase) * 2.0
+                    };
+                    dot.opacity(0.3 + wave * 0.7)
+                },
+            )
+            .into_any_element()
         }))
         .into_any_element()
 }
@@ -19481,12 +21189,14 @@ fn render_assistant_text_segment(
     stream_animation_id: &str,
     streaming: bool,
     theme: UiTheme,
+    reduced: bool,
 ) -> AnyElement {
     if streaming {
         fade_in(
             render_streaming_markdown(theme, text).text_size(px(tokens::TEXT_MESSAGE)),
             format!("{stream_animation_id}-content"),
             STREAM_TEXT_FADE_DURATION,
+            reduced,
         )
         .into_any_element()
     } else {
@@ -19503,13 +21213,24 @@ fn render_assistant_text_segment(
     }
 }
 
-fn render_reasoning_text_segment(id: String, text: &str, streaming: bool) -> AnyElement {
+fn render_reasoning_text_segment(
+    id: String,
+    text: &str,
+    streaming: bool,
+    reduced: bool,
+) -> AnyElement {
     let text = normalize_reasoning_for_display(text);
     let markdown = TextView::markdown(id.clone(), text.into_owned())
         .selectable(true)
         .text_size(px(tokens::TEXT_SMALL));
     if streaming {
-        fade_in(markdown, format!("{id}-content"), STREAM_TEXT_FADE_DURATION).into_any_element()
+        fade_in(
+            markdown,
+            format!("{id}-content"),
+            STREAM_TEXT_FADE_DURATION,
+            reduced,
+        )
+        .into_any_element()
     } else {
         // Keep the parsed document behind a stable key. The variable-height
         // conversation list requests a visible message again while scrolling;
@@ -19532,6 +21253,7 @@ fn render_image_attachments(
     message_id: &str,
     attachments: &[PathBuf],
     theme: UiTheme,
+    reduced: bool,
 ) -> Vec<AnyElement> {
     attachments
         .iter()
@@ -19563,6 +21285,7 @@ fn render_image_attachments(
                 image,
                 format!("{message_id}-image-{index}"),
                 ATTACHMENT_FADE_DURATION,
+                reduced,
             )
             .into_any_element()
         })
@@ -19614,6 +21337,7 @@ fn render_ordered_message_content(
                         &stream_animation_id,
                         streaming && end == message.text.len(),
                         theme,
+                        reduced_motion(cx),
                     ));
                     text_segment_index += 1;
                 }
@@ -19744,9 +21468,11 @@ fn render_message(
 
     if message.role == MessageRole::User {
         let message_id = format!("message-{}-{index}", session_id.as_str());
-        let image_attachments = render_image_attachments(&message_id, &message.attachments, theme);
+        let image_attachments =
+            render_image_attachments(&message_id, &message.attachments, theme, reduced_motion(cx));
         let has_images = !image_attachments.is_empty();
         return div()
+            .w_full()
             .flex()
             .flex_col()
             .items_end()
@@ -19800,6 +21526,7 @@ fn render_message(
             format!("message-working-{}-{index}", session_id.as_str()),
             theme,
             4.0,
+            reduced_motion(cx),
         )]
     } else {
         let stream_animation_id =
@@ -19812,6 +21539,7 @@ fn render_message(
             &stream_animation_id,
             streaming,
             theme,
+            reduced_motion(cx),
         )]
     };
     let user_question_element = if assistant {
@@ -19858,6 +21586,7 @@ fn render_message(
     // stable element id lets GPUI continue the same one-shot animation across
     // the batched stream updates instead of restarting it on every delta.
     let should_fade_in = message.animate_in
+        && !reduced_motion(cx)
         && assistant
         && (!message.text.is_empty() || !message.reasoning.is_empty());
     if should_fade_in {
@@ -19906,6 +21635,7 @@ fn settings_tab_description(tab: SettingsTab) -> &'static str {
     match tab {
         SettingsTab::Models => "settings.provider_catalogs",
         SettingsTab::Agents => "settings.delegated_agents_description",
+        SettingsTab::Appearance => "settings.appearance_description",
         SettingsTab::RemoteAgent => "settings.remote_agent_description",
         SettingsTab::Diagnostics => "settings.session_trace_short",
         SettingsTab::Storage => "settings.local_storage",
@@ -20592,6 +22322,12 @@ mod workspace_grouping_tests {
             "tool.context_window",
             "tool.context_window_started",
             "tool.context_window_automatic",
+            "artifact.empty",
+            "artifact.kind.pdf",
+            "artifact.open",
+            "artifact.page",
+            "artifact.remove",
+            "chat.artifacts",
             "chat.copy_message",
             "chat.branch",
             "chat.hide_tool_activity",
@@ -20605,6 +22341,7 @@ mod workspace_grouping_tests {
             "notice.compact_failed",
             "notice.connection_missing",
             "security.allow_all_short",
+            "tool.publish_artifact",
             "security.ask_short",
             "tool.output_truncated",
             "tool.stopped_by_user",
@@ -20873,9 +22610,141 @@ mod remote_agent_question_tests {
 }
 
 #[cfg(test)]
+mod artifact_viewer_tests {
+    use super::{artifact_display_path, format_artifact_size, WorkArtifact, WorkArtifactKind};
+    use std::path::PathBuf;
+
+    fn artifact(path: &str) -> WorkArtifact {
+        WorkArtifact {
+            id: "artifact".into(),
+            path: PathBuf::from(path),
+            title: "Report".into(),
+            kind: WorkArtifactKind::Markdown,
+            description: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn artifact_completion_routes_to_its_session_and_rejects_stale_refreshes() {
+        use super::{
+            artifact_request_session_mut, ArtifactPreview, ArtifactRequestKey, ShellSession,
+        };
+        use averroes_core::connection::SessionBinding;
+        let mut a = ShellSession::new(None, SessionBinding::default(), false);
+        let b = ShellSession::new(None, SessionBinding::default(), false);
+        a.artifact_panel.selected = Some(artifact("/workspace/report.md"));
+        a.artifact_panel.generation = 2;
+        let mut key = ArtifactRequestKey {
+            session_id: a.id.clone(),
+            artifact_id: "artifact".into(),
+            generation: 1,
+        };
+        let mut sessions = vec![a, b];
+        assert!(artifact_request_session_mut(&mut sessions, &key).is_none());
+        key.generation = 2;
+        let owner = artifact_request_session_mut(&mut sessions, &key).unwrap();
+        owner.artifact_panel.preview = ArtifactPreview::Text("from A".into());
+        assert_eq!(
+            sessions[0].artifact_panel.preview,
+            ArtifactPreview::Text("from A".into())
+        );
+        assert_eq!(sessions[1].artifact_panel.preview, ArtifactPreview::Idle);
+        sessions.remove(0);
+        assert!(artifact_request_session_mut(&mut sessions, &key).is_none());
+    }
+
+    #[test]
+    fn workspace_artifact_paths_are_relative() {
+        let artifact = artifact("/workspace/docs/report.md");
+        assert_eq!(
+            artifact_display_path(&artifact, Some(std::path::Path::new("/workspace"))),
+            "docs/report.md"
+        );
+        assert_eq!(
+            artifact_display_path(&artifact, None),
+            "/workspace/docs/report.md"
+        );
+    }
+
+    #[test]
+    fn artifact_sizes_are_human_readable() {
+        assert_eq!(format_artifact_size(12), "12 B");
+        assert_eq!(format_artifact_size(2 * 1024), "2.0 KB");
+        assert_eq!(format_artifact_size(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    #[tokio::test]
+    async fn loads_markdown_artifact_previews() {
+        let path =
+            std::env::temp_dir().join(format!("averroes-artifact-test-{}.md", std::process::id()));
+        std::fs::write(&path, "# Report\n\nGenerated content.").unwrap();
+        let preview = super::load_artifact_preview_file(path.clone(), WorkArtifactKind::Markdown)
+            .await
+            .unwrap();
+        match preview {
+            super::ArtifactPreview::Markdown(text) => {
+                assert!(text.contains("Generated content."));
+            }
+            other => panic!("unexpected preview: {other:?}"),
+        }
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
 mod model_choice_tests {
     use super::{ConnectionId, ConnectionKind, ModelChoice, ModelInfo, ModelSource};
     use averroes_core::provider::ModelCapabilities;
+
+    #[test]
+    fn model_catalog_preserves_connections_and_searches_all_terms() {
+        use gpui_component::select::{SelectDelegate, SelectItem};
+        let mut choices = Vec::new();
+        for index in 0..512 {
+            for connection in ["Personal", "Trabajo"] {
+                choices.push(ModelChoice {
+                    connection_id: ConnectionId(connection.into()),
+                    connection_name: connection.to_owned().into(),
+                    connection_kind: ConnectionKind::Compatible,
+                    info: ModelInfo {
+                        id: format!("model-{index}"),
+                        display_name: format!("Qwen {index}"),
+                        provider: "compatible".into(),
+                        description: None,
+                        capabilities: ModelCapabilities {
+                            chat: true,
+                            embeddings: false,
+                            vision: false,
+                            tools: true,
+                        },
+                        source: ModelSource::Live,
+                        featured: false,
+                        default_reasoning_effort: None,
+                        available_reasoning_efforts: Vec::new(),
+                    },
+                });
+            }
+        }
+        let grouped = super::grouped_model_items(&choices);
+        assert_eq!(grouped.items_count(0), 512);
+        assert_eq!(grouped.items_count(1), 512);
+        for choice in &choices {
+            assert!(grouped.position(choice).is_some());
+        }
+        let found = choices
+            .iter()
+            .filter(|choice| choice.matches("trabajo qwen 511"))
+            .collect::<Vec<_>>();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].connection_id, ConnectionId("Trabajo".into()));
+        let mut tagged = choices[0].clone();
+        tagged.info.display_name = "qwen3:8b".into();
+        assert_eq!(tagged.display_label(), "qwen3:8b");
+        tagged.info.display_name = "Modelo de investigación".into();
+        assert!(tagged.matches("INVESTIGACIÓN personal"));
+    }
 
     #[test]
     fn model_choice_keeps_the_distinctive_model_id_visible() {

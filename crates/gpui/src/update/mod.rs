@@ -81,7 +81,9 @@ pub(crate) enum UpdateError {
     #[error("no DMG asset found for {architecture:?}")]
     MissingDmg { architecture: Architecture },
 
-    #[error("unsafe update URL {url:?}; expected an HTTPS URL in the Averroes GitHub repository")]
+    #[error(
+        "unsafe update URL {url:?}; expected an HTTPS URL in the application GitHub repository"
+    )]
     UnsafeUrl { url: String },
 
     #[error("DMG asset {asset:?} has no SHA-256 digest")]
