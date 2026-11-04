@@ -7,6 +7,9 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="QDivZero Harness"
+# GitHub normalizes spaces in uploaded asset names. Keep the artifact basename
+# stable so the published SHA256SUMS entry matches the downloaded filename.
+DMG_BASENAME="QDivZero.Harness"
 BUNDLE_ID="com.valendra.averroes"
 MINIMUM_MACOS_VERSION="13.0"
 TARGET_DIR="${CARGO_TARGET_DIR:-${PROJECT_ROOT}/target}"
@@ -78,7 +81,7 @@ fi
 
 BINARY="${TARGET_DIR}/release/averroes-gpui"
 BUNDLE="${TARGET_DIR}/release/${APP_NAME}.app"
-DMG="${DIST_DIR}/${APP_NAME}-${VERSION}-macos-${ARCH}.dmg"
+DMG="${DIST_DIR}/${DMG_BASENAME}-${VERSION}-macos-${ARCH}.dmg"
 ICON="${PROJECT_ROOT}/assets/QDivZeroHarness.icns"
 
 ensure_safe_artifact_path() {
