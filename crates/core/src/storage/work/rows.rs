@@ -1,10 +1,13 @@
 use super::types::{
-    note_search_key, CheckpointStatus, TaskPriority, TaskStatus, WorkHistoryEntry, WorkHistoryKind,
-    WorkMessage, WorkMessageRole, WorkNote, WorkNoteSearchPage,
+    note_search_key, CheckpointStatus, TaskPriority, TaskStatus, WorkArtifactKind,
+    WorkHistoryEntry, WorkHistoryKind, WorkMessage, WorkMessageRole, WorkNote, WorkNoteSearchPage,
 };
-use super::{WorkCheckpoint, WorkConversation, WorkDatabaseError, WorkSource, WorkTask};
+use super::{
+    WorkArtifact, WorkCheckpoint, WorkConversation, WorkDatabaseError, WorkSource, WorkTask,
+};
 use rusqlite::{params, types::Type, Connection, OptionalExtension, Transaction};
 use serde::de::DeserializeOwned;
+use std::path::PathBuf;
 
 fn json_column<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T> {
     let value = row.get::<_, String>(index)?;
@@ -1002,6 +1005,77 @@ pub(super) fn load_tasks(
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub(super) fn upsert_artifact_connection(
+    connection: &Connection,
+    conversation_id: &str,
+    artifact: &WorkArtifact,
+) -> Result<(), WorkDatabaseError> {
+    connection.execute(
+        "INSERT INTO artifacts
+            (conversation_id, artifact_id, path, title, kind, description, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(conversation_id, artifact_id) DO UPDATE SET
+            path = excluded.path,
+            title = excluded.title,
+            kind = excluded.kind,
+            description = excluded.description,
+            updated_at = excluded.updated_at",
+        params![
+            conversation_id,
+            artifact.id,
+            artifact.path.to_string_lossy().to_string(),
+            artifact.title,
+            artifact.kind.as_str(),
+            artifact.description,
+            artifact.created_at,
+            artifact.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkArtifact> {
+    Ok(WorkArtifact {
+        id: row.get(0)?,
+        path: PathBuf::from(row.get::<_, String>(1)?),
+        title: row.get(2)?,
+        kind: WorkArtifactKind::parse(&row.get::<_, String>(3)?),
+        description: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+pub(super) fn load_artifacts(
+    connection: &Connection,
+    conversation_id: &str,
+) -> Result<Vec<WorkArtifact>, WorkDatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT artifact_id, path, title, kind, description, created_at, updated_at
+         FROM artifacts
+         WHERE conversation_id = ?1
+         ORDER BY updated_at DESC, artifact_id",
+    )?;
+    let rows = statement.query_map(params![conversation_id], artifact_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub(super) fn load_artifact_by_path(
+    connection: &Connection,
+    conversation_id: &str,
+    path: &str,
+) -> Result<Option<WorkArtifact>, WorkDatabaseError> {
+    Ok(connection
+        .query_row(
+            "SELECT artifact_id, path, title, kind, description, created_at, updated_at
+             FROM artifacts
+             WHERE conversation_id = ?1 AND path = ?2",
+            params![conversation_id, path],
+            artifact_from_row,
+        )
+        .optional()?)
 }
 
 pub(super) fn upsert_source_connection(

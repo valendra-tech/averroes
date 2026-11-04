@@ -136,7 +136,10 @@ mod platform {
     impl AssertionBackend for Backend {
         fn create(&self) -> Result<u32, String> {
             let assertion_type = CFString::new("PreventUserIdleSystemSleep");
-            let assertion_name = CFString::new("Averroes user-started agent task");
+            let assertion_name = CFString::new(&format!(
+                "{} user-started agent task",
+                crate::branding::APP_NAME
+            ));
             let mut assertion_id = 0;
             let return_code = unsafe {
                 IOPMAssertionCreateWithName(

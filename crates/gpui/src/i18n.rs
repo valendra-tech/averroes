@@ -62,7 +62,12 @@ impl Localization {
         let messages = serde_json::from_str::<HashMap<String, String>>(source)
             .expect("embedded localization catalog must be valid JSON")
             .into_iter()
-            .map(|(key, value)| (key, SharedString::new(value)))
+            .map(|(key, value)| {
+                (
+                    key,
+                    SharedString::new(value.replace("{app_name}", crate::brand::APP_NAME)),
+                )
+            })
             .collect();
         Self { locale, messages }
     }
@@ -97,7 +102,25 @@ pub fn format(cx: &App, key: &str, values: &[(&str, String)]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Locale;
+    use super::{Locale, Localization};
+
+    #[test]
+    fn product_identity_is_resolved_in_both_embedded_catalogs() {
+        for locale in [Locale::English, Locale::Spanish] {
+            let localization = Localization::new(locale);
+            assert_eq!(
+                localization.text("sidebar.brand").as_ref(),
+                "QDivZero Harness"
+            );
+            assert!(localization
+                .text("app.needs_attention")
+                .contains("QDivZero Harness"));
+            assert!(localization
+                .messages
+                .values()
+                .all(|text| !text.contains("{app_name}") && !text.contains("Averroes")));
+        }
+    }
 
     #[test]
     fn maps_spanish_locale_tags_to_the_spanish_catalog() {

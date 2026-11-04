@@ -153,6 +153,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_appearance_settings_have_automatic_defaults() {
+        let config: AppConfig = toml::from_str("version = 1").unwrap();
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["appearance"],
+            serde_json::json!({"material": "automatic", "motion": "follow_system"})
+        );
+    }
+
+    #[test]
+    fn appearance_preferences_survive_toml_round_trip() {
+        let config: AppConfig =
+            toml::from_str("version = 1\n[appearance]\nmaterial = 'opaque'\nmotion = 'reduced'\n")
+                .unwrap();
+        let source = toml::to_string(&config).unwrap();
+        let restored: AppConfig = toml::from_str(&source).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap()["appearance"],
+            serde_json::json!({"material": "opaque", "motion": "reduced"})
+        );
+    }
+
+    #[test]
     fn old_settings_without_remote_agent_use_safe_defaults() {
         let source = r#"
 version = 1

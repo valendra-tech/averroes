@@ -1,11 +1,14 @@
+use super::progress::{activity_ring, status_pill, StatusTone};
 use crate::ui::tokens;
 use crate::ui::UiTheme;
+use crate::{i18n, ui::animation::reduced_motion};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     div, px, AnyElement, Div, ElementId, InteractiveElement, IntoElement, ParentElement, Rgba,
     SharedString, Stateful, Styled,
 };
-use gpui_component::{Icon, IconName};
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{Icon, IconName, Selectable, Sizable};
 
 enum RowIcon {
     Named(IconName),
@@ -23,6 +26,7 @@ pub struct SidebarRow {
     selected: bool,
     processing: bool,
     unread: bool,
+    conversation: bool,
 }
 
 impl SidebarRow {
@@ -38,6 +42,7 @@ impl SidebarRow {
             selected: false,
             processing: false,
             unread: false,
+            conversation: false,
         }
     }
 
@@ -76,28 +81,31 @@ impl SidebarRow {
         self
     }
 
-    pub fn processing(mut self, processing: bool) -> Self {
-        self.processing = processing;
+    pub fn conversation(mut self) -> Self {
+        self.conversation = true;
         self
     }
 
-    pub fn unread(mut self, unread: bool) -> Self {
-        self.unread = unread;
-        self
-    }
-
-    pub fn render(self, theme: UiTheme) -> Stateful<Div> {
+    pub fn render(self, theme: UiTheme, cx: &gpui::App) -> Stateful<Div> {
         let icon_color = self.icon_color.unwrap_or(theme.muted);
+        let activity_id = self.id.clone();
         div()
             .id(self.id)
             .flex_none()
             .w_full()
             .h(px(tokens::ROW_HEIGHT))
+            .when(self.conversation, |row| {
+                row.mb(px(tokens::CONVERSATION_ROW_GAP))
+            })
             .pl(px(self.indent))
             .pr(px(tokens::SPACE_12))
             .flex()
             .items_center()
-            .gap(px(tokens::SPACE_12))
+            .gap(px(if self.conversation {
+                tokens::SPACE_6
+            } else {
+                tokens::SPACE_12
+            }))
             .rounded(px(tokens::RADIUS_CARD))
             .overflow_hidden()
             .cursor_pointer()
@@ -106,7 +114,9 @@ impl SidebarRow {
                 row.bg(theme.surface_hover)
                     .font_weight(tokens::WEIGHT_MEDIUM)
             })
-            .hover(|style| style.bg(theme.surface_hover))
+            .when(!self.selected, |row| {
+                row.hover(|style| style.bg(theme.surface_hover.opacity(0.45)))
+            })
             .children(self.leading)
             .children(self.icon.map(|icon| {
                 match icon {
@@ -130,7 +140,7 @@ impl SidebarRow {
                     .text_ellipsis()
                     .child(self.label),
             )
-            .when(self.unread, |row| {
+            .when(self.unread && !self.processing, |row| {
                 row.child(
                     div()
                         .flex_none()
@@ -141,12 +151,21 @@ impl SidebarRow {
             })
             .when(self.processing, |row| {
                 row.child(
-                    Icon::new(IconName::Loader)
-                        .size(px(tokens::ICON_SMALL))
-                        .text_color(theme.accent_text),
+                    status_pill(theme, StatusTone::Info)
+                        .child(activity_ring(theme, activity_id, reduced_motion(cx)))
+                        .child(i18n::text(cx, "sidebar.in_progress")),
                 )
             })
             .children(self.accessory)
+    }
+
+    pub fn processing(mut self, processing: bool) -> Self {
+        self.processing = processing;
+        self
+    }
+    pub fn unread(mut self, unread: bool) -> Self {
+        self.unread = unread;
+        self
     }
 }
 
@@ -162,41 +181,23 @@ pub fn section_header(theme: UiTheme, label: impl Into<SharedString>, top: f32) 
         .into_any_element()
 }
 
-pub fn toolbar_surface(theme: UiTheme) -> Div {
-    div()
-        .flex_none()
-        .h(px(tokens::TOOLBAR_HEIGHT))
-        .px(px(tokens::SPACE_16))
-        .flex()
-        .items_center()
-        .gap(px(tokens::SPACE_8))
-        .border_b_1()
-        .border_color(theme.hairline)
-}
-
 pub fn segmented_tab(
     theme: UiTheme,
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     selected: bool,
-) -> Stateful<Div> {
-    div()
-        .id(id.into())
-        .h(px(tokens::CONTROL_LARGE))
-        .px(px(tokens::SPACE_12))
-        .flex()
-        .items_center()
+) -> Button {
+    Button::new(id)
+        .ghost()
+        .with_size(px(tokens::CONTROL_LARGE))
+        .label(label)
+        .selected(selected)
         .rounded(px(tokens::RADIUS_CONTROL))
-        .cursor_pointer()
         .text_size(px(tokens::TEXT_BODY))
         .text_color(if selected {
             theme.foreground
         } else {
             theme.muted
         })
-        .when(selected, |tab| {
-            tab.bg(theme.surface).font_weight(tokens::WEIGHT_MEDIUM)
-        })
-        .hover(|style| style.bg(theme.surface_hover))
-        .child(label.into())
+        .when(selected, |tab| tab.font_weight(tokens::WEIGHT_MEDIUM))
 }

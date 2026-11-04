@@ -1,3 +1,4 @@
+pub mod artifact;
 pub mod ask_user;
 pub mod bash;
 pub mod browser;

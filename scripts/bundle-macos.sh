@@ -6,7 +6,7 @@ set -euo pipefail
 # so local builds and CI produce identical artifacts.
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_NAME="Averroes"
+APP_NAME="QDivZero Harness"
 BUNDLE_ID="com.valendra.averroes"
 MINIMUM_MACOS_VERSION="13.0"
 TARGET_DIR="${CARGO_TARGET_DIR:-${PROJECT_ROOT}/target}"
@@ -79,7 +79,7 @@ fi
 BINARY="${TARGET_DIR}/release/averroes-gpui"
 BUNDLE="${TARGET_DIR}/release/${APP_NAME}.app"
 DMG="${DIST_DIR}/${APP_NAME}-${VERSION}-macos-${ARCH}.dmg"
-ICON="${PROJECT_ROOT}/assets/AppIcon.icns"
+ICON="${PROJECT_ROOT}/assets/QDivZeroHarness.icns"
 
 ensure_safe_artifact_path() {
     local artifact="$1"

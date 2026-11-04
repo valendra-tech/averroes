@@ -160,7 +160,7 @@ impl WorkDatabase {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
             "SELECT window_id, session_ids_json, active_session_id,
-                    x, y, width, height, mode
+                    x, y, width, height, mode, layout_json
              FROM app_windows
              ORDER BY updated_at ASC, window_id ASC",
         )?;
@@ -187,6 +187,9 @@ impl WorkDatabase {
                 width: row.get(5)?,
                 height: row.get(6)?,
                 mode,
+                layout: serde_json::from_str::<WorkWindowLayout>(&row.get::<_, String>(8)?)
+                    .unwrap_or_default()
+                    .normalized(),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -194,6 +197,7 @@ impl WorkDatabase {
 
     pub fn save_window_state(&self, state: &WorkWindowState) -> Result<(), WorkDatabaseError> {
         let session_ids = serde_json::to_string(&state.session_ids)?;
+        let layout = serde_json::to_string(&state.layout.normalized())?;
         let mode = match state.mode {
             WorkWindowMode::Windowed => "windowed",
             WorkWindowMode::Maximized => "maximized",
@@ -202,8 +206,8 @@ impl WorkDatabase {
         self.connection.lock().execute(
             "INSERT INTO app_windows
                 (window_id, session_ids_json, active_session_id,
-                 x, y, width, height, mode, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 x, y, width, height, mode, updated_at, layout_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(window_id) DO UPDATE SET
                 session_ids_json = excluded.session_ids_json,
                 active_session_id = excluded.active_session_id,
@@ -212,7 +216,8 @@ impl WorkDatabase {
                 width = excluded.width,
                 height = excluded.height,
                 mode = excluded.mode,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                layout_json = excluded.layout_json",
             params![
                 state.id,
                 session_ids,
@@ -223,6 +228,7 @@ impl WorkDatabase {
                 state.height,
                 mode,
                 now(),
+                layout,
             ],
         )?;
         Ok(())
@@ -904,6 +910,51 @@ impl WorkDatabase {
     pub fn upsert_task(&self, session_id: &str, task: &WorkTask) -> Result<(), WorkDatabaseError> {
         let connection = self.connection.lock();
         rows::upsert_task_connection(&connection, session_id, task)
+    }
+
+    pub fn artifacts(&self, session_id: &str) -> Result<Vec<WorkArtifact>, WorkDatabaseError> {
+        let connection = self.connection.lock();
+        rows::load_artifacts(&connection, session_id)
+    }
+
+    pub fn artifact_by_path(
+        &self,
+        session_id: &str,
+        path: &Path,
+    ) -> Result<Option<WorkArtifact>, WorkDatabaseError> {
+        let connection = self.connection.lock();
+        rows::load_artifact_by_path(&connection, session_id, &path.to_string_lossy())
+    }
+
+    /// Remove a registry entry without removing its file.
+    pub fn delete_artifact(
+        &self,
+        session_id: &str,
+        artifact_id: &str,
+    ) -> Result<bool, WorkDatabaseError> {
+        let changed = self.connection.lock().execute(
+            "DELETE FROM artifacts WHERE conversation_id = ?1 AND artifact_id = ?2",
+            params![session_id, artifact_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Persist an artifact and return the canonical record. Publishing the
+    /// same path again updates the existing artifact instead of creating a
+    /// duplicate entry; the original id and creation time are preserved.
+    pub fn upsert_artifact(
+        &self,
+        session_id: &str,
+        artifact: &WorkArtifact,
+    ) -> Result<WorkArtifact, WorkDatabaseError> {
+        let mut artifact = artifact.clone();
+        if let Some(existing) = self.artifact_by_path(session_id, &artifact.path)? {
+            artifact.id = existing.id;
+            artifact.created_at = existing.created_at;
+        }
+        let connection = self.connection.lock();
+        rows::upsert_artifact_connection(&connection, session_id, &artifact)?;
+        Ok(artifact)
     }
 
     pub fn scheduled_tasks(
@@ -1729,6 +1780,57 @@ mod tests {
             active_window_id: "initial".into(),
             history_entries: Vec::new(),
         }
+    }
+
+    #[test]
+    fn artifacts_are_persisted_and_updated_by_path() {
+        use std::path::{Path, PathBuf};
+
+        let (_directory, database) = database();
+        database
+            .save_conversation(&test_conversation("artifact-session"))
+            .unwrap();
+        let timestamp = now();
+        let original = WorkArtifact {
+            id: "artifact-1".into(),
+            path: PathBuf::from("/tmp/report.pdf"),
+            title: "Report".into(),
+            kind: WorkArtifactKind::Pdf,
+            description: Some("Generated report".into()),
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        database
+            .upsert_artifact("artifact-session", &original)
+            .unwrap();
+
+        let updated = WorkArtifact {
+            id: "artifact-2".into(),
+            title: "Updated report".into(),
+            updated_at: timestamp + 1,
+            ..original.clone()
+        };
+        let stored = database
+            .upsert_artifact("artifact-session", &updated)
+            .unwrap();
+
+        assert_eq!(stored.id, "artifact-1");
+        assert_eq!(stored.title, "Updated report");
+        let loaded = database.artifacts("artifact-session").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].kind, WorkArtifactKind::Pdf);
+        assert_eq!(
+            database
+                .artifact_by_path("artifact-session", Path::new("/tmp/report.pdf"))
+                .unwrap()
+                .unwrap()
+                .id,
+            "artifact-1"
+        );
+        assert!(database
+            .delete_artifact("artifact-session", "artifact-1")
+            .unwrap());
+        assert!(database.artifacts("artifact-session").unwrap().is_empty());
     }
 
     fn private_test_conversation(id: &str) -> WorkConversation {
@@ -2985,6 +3087,11 @@ mod tests {
             width: 1440,
             height: 900,
             mode: WorkWindowMode::Maximized,
+            layout: WorkWindowLayout {
+                sidebar_width: 320,
+                inspector_width: 600,
+                sidebar_visible: false,
+            },
         };
 
         database.save_window_state(&state).unwrap();
@@ -2994,6 +3101,56 @@ mod tests {
 
         reopened.delete_window_state(&state.id).unwrap();
         assert!(reopened.window_states().unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_window_layout_does_not_discard_the_window() {
+        let (_directory, database) = database();
+        database
+            .connection
+            .lock()
+            .execute(
+                "INSERT INTO app_windows
+             (window_id, x, y, width, height, mode, updated_at, layout_json)
+             VALUES ('legacy', 0, 0, 1440, 900, 'windowed', 1, 'not-json')",
+                [],
+            )
+            .unwrap();
+        let windows = database.window_states().unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&windows[0]).unwrap()["layout"],
+            serde_json::json!({"sidebar_width": 246, "inspector_width": 356, "sidebar_visible": true})
+        );
+    }
+
+    #[test]
+    fn legacy_window_layout_migration_preserves_sessions_and_geometry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE app_windows (
+                window_id TEXT PRIMARY KEY, session_ids_json TEXT NOT NULL DEFAULT '[]',
+                active_session_id TEXT, x INTEGER NOT NULL, y INTEGER NOT NULL,
+                width INTEGER NOT NULL, height INTEGER NOT NULL,
+                mode TEXT NOT NULL, updated_at INTEGER NOT NULL
+             );
+             INSERT INTO app_windows VALUES
+                ('old-window', '[\"conversation-1\"]', 'conversation-1',
+                 120, 80, 1440, 900, 'windowed', 1);",
+            )
+            .unwrap();
+        drop(connection);
+        let database = WorkDatabase::open_at(path).unwrap();
+        let windows = database.window_states().unwrap();
+        assert_eq!(windows[0].session_ids, vec!["conversation-1"]);
+        assert_eq!((windows[0].x, windows[0].y), (120, 80));
+        assert_eq!(
+            serde_json::to_value(&windows[0]).unwrap()["layout"],
+            serde_json::json!({"sidebar_width": 246, "inspector_width": 356, "sidebar_visible": true})
+        );
     }
 
     #[test]

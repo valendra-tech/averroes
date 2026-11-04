@@ -43,7 +43,7 @@ impl Default for WebFetchTool {
                 }
             }))
             .connect_timeout(CONNECT_TIMEOUT)
-            .user_agent(format!("Averroes/{}", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("{}/{}", crate::branding::HTTP_CLIENT_NAME, env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { client }

@@ -507,7 +507,7 @@ mod macos {
         let access = ScreenCaptureAccess;
         if !access.preflight() && !access.request() {
             return Err(execution(
-                "Screen Recording permission is required. Enable Averroes in System Settings > Privacy & Security > Screen Recording, then retry the capture",
+                format!("Screen Recording permission is required. Enable {} in System Settings > Privacy & Security > Screen Recording, then retry the capture", crate::branding::APP_NAME),
             ));
         }
 
@@ -941,7 +941,7 @@ mod macos {
             }
             open_accessibility_settings();
             Err(execution(
-                "Accessibility permission is required for desktop input. macOS requires you to enable Averroes manually in the Accessibility settings that were opened, then retry",
+                format!("Accessibility permission is required for desktop input. macOS requires you to enable {} manually in the Accessibility settings that were opened, then retry", crate::branding::APP_NAME),
             ))
         }
     }

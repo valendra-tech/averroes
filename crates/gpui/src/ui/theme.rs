@@ -4,6 +4,12 @@ use gpui::{px, rgb, App, Font, FontFallbacks, Rgba, Window};
 pub struct UiTheme {
     pub background: Rgba,
     pub rail: Rgba,
+    pub chrome_opaque: Rgba,
+    pub canvas: Rgba,
+    pub chrome_tint: Rgba,
+    pub rim: Rgba,
+    pub chrome_shadow: Rgba,
+    pub paper_canvas: Rgba,
     pub surface: Rgba,
     pub surface_subtle: Rgba,
     pub surface_hover: Rgba,
@@ -33,23 +39,29 @@ impl UiTheme {
     pub const RADIUS: f32 = crate::ui::tokens::RADIUS_CARD;
 
     pub fn dark() -> Self {
-        let accent = rgb(0x0A84FF);
+        let accent = rgb(0x006DDD);
         let success = rgb(0x30D158);
         let warning = rgb(0xFF9F0A);
         let destructive = rgb(0xFF453A);
         Self {
-            background: rgb(0x1E1E1E),
-            rail: rgb(0x2A2A2C).opacity(0.72),
-            surface: rgb(0x2C2C2E),
-            surface_subtle: rgb(0x232325),
-            surface_hover: rgb(0x3A3A3C),
-            foreground: rgb(0xFFFFFF),
-            muted: rgb(0xA1A1A6),
-            faint: rgb(0x98989D),
+            background: rgb(0x1D1E23),
+            rail: rgb(0x262831).opacity(0.76),
+            chrome_opaque: rgb(0x282A31),
+            canvas: rgb(0x0C0F16).opacity(0.25),
+            chrome_tint: rgb(0x262831).opacity(0.76),
+            rim: rgb(0xFFFFFF).opacity(0.14),
+            chrome_shadow: rgb(0x000000).opacity(0.20),
+            paper_canvas: rgb(0x292B32),
+            surface: rgb(0x25272E),
+            surface_subtle: rgb(0x282A31),
+            surface_hover: rgb(0x353840),
+            foreground: rgb(0xEEEFF3),
+            muted: rgb(0xB0B3BF),
+            faint: rgb(0xA9ADB8),
             border: rgb(0x3A3A3C),
             hairline: rgb(0xFFFFFF).opacity(0.08),
             accent,
-            accent_hover: rgb(0x409CFF),
+            accent_hover: rgb(0x0070E0),
             accent_text: rgb(0x409CFF),
             accent_soft: accent.opacity(0.22),
             selection: accent.opacity(0.28),
@@ -67,19 +79,25 @@ impl UiTheme {
     }
 
     pub fn light() -> Self {
-        let accent = rgb(0x007AFF);
+        let accent = rgb(0x0067D9);
         let success = rgb(0x34C759);
         let warning = rgb(0xFF9500);
         let destructive = rgb(0xFF3B30);
         Self {
-            background: rgb(0xFFFFFF),
-            rail: rgb(0xF6F6F7),
+            background: rgb(0xFDFDFD),
+            rail: rgb(0xFBFBFD).opacity(0.70),
+            chrome_opaque: rgb(0xF3F3F5),
+            canvas: rgb(0xFFFFFF).opacity(0.17),
+            chrome_tint: rgb(0xFBFBFD).opacity(0.70),
+            rim: rgb(0xFFFFFF).opacity(0.82),
+            chrome_shadow: rgb(0x141E32).opacity(0.07),
+            paper_canvas: rgb(0xE9EAEE),
             surface: rgb(0xFFFFFF),
-            surface_subtle: rgb(0xF5F5F7),
-            surface_hover: rgb(0xE5E5EA),
-            foreground: rgb(0x1D1D1F),
-            muted: rgb(0x5A5A5F),
-            faint: rgb(0x69696E),
+            surface_subtle: rgb(0xF3F3F5),
+            surface_hover: rgb(0xE8E9ED),
+            foreground: rgb(0x202127),
+            muted: rgb(0x5D616C),
+            faint: rgb(0x5D616C),
             border: rgb(0xD1D1D6),
             hairline: rgb(0x000000).opacity(0.08),
             accent,
@@ -105,6 +123,31 @@ impl UiTheme {
             Self::dark()
         } else {
             Self::light()
+        }
+    }
+
+    pub fn canvas_fill(self, mode: super::material::MaterialMode) -> Rgba {
+        if mode == super::material::MaterialMode::Opaque {
+            self.chrome_opaque
+        } else {
+            self.canvas
+        }
+    }
+
+    pub fn chrome_fill(self, mode: super::material::MaterialMode) -> Rgba {
+        if mode == super::material::MaterialMode::Opaque {
+            self.chrome_opaque
+        } else {
+            self.chrome_tint
+        }
+    }
+
+    pub fn navigation_fill(self, mode: super::material::MaterialMode) -> Rgba {
+        if mode == super::material::MaterialMode::Opaque {
+            self.chrome_opaque
+        } else {
+            // Automatic delegates the panel material to AppKit.
+            gpui::rgba(0)
         }
     }
 
@@ -140,12 +183,11 @@ impl UiTheme {
         theme.mode = mode;
         theme.font_family = Self::UI_FONT.into();
         theme.mono_font_family = Self::MONO_FONT.into();
-        theme.font_size = px(17.0);
+        theme.font_size = px(crate::ui::tokens::TEXT_BODY);
         theme.mono_font_size = px(crate::ui::tokens::TEXT_SMALL);
         theme.radius = px(crate::ui::tokens::RADIUS_CONTROL);
         theme.radius_lg = px(crate::ui::tokens::RADIUS_SHEET);
-        // This is deliberately a flat workspace. Elevation is provided by
-        // color and borders, not a blanket layer of drop shadows.
+        // Pane chrome and ordinary form controls stay restrained.
         theme.shadow = false;
         theme.focus_ring = true;
 
@@ -338,8 +380,36 @@ mod tests {
     }
 
     #[test]
+    fn opaque_sidebar_fallback_preserves_readable_text() {
+        use crate::ui::material::MaterialMode;
+        for theme in [UiTheme::light(), UiTheme::dark()] {
+            let rendered = theme.navigation_fill(MaterialMode::Opaque);
+            for (label, color) in [
+                ("foreground", theme.foreground),
+                ("muted", theme.muted),
+                ("faint", theme.faint),
+            ] {
+                assert_text_contrast(&theme, label, color, rendered);
+            }
+        }
+    }
+
+    #[test]
     fn gpui_appearance_maps_to_the_expected_component_mode() {
         assert!(!gpui_component::ThemeMode::from(gpui::WindowAppearance::Light).is_dark());
         assert!(gpui_component::ThemeMode::from(gpui::WindowAppearance::Dark).is_dark());
+    }
+
+    #[test]
+    fn primary_action_labels_are_readable_in_both_appearances() {
+        for theme in [UiTheme::light(), UiTheme::dark()] {
+            assert_text_contrast(&theme, "primary label", rgb(0xFFFFFF), theme.accent);
+            assert_text_contrast(
+                &theme,
+                "hovered primary label",
+                rgb(0xFFFFFF),
+                theme.accent_hover,
+            );
+        }
     }
 }

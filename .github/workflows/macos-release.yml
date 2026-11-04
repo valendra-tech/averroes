@@ -312,12 +312,12 @@ jobs:
           trap cleanup_mount EXIT
 
           hdiutil attach -readonly -nobrowse -mountpoint "${MOUNT_POINT}" "${DMG_PATH}"
-          if [[ ! -d "${MOUNT_POINT}/Averroes.app" ]]; then
-            printf 'Expected Averroes.app is missing from the mounted DMG.\n' >&2
+          if [[ ! -d "${MOUNT_POINT}/QDivZero Harness.app" ]]; then
+            printf 'Expected QDivZero Harness.app is missing from the mounted DMG.\n' >&2
             exit 1
           fi
-          codesign --verify --deep --strict --verbose=2 "${MOUNT_POINT}/Averroes.app"
-          spctl --assess --type execute --verbose=2 "${MOUNT_POINT}/Averroes.app"
+          codesign --verify --deep --strict --verbose=2 "${MOUNT_POINT}/QDivZero Harness.app"
+          spctl --assess --type execute --verbose=2 "${MOUNT_POINT}/QDivZero Harness.app"
 
       - name: Upload validated DMG
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -404,8 +404,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          ARM64_NAME="Averroes-${RELEASE_VERSION}-macos-arm64.dmg"
-          # X86_64_NAME="Averroes-${RELEASE_VERSION}-macos-x86_64.dmg"
+          ARM64_NAME="QDivZero Harness-${RELEASE_VERSION}-macos-arm64.dmg"
+          # X86_64_NAME="QDivZero Harness-${RELEASE_VERSION}-macos-x86_64.dmg"
           CHECKSUM_NAME="SHA256SUMS.txt"
           ARM64_DMG="${ARTIFACTS_DIR}/${ARM64_NAME}"
           # X86_64_DMG="${ARTIFACTS_DIR}/${X86_64_NAME}"

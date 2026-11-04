@@ -231,6 +231,14 @@ mod tests {
     use crate::update::UpdateError;
     use semver::Version;
 
+    #[test]
+    fn branded_installer_names_with_spaces_keep_architecture_and_url_validation() {
+        let name = "QDivZero Harness-1.4.0-macos-arm64.dmg";
+        let selected = select_dmg(&[fixture_dmg(name)], Architecture::Arm64).unwrap();
+        assert_eq!(selected.name, name);
+        assert!(validate_asset_url(&selected.browser_download_url).is_ok());
+    }
+
     fn fixture_dmg(name: &str) -> ReleaseAsset {
         ReleaseAsset {
             name: name.into(),

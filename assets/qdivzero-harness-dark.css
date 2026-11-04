@@ -1,0 +1,2 @@
+/* Preserve the supplied paths and cyan accent; lift the dark ink for dark UI. */
+path[fill="#030650"], path[fill="#101044"] { fill: #DFEAFF; }

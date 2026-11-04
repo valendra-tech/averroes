@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod auth;
+pub mod branding;
 pub mod compaction;
 pub mod config;
 pub mod connections;

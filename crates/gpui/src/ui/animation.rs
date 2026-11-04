@@ -1,6 +1,4 @@
-use gpui::{
-    ease_out_quint, Animation, AnimationElement, AnimationExt, ElementId, IntoElement, Styled,
-};
+use gpui::{ease_out_quint, Animation, AnimationExt, ElementId, IntoElement, Styled};
 use std::time::Duration;
 
 pub const MESSAGE_FADE_DURATION: Duration = Duration::from_millis(220);
@@ -12,13 +10,46 @@ pub fn fade_opacity(delta: f32) -> f32 {
     delta.clamp(0.0, 1.0)
 }
 
-pub fn fade_in<E>(element: E, id: impl Into<ElementId>, duration: Duration) -> AnimationElement<E>
+pub fn reduced_motion(cx: &gpui::App) -> bool {
+    cx.has_global::<super::material::EffectiveVisuals>()
+        && cx
+            .global::<super::material::EffectiveVisuals>()
+            .reduced_motion
+}
+
+pub fn animate_if<E>(
+    element: E,
+    id: impl Into<ElementId>,
+    animation: Animation,
+    enabled: bool,
+    animator: impl Fn(E, f32) -> E + 'static,
+) -> gpui::AnyElement
+where
+    E: IntoElement + 'static,
+{
+    if enabled {
+        element
+            .with_animation(id, animation, animator)
+            .into_any_element()
+    } else {
+        element.into_any_element()
+    }
+}
+
+pub fn fade_in<E>(
+    element: E,
+    id: impl Into<ElementId>,
+    duration: Duration,
+    reduced: bool,
+) -> gpui::AnyElement
 where
     E: IntoElement + Styled + 'static,
 {
-    element.with_animation(
+    animate_if(
+        element,
         id,
         Animation::new(duration).with_easing(ease_out_quint()),
+        !reduced,
         |element, delta| element.opacity(fade_opacity(delta)),
     )
 }

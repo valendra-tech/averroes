@@ -4,7 +4,7 @@ use crate::connection::{ConnectionId, SessionBinding};
 use crate::provider::types::{ChatMessage, ImageSource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkProject {
@@ -51,6 +51,44 @@ pub struct WorkWindowState {
     pub width: i32,
     pub height: i32,
     pub mode: WorkWindowMode,
+    #[serde(default)]
+    pub layout: WorkWindowLayout,
+}
+
+/// Requested panel sizes, independent of temporary viewport constraints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkWindowLayout {
+    pub sidebar_width: i32,
+    pub inspector_width: i32,
+    pub sidebar_visible: bool,
+}
+
+impl WorkWindowLayout {
+    pub const SIDEBAR_MIN: i32 = 220;
+    pub const SIDEBAR_MAX: i32 = 380;
+    pub const INSPECTOR_MIN: i32 = 320;
+    pub const INSPECTOR_MAX: i32 = 700;
+
+    pub fn normalized(mut self) -> Self {
+        self.sidebar_width = self
+            .sidebar_width
+            .clamp(Self::SIDEBAR_MIN, Self::SIDEBAR_MAX);
+        self.inspector_width = self
+            .inspector_width
+            .clamp(Self::INSPECTOR_MIN, Self::INSPECTOR_MAX);
+        self
+    }
+}
+
+impl Default for WorkWindowLayout {
+    fn default() -> Self {
+        Self {
+            sidebar_width: 246,
+            inspector_width: 356,
+            sidebar_visible: true,
+        }
+    }
 }
 
 /// A virtual project/folder that groups conversations inside one workspace.
@@ -290,6 +328,76 @@ pub struct WorkSource {
     pub detail: Option<String>,
     pub count: u32,
     pub last_used_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkArtifactKind {
+    Markdown,
+    Pdf,
+    Image,
+    Latex,
+    Text,
+    Other,
+}
+
+impl WorkArtifactKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Pdf => "pdf",
+            Self::Image => "image",
+            Self::Latex => "latex",
+            Self::Text => "text",
+            Self::Other => "other",
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Self {
+        match value {
+            "markdown" => Self::Markdown,
+            "pdf" => Self::Pdf,
+            "image" => Self::Image,
+            "latex" => Self::Latex,
+            "text" => Self::Text,
+            _ => Self::Other,
+        }
+    }
+
+    /// Infer the artifact kind from a file path. The UI and the publish tool
+    /// share this classification so the preview never disagrees with storage.
+    pub fn from_path(path: &Path) -> Self {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match extension.as_str() {
+            "md" | "markdown" | "mdx" => Self::Markdown,
+            "pdf" => Self::Pdf,
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" => Self::Image,
+            "tex" | "latex" => Self::Latex,
+            "txt" | "log" | "csv" | "tsv" | "json" | "jsonl" | "yaml" | "yml" | "toml" | "xml"
+            | "html" | "htm" | "css" | "scss" | "js" | "jsx" | "ts" | "tsx" | "rs" | "py"
+            | "rb" | "go" | "java" | "kt" | "swift" | "c" | "h" | "cc" | "cpp" | "hpp" | "sh"
+            | "zsh" | "bash" | "fish" | "sql" | "ini" | "conf" | "cfg" | "env" | "svg" => {
+                Self::Text
+            }
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkArtifact {
+    pub id: String,
+    pub path: PathBuf,
+    pub title: String,
+    pub kind: WorkArtifactKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -27,16 +27,25 @@ pub const SPACE_32: f32 = 32.0;
 pub const RADIUS_CONTROL: f32 = 6.0;
 pub const RADIUS_CARD: f32 = 10.0;
 pub const RADIUS_SHEET: f32 = 14.0;
-pub const RADIUS_COMPOSER: f32 = 16.0;
+pub const RADIUS_COMPOSER: f32 = 24.0;
+pub const RADIUS_SIDEBAR: f32 = 16.0;
+pub const RADIUS_WORKSPACE: f32 = 15.0;
+pub const RADIUS_INSPECTOR: f32 = 14.0;
 
 pub const CONTROL_SMALL: f32 = 22.0;
 pub const CONTROL_REGULAR: f32 = 28.0;
 pub const CONTROL_LARGE: f32 = 32.0;
 pub const ROW_HEIGHT: f32 = 34.0;
+pub const CONVERSATION_ROW_GAP: f32 = SPACE_6;
 pub const NAV_HEIGHT: f32 = 36.0;
-pub const TOOLBAR_HEIGHT: f32 = 44.0;
+pub const TOOLBAR_HEIGHT: f32 = 58.0;
+pub const CONTROL_ICON: f32 = 30.0;
+pub const CONTROL_COMPACT: f32 = 28.0;
+pub const CONTROL_SEND: f32 = 32.0;
+pub const SETTINGS_CONTROL_HEIGHT: f32 = 34.0;
+pub const SETTINGS_ACTION_HEIGHT: f32 = 32.0;
+pub const SETTINGS_PAGE_WIDTH: f32 = 880.0;
 
-pub const SIDEBAR_WIDTH: f32 = 280.0;
 pub const SIDEBAR_GUTTER: f32 = 12.0;
 pub const ICON_SIZE: f32 = 16.0;
 pub const ICON_SMALL: f32 = 13.0;
@@ -81,9 +90,6 @@ mod tests {
         assert_eq!(RADIUS_CONTROL, 6.0);
         assert_eq!(RADIUS_CARD, 10.0);
         assert_eq!(RADIUS_SHEET, 14.0);
-        assert_eq!(RADIUS_COMPOSER, 16.0);
         assert_eq!(ROW_HEIGHT, 34.0);
-        assert_eq!(TOOLBAR_HEIGHT, 44.0);
-        assert_eq!(SIDEBAR_WIDTH, 280.0);
     }
 }

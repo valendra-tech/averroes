@@ -16,7 +16,7 @@ fn tool_icon_path(tool_name: &str) -> &'static str {
         "bash" | "shell" | "terminal" => "tools/terminal.svg",
         "file_read" | "read_file" | "read" => "tools/file-read.svg",
         "file_write" | "write_file" | "write" => "tools/file-write.svg",
-        "patch" => "tools/file-write.svg",
+        "patch" | "publish_artifact" => "tools/file-write.svg",
         "change_directory" => "tools/folder-search.svg",
         "glob" | "find_files" => "tools/folder-search.svg",
         "grep" | "search" => "tools/search.svg",
@@ -44,6 +44,7 @@ mod tests {
         assert_eq!(tool_icon_path("file_read"), "tools/file-read.svg");
         assert_eq!(tool_icon_path("file_write"), "tools/file-write.svg");
         assert_eq!(tool_icon_path("patch"), "tools/file-write.svg");
+        assert_eq!(tool_icon_path("publish_artifact"), "tools/file-write.svg");
         assert_eq!(
             tool_icon_path("change_directory"),
             "tools/folder-search.svg"
